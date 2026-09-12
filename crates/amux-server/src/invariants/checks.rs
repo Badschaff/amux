@@ -639,6 +639,9 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     ("_amux_task_artifacts", "updated_at", false),
     ("_amux_verifications", "created_at", false),
     ("_amux_request_log", "ts", false),
+    // Interaction writers use timestamp_millis(), matching browser Date.now().
+    ("_amux_interactions", "created_at", true),
+    ("_amux_interactions", "updated_at", true),
     // AF-175's boot column: which process wrote the row. Same unit as `ts` by
     // construction — it is `heartbeat::boot_at()`, the same clock — and the
     // one-sided restart predicate depends on `boot_at <= ts` holding, so a unit
