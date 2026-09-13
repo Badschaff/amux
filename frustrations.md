@@ -2575,3 +2575,14 @@ CARD: AMUX-4469
 SYMPTOM: During AF-748 board verification, /api/browser/ios/targets returned measured:true n_considered:10 while /api/debug/routes listed zero simulator routes. The fresh route.callers_have_routes results failed for the iOS prefix and targets. The coverage test followed api/mod.rs into browser.rs but never its nested browser/ios.rs; the extended test failed on all ten omitted paths before the catalog fix.
 COST: Two recurring automatic reports (AMUX-4468/4469) required another investigation; the diagnostic catalog could misclassify simulator request failures as missing routes.
 FIX: Add all ten real paths with their actual verbs and descend into nested router modules in the completeness test. Require a positive nested-route canary; verify the live catalog and invariant after deployment. Existing invariant incident warnings and normalized request-log verdicts carry the operational signal. Independent review remains pending.
+
+## A latency fixture changes the scan limit for sibling tests
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-397
+SYMPTOM: The scan-cap test sets process-wide AMUX_LATENCY_SCAN_CAP=200 while other tests use the same environment. A clean0c79fc53 rollup test given that value reproduces the reported empty findings: expected1, got0. Only20 baseline rows survive, below the detector's per-family minimum. An earlier separate window override was removed, but this fixture still changed global state.
+COST: Historical CI failures were charged to unrelated pushes; this audit needed a clean controlled reproduction and a scoped134-test run before the old flaky-test card could be assessed honestly.
+FIX: Pass the fixture's scan cap directly to the shared detector implementation, snapshot the production limit once, and include scan_cap with the considered/excluded population in the INFO log. Awaiting commit, clean gates and independent review.

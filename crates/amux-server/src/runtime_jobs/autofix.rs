@@ -1310,6 +1310,7 @@ struct P95Hit {
     /// (AMUX-3910)? Carried onto the card so `baseline_samples` cannot claim a
     /// 72h norm that was computed over 68h.
     scan_capped: bool,
+    scan_cap: usize,
     oldest_seen_h: f64,
 }
 
@@ -1375,7 +1376,7 @@ fn p95_finding(h: &P95Hit, mult: f64, min_n: i64, now: f64) -> Finding {
                      {:.1}h rather than the {:.0}h named above. The WINDOW is complete: the \
                      scan is ordered newest-first, so a cap can only shorten the baseline. \
                      Treat the multiple as directional.",
-                        latency_scan_cap(),
+                        h.scan_cap,
                         h.oldest_seen_h,
                         baseline_h()
                     )
@@ -1405,6 +1406,17 @@ pub(crate) fn detect_latency_at(
     conn: &Connection,
     now: f64,
     boot: Option<f64>,
+) -> (Vec<Finding>, Vec<Suppressed>) {
+    detect_latency_with_scan_cap(conn, now, boot, latency_scan_cap())
+}
+
+// AF-397: snapshot the configured limit once per scan. Tests pass their fixture limit
+// here instead of changing the process environment while sibling tests run.
+fn detect_latency_with_scan_cap(
+    conn: &Connection,
+    now: f64,
+    boot: Option<f64>,
+    scan_cap: usize,
 ) -> (Vec<Finding>, Vec<Suppressed>) {
     let w_start = now - window_h() * 3600.0;
     let b_start = now - baseline_h() * 3600.0;
@@ -1459,7 +1471,7 @@ pub(crate) fn detect_latency_at(
          ORDER BY ts DESC LIMIT ?2",
     ) {
         if let Ok(rows) =
-            stmt.query_map(rusqlite::params![b_start, latency_scan_cap() as i64], |r| {
+            stmt.query_map(rusqlite::params![b_start, scan_cap as i64], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, f64>(1)?,
@@ -1538,13 +1550,14 @@ pub(crate) fn detect_latency_at(
             tracing::info!(
                 considered,
                 excluded = spanned_restart,
+                scan_cap,
                 boot_at = boot.unwrap_or(0.0),
                 "latency: scanned request rows; excluded those whose clock spans this \
                  process's start — wall time across a restart is not service time (AF-175)"
             );
             considered_rows = considered;
             excluded_rows = spanned_restart;
-            if considered >= latency_scan_cap() {
+            if considered >= scan_cap {
                 // The cap is binding. It is now DIRECTED (newest first), so the
                 // window is whole and only the far end of the baseline is lost —
                 // but that still shortens the trailing norm every comparison is
@@ -1559,7 +1572,7 @@ pub(crate) fn detect_latency_at(
                 scan_capped = true;
                 tracing::warn!(
                     considered,
-                    cap = latency_scan_cap(),
+                    cap = scan_cap,
                     oldest_seen_h = (now - oldest_seen) / 3600.0,
                     "latency: row cap reached — baseline is truncated to the most recent rows; \
                      the WINDOW is complete (ORDER BY ts DESC, AMUX-3910) but the trailing norm \
@@ -1650,6 +1663,7 @@ pub(crate) fn detect_latency_at(
             win_n: win.len(),
             base_n: base.len(),
             scan_capped,
+            scan_cap,
             oldest_seen_h: (now - oldest_seen) / 3600.0,
         });
     }
@@ -11844,10 +11858,8 @@ mod tests {
         for i in 0..60 {
             insert(&st, now - 300.0 - i as f64, 900.0);
         }
-        std::env::set_var("AMUX_LATENCY_SCAN_CAP", "200");
         let conn = st.store.read().unwrap();
-        let (f, _) = detect_latency_at(&conn, now, None);
-        std::env::remove_var("AMUX_LATENCY_SCAN_CAP");
+        let (f, _) = detect_latency_with_scan_cap(&conn, now, None, 200);
 
         let hit = f
             .iter()
@@ -11867,6 +11879,10 @@ mod tests {
         assert!(
             ev["scan_coverage"].starts_with("PARTIAL"),
             "a capped scan must say so on the artifact, not only in the log: {ev:?}"
+        );
+        assert!(
+            ev["scan_coverage"].contains("200-row"),
+            "the evidence must name this scan's actual limit: {ev:?}"
         );
         assert!(
             ev["scan_coverage"].contains("WINDOW is complete"),
