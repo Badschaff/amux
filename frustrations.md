@@ -2541,3 +2541,14 @@ CARD: AF-750
 SYMPTOM: Owner desktop/mobile screenshots showed an overflowing notification badge beside an oversized red status panel and mixed emoji controls. The header diagnostic ignored desktop widths entirely.
 COST: The owner requested repeated desktop/mobile visual corrections; fitting the overall header width had not ensured clean individual control boundaries.
 FIX: AF-750 / AF-751, dashboard 0.9.930: contain the badge, use consistent line icons and lighter status controls, align desktop actions, preserve 44px mobile targets and fit the four primary mobile navigation labels. The existing mobile-header-clipped beacon now measures both desktop and mobile, includes the actual visible control count and detects escaping badges. A deliberate desktop badge overflow requires the real diagnostic request in the regression test.
+
+## An own mtime observation can become "your edit record" in the commit nudge
+AREA: attribution
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-746
+SYMPTOM: mixpeek-frustrations reported six studio paths labeled as carrying its edit record despite zero worktree edits. The current local observation store contains none of those historical studio records, so that incident's exact provenance is unconfirmed. Source inspection independently found apply_observed promoting requester-only mtimes into GuardInputs.mine when peers are visible and have no recorded claim. The nudge interprets omission from foreign/unclaimed as authorship. Its decoder also reads the boolean undecided field as an array and cannot detect paths omitted by the guard's cap.
+COST: The reporter declined every remedy to avoid sweeping another lane's work. This investigation required separate guard-to-nudge boundary reproductions because the existing peer-observation regressions did not cover self-attribution. No foreign worktree changes or reported sweep occurred.
+FIX: Keep observation-only paths unclaimed and committable under the existing visible-cotenant policy; preserve real writer/blind protection. Require a complete, decided guard population before the nudge derives ownership. Retain measured diagnostics and tests at the real consumer boundary. Historical six-path provenance remains unconfirmed until its original verdict is available.

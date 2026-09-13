@@ -51,7 +51,7 @@
 //! # Response (what the installed hooks read)
 //!
 //! ```json
-//! {"ok": true,
+//! {"ok": true, "classified_paths": ["<repo-relative>"],
 //!  "foreign":   [{"path","owner","age_secs","provenance","has_unstaged_changes","why"}],
 //!  "shared":    [{"path","owner","peer","age_secs","has_unstaged_changes"}],
 //!  "unclaimed": [{"path","has_unstaged_changes"}],
@@ -1698,7 +1698,9 @@ fn is_restore_only_command(cmd: &str) -> bool {
 // before the command and reports every file whose mtime moved during it.
 // The mtime is a fact about the disk, but every concurrent reader can observe
 // the same fact. MOS-33 keeps these records as uncertainty, separate from named
-// edit claims; they cannot establish a peer owner or replace a recorded writer.
+// edit claims; they cannot establish any owner or replace a recorded writer.
+// AF-746 removes the requester-only fallback too: unclaimed is committable
+// with visible cotenants, without turning permission into an authorship claim.
 
 /// Matches the guard's default window; observed rows older than this are
 /// pruned at write.
@@ -1965,19 +1967,9 @@ pub(crate) fn apply_observed(
             }
         }
     }
-    for (path, ts) in mine_obs {
-        // Preserve the own-shell fallback where nobody else has a recorded
-        // claim and all cotenants are visible. It must not overwrite an actual
-        // edit timestamp, weaken a peer claim, or hide an invisible cotenant.
-        // The uncertainty itself is retained above even when no fallback is safe.
-        if !inputs.mine.contains_key(path)
-            && !inputs.theirs.contains_key(path)
-            && !inputs.blind_cotenant
-        {
-            inputs.mine.insert(path.clone(), *ts);
-            inputs.mine_observed_only.insert(path.clone());
-        }
-    }
+    // AF-746: observing an mtime never establishes authorship, including for
+    // the requester. Unclaimed work remains committable with visible cotenants;
+    // permission to commit must not mint an edit record for downstream nudges.
 }
 
 /// AMUX-3446: the committer's own firsthand edit CONTENT per file, from their
@@ -2140,7 +2132,7 @@ pub(crate) enum LineAccounting {
 /// record is an MTIME MY BASH WINDOW CAUGHT, and on a shared checkout that
 /// includes writes I did not make: measured live while building this fix, a
 /// peer's `integrations/browser.rs` write landed inside my window and entered
-/// MY observed set 59 seconds later (the `mine_observed_only` provenance
+/// MY observed set 59 seconds later (the historical `mine_observed_only` provenance
 /// AMUX-3662 exists for). Suppressing on my observed record ALONE would
 /// therefore also suppress the one case the check is most useful in. So when a
 /// peer also claims the path, the detail stays on: that is exactly when a
@@ -2634,10 +2626,6 @@ pub(crate) struct GuardInputs {
     /// Paths with peer transcript content, used by line accounting and split
     /// risk. Observations never write this set or `theirs_firsthand`.
     pub theirs_transcript: HashSet<String>,
-    /// The requesting session's own observation-only fallback. This permits
-    /// shell-authored work when there is no conflicting or invisible peer;
-    /// it is never first-hand evidence and never displaces recorded edits.
-    pub mine_observed_only: HashSet<String>,
     /// Raw mtime observations retained separately from ownership, including
     /// observations that coincide with (or postdate) a recorded writer.
     pub observed_mine: HashMap<String, f64>,
@@ -2670,6 +2658,10 @@ pub(crate) struct GuardInputs {
 
 #[derive(Default)]
 pub(crate) struct Verdict {
+    /// Exact population classified, including positively claimed paths that
+    /// do not appear in a warning bucket. Consumers must not infer ownership
+    /// for omitted paths when the request was truncated or undecidable.
+    pub classified_paths: Vec<String>,
     pub foreign: Vec<Value>,
     pub shared: Vec<Value>,
     pub unclaimed: Vec<Value>,
@@ -2709,6 +2701,7 @@ pub(crate) fn classify(
         if rel.trim().is_empty() {
             continue;
         }
+        v.classified_paths.push(rel.clone());
         let hit = inp.theirs.get(ap);
         let is_dirty = inp.dirty.contains(ap);
         let own_observation = inp.observed_mine.get(ap);
@@ -2854,8 +2847,6 @@ pub(crate) fn classify(
                     // decide who wrote the file, it says how each side knows.
                     "mine_provenance": if !inp.mine.contains_key(ap) {
                         "none"
-                    } else if inp.mine_observed_only.contains(ap) {
-                        "observed"
                     } else {
                         "transcript"
                     },
@@ -3115,6 +3106,7 @@ impl Envelope {
     fn json(self) -> Value {
         json!({
             "ok": true,
+            "classified_paths": self.verdict.classified_paths,
             "foreign": self.verdict.foreign,
             "shared": self.verdict.shared,
             "unclaimed": self.verdict.unclaimed,
@@ -3656,7 +3648,6 @@ pub async fn staged_guard_inner(
     let inputs = GuardInputs {
         mine: mine.paths,
         mine_firsthand: mine_fh.paths.keys().cloned().collect(),
-        mine_observed_only: HashSet::new(),
         observed_mine: HashMap::new(),
         observed_peers: HashMap::new(),
         observed_windows: HashMap::new(),
@@ -3710,6 +3701,9 @@ pub async fn staged_guard_inner(
         tracing::info!(
             target: "staged_guard",
             session = %session,
+            measured = true,
+            n_considered = pairs.len(),
+            self_observations = v.observations.iter().filter(|row| row["mine_age_secs"].is_number()).count(),
             observed_paths = v.observations.len(),
             peer_observations,
             staged_paths = pairs.len(),
@@ -6118,8 +6112,8 @@ mod tests {
         }
     }
 
-    /// AF-123's own-shell workflow stays available, while MOS-33 refuses
-    /// the unsafe extension that ranked a concurrent observation as a write.
+    /// AF-123's own-shell workflow stays committable without claiming that
+    /// an observation identifies its writer (AF-746).
     #[test]
     fn own_shell_observations_work_without_weakening_recorded_or_blind_protection() {
         // AF-123's legitimate case: an own shell edit and a fully visible
@@ -6133,8 +6127,9 @@ mod tests {
         );
         let v = classify(&[pair("f.rs")], 2000.0, 3600.0, &own);
         assert!(v.foreign.is_empty());
-        assert!(v.unclaimed.is_empty());
+        assert_eq!(v.unclaimed.len(), 1);
         assert_eq!(v.observations.len(), 1);
+        assert!(!own.mine.contains_key("/repo/f.rs"));
         assert!(!own.mine_firsthand.contains("/repo/f.rs"));
 
         // A reader's mtime must never displace an actual writer, whether its
@@ -7723,6 +7718,60 @@ mod tests {
                 assert_eq!(v["unclaimed"].as_array().unwrap().len(), 1);
             }
         }
+    }
+
+    #[test]
+    fn own_observation_does_not_become_nudge_authorship() {
+        use crate::runtime_jobs::commit_nudge::{build, ownership_from_verdict, Freshness};
+        let paths = vec!["studio/server/routes/agentCredentials.ts".to_string()];
+        for dirty in [false, true] {
+            let mut inputs = GuardInputs::default();
+            let absolute = format!("/repo/{}", paths[0]);
+            if dirty { inputs.dirty.insert(absolute.clone()); }
+            apply_observed(&mut inputs, &HashMap::from([(absolute.clone(), 1900.0)]), &[], &[]);
+            let verdict = Envelope {
+                verdict: classify(&[pair(&paths[0])], 2000.0, 3600.0, &inputs),
+                ..Default::default()
+            }.json();
+            assert!(verdict["foreign"].as_array().unwrap().is_empty(), "unclaimed work remains committable");
+            let own = ownership_from_verdict("fixture-observer", &verdict, &paths).unwrap();
+            let fresh = Freshness { stale: paths.clone(), ..Default::default() };
+            let text = build("/repo", &paths, &own, &fresh, "test specimen").unwrap();
+            assert!(text.contains("NONE carries your edit record"), "{text}");
+            assert!(!text.contains("CONTESTED"), "observation invented a coauthor: {text}");
+
+            // A real edit record remains positive even alongside observations.
+            inputs.mine.insert(absolute.clone(), 1900.0);
+            inputs.mine_firsthand.insert(absolute);
+            let verdict = Envelope {
+                verdict: classify(&[pair(&paths[0])], 2000.0, 3600.0, &inputs),
+                ..Default::default()
+            }.json();
+            let own = ownership_from_verdict("fixture-observer", &verdict, &paths).unwrap();
+            let text = build("/repo", &paths, &own, &fresh, "test specimen").unwrap();
+            assert!(text.contains("of your dirty file(s)"), "{text}");
+        }
+    }
+
+    #[test]
+    fn incomplete_guard_verdict_cannot_become_nudge_authorship() {
+        use crate::runtime_jobs::commit_nudge::ownership_from_verdict;
+        let paths = vec!["first.rs".to_string(), "omitted.rs".to_string()];
+        let complete = Envelope {
+            verdict: classify(&[pair("first.rs"), pair("omitted.rs")], 2000.0, 3600.0, &GuardInputs::default()),
+            ..Default::default()
+        }.json();
+        assert!(ownership_from_verdict("fixture-observer", &complete, &paths).is_some());
+        for flag in ["undecided", "enabled"] {
+            let mut unavailable = complete.clone();
+            unavailable[flag] = json!(flag == "undecided");
+            assert!(ownership_from_verdict("fixture-observer", &unavailable, &paths).is_none(), "{flag}: {unavailable}");
+        }
+        let truncated = Envelope {
+            verdict: classify(&[pair("first.rs")], 2000.0, 3600.0, &GuardInputs::default()),
+            ..Default::default()
+        }.json();
+        assert!(ownership_from_verdict("fixture-observer", &truncated, &paths).is_none());
     }
 
     /// The envelope shape the installed hooks parse. Every key on every path,

@@ -1504,6 +1504,61 @@ async fn ownership_from_guard(session: &str, dir: &str, paths: &[String]) -> Opt
         // and that is the failure mode, not the safe default.
         return None;
     }
+    let mut own = ownership_from_verdict(session, &v, paths)?;
+    // SETTLED-MINE + DIRTY-THEIRS IS NOT A CONTEST (AMUX-3436). `shared` keys
+    // on edit records inside the window, which cannot tell edited-and-committed
+    // from edited-and-dirty: a session whose every hunk already landed in HEAD
+    // was told to stage per-hunk over a file where all dirty bytes were a
+    // peer's in-flight work. The discriminator exists — owner_committed_since,
+    // the same check the victim notice runs — so ask it: a shared path whose
+    // OWN edit is strictly settled by a newer own commit demotes to foreign
+    // (NOT YOURS, the peer named). Unsettled, unknown-peer, or unanswerable
+    // rows keep today's CONTESTED, the safe direction.
+    let mut settled: BTreeSet<String> = BTreeSet::new();
+    if let Some(rows) = v.get("shared").and_then(Value::as_array) {
+        for row in rows {
+            let Some(path) = row.get("path").and_then(Value::as_str) else { continue };
+            let peer = row.get("owner").and_then(Value::as_str).unwrap_or("(unknown)");
+            let Some(mine_age) = row.get("mine_age_secs").and_then(Value::as_i64) else {
+                continue;
+            };
+            if peer == "(unknown)" || session.is_empty() {
+                continue;
+            }
+            if crate::api::git_guard::owner_committed_since(dir, path, session, mine_age)
+                .await
+                .is_some()
+            {
+                settled.insert(path.to_string());
+            }
+        }
+    }
+    demote_settled_shared(&mut own, &settled);
+    Some(own)
+}
+
+/// Decode the guard's actual envelope; kept pure so tests exercise the same
+/// boundary the scheduled nudge consumes.
+pub(crate) fn ownership_from_verdict(session: &str, v: &Value, paths: &[String]) -> Option<Ownership> {
+    let classified: BTreeSet<&str> = v.get("classified_paths")
+        .and_then(Value::as_array)
+        .into_iter().flatten().filter_map(Value::as_str).collect();
+    let n_considered = paths.iter().filter(|path| classified.contains(path.as_str())).count();
+    if v.get("ok").and_then(Value::as_bool) != Some(true)
+        || v.get("enabled").and_then(Value::as_bool) == Some(false)
+        || v.get("undecided").and_then(Value::as_bool) != Some(false)
+        || n_considered != paths.len()
+    {
+        tracing::warn!(
+            target: "commit_nudge",
+            session,
+            measured = false,
+            n_considered,
+            n_requested = paths.len(),
+            "[commit-nudge/AF-746] ownership_probe_unavailable: disabled, undecided or incomplete guard verdict; no ownership inferred"
+        );
+        return None;
+    }
     let pairs = |k: &str| -> Vec<(String, String)> {
         v.get(k)
             .and_then(Value::as_array)
@@ -1565,42 +1620,13 @@ async fn ownership_from_guard(session: &str, dir: &str, paths: &[String]) -> Opt
             })
             .unwrap_or_default()
     };
-    let mut own = Ownership {
+    let own = Ownership {
         foreign: pairs("foreign"),
         shared: pairs("shared"),
-        undecided: plain("undecided"),
+        undecided: Vec::new(),
         partial,
         unclaimed: plain("unclaimed"),
     };
-    // SETTLED-MINE + DIRTY-THEIRS IS NOT A CONTEST (AMUX-3436). `shared` keys
-    // on edit records inside the window, which cannot tell edited-and-committed
-    // from edited-and-dirty: a session whose every hunk already landed in HEAD
-    // was told to stage per-hunk over a file where all dirty bytes were a
-    // peer's in-flight work. The discriminator exists — owner_committed_since,
-    // the same check the victim notice runs — so ask it: a shared path whose
-    // OWN edit is strictly settled by a newer own commit demotes to foreign
-    // (NOT YOURS, the peer named). Unsettled, unknown-peer, or unanswerable
-    // rows keep today's CONTESTED, the safe direction.
-    let mut settled: BTreeSet<String> = BTreeSet::new();
-    if let Some(rows) = v.get("shared").and_then(Value::as_array) {
-        for row in rows {
-            let Some(path) = row.get("path").and_then(Value::as_str) else { continue };
-            let peer = row.get("owner").and_then(Value::as_str).unwrap_or("(unknown)");
-            let Some(mine_age) = row.get("mine_age_secs").and_then(Value::as_i64) else {
-                continue;
-            };
-            if peer == "(unknown)" || session.is_empty() {
-                continue;
-            }
-            if crate::api::git_guard::owner_committed_since(dir, path, session, mine_age)
-                .await
-                .is_some()
-            {
-                settled.insert(path.to_string());
-            }
-        }
-    }
-    demote_settled_shared(&mut own, &settled);
     Some(own)
 }
 
