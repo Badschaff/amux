@@ -1444,3 +1444,69 @@ fn the_message_tabs_load_a_small_first_page() {
         );
     }
 }
+
+/// AMUX-4475: the toolbar controls must read as one consistent bordered set
+/// (Ethan, 2026-09-12: "borders around buttons too", "make the components all
+/// consistent", flat emoji throughout). The AF-750 header refinement had made
+/// the icon/count buttons borderless (border-color:transparent). Pin the boxed
+/// styling back so a later refactor cannot silently flatten them again.
+#[test]
+fn the_toolbar_buttons_are_boxed_not_borderless() {
+    let css = asset("app.css");
+    // The header override must NOT strip the border to transparent.
+    assert!(
+        !css.contains("border-color:transparent; background:transparent"),
+        "the header buttons are borderless again (border-color:transparent) — Ethan asked \
+         for borders around the toolbar buttons (AMUX-4475)"
+    );
+    // notif bell must carry a real border in the header.
+    let notif = regex::Regex::new(r"\.header-row #notif-btn \{[^}]*\}")
+        .unwrap()
+        .find(&css)
+        .map(|m| m.as_str().to_string())
+        .expect(".header-row #notif-btn rule must exist");
+    assert!(
+        notif.contains("border:1px solid var(--border)"),
+        "the notification bell must be a bordered box in the toolbar (AMUX-4475); got: {notif}"
+    );
+    // active + settings must be bordered boxes too.
+    let box_rule = regex::Regex::new(
+        r"\.header-row \.btn-active, \.header-row \.settings-btn \{[^}]*\}",
+    )
+    .unwrap()
+    .find(&css)
+    .map(|m| m.as_str().to_string())
+    .expect(".header-row .btn-active, .settings-btn rule must exist");
+    assert!(
+        box_rule.contains("border:1px solid var(--border)"),
+        "the active/settings toolbar buttons must be bordered boxes (AMUX-4475); got: {box_rule}"
+    );
+}
+
+/// AMUX-4475: flat emoji throughout the toolbar (Ethan's choice). The settings
+/// gear was a monochrome text glyph (U+2699) while the bell was a colour emoji;
+/// the gear now carries VARIATION SELECTOR-16 (U+FE0F) so it renders as an emoji
+/// to match. Also: the bell button must not re-add an inline border:none that
+/// would beat the stylesheet box.
+#[test]
+fn the_toolbar_icons_render_as_consistent_emoji() {
+    let html = asset("index.html");
+    let gear = regex::Regex::new(r#"id="settings-btn"[^>]*>([^<]*)</button>"#)
+        .unwrap()
+        .captures(&html)
+        .map(|c| c[1].to_string())
+        .expect("settings-btn must exist");
+    assert!(
+        gear.contains("&#x2699;&#xFE0F;") || gear.contains('\u{2699}'),
+        "the settings gear must render as an emoji (U+2699 + VS16) to match the bell (AMUX-4475); got: {gear:?}"
+    );
+    let notif = regex::Regex::new(r#"id="notif-btn"[^>]*style="([^"]*)""#)
+        .unwrap()
+        .captures(&html)
+        .map(|c| c[1].to_string())
+        .expect("notif-btn must exist");
+    assert!(
+        !notif.contains("border:none"),
+        "the bell must not carry an inline border:none — it beats the toolbar box border (AMUX-4475); got: {notif}"
+    );
+}

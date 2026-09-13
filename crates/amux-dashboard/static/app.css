@@ -6494,14 +6494,18 @@ input.mdai-edge-path-input:focus { border-color: var(--accent); box-shadow: 0 0 
 .header-row > .header-actions { margin-left:auto; }
 .header-row #interaction-feedback { margin-left:0; }
 .header-row #brand-header { font-size:1.3rem; }
-.header-row #notif-btn { width:44px; height:44px; min-width:44px; display:flex; align-items:center; justify-content:center; color:var(--dim); opacity:1 !important; border-radius:10px; }
+/* AMUX-4475: toolbar icon buttons get a consistent bordered box (Ethan,
+   2026-09-12: "borders around buttons too" + "make the components all
+   consistent"). Every header control now reads as the same boxed button. */
+.header-row #notif-btn { width:44px; height:44px; min-width:44px; display:flex; align-items:center; justify-content:center; color:var(--dim); opacity:1 !important; border:1px solid var(--border); background:var(--card); border-radius:8px; }
 .header-row #notif-badge { top:0; right:0; border:2px solid var(--bg); height:18px; min-width:18px; border-radius:10px; font-size:9px; }
 .header-row .btn-active .active-dot { box-shadow:none; width:6px; height:6px; }
-.header-row .btn-rate-limit { color:var(--red); border-color:transparent; background:transparent; }
-.header-row .btn-active, .header-row .settings-btn { border-color:transparent; background:transparent; }
+.header-row .btn-rate-limit { color:var(--red); border:1px solid rgba(248,81,73,0.45); background:rgba(248,81,73,0.12); }
+.header-row .btn-active, .header-row .settings-btn { border:1px solid var(--border); background:var(--card); border-radius:8px; }
 .header-row #settings-btn { color:var(--dim); }
 .header-row svg { flex-shrink:0; }
-.header-row #notif-btn:hover, .header-row .btn-active:hover, .header-row .settings-btn:hover, .header-row .btn-rate-limit:hover { background:var(--card); }
+.header-row #notif-btn:hover, .header-row .btn-active:hover, .header-row .settings-btn:hover { background:var(--border); }
+.header-row .btn-rate-limit:hover { background:rgba(248,81,73,0.22); }
 @media (min-width:601px) { .header-row .header-actions { gap:10px !important; } .header-row .settings-btn,.header-row .btn-active,.header-row .btn-rate-limit,.header-row .header-add-btn { min-height:44px; } }
 @media (max-width:600px) {
  .header-row { gap:1px; }
