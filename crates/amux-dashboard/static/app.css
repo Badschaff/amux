@@ -6436,6 +6436,12 @@ input.mdai-edge-path-input:focus { border-color: var(--accent); box-shadow: 0 0 
 .amux-dialog-viewport > :is(.edit-box,.board-edit-box,.queue-box,.map-modal-box,.amux-modal,.modal) {
   max-height: calc(var(--dialog-viewport-height, 100dvh) - 40px) !important;
 }
+/* The board backdrop already reserves the warning's measured height in its
+   bottom padding. Preserve that reservation when keyboard sizing overrides
+   the board box's original max-height (AF-777). */
+.amux-dialog-viewport > .board-edit-box {
+  max-height: calc(var(--dialog-viewport-height, 100dvh) - 40px - var(--sw-fail-h, 0px)) !important;
+}
 .orch-heading { display:flex; align-items:center; gap:12px; justify-content:space-between; }
 .orch-heading h3 { margin:0; }
 .orch-heading button { flex-shrink:0; min-width:44px; min-height:44px; }

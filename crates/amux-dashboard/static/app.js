@@ -1824,6 +1824,20 @@ function _modalLayoutCheck() {
       : root.classList.contains('chip-picker-overlay') ? 'button[onclick="closeChipPicker()"]' : null;
     if (dismiss && !root.querySelector(dismiss)) clipped.push((root.id || root.classList[0]) + ':no-dismiss');
     const foot = box.querySelector(':scope > .edit-actions,:scope > .board-edit-actions,:scope > .queue-actions,:scope > .map-modal-actions,:scope > .amux-modal-foot');
+    const warning = document.getElementById('sw-fail-bar');
+    if (foot && warning) {
+      const w = warning.getBoundingClientRect();
+      // A button's centre can remain tappable while its lower edge is covered.
+      // Probe the actual overlapping area, not only the centre or CSS visibility.
+      const covered = Array.from(foot.querySelectorAll('button')).some(button => {
+        const a = button.getBoundingClientRect();
+        const left = Math.max(a.left, w.left), right = Math.min(a.right, w.right);
+        const top = Math.max(a.top, w.top), bottom = Math.min(a.bottom, w.bottom);
+        if (right <= left || bottom <= top) return false;
+        return !!document.elementFromPoint((left + right) / 2, (top + bottom) / 2)?.closest('#sw-fail-bar');
+      });
+      if (covered) clipped.push((root.id || root.classList[0]) + ':footer-covered-by-warning');
+    }
     if (foot && box.scrollHeight > box.clientHeight + 8 && getComputedStyle(foot).position === 'sticky') {
       const f = foot.getBoundingClientRect();
       if (f.height && r.bottom - f.bottom > 3) clipped.push((root.id || root.classList[0]) + ':footer-gap');
@@ -10609,7 +10623,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.936';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.937';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.

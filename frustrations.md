@@ -2768,3 +2768,14 @@ CARD: AF-775
 SYMPTOM: All three golden offline CI cases expected 3 ops while the current banner says 3 queued, will send on reconnect, so the retained real replay/uniqueness assertions were never reached.
 COST: Three persistent CI failures and loss of downstream offline replay coverage in the full matrix until this fixture was corrected.
 FIX: Assert the current explicit queued state/count, retain original real UI replay and uniqueness checks, and publish measured banner/queue/operation evidence in CI and amux client-debug. Working-tree six-case golden suite passes; clean gates/review/publication pending.
+
+## Keyboard sizing overrides the offline warning's reserved space and covers Save
+AREA: browser
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-777
+SYMPTOM: Published ec76baf7 CI has two Chromium sw-fail-bar positive failures: the actual hit target at Save is the warning. The shared keyboard max-height rule overrides the board editor's earlier subtraction of its measured warning height. A source geometry probe additionally shows a negative modal top and partially covered button edges even where the centre remains tappable.
+COST: Two failing CI cases and another browser/native audit to reconcile the keyboard and offline-warning fixes; a user can see Save while its tap area is covered.
+FIX: Preserve the measured warning subtraction in keyboard-sized board boxes, and report actual partial footer coverage through the existing measured modal-layout diagnostic. Owned draft has 33 browser passes plus two native iOS 26.5 checks covering real Save/readback, fully visible warning/buttons, broken-height diagnostic and dismissal; screenshots personally inspected. Independent review, clean integration gates and publication remain pending.
