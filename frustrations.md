@@ -2333,17 +2333,6 @@ SYMPTOM: Owner screenshots show messages received in this conversation remaining
 COST: Repeated manual Retry, duplicate-looking rows, and a false failed-operation banner on the phone.
 FIX: In progress: retain unknown acceptance and retry bounded receipt reads, use the correct steering namespace, and join display rows by transport identity. AF-736 tracks the duplicate representation; simulator verification remains outstanding.
 
-## Safari Simulator acknowledges pointer input without applying the requested click
-AREA: browser
-SEVERITY: blocks
-STATUS: open
-DATE: 2026-09-12
-SESSION: amux-frustrations
-CARD: AF-732
-SYMPTOM: Safari WebDriver on local iOS 26.5 returns success for element clicks and pointer actions while a form remains unfocused; send-keys similarly succeeds without changing the field. Native screenshots include insets absent from DOM coordinates.
-COST: Simulator end-to-end interaction tests fail despite successful API replies; repeated compile/test cycles delayed usable browser integration.
-FIX: In progress: test native XCTest input through Appium, require observed effects in the harness, and preserve input-method and failure diagnostics instead of claiming successful native input from transport status.
-
 ## Loaded mobile header hid controls and its compact label escaped its button
 AREA: browser
 SEVERITY: slows
@@ -2354,17 +2343,6 @@ CARD: AF-731
 SYMPTOM: The owner could not reach Settings beside the fleet's connection and limit labels. A first compact draft passed outer-button bounds but native Safari placed the red limited count beneath the next button.
 COST: Unreachable mobile controls and an extra native verification/correction cycle after desktop geometry passed.
 FIX: This candidate uses compact labels with full 44-point targets, a real count element, and measured mobile-header-clipped beacons for both control bounds and label containment. Phone-width tests and a visually inspected real iOS 26.5 screenshot cover a loaded 52-worker fleet with 18 limited; all eight targets are unobstructed. Deployment remains separate.
-
-## Native Simulator page tap hit the keyboard instead of the requested Save button
-AREA: browser
-SEVERITY: blocks
-STATUS: fixed
-DATE: 2026-09-12
-SESSION: amux-frustrations
-CARD: AF-732
-SYMPTOM: Native board-create typing was correct, but clicking Save appended J to the note and sent no board POST. DOM elementFromPoint saw the page button behind UIKit's keyboard; the native screen received that coordinate as a keyboard key.
-COST: Board persistence failed after the 20-view walkthrough, despite a successful tap response and the simpler native input probe passing.
-FIX: Candidate checks native keyboard visibility, dismisses through the native Safari input toolbar Done control, confirms it is gone, and checks visualViewport before dispatch. A failed dismissal refuses the tap. keyboard_blocks_page_tap emits measured=true/n_considered=1 before recovery. The new regression first failed on e48bc2a8 and then passed; native board-create/reload is now in the baseline harness, with exact persisted-note verification. Native correction: 12 passed, 0 failed on unchanged API build 5c158f091d1eba15; exact title/note survived creation, detail and reload. Focused Rust tests: 7 passed; workspace/all-target Clippy: exit 0.
 
 ## Archive reason persisted but CLI reported it ignored
 AREA: board
@@ -2542,72 +2520,6 @@ SYMPTOM: Native Safari keyboard/menu acceptance passed on small fixtures, but th
 COST: Live deployment verification stopped; roughly 15 minutes reproducing against real data and distinguishing a retained-keyboard test setup error from the driver failure.
 FIX: Use a native class-chain query scoped to Safari's toolbar Done control, keep ambiguity/visibility checks, preserve the original failure when context restoration also fails, and emit webdriver_transport_failed with operation, deadline, timeout and measured/count fields. Native live board taps now complete through the replacement query. The real Safari keyboard/menu rerun against production page data passed (1 passed, 0 failed), preserved the unsent draft, and its screenshots were inspected. The four-case refusal/dismissal/context-restoration regression passed; final deployment evidence is tracked on AF-745.
 
-## Mobile dialogs put Close outside the screen
-AREA: browser
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-09-12
-SESSION: amux-frustrations
-CARD: AF-749
-SYMPTOM: User screenshot showed the limited-workers dialog clipped above the mobile viewport. Native Safari measured its box at top -131.5 and bottom 885.5 in 754 visible pixels; a swipe did not recover Close.
-COST: The owner could not dismiss or use the long dialog; native audit reproduced inaccessible actions.
-FIX: AF-749, dashboard 0.9.929. Bound shared dialog bodies, pin their actions and size overlays to the keyboard-visible viewport. modal-layout-clipped reports measured population and clipped controls. Deployment and exact-commit evidence are recorded on the card.
-
-## Connection, journal and team dialogs are unreadable in light mode
-AREA: browser
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-09-12
-SESSION: amux-frustrations
-CARD: AF-749
-SYMPTOM: Native screenshots showed transparent connection/journal panels and dark text on hardcoded dark team/invite panels. Undefined --card-bg/--surface/--bg2 tokens did not follow the active theme.
-COST: Geometry-only tests passed while four dialog families were visually unreadable; the screenshot audit required another correction cycle.
-FIX: AF-749, dashboard 0.9.929. Use existing --card/--text tokens; modal-layout-clipped now includes transparent and low-contrast surface findings, with positive-control coverage. Deployment and exact-commit evidence are recorded on the card.
-
-## Video Close disappears with playback controls
-AREA: browser
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-09-12
-SESSION: amux-frustrations
-CARD: AF-749
-SYMPTOM: The native video audit could no longer tap Close after the playback toolbar auto-hid. The button was inside that toolbar and only 23 by 20 CSS pixels.
-COST: Native dismissal failed until the overlay was abandoned by navigation.
-FIX: AF-749, dashboard 0.9.929. Move Close into a persistent heading, enforce 44px targets and log a missing persistent video dismiss control through modal-layout-clipped. Deployment and exact-commit evidence are recorded on the card.
-
-## Proxy configuration opens invisible and unclickable
-AREA: browser
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-09-12
-SESSION: amux-frustrations
-CARD: AF-749
-SYMPTOM: Proxy form open/edit set display:flex without adding the active class required by the modal opacity/pointer-events contract.
-COST: Opening proxy configuration did not expose an interactive form; browser hit-testing reproduced the missing activation.
-FIX: AF-749, dashboard 0.9.929. Apply/remove the active class in the existing open/edit/close functions; modal-layout-clipped identifies an inactive displayed proxy form. Deployment and exact-commit evidence are recorded on the card.
-
-## Calendar subscription can hang before exposing Close
-AREA: browser
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-09-12
-SESSION: amux-frustrations
-CARD: AF-749
-SYMPTOM: The subscription dialog awaited an unbounded tunnel-status fetch before rendering its only Close button. A held response left Loading on screen indefinitely.
-COST: The mobile audit encountered a loading dialog without a dismiss action.
-FIX: AF-749, dashboard 0.9.929. Render Close immediately and bound response plus body consumption to five seconds; tunnel-status-unavailable identifies timeout versus request failure. Deployment and exact-commit evidence are recorded on the card.
-
-## Unsaved scope edits invoke a native confirmation blocked in PWA
-AREA: browser
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-09-12
-SESSION: amux-frustrations
-CARD: AF-749
-SYMPTOM: Closing an edited scope/memory form called native confirm rather than the shared confirmation UI. Native Safari surfaced an alert outside the app and interrupted subsequent modal interactions.
-COST: The scope dismissal path interrupted the native audit and required dismissing a browser alert before continuing.
-FIX: AF-749, dashboard 0.9.929. Use showConfirm; cancellation preserves edits and explicit discard closes both dialogs. scope-discard-choice records the boolean choice without draft text. Deployment and exact-commit evidence are recorded on the card.
-
 ## Memory pressure ranking hides the largest compressed consumers
 AREA: instruments
 SEVERITY: blocks
@@ -2629,80 +2541,3 @@ CARD: AF-750
 SYMPTOM: Owner desktop/mobile screenshots showed an overflowing notification badge beside an oversized red status panel and mixed emoji controls. The header diagnostic ignored desktop widths entirely.
 COST: The owner requested repeated desktop/mobile visual corrections; fitting the overall header width had not ensured clean individual control boundaries.
 FIX: AF-750 / AF-751, dashboard 0.9.930: contain the badge, use consistent line icons and lighter status controls, align desktop actions, preserve 44px mobile targets and fit the four primary mobile navigation labels. The existing mobile-header-clipped beacon now measures both desktop and mobile, includes the actual visible control count and detects escaping badges. A deliberate desktop badge overflow requires the real diagnostic request in the regression test.
-
-## Go reuses an expired iOS WebDriver session forever
-AREA: browser
-SEVERITY: blocks
-STATUS: open
-DATE: 2026-09-12
-SESSION: amux-frustrations
-CARD: AF-732
-SYMPTOM: After a native audit pause/restart, iOS status returned running:false and owned:true. Repeated Go requests reused the saved session id and returned 502 invalid session id; only explicit Stop released it. The installed Appium base driver defaults to a 60-second new-command timeout.
-COST: Native header/modal audits were interrupted and required manual Stop before they could restart; retaining ownership had been mistaken for retaining a live browser session.
-FIX: Keep explicitly owned Appium sessions alive until Stop; on explicit Go probe the saved session and release only a proven invalid session id. Preserve ownership on ambiguous transport failures, never replay commands, and emit expired_session_released with measured population. Regression covers live/expired/unknown outcomes plus wrong-worker/device refusal; deployment verification pending.
-
-## Debugger drives a hidden Safari tab while native input hits another
-AREA: browser
-SEVERITY: blocks
-STATUS: open
-DATE: 2026-09-12
-SESSION: amux-frustrations
-CARD: AF-732
-SYMPTOM: Go changed a background WebKit page while Safari still displayed a different tab. Native taps acknowledged without opening the requested dialog, or fell into calibration that timed out. The debugger reported document.visibilityState hidden and focus false while a native screenshot showed a different origin/page.
-COST: Repeated mobile header and modal audits failed ambiguously; API dispatch acknowledgements were insufficient to establish which page received input.
-FIX: Explicit Go opens the URL through native Safari and selects its visible debugger context; hidden tabs refuse native input before dispatch with hidden_native_tab. native_tab_aligned records successful alignment. Prototype alignment passed seven actual header open/close interactions; adapter unit and deployed native tests pending.
-
-## Go probes stale Safari tabs before the page it just opened
-AREA: browser
-SEVERITY: blocks
-STATUS: open
-DATE: 2026-09-12
-SESSION: amux-frustrations
-CARD: AF-732
-SYMPTOM: After two successful native modal cases, Go exceeded its 35-second foreground-alignment deadline. A staged probe then measured native open at 114ms and context inventory at 9ms, but an old context returned 500 for its visibility read before the requested page was tried.
-COST: Board-focus and channel could not complete in the four-modal audit despite Safari displaying the requested app; earlier tab history poisoned new navigation.
-FIX: Prioritize the requested URL from Appium context metadata, then recent Safari contexts for redirects; do not scan oldest-first. Regression refuses unrelated contexts before the requested target. native_tab_aligned logs candidate count and URL-match verdict without URL contents. Native follow-up pending.
-
-## Repeated Simulator Go accumulates streaming Safari tabs
-AREA: browser
-SEVERITY: blocks
-STATUS: open
-DATE: 2026-09-12
-SESSION: amux-frustrations
-CARD: AF-732
-SYMPTOM: Every explicit Go deep link opened another native Safari tab. Six test-origin connections remained open and later modal audit pages stalled blank, while the proxy still answered HTTP 200. Native alignment reported visible without proving page load success.
-COST: Complete modal audit stopped after three passes followed by repeated blank-page failures; native fixture tabs needed cleanup before further measurements.
-FIX: Reuse an already-visible debugger tab for URL navigation; retain native alignment only for hidden tabs. native_tab_reused logs measured population. Repeated-navigation regression first failed on unexpected deep-link creation; native proof pending.
-
-## Shared primary buttons use white text on a pale dark-theme accent
-AREA: browser
-SEVERITY: slows
-STATUS: open
-DATE: 2026-09-12
-SESSION: amux-frustrations
-CARD: AF-754
-SYMPTOM: The shared .btn.primary rule pairs white text with the dark theme's bright accent, so its text does not meet the existing 4.5 contrast threshold used by amux's modal diagnostics. Copies of the same control have no documented foreground token.
-COST: The component consistency audit found that a visually shared button could carry different readability failures between themes.
-FIX: Pair --accent with --on-accent and use the production-backed Style guide. _uiComponentCheck emits measured ui-component-drift with identifiers/counts when an enabled opaque primary button has low contrast; a deliberate equal foreground/background regression checks the beacon.
-
-## Native Safari select ignores a shared minimum control height
-AREA: browser
-SEVERITY: slows
-STATUS: open
-DATE: 2026-09-12
-SESSION: amux-frustrations
-CARD: AF-754
-SYMPTOM: The component gallery's native select rendered 23 pixels high in Safari although --control-height and min-height requested 44. The new real-browser control-size assertion failed while 32 other regression cases passed.
-COST: A shared sizing token alone falsely appeared to make phone controls consistent; the native select needed an explicit height.
-FIX: select.input uses the shared explicit control height and retains its native picker. _uiComponentCheck records small-control defects for visible shared controls on phones, with measured population and no field values.
-
-## Tall desktop dialogs appear underneath the application tab strip
-AREA: browser
-SEVERITY: slows
-STATUS: open
-DATE: 2026-09-12
-SESSION: amux-frustrations
-CARD: AF-754
-SYMPTOM: Visual inspection showed a tall Style guide heading partly covered by the fixed app tab strip despite a clean viewport-bounds check. Standard modal-overlay used z-index 300 and the tab strip 1000; confirmation overlays also need to remain above a parent dialog.
-COST: Geometry-only checks missed painted occlusion. Standardizing dialog layers exposed a covered confirmation in the interaction regression before shipping.
-FIX: Shared --layer-dialog and --layer-confirmation put dialogs above the app strip and confirmations above their parent. _modalLayoutCheck reports behind-tab-bar and covered-actions through the existing measured modal-layout-clipped beacon. Tests click the nested confirmation and hit-test the actual heading.

@@ -9819,3 +9819,183 @@ have playwright.config.ts record the server build hash (GET /health .build) into
 run report so a mid-session flip names "the binary moved" instead of reading as
 flaky tests; separately, someone with git access should bisect the 401->200 auth
 behavior on current crates/amux-server HEAD.
+
+## Shared primary buttons use white text on a pale dark-theme accent
+VALIDATED: amux-frustrations | Originating verifier amux-frustrations, 2026-09-12. Shared --accent/--on-accent rendered without low contrast in both themes; deliberately equal foreground/background emitted ui-component-drift low-contrast in all three browser engines. node_modules/.bin/playwright test --config=scratch/ios-simulator-review/ui-guide-clean.config.ts -> 33 passed (1.0m) at clean 9b186f85. Actual native iOS26.5 live-guide scroll/type/dismiss -> 1 considered, failures:[]; candidate light/dark/calendar -> 3 considered, failures:[]. python3 scratch/ios-simulator-review/verify-ui-guide-live.py -> 5/5 assets match 9b186f85ce80/build d31572e4a42df479, same build before/after. Full command/results and inspected screenshots: scratch/ios-simulator-review/ui-guide-evidence.txt. Narrow entry validation only; no all-widget or peer-Verified claim.
+AREA: browser
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-754
+SYMPTOM: The shared .btn.primary rule pairs white text with the dark theme's bright accent, so its text does not meet the existing 4.5 contrast threshold used by amux's modal diagnostics. Copies of the same control have no documented foreground token.
+COST: The component consistency audit found that a visually shared button could carry different readability failures between themes.
+FIX: Pair --accent with --on-accent and use the production-backed Style guide. _uiComponentCheck emits measured ui-component-drift with identifiers/counts when an enabled opaque primary button has low contrast; a deliberate equal foreground/background regression checks the beacon.
+
+## Native Safari select ignores a shared minimum control height
+VALIDATED: amux-frustrations | Originating verifier amux-frustrations, 2026-09-12. WebKit actual select bounds are at least 44 pixels at phone widths after adding explicit shared height; original run failed at 23 pixels. Native iOS guide measures 14 shared controls with zero size/contrast issues. node_modules/.bin/playwright test --config=scratch/ios-simulator-review/ui-guide-clean.config.ts -> 33 passed (1.0m) at clean 9b186f85. Actual native iOS26.5 live-guide scroll/type/dismiss -> 1 considered, failures:[]; candidate light/dark/calendar -> 3 considered, failures:[]. python3 scratch/ios-simulator-review/verify-ui-guide-live.py -> 5/5 assets match 9b186f85ce80/build d31572e4a42df479, same build before/after. Full command/results and inspected screenshots: scratch/ios-simulator-review/ui-guide-evidence.txt. Narrow entry validation only; no all-widget or peer-Verified claim.
+AREA: browser
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-754
+SYMPTOM: The component gallery's native select rendered 23 pixels high in Safari although --control-height and min-height requested 44. The new real-browser control-size assertion failed while 32 other regression cases passed.
+COST: A shared sizing token alone falsely appeared to make phone controls consistent; the native select needed an explicit height.
+FIX: select.input uses the shared explicit control height and retains its native picker. _uiComponentCheck records small-control defects for visible shared controls on phones, with measured population and no field values.
+
+## Tall desktop dialogs appear underneath the application tab strip
+VALIDATED: amux-frustrations | Originating verifier amux-frustrations, 2026-09-12. Actual desktop heading hit testing and nested confirmation Cancel pass. Deliberately lowering confirmation z-index produces covered-actions. Shared dialog and confirmation layers sit above chrome and their parent respectively. node_modules/.bin/playwright test --config=scratch/ios-simulator-review/ui-guide-clean.config.ts -> 33 passed (1.0m) at clean 9b186f85. Actual native iOS26.5 live-guide scroll/type/dismiss -> 1 considered, failures:[]; candidate light/dark/calendar -> 3 considered, failures:[]. python3 scratch/ios-simulator-review/verify-ui-guide-live.py -> 5/5 assets match 9b186f85ce80/build d31572e4a42df479, same build before/after. Full command/results and inspected screenshots: scratch/ios-simulator-review/ui-guide-evidence.txt. Narrow entry validation only; no all-widget or peer-Verified claim.
+AREA: browser
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-754
+SYMPTOM: Visual inspection showed a tall Style guide heading partly covered by the fixed app tab strip despite a clean viewport-bounds check. Standard modal-overlay used z-index 300 and the tab strip 1000; confirmation overlays also need to remain above a parent dialog.
+COST: Geometry-only checks missed painted occlusion. Standardizing dialog layers exposed a covered confirmation in the interaction regression before shipping.
+FIX: Shared --layer-dialog and --layer-confirmation put dialogs above the app strip and confirmations above their parent. _modalLayoutCheck reports behind-tab-bar and covered-actions through the existing measured modal-layout-clipped beacon. Tests click the nested confirmation and hit-test the actual heading.
+
+## Safari Simulator acknowledges pointer input without applying the requested click
+VALIDATED: amux-frustrations | The backend uses native XCTest actions; actual native input/tap changed the fixture and live guide, rather than trusting WebDriver success alone. Originating verifier amux-frustrations, 2026-09-12. Native recovery command: AMUX_IOS_TEST_URL=https://localhost:18863 AMUX_IOS_JOURNAL=<isolated-home>/browser-ios.json AMUX_SESSION=amux-frustrations node scripts/test-ios-session-recovery.mjs -> measured:true, n_considered:5, five PASS at ff807707/build2d3d72ebb67df78b (scratch/ios-simulator-review/ios-tab-reuse-native.log). scripts/safe-cargo.sh test -p amux-server --lib api::browser::ios::tests -- --test-threads=1 -> 10 passed, 0 failed (ios-tab-reuse-unit-final.log). Native modal record modal-native-tab-reuse/results.json has 54 considered, 53 pass, one retained calendar calibration failure; modal-native-calendar-correction/results.json passes that one case separately. Billing is presentation-only; no destructive-submit or all-lifecycle claim. The named modal cases above passed in the primary run on app0.9.931. Current clean9b186f85 app0.9.933 guide/modal/header matrix -> 33 passed (ui-guide-final-browser.log); current live-origin guide native scroll/type/dismiss -> 1 considered, failures:[] (ui-guide-native-live/results.json). /health9b186f85ce80/buildd31572e4a42df479 and five assets match (ui-guide-live-assets.json); ios.rs unchanged since tested ff807707. Narrow ledger retirement only, no independent peer-Verified claim.
+AREA: browser
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-732
+SYMPTOM: Safari WebDriver on local iOS 26.5 returns success for element clicks and pointer actions while a form remains unfocused; send-keys similarly succeeds without changing the field. Native screenshots include insets absent from DOM coordinates.
+COST: Simulator end-to-end interaction tests fail despite successful API replies; repeated compile/test cycles delayed usable browser integration.
+FIX: In progress: test native XCTest input through Appium, require observed effects in the harness, and preserve input-method and failure diagnostics instead of claiming successful native input from transport status.
+
+## Native Simulator page tap hit the keyboard instead of the requested Save button
+VALIDATED: amux-frustrations | native_click_dismisses_keyboard_or_refuses_without_dispatch passes in the 10-case adapter suite. The original baseline test:ios persisted the exact board title/note through native Save/detail/reload (12 passed, build5c158f091d1eba15). Latest live guide native keyboard-open Close also dismissed the guide; keyboard_blocks_page_tap remains in the current adapter. Originating verifier amux-frustrations, 2026-09-12. Native recovery command: AMUX_IOS_TEST_URL=https://localhost:18863 AMUX_IOS_JOURNAL=<isolated-home>/browser-ios.json AMUX_SESSION=amux-frustrations node scripts/test-ios-session-recovery.mjs -> measured:true, n_considered:5, five PASS at ff807707/build2d3d72ebb67df78b (scratch/ios-simulator-review/ios-tab-reuse-native.log). scripts/safe-cargo.sh test -p amux-server --lib api::browser::ios::tests -- --test-threads=1 -> 10 passed, 0 failed (ios-tab-reuse-unit-final.log). Native modal record modal-native-tab-reuse/results.json has 54 considered, 53 pass, one retained calendar calibration failure; modal-native-calendar-correction/results.json passes that one case separately. Billing is presentation-only; no destructive-submit or all-lifecycle claim. The named modal cases above passed in the primary run on app0.9.931. Current clean9b186f85 app0.9.933 guide/modal/header matrix -> 33 passed (ui-guide-final-browser.log); current live-origin guide native scroll/type/dismiss -> 1 considered, failures:[] (ui-guide-native-live/results.json). /health9b186f85ce80/buildd31572e4a42df479 and five assets match (ui-guide-live-assets.json); ios.rs unchanged since tested ff807707. Narrow ledger retirement only, no independent peer-Verified claim.
+AREA: browser
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-732
+SYMPTOM: Native board-create typing was correct, but clicking Save appended J to the note and sent no board POST. DOM elementFromPoint saw the page button behind UIKit's keyboard; the native screen received that coordinate as a keyboard key.
+COST: Board persistence failed after the 20-view walkthrough, despite a successful tap response and the simpler native input probe passing.
+FIX: Candidate checks native keyboard visibility, dismisses through the native Safari input toolbar Done control, confirms it is gone, and checks visualViewport before dispatch. A failed dismissal refuses the tap. keyboard_blocks_page_tap emits measured=true/n_considered=1 before recovery. The new regression first failed on e48bc2a8 and then passed; native board-create/reload is now in the baseline harness, with exact persisted-note verification. Native correction: 12 passed, 0 failed on unchanged API build 5c158f091d1eba15; exact title/note survived creation, detail and reload. Focused Rust tests: 7 passed; workspace/all-target Clippy: exit 0.
+
+## Go reuses an expired iOS WebDriver session forever
+VALIDATED: amux-frustrations | The five-case native recovery run waits 65 seconds and proves owned-session survival, then deletes its own driver session and explicitly Go-recovers without Stop or replay. go_releases_only_a_proven_expired_owned_session_without_replaying_actions also covers ambiguous failures and owner/device refusal. Originating verifier amux-frustrations, 2026-09-12. Native recovery command: AMUX_IOS_TEST_URL=https://localhost:18863 AMUX_IOS_JOURNAL=<isolated-home>/browser-ios.json AMUX_SESSION=amux-frustrations node scripts/test-ios-session-recovery.mjs -> measured:true, n_considered:5, five PASS at ff807707/build2d3d72ebb67df78b (scratch/ios-simulator-review/ios-tab-reuse-native.log). scripts/safe-cargo.sh test -p amux-server --lib api::browser::ios::tests -- --test-threads=1 -> 10 passed, 0 failed (ios-tab-reuse-unit-final.log). Native modal record modal-native-tab-reuse/results.json has 54 considered, 53 pass, one retained calendar calibration failure; modal-native-calendar-correction/results.json passes that one case separately. Billing is presentation-only; no destructive-submit or all-lifecycle claim. The named modal cases above passed in the primary run on app0.9.931. Current clean9b186f85 app0.9.933 guide/modal/header matrix -> 33 passed (ui-guide-final-browser.log); current live-origin guide native scroll/type/dismiss -> 1 considered, failures:[] (ui-guide-native-live/results.json). /health9b186f85ce80/buildd31572e4a42df479 and five assets match (ui-guide-live-assets.json); ios.rs unchanged since tested ff807707. Narrow ledger retirement only, no independent peer-Verified claim.
+AREA: browser
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-732
+SYMPTOM: After a native audit pause/restart, iOS status returned running:false and owned:true. Repeated Go requests reused the saved session id and returned 502 invalid session id; only explicit Stop released it. The installed Appium base driver defaults to a 60-second new-command timeout.
+COST: Native header/modal audits were interrupted and required manual Stop before they could restart; retaining ownership had been mistaken for retaining a live browser session.
+FIX: Keep explicitly owned Appium sessions alive until Stop; on explicit Go probe the saved session and release only a proven invalid session id. Preserve ownership on ambiguous transport failures, never replay commands, and emit expired_session_released with measured population. Regression covers live/expired/unknown outcomes plus wrong-worker/device refusal; deployment verification pending.
+
+## Debugger drives a hidden Safari tab while native input hits another
+VALIDATED: amux-frustrations | Native fixture confirms Go selects the visible tab and input/tap reaches it. Deliberately hidden debugger context refuses input without either button being pressed; native_go_selects_visible_safari_and_hidden_input_never_dispatches passes. Originating verifier amux-frustrations, 2026-09-12. Native recovery command: AMUX_IOS_TEST_URL=https://localhost:18863 AMUX_IOS_JOURNAL=<isolated-home>/browser-ios.json AMUX_SESSION=amux-frustrations node scripts/test-ios-session-recovery.mjs -> measured:true, n_considered:5, five PASS at ff807707/build2d3d72ebb67df78b (scratch/ios-simulator-review/ios-tab-reuse-native.log). scripts/safe-cargo.sh test -p amux-server --lib api::browser::ios::tests -- --test-threads=1 -> 10 passed, 0 failed (ios-tab-reuse-unit-final.log). Native modal record modal-native-tab-reuse/results.json has 54 considered, 53 pass, one retained calendar calibration failure; modal-native-calendar-correction/results.json passes that one case separately. Billing is presentation-only; no destructive-submit or all-lifecycle claim. The named modal cases above passed in the primary run on app0.9.931. Current clean9b186f85 app0.9.933 guide/modal/header matrix -> 33 passed (ui-guide-final-browser.log); current live-origin guide native scroll/type/dismiss -> 1 considered, failures:[] (ui-guide-native-live/results.json). /health9b186f85ce80/buildd31572e4a42df479 and five assets match (ui-guide-live-assets.json); ios.rs unchanged since tested ff807707. Narrow ledger retirement only, no independent peer-Verified claim.
+AREA: browser
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-732
+SYMPTOM: Go changed a background WebKit page while Safari still displayed a different tab. Native taps acknowledged without opening the requested dialog, or fell into calibration that timed out. The debugger reported document.visibilityState hidden and focus false while a native screenshot showed a different origin/page.
+COST: Repeated mobile header and modal audits failed ambiguously; API dispatch acknowledgements were insufficient to establish which page received input.
+FIX: Explicit Go opens the URL through native Safari and selects its visible debugger context; hidden tabs refuse native input before dispatch with hidden_native_tab. native_tab_aligned records successful alignment. Prototype alignment passed seven actual header open/close interactions; adapter unit and deployed native tests pending.
+
+## Go probes stale Safari tabs before the page it just opened
+VALIDATED: amux-frustrations | native_go_selects_visible_safari_and_hidden_input_never_dispatches forbids probing the stale context before the requested URL; current code prioritizes metadata URL match then newest Safari contexts. The corrected four-modal native run passed, followed by the later repeated-Go recovery and full modal traversal. Originating verifier amux-frustrations, 2026-09-12. Native recovery command: AMUX_IOS_TEST_URL=https://localhost:18863 AMUX_IOS_JOURNAL=<isolated-home>/browser-ios.json AMUX_SESSION=amux-frustrations node scripts/test-ios-session-recovery.mjs -> measured:true, n_considered:5, five PASS at ff807707/build2d3d72ebb67df78b (scratch/ios-simulator-review/ios-tab-reuse-native.log). scripts/safe-cargo.sh test -p amux-server --lib api::browser::ios::tests -- --test-threads=1 -> 10 passed, 0 failed (ios-tab-reuse-unit-final.log). Native modal record modal-native-tab-reuse/results.json has 54 considered, 53 pass, one retained calendar calibration failure; modal-native-calendar-correction/results.json passes that one case separately. Billing is presentation-only; no destructive-submit or all-lifecycle claim. The named modal cases above passed in the primary run on app0.9.931. Current clean9b186f85 app0.9.933 guide/modal/header matrix -> 33 passed (ui-guide-final-browser.log); current live-origin guide native scroll/type/dismiss -> 1 considered, failures:[] (ui-guide-native-live/results.json). /health9b186f85ce80/buildd31572e4a42df479 and five assets match (ui-guide-live-assets.json); ios.rs unchanged since tested ff807707. Narrow ledger retirement only, no independent peer-Verified claim.
+AREA: browser
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-732
+SYMPTOM: After two successful native modal cases, Go exceeded its 35-second foreground-alignment deadline. A staged probe then measured native open at 114ms and context inventory at 9ms, but an old context returned 500 for its visibility read before the requested page was tried.
+COST: Board-focus and channel could not complete in the four-modal audit despite Safari displaying the requested app; earlier tab history poisoned new navigation.
+FIX: Prioritize the requested URL from Appium context metadata, then recent Safari contexts for redirects; do not scan oldest-first. Regression refuses unrelated contexts before the requested target. native_tab_aligned logs candidate count and URL-match verdict without URL contents. Native follow-up pending.
+
+## Repeated Simulator Go accumulates streaming Safari tabs
+VALIDATED: amux-frustrations | The native recovery run performs twelve explicit Go navigations, loads each fixture, and asserts the same window handle list. native_go_reuses_visible_tab_without_accumulating_tabs first failed on unexpected deepLink, then passed. native_tab_reused records the current path. Originating verifier amux-frustrations, 2026-09-12. Native recovery command: AMUX_IOS_TEST_URL=https://localhost:18863 AMUX_IOS_JOURNAL=<isolated-home>/browser-ios.json AMUX_SESSION=amux-frustrations node scripts/test-ios-session-recovery.mjs -> measured:true, n_considered:5, five PASS at ff807707/build2d3d72ebb67df78b (scratch/ios-simulator-review/ios-tab-reuse-native.log). scripts/safe-cargo.sh test -p amux-server --lib api::browser::ios::tests -- --test-threads=1 -> 10 passed, 0 failed (ios-tab-reuse-unit-final.log). Native modal record modal-native-tab-reuse/results.json has 54 considered, 53 pass, one retained calendar calibration failure; modal-native-calendar-correction/results.json passes that one case separately. Billing is presentation-only; no destructive-submit or all-lifecycle claim. The named modal cases above passed in the primary run on app0.9.931. Current clean9b186f85 app0.9.933 guide/modal/header matrix -> 33 passed (ui-guide-final-browser.log); current live-origin guide native scroll/type/dismiss -> 1 considered, failures:[] (ui-guide-native-live/results.json). /health9b186f85ce80/buildd31572e4a42df479 and five assets match (ui-guide-live-assets.json); ios.rs unchanged since tested ff807707. Narrow ledger retirement only, no independent peer-Verified claim.
+AREA: browser
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-732
+SYMPTOM: Every explicit Go deep link opened another native Safari tab. Six test-origin connections remained open and later modal audit pages stalled blank, while the proxy still answered HTTP 200. Native alignment reported visible without proving page load success.
+COST: Complete modal audit stopped after three passes followed by repeated blank-page failures; native fixture tabs needed cleanup before further measurements.
+FIX: Reuse an already-visible debugger tab for URL navigation; retain native alignment only for hidden tabs. native_tab_reused logs measured population. Repeated-navigation regression first failed on unexpected deep-link creation; native proof pending.
+
+## Mobile dialogs put Close outside the screen
+VALIDATED: amux-frustrations | Native limited-workers and confirm-long cases scroll upward away from bottom and dismiss, with visible Close; current long-dialog browser tests exercise phone, keyboard and landscape heights and require a clipping beacon for a deliberately broken dialog. Originating verifier amux-frustrations, 2026-09-12. Native recovery command: AMUX_IOS_TEST_URL=https://localhost:18863 AMUX_IOS_JOURNAL=<isolated-home>/browser-ios.json AMUX_SESSION=amux-frustrations node scripts/test-ios-session-recovery.mjs -> measured:true, n_considered:5, five PASS at ff807707/build2d3d72ebb67df78b (scratch/ios-simulator-review/ios-tab-reuse-native.log). scripts/safe-cargo.sh test -p amux-server --lib api::browser::ios::tests -- --test-threads=1 -> 10 passed, 0 failed (ios-tab-reuse-unit-final.log). Native modal record modal-native-tab-reuse/results.json has 54 considered, 53 pass, one retained calendar calibration failure; modal-native-calendar-correction/results.json passes that one case separately. Billing is presentation-only; no destructive-submit or all-lifecycle claim. The named modal cases above passed in the primary run on app0.9.931. Current clean9b186f85 app0.9.933 guide/modal/header matrix -> 33 passed (ui-guide-final-browser.log); current live-origin guide native scroll/type/dismiss -> 1 considered, failures:[] (ui-guide-native-live/results.json). /health9b186f85ce80/buildd31572e4a42df479 and five assets match (ui-guide-live-assets.json); ios.rs unchanged since tested ff807707. Narrow ledger retirement only, no independent peer-Verified claim.
+AREA: browser
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-749
+SYMPTOM: User screenshot showed the limited-workers dialog clipped above the mobile viewport. Native Safari measured its box at top -131.5 and bottom 885.5 in 754 visible pixels; a swipe did not recover Close.
+COST: The owner could not dismiss or use the long dialog; native audit reproduced inaccessible actions.
+FIX: AF-749, dashboard 0.9.929. Bound shared dialog bodies, pin their actions and size overlays to the keyboard-visible viewport. modal-layout-clipped reports measured population and clipped controls. Deployment and exact-commit evidence are recorded on the card.
+
+## Connection, journal and team dialogs are unreadable in light mode
+VALIDATED: amux-frustrations | The actual native journal-config/team-editor/connection-scope cases pass and screenshots are readable. Both-theme browser surface tests pass and deliberately transparent surfaces emit the diagnostic. Current code uses --card/--text, not undefined surface variables. Originating verifier amux-frustrations, 2026-09-12. Native recovery command: AMUX_IOS_TEST_URL=https://localhost:18863 AMUX_IOS_JOURNAL=<isolated-home>/browser-ios.json AMUX_SESSION=amux-frustrations node scripts/test-ios-session-recovery.mjs -> measured:true, n_considered:5, five PASS at ff807707/build2d3d72ebb67df78b (scratch/ios-simulator-review/ios-tab-reuse-native.log). scripts/safe-cargo.sh test -p amux-server --lib api::browser::ios::tests -- --test-threads=1 -> 10 passed, 0 failed (ios-tab-reuse-unit-final.log). Native modal record modal-native-tab-reuse/results.json has 54 considered, 53 pass, one retained calendar calibration failure; modal-native-calendar-correction/results.json passes that one case separately. Billing is presentation-only; no destructive-submit or all-lifecycle claim. The named modal cases above passed in the primary run on app0.9.931. Current clean9b186f85 app0.9.933 guide/modal/header matrix -> 33 passed (ui-guide-final-browser.log); current live-origin guide native scroll/type/dismiss -> 1 considered, failures:[] (ui-guide-native-live/results.json). /health9b186f85ce80/buildd31572e4a42df479 and five assets match (ui-guide-live-assets.json); ios.rs unchanged since tested ff807707. Narrow ledger retirement only, no independent peer-Verified claim.
+AREA: browser
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-749
+SYMPTOM: Native screenshots showed transparent connection/journal panels and dark text on hardcoded dark team/invite panels. Undefined --card-bg/--surface/--bg2 tokens did not follow the active theme.
+COST: Geometry-only tests passed while four dialog families were visually unreadable; the screenshot audit required another correction cycle.
+FIX: AF-749, dashboard 0.9.929. Use existing --card/--text tokens; modal-layout-clipped now includes transparent and low-contrast surface findings, with positive-control coverage. Deployment and exact-commit evidence are recorded on the card.
+
+## Video Close disappears with playback controls
+VALIDATED: amux-frustrations | The native video-player case dismisses successfully; inspected screenshot shows Close in a persistent heading outside the fading controls. Current browser regression hides playback controls and verifies Close remains visible and reachable. Originating verifier amux-frustrations, 2026-09-12. Native recovery command: AMUX_IOS_TEST_URL=https://localhost:18863 AMUX_IOS_JOURNAL=<isolated-home>/browser-ios.json AMUX_SESSION=amux-frustrations node scripts/test-ios-session-recovery.mjs -> measured:true, n_considered:5, five PASS at ff807707/build2d3d72ebb67df78b (scratch/ios-simulator-review/ios-tab-reuse-native.log). scripts/safe-cargo.sh test -p amux-server --lib api::browser::ios::tests -- --test-threads=1 -> 10 passed, 0 failed (ios-tab-reuse-unit-final.log). Native modal record modal-native-tab-reuse/results.json has 54 considered, 53 pass, one retained calendar calibration failure; modal-native-calendar-correction/results.json passes that one case separately. Billing is presentation-only; no destructive-submit or all-lifecycle claim. The named modal cases above passed in the primary run on app0.9.931. Current clean9b186f85 app0.9.933 guide/modal/header matrix -> 33 passed (ui-guide-final-browser.log); current live-origin guide native scroll/type/dismiss -> 1 considered, failures:[] (ui-guide-native-live/results.json). /health9b186f85ce80/buildd31572e4a42df479 and five assets match (ui-guide-live-assets.json); ios.rs unchanged since tested ff807707. Narrow ledger retirement only, no independent peer-Verified claim.
+AREA: browser
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-749
+SYMPTOM: The native video audit could no longer tap Close after the playback toolbar auto-hid. The button was inside that toolbar and only 23 by 20 CSS pixels.
+COST: Native dismissal failed until the overlay was abandoned by navigation.
+FIX: AF-749, dashboard 0.9.929. Move Close into a persistent heading, enforce 44px targets and log a missing persistent video dismiss control through modal-layout-clipped. Deployment and exact-commit evidence are recorded on the card.
+
+## Proxy configuration opens invisible and unclickable
+VALIDATED: amux-frustrations | Native proxy-form opens and dismisses successfully. Current browser regression opens the form and proves its active class, visible state, hit testing and dismissal. Originating verifier amux-frustrations, 2026-09-12. Native recovery command: AMUX_IOS_TEST_URL=https://localhost:18863 AMUX_IOS_JOURNAL=<isolated-home>/browser-ios.json AMUX_SESSION=amux-frustrations node scripts/test-ios-session-recovery.mjs -> measured:true, n_considered:5, five PASS at ff807707/build2d3d72ebb67df78b (scratch/ios-simulator-review/ios-tab-reuse-native.log). scripts/safe-cargo.sh test -p amux-server --lib api::browser::ios::tests -- --test-threads=1 -> 10 passed, 0 failed (ios-tab-reuse-unit-final.log). Native modal record modal-native-tab-reuse/results.json has 54 considered, 53 pass, one retained calendar calibration failure; modal-native-calendar-correction/results.json passes that one case separately. Billing is presentation-only; no destructive-submit or all-lifecycle claim. The named modal cases above passed in the primary run on app0.9.931. Current clean9b186f85 app0.9.933 guide/modal/header matrix -> 33 passed (ui-guide-final-browser.log); current live-origin guide native scroll/type/dismiss -> 1 considered, failures:[] (ui-guide-native-live/results.json). /health9b186f85ce80/buildd31572e4a42df479 and five assets match (ui-guide-live-assets.json); ios.rs unchanged since tested ff807707. Narrow ledger retirement only, no independent peer-Verified claim.
+AREA: browser
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-749
+SYMPTOM: Proxy form open/edit set display:flex without adding the active class required by the modal opacity/pointer-events contract.
+COST: Opening proxy configuration did not expose an interactive form; browser hit-testing reproduced the missing activation.
+FIX: AF-749, dashboard 0.9.929. Apply/remove the active class in the existing open/edit/close functions; modal-layout-clipped identifies an inactive displayed proxy form. Deployment and exact-commit evidence are recorded on the card.
+
+## Calendar subscription can hang before exposing Close
+VALIDATED: amux-frustrations | Native calendar-subscription opens and dismisses. Current held-status-response browser regression verifies immediate Close and the bounded five-second tunnel-status-unavailable signal. Originating verifier amux-frustrations, 2026-09-12. Native recovery command: AMUX_IOS_TEST_URL=https://localhost:18863 AMUX_IOS_JOURNAL=<isolated-home>/browser-ios.json AMUX_SESSION=amux-frustrations node scripts/test-ios-session-recovery.mjs -> measured:true, n_considered:5, five PASS at ff807707/build2d3d72ebb67df78b (scratch/ios-simulator-review/ios-tab-reuse-native.log). scripts/safe-cargo.sh test -p amux-server --lib api::browser::ios::tests -- --test-threads=1 -> 10 passed, 0 failed (ios-tab-reuse-unit-final.log). Native modal record modal-native-tab-reuse/results.json has 54 considered, 53 pass, one retained calendar calibration failure; modal-native-calendar-correction/results.json passes that one case separately. Billing is presentation-only; no destructive-submit or all-lifecycle claim. The named modal cases above passed in the primary run on app0.9.931. Current clean9b186f85 app0.9.933 guide/modal/header matrix -> 33 passed (ui-guide-final-browser.log); current live-origin guide native scroll/type/dismiss -> 1 considered, failures:[] (ui-guide-native-live/results.json). /health9b186f85ce80/buildd31572e4a42df479 and five assets match (ui-guide-live-assets.json); ios.rs unchanged since tested ff807707. Narrow ledger retirement only, no independent peer-Verified claim.
+AREA: browser
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-749
+SYMPTOM: The subscription dialog awaited an unbounded tunnel-status fetch before rendering its only Close button. A held response left Loading on screen indefinitely.
+COST: The mobile audit encountered a loading dialog without a dismiss action.
+FIX: AF-749, dashboard 0.9.929. Render Close immediately and bound response plus body consumption to five seconds; tunnel-status-unavailable identifies timeout versus request failure. Deployment and exact-commit evidence are recorded on the card.
+
+## Unsaved scope edits invoke a native confirmation blocked in PWA
+VALIDATED: amux-frustrations | Native scope-memory receives text, escapes bottom scrolling and explicitly discards through the in-app confirmation. Current browser regression proves Cancel preserves edits and confirmed discard closes both dialogs; scope-discard-choice remains logged without draft text. Originating verifier amux-frustrations, 2026-09-12. Native recovery command: AMUX_IOS_TEST_URL=https://localhost:18863 AMUX_IOS_JOURNAL=<isolated-home>/browser-ios.json AMUX_SESSION=amux-frustrations node scripts/test-ios-session-recovery.mjs -> measured:true, n_considered:5, five PASS at ff807707/build2d3d72ebb67df78b (scratch/ios-simulator-review/ios-tab-reuse-native.log). scripts/safe-cargo.sh test -p amux-server --lib api::browser::ios::tests -- --test-threads=1 -> 10 passed, 0 failed (ios-tab-reuse-unit-final.log). Native modal record modal-native-tab-reuse/results.json has 54 considered, 53 pass, one retained calendar calibration failure; modal-native-calendar-correction/results.json passes that one case separately. Billing is presentation-only; no destructive-submit or all-lifecycle claim. The named modal cases above passed in the primary run on app0.9.931. Current clean9b186f85 app0.9.933 guide/modal/header matrix -> 33 passed (ui-guide-final-browser.log); current live-origin guide native scroll/type/dismiss -> 1 considered, failures:[] (ui-guide-native-live/results.json). /health9b186f85ce80/buildd31572e4a42df479 and five assets match (ui-guide-live-assets.json); ios.rs unchanged since tested ff807707. Narrow ledger retirement only, no independent peer-Verified claim.
+AREA: browser
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-749
+SYMPTOM: Closing an edited scope/memory form called native confirm rather than the shared confirmation UI. Native Safari surfaced an alert outside the app and interrupted subsequent modal interactions.
+COST: The scope dismissal path interrupted the native audit and required dismissing a browser alert before continuing.
+FIX: AF-749, dashboard 0.9.929. Use showConfirm; cancellation preserves edits and explicit discard closes both dialogs. scope-discard-choice records the boolean choice without draft text. Deployment and exact-commit evidence are recorded on the card.
