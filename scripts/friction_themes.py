@@ -657,6 +657,10 @@ def log_attachment_exclusion(considered, excluded):
     event = {"event": "friction_attachment_metadata_excluded", "measured": True,
              "n_considered": considered, "ignored_upload_references": excluded,
              "ts": int(time.time())}
+    log_friction_event(event)
+
+
+def log_friction_event(event):
     try:
         folder = os.path.join(os.environ.get("AMUX_HOME", os.path.expanduser("~/.amux")), "logs")
         os.makedirs(folder, exist_ok=True)
@@ -862,15 +866,15 @@ def signal_ledger_clusters(now_ms):
 
 
 # ---------------------------------------------------------------------------
-# Signal 4: nudge pressure that does not move a queue
+# Signal 4: board-drive nudge pressure without terminal completions
 #
-# A lane that received many machine nudges and closed nothing is a loop with no
-# negative feedback term. Per repo, because the two halves of the fleet run on
-# different cadences and averaging them hides both.
+# Peer collaboration is not a nudge. Terminal closures alone cannot measure
+# useful nonterminal movement, so this signal is an inspection candidate, not
+# a finding that a lane made no progress.
 # ---------------------------------------------------------------------------
 def signal_nudge_without_movement(con, now_ms):
     if con is None:
-        return [Signal("nudge-no-movement", "both", "Nudges sent to lanes whose queue did not move",
+        return [Signal("nudge-no-movement", "both", "Repeated board-drive nudges without a terminal completion",
                        measured=False, why_unmeasured="amux.db unreadable")]
     win_ms = int(DAYS * 86400_000)
     since = now_ms - win_ms
@@ -887,16 +891,18 @@ def signal_nudge_without_movement(con, now_ms):
         "WHERE closed_at IS NOT NULL AND closed_at >= ? GROUP BY session",
         (since // 1000,)).fetchall())
 
-    per_lane = defaultdict(lambda: {"machine": 0, "human": 0})
+    per_lane = defaultdict(lambda: {"machine": 0, "human": 0, "nudges": 0})
     for r in msgs:
         bucket = "human" if (r["type"] == "user" and not r["origin"]) else "machine"
         per_lane[r["session"]][bucket] += r["c"]
+        if r["type"] == "pickup" and r["origin"] == "board-drive":
+            per_lane[r["session"]]["nudges"] += r["c"]
 
     s = Signal("nudge-no-movement", "both",
-               "Lanes nudged repeatedly whose board queue did not move",
+               "Repeated board-drive nudges without a terminal completion",
                n_considered=sum(v["machine"] + v["human"] for v in per_lane.values()))
-    for lane, counts in sorted(per_lane.items(), key=lambda kv: -kv[1]["machine"]):
-        if counts["machine"] < 10:
+    for lane, counts in sorted(per_lane.items(), key=lambda kv: -kv[1]["nudges"]):
+        if counts["nudges"] < 10:
             continue
         moved = closed.get(lane, 0)
         if moved > 0:
@@ -905,15 +911,26 @@ def signal_nudge_without_movement(con, now_ms):
         s.evidence.append({
             "lane": lane, "repo": lane_repo(lane),
             "machine_msgs": counts["machine"], "human_msgs": counts["human"],
+            "nudge_msgs": counts["nudges"],
+            "other_machine_msgs": counts["machine"] - counts["nudges"],
             "cards_closed_in_window": moved,
         })
     s.active = s.value > 0
+    repos = {e["repo"] for e in s.evidence}
+    s.repo_scope = "both" if {"amux", "mixpeek"} <= repos else (
+        "amux" if "amux" in repos else "mixpeek" if "mixpeek" in repos else "other")
     s.detail = {
         "lanes_over_threshold": s.value,
-        "threshold": "10+ machine messages and 0 cards closed",
+        "threshold": "10+ board-drive pickup messages and 0 terminal completions",
         "total_machine_msgs": sum(v["machine"] for v in per_lane.values()),
         "total_human_msgs": sum(v["human"] for v in per_lane.values()),
+        "total_nudge_msgs": sum(v["nudges"] for v in per_lane.values()),
+        "other_machine_msgs": sum(v["machine"] - v["nudges"] for v in per_lane.values()),
+        "nonterminal_movement_measured": False,
+        "why_nonterminal_movement_unmeasured": "Only closed_at is counted; nonterminal transitions and useful work are not measured",
     }
+    log_friction_event({"event": "friction_nudge_population", "measured": True,
+                       "n_considered": s.n_considered, "ts": int(time.time()), **s.detail})
     return [s]
 
 

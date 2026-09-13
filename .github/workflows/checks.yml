@@ -189,6 +189,8 @@ jobs:
           ./scripts/test-friction-themes.sh
       - name: attachment metadata cannot manufacture cross-repo instructions (AF-888)
         run: python3 scripts/test-friction-attachments.py
+      - name: peer collaboration cannot inflate board-drive nudge pressure (AF-890)
+        run: python3 scripts/test-friction-nudges.py
       # AF-360. The dashboard stamps every outgoing message with the send time
       # and had no guard against text that already carried one, so re-sending
       # produced a nested stamp. Measured live on MSG-35221. The reader strips a

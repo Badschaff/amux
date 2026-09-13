@@ -2979,3 +2979,14 @@ CARD: AF-891
 SYMPTOM: After private Rust artifact staging shipped, tests/cli_install.py executed only installer stage3 without the INSTALL_ARTIFACT_DIR created in stage2. It tried mkdir /publish and failed before reaching the real Bash syntax-refusal guard, reddening CI despite the new Rust publication checks passing.
 COST: The checks gate failed on eefc294f and could not test the Bash publisher boundary it claimed to exercise. The isolated fixture had drifted from the caller's required inputs.
 FIX: Supply a private Rust stage and stub only Rust artifact validation in this Bash-boundary fixture; retain the actual guarded Bash publisher and old-installed sentinel checks. The full Rust artifact path remains covered by its separate actual-installer matrix. Existing test and CI refusal output makes a recurrence visible. Origin validation and resolved gates remain required before retirement.
+
+## Peer collaboration is counted as board nudges and terminal closures as all progress
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-890
+SYMPTOM: The nudge-no-movement theme signal counted 8 board-drive pickup messages plus 8 substantive peer messages as 16 nudges for mixpeek-security. It called zero terminal closures no queue movement even though cards moved to explicit external-wait states.
+COST: A collaboration-heavy lane was presented as a stuck nudge loop, inviting an unsupported fleet mechanism diagnosis and needless inspection of peer work.
+FIX: Count only the actual board-drive pickup producer toward the nudge threshold, retain peer traffic separately, and state that nonterminal movement is unmeasured. Actual SQL tests retain a ten-nudge positive control and a terminal-completion control; friction_nudge_population records both populations. Origin validation and resolved verification gates remain required before retirement.
