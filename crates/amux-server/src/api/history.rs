@@ -191,7 +191,13 @@ async fn get_history_item(
                 )
                 .ok()
             };
-            let (verdict, source) = delivery_truth(&delivery, steering);
+            let submit_verdict = d.get("submit_verdict").and_then(Value::as_str);
+            let (verdict, source) = delivery_truth(&delivery, submit_verdict, steering);
+            if delivery == "direct" && verdict != "delivered" {
+                tracing::warn!(message_id = nid, ?submit_verdict, delivered = verdict,
+                    measured = true, n_considered = 1,
+                    "history_delivery_not_confirmed: direct record does not prove submission");
+            }
             d["delivered"] = json!(verdict);
             d["delivered_source"] = json!(source);
             if let Some(Some(t)) = steering {
@@ -231,12 +237,15 @@ async fn get_history_item(
 /// `steering` encodes THREE input states, because collapsing the last two is the
 /// whole defect: None = no matching row; Some(None) = row found, unstamped;
 /// Some(Some(t)) = row found, delivered at t.
-fn delivery_truth(cmd_delivery: &str, steering: Option<Option<f64>>) -> (&'static str, &'static str) {
-    // A DIRECT send really was delivered when it was recorded — AMUX-3541 kept
-    // `now_ms` there for exactly that reason, so cmd_history is authoritative
-    // for this case and no join is needed.
+fn delivery_truth(cmd_delivery: &str, submit_verdict: Option<&str>, steering: Option<Option<f64>>) -> (&'static str, &'static str) {
+    // Direct is a transport choice. The same durable record can say its
+    // submission stuck, was unverified, or has no outcome evidence at all.
     if cmd_delivery == "direct" {
-        return ("delivered", "cmd_history — a direct send is delivered when it is recorded");
+        return match submit_verdict {
+            Some("confirmed" | "retried") => ("delivered", "cmd_history.submit_verdict — submission confirmed"),
+            Some("stuck") => ("not delivered", "cmd_history.submit_verdict — submission remained stuck"),
+            _ => ("unknown", "cmd_history.submit_verdict — submission is not confirmed; direct alone is not evidence"),
+        };
     }
     match steering {
         Some(Some(_)) => ("delivered", "steering_history — stamped by the deliverer when it landed"),
@@ -1416,6 +1425,25 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn direct_history_delivery_obeys_recorded_submission_verdict() {
+        let (app, state, _dir) = app_with_state();
+        state.store.write_async(|conn| {
+            for (id, verdict) in [(1, Some("confirmed")), (2, Some("stuck")),
+                (3, Some("retried")), (4, Some("unverified")), (5, None),
+                (6, Some("future-state"))] {
+                conn.execute("INSERT INTO cmd_history(id,text,type,session,ts,delivery,submit_verdict) VALUES(?1,'fixture','user','direct-verdict-fixture',1000,'direct',?2)", rusqlite::params![id,verdict])?;
+            }
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+        for (id, expected) in [(1,"delivered"),(2,"not delivered"),(3,"delivered"),
+            (4,"unknown"),(5,"unknown"),(6,"unknown")] {
+            let (status, value) = send(&app,"GET",&format!("/api/history/{id}"),None).await;
+            assert_eq!(status,StatusCode::OK,"{value}");
+            assert_eq!(value["delivered"],expected,"actual history endpoint row {id}: {value}");
+        }
+    }
+
     /// The sweep instrument that misled in both directions must now be unable to.
     ///
     /// Both historical misreadings were of the SAME column and pointed opposite
@@ -1427,17 +1455,17 @@ mod tests {
     fn an_unstamped_column_is_never_read_as_a_delivery_verdict() {
         // The case that nearly produced a false finding: queued, cmd_history
         // silent, and the deliverer's own table says it landed in 2 seconds.
-        let (v, src) = delivery_truth("queued", Some(Some(1_787_779_179.0)));
+        let (v, src) = delivery_truth("queued", None, Some(Some(1_787_779_179.0)));
         assert_eq!(v, "delivered");
         assert!(src.contains("steering_history"), "must name the instrument that answered: {src}");
 
         // A row the deliverer HOLDS and has not stamped is real evidence of
         // non-delivery, and must not be flattened into the unknown case.
-        assert_eq!(delivery_truth("queued", Some(None)).0, "not delivered");
+        assert_eq!(delivery_truth("queued", None, Some(None)).0, "not delivered");
 
         // NO ROW IS NOT A NEGATIVE. This is the assertion that stops the whole
         // class: absence of a lookup result is a fact about the lookup.
-        let (v3, src3) = delivery_truth("queued", None);
+        let (v3, src3) = delivery_truth("queued", None, None);
         assert_eq!(v3, "unknown", "no steering row means we cannot tell, not that it failed");
         assert_ne!(v3, "not delivered");
         assert!(
@@ -1449,19 +1477,18 @@ mod tests {
         // The three inputs must not collapse into two outputs — if any pair
         // renders alike, the join has bought nothing over reading the column.
         let all = [
-            delivery_truth("queued", Some(Some(1.0))).0,
-            delivery_truth("queued", Some(None)).0,
-            delivery_truth("queued", None).0,
+            delivery_truth("queued", None, Some(Some(1.0))).0,
+            delivery_truth("queued", None, Some(None)).0,
+            delivery_truth("queued", None, None).0,
         ];
         let mut uniq = all.to_vec();
         uniq.sort_unstable();
         uniq.dedup();
         assert_eq!(uniq.len(), 3, "three input states must yield three verdicts: {all:?}");
 
-        // A direct send is honestly answerable from cmd_history alone (AMUX-3541
-        // kept `now_ms` there deliberately), so it must NOT be reported as
-        // unknown merely because no steering row was looked up.
-        let (v4, src4) = delivery_truth("direct", None);
+        // A confirmed direct submission is answerable from its durable verdict,
+        // without requiring an unrelated steering-history record.
+        let (v4, src4) = delivery_truth("direct", Some("confirmed"), None);
         assert_eq!(v4, "delivered");
         assert!(src4.contains("cmd_history"), "and it must say which instrument: {src4}");
     }

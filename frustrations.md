@@ -2957,3 +2957,14 @@ CARD: AF-888
 SYMPTOM: friction_themes.py reported eight cross-lane repeated instructions, including three cross-repo groups, over 115 messages. Seven groups matched only common amux upload-path tokens in unrelated screenshot requests. Even after filtering those paths, the signal kept its literal both-repos scope for one genuine amux-only toolbar request.
 COST: The daily sweep would prescribe a global rule for a class manufactured from transport metadata. Extra manual message inspection was needed to reject the signal.
 FIX: Strip only amux @-upload references before phrase extraction, derive scope from all surviving evidence, and report excluded-reference counts in the signal and friction-sweep.log. Actual SQL-signal tests must retain genuine repeated instructions and ordinary filesystem prose while rejecting screenshot-only matches. Originating-session validation and resolved verification gates remain required before retirement.
+
+## Direct message records override their own failed submission verdict in diagnostics
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-889
+SYMPTOM: The frustration scan labeled MSG-59389 and MSG-59393 delivered even though each stored submit_verdict=stuck. The same shortcut in GET /api/history/{id} returned delivered beside a stuck verdict. Both readers treated direct transport selection as proof of successful submission.
+COST: The message sweep was told the two repeated RTSP requests had landed, concealing the delivery failure behind a success-shaped annotation. Extra source and exact-ID checks were required before judging the repeat.
+FIX: In both readers derive direct delivery from the existing durable submission verdict: confirmed/retried delivered, stuck not delivered, unverified/missing/unknown values unknown. Exercise the actual scanner query/output and actual history endpoint, with confirmed positive controls and explicit failure diagnostics. Queued steering-history inference is separate; no production send or retry is needed for this read-path correction. Originating-session validation and resolved verification gates remain required before retirement.

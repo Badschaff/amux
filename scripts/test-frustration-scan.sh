@@ -122,6 +122,9 @@ rows = [
     (24, "did the nightly sync run", "user", "mm", now - 70_000, "", "", "queued"),
 ]
 c.executemany("INSERT INTO cmd_history VALUES (?,?,?,?,?,?,?,?)", rows)
+# Direct delivery positive controls carry actual modern submission evidence.
+c.execute("ALTER TABLE cmd_history ADD COLUMN submit_verdict TEXT")
+c.execute("UPDATE cmd_history SET submit_verdict='confirmed' WHERE delivery='direct'")
 c.commit()
 PY
 
@@ -304,7 +307,7 @@ for f in d["findings"]:
         if m["id"] in (7,8):
             if m.get("delivered") != "delivered": sys.exit(1)
 sys.exit(0)'; then
-  ok "M: a direct send is annotated delivered, without a per-message HTTP lookup"
+  ok "M: a confirmed direct send is annotated delivered, without a per-message HTTP lookup"
 else
   bad "M: a direct send was not annotated delivered"
 fi
@@ -404,5 +407,10 @@ else
   bad "Q: a genuine double-delivery stopped being reported"
 fi
 
+if python3 scripts/test-frustration-delivery.py "$SCAN"; then
+  ok "R: direct submission verdicts survive the actual SQL and candidate-output boundary"
+else
+  bad "R: direct records still manufacture delivery certainty"
+fi
 echo "frustration-scan cells: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
