@@ -2563,3 +2563,15 @@ CARD: AF-746
 SYMPTOM: ts-gke reported overriding the ownership guard after an empty git diff --cached on a path that was not staged in the ordinary index. A real disposable Git reproduction confirms that git commit <path> gives the hook a temporary index and discards it on refusal. The emitted cached-diff hint then produces the same empty output for a legitimate append and a peer-style full rewrite. The report's eventual 66-line append was correct, but this check could not distinguish it.
 COST: One reported override used an unmeasured comparison; no incorrect commit was reported. Reproducing both append and rewrite through the actual hook required a separate fixture because ordinary staged-hook tests retained the index and missed the timing gap.
 FIX: Explain temporary-index lifetime in both the server refusal and installed hook. For pathspec retries compare the working tree against HEAD, the actual commit baseline; for staged commits first stage intended changes and inspect the cached diff. Require expected path/hunks and successful comparison; empty output, missing HEAD and errors are not ownership verification. Log measured review-required populations without claiming the user performed a review.
+
+
+## Working iOS routes are absent from the diagnostic catalog
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AMUX-4469
+SYMPTOM: During AF-748 board verification, /api/browser/ios/targets returned measured:true n_considered:10 while /api/debug/routes listed zero simulator routes. The fresh route.callers_have_routes results failed for the iOS prefix and targets. The coverage test followed api/mod.rs into browser.rs but never its nested browser/ios.rs; the extended test failed on all ten omitted paths before the catalog fix.
+COST: Two recurring automatic reports (AMUX-4468/4469) required another investigation; the diagnostic catalog could misclassify simulator request failures as missing routes.
+FIX: Add all ten real paths with their actual verbs and descend into nested router modules in the completeness test. Require a positive nested-route canary; verify the live catalog and invariant after deployment. Existing invariant incident warnings and normalized request-log verdicts carry the operational signal. Independent review remains pending.
