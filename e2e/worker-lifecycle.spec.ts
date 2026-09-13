@@ -254,8 +254,29 @@ for (const modelFamily of ['sonnet', 'haiku']) {
 
       await page.reload();
       await page.waitForFunction(() => typeof (window as any).fetchSessions === 'function');
-      await expect(page.locator('text=/Unsaved changes/')).toHaveCount(0);
+      // Startup renders the durable offline cache before the first list read.
+      // A function definition and an absent modal cannot prove deletion.
+      await page.evaluate(() => (window as any).fetchSessions());
+      const deletedCard = page.locator(`.card[data-session="${worker}"]`);
+      // A soft assertion preserves this failure if a later diagnostic read fails.
+      await expect.soft(deletedCard, 'deleted worker must disappear from the refreshed fleet').toHaveCount(0);
+      const list = await request.get('/api/sessions', { headers: auth, timeout: 5000 });
+      const workers = list.ok() ? await list.json() : null;
+      const measured = Array.isArray(workers);
+      const deletionEvidence = {
+        kind: 'e2e-worker-deletion-view', measured, n_considered: measured ? 1 : 0, worker,
+        visible_cards: await deletedCard.count(), list_status: list.status(),
+        list_contains_worker: measured ? workers.some((s: any) => s.name === worker) : null,
+        why_unmeasured: measured ? null : 'Session list read did not return an array',
+      };
+      console.log(JSON.stringify(deletionEvidence));
+      await testInfo.attach('worker-deletion-view', { body: JSON.stringify(deletionEvidence), contentType: 'application/json' });
       await page.screenshot({ path: testInfo.outputPath('worker-deleted.png') });
+      const beacon = await request.post('/api/client-debug', { headers: auth, data: deletionEvidence, timeout: 5000 });
+      expect(beacon.ok(), 'deletion visibility diagnostic must reach amux logs').toBeTruthy();
+      expect(measured, 'deletion evidence requires a successful array list read').toBe(true);
+      expect(deletionEvidence.list_contains_worker, 'deleted worker must be absent from the API list').toBe(false);
+      await expect(page.locator('text=/Unsaved changes/')).toHaveCount(0);
     }
   });
 }

@@ -2686,3 +2686,15 @@ CARD: AF-773
 SYMPTOM: All6 worker-lifecycle failures in completed CI run34749407249 reported only left-worker-behind. The test asserted bareDELETE403, repeated that forbidden call in finally, then threw over the original error. Exact historical-body fault control lost ORIGINAL_MID_FLOW_FAILURE and kept its fixture worker. Corrected teardown exposed a hidden receipt-target span selected ahead of the visible worker card.
 COST: Six original CI failure causes were hidden, and refused cleanup could leave test-owned provider panes on the shared host. A fresh real desktop run spent30s on the hidden locator; its cleanup is independently confirmed absent with an exact tmux control. No claim about how many historical orphans remain.
 FIX: AF-773 gives exact-fixture teardown a separate budget and guarded POST, retains primary and cleanup errors, emits measured client-debug/CI evidence, and scopes the worker visibility assertion to its real fleet card. Five installed-runner controls pass; all-project product lifecycle results remain separately required.
+
+
+## Lifecycle deletion screenshot passed while the worker card remained visible
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-773
+SYMPTOM: Exact d5293449 lifecycle matrix reported6 passed, but Safari Haiku worker-deleted.png still showed the deleted worker as WORKING. The test waited for a function definition and absence of an unrelated modal after reload, without requiring fresh session data or the actual card to disappear.
+COST: One misleading deletion screenshot in a green six-case matrix; independent visual inspection and two focused browser probes were needed before closure.
+FIX: Await the current list refresh and assert exact UI/API absence, with measured deletion-view evidence in client-debug and screenshots. Frozen stale-list negative control fails expected0/received1 while API membership is false; clean matrix and independent review pending.
