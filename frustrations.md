@@ -2801,3 +2801,14 @@ CARD: AF-779
 SYMPTOM: Owner screenshot requested a fitting top bar. At 320px parent 9550ba05 renders a 106px two-row header; the prior geometry probe returns no clipping. Compact rules end at 480px although mobile layout extends to 600px.
 COST: Repeated owner report and a header consuming an extra 44px row on narrow phones; prior green clipping coverage missed it.
 FIX: AF-779 one-row 44px targets with fitting edge spacing through 600px, removed redundant top padding, and measured header-row-wrapped diagnostic. Browser 9/0 and real iOS Safari 6/0; research/mobile-header-fit-2026-09-13.md.
+
+## Structured board creation waits for a model answer that cannot affect its outcome
+AREA: board
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-785
+SYMPTOM: Creating explicit ledger fix records waited tens of seconds per request. create_item called semantic plan while holding the lane lock, then always discarded its decision when graph/gate/scheduling metadata required a separate structured record. The branch-order regression measured one comparison invocation where zero was required.
+COST: The ledger mapping paused after three creates instead of repeating this cost across the remaining100 records; an attempted atomic decomposition correctly refused the manually created epic and was not bypassed.
+FIX: Decide the existing structured-create policy before invoking its comparison closure; keep ordinary semantic reconciliation and WIP/ownership guards. Emit measured structured_create with model_called=false and candidate_population_measured=false; do not claim a semantic comparison ran. Red control0/1, corrected intake3/0; release and live adoption still pending under AF-785.

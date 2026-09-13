@@ -4446,16 +4446,10 @@ pub async fn create_item(
         .collect();
 
     let _intake_guard = super::board_intake::lock(&session, &owner_type).await;
-    let mut intake = super::board_intake::plan(&state.store, &session, &owner_type, &title,
-        &body_str(&map, "desc").unwrap_or_default()).await;
-    // Reconciliation must not silently drop graph edges, explicit gates,
-    // callbacks or scheduling metadata from a structured create request.
-    if ["depends_on", "gate", "callback", "due", "due_time", "reviewer", "shepherd",
-        "ask_actor", "ask_type", "ask_question", "ask_unblocks", "tags"].iter()
-        .any(|key| map.get(*key).is_some_and(|v| !v.is_null() && v != "" && v != &json!([])))
-        || matches!(item_type.as_str(), "epic" | "watch" | "tripwire") {
-        intake.preserve_structured_request();
-    }
+    let intake = super::board_intake::plan_create(&map, &item_type, || async {
+        super::board_intake::plan(&state.store, &session, &owner_type, &title,
+            &body_str(&map, "desc").unwrap_or_default()).await
+    }).await;
     let intake_response = intake.clone();
     // A repeated/refined request should not be refused merely because the
     // existing queue is full; reconciliation adds no WIP slot.
