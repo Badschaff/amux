@@ -2790,3 +2790,14 @@ CARD: AF-729
 SYMPTOM: Four authorized historical-review archives used --outcome-stdin, a flag supported by status verbs but not archive. The archive parser broke on the unknown flag, sent archived=true anyway and returned exit0. Readback found no supplied reason in any of the four logs. A regression against the actual CLI reproduced invalid-argv PATCHes; this is separate from the already-landed API archive_outcome fix.
 COST: Four missing audit reasons, four readbacks, and eight corrective unarchive/rearchive operations before all exact reasons were present; the first success reports hid incomplete writes.
 FIX: Refuse unknown/trailing or missing-value archive arguments before any board PATCH, retain supported flag behavior, and emit a bounded privacy-safe cli-argument-refused diagnostic. Candidate and tests are in research/archive-cli-argument-refusal-2026-09-13.md; keep open until reviewed client installation and readback.
+
+## Mobile header wraps while its clipping diagnostic reports no problem
+AREA: browser
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-779
+SYMPTOM: Owner screenshot requested a fitting top bar. At 320px parent 9550ba05 renders a 106px two-row header; the prior geometry probe returns no clipping. Compact rules end at 480px although mobile layout extends to 600px.
+COST: Repeated owner report and a header consuming an extra 44px row on narrow phones; prior green clipping coverage missed it.
+FIX: AF-779 one-row 44px targets with fitting edge spacing through 600px, removed redundant top padding, and measured header-row-wrapped diagnostic. Browser 9/0 and real iOS Safari 6/0; research/mobile-header-fit-2026-09-13.md.

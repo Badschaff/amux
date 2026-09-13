@@ -8,7 +8,7 @@ test('loaded fleet header controls stay visible and operable at phone widths',as
   }))}));
   await page.goto('/');
   await expect(page.locator('#active-count')).toHaveText('52');
-  for(const width of [320,375,402]){
+  for(const width of [320,375,402,480,481,600]){
     await page.setViewportSize({width,height:800});
     await expect(page.locator('#rate-limit-pill-count')).toHaveText('18');
     await expect(page.locator('#rate-limit-pill-count')).toBeVisible();
@@ -19,8 +19,11 @@ test('loaded fleet header controls stay visible and operable at phone widths',as
       const box=await page.locator('#'+id).boundingBox();
       expect(box).not.toBeNull();expect(box!.width).toBeGreaterThanOrEqual(44);expect(box!.height).toBeGreaterThanOrEqual(44);
       expect(box!.x).toBeGreaterThanOrEqual(0);expect(box!.x+box!.width).toBeLessThanOrEqual(width);
+      expect(await page.locator('#'+id).evaluate(e=>{const r=e.getBoundingClientRect();return e.contains(document.elementFromPoint(r.x+r.width/2,r.y+r.height/2));})).toBe(true);
     }
-    if(width>=375)expect(await page.locator('.header-row').evaluate(e=>e.getBoundingClientRect().height)).toBeLessThanOrEqual(64);
+    expect(await page.locator('.header-row').evaluate(e=>e.getBoundingClientRect().height)).toBeLessThanOrEqual(57);
+    const tops=await page.locator('#brand-header,#conn-status,#notif-btn,#rate-limit-pill,#active-btn,#add-btn,#settings-btn').evaluateAll(els=>els.map(e=>e.getBoundingClientRect().top));
+    expect(Math.max(...tops)-Math.min(...tops)).toBeLessThanOrEqual(1);
     await page.locator('#settings-btn').click();await expect(page.locator('#settings-menu')).toBeVisible();
     expect(await page.locator('#settings-menu').evaluate(e=>e.getBoundingClientRect().top)).toBeGreaterThanOrEqual((await page.locator('#settings-btn').boundingBox())!.y+44);
     await page.screenshot({path:info.outputPath('header-settings-'+width+'.png')});
@@ -59,4 +62,17 @@ test('header badge, controls and text tabs fit both themes from phone through de
  await page.locator('#notif-badge').evaluate(e=>{e.style.right='-25px';});
  await page.setViewportSize({width:1399,height:900});
  const data=(await beacon).postDataJSON();expect(data.measured).toBe(true);expect(data.n_considered).toBeGreaterThan(0);expect(data.surface).toBe('desktop');
+});
+
+// A second row is a fit regression even when no element overflows the page.
+test('wrapped mobile header self-announces in client diagnostics',async({page})=>{
+ await page.addInitScript(()=>localStorage.setItem('amux_walkthrough_done','1'));
+ await page.goto('/');
+ await page.setViewportSize({width:375,height:800});
+ await expect(page.locator('#settings-btn')).toBeVisible();
+ await expect.poll(()=>page.evaluate(()=>(window as any)._headerLayoutCheck())).toEqual([]);
+ const beacon=page.waitForRequest(r=>r.url().endsWith('/api/client-debug')&&r.postDataJSON()?.clipped?.includes('header-row-wrapped'));
+ await page.locator('.header-row').evaluate(e=>{e.style.width='200px';e.style.flexWrap='wrap';});
+ const data=(await beacon).postDataJSON();
+ expect(data.measured).toBe(true);expect(data.n_considered).toBeGreaterThanOrEqual(5);expect(data.surface).toBe('mobile');
 });

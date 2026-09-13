@@ -1584,9 +1584,13 @@
       content: ''; position: absolute; left: 50%; top: 50%;
       width: 44px; height: 44px; transform: translate(-50%, -50%);
     }
-    /* Compact labels, full touch targets. At 320px the action-status icon
-       can wrap; no control is clipped to make a nominally single row fit. */
-    .header-row { gap:1px; padding:8px; flex-wrap:wrap; justify-content:flex-start; }
+  }
+  @media (max-width: 600px) {
+    /* AF-779: seven 44px targets + 12px edge padding fit even at 320px.
+       Keep one row through the full mobile breakpoint; spare width becomes
+       space between controls, rather than a second row or clipped actions. */
+    body { padding-top:max(var(--chrome-tab-h, 0px), env(safe-area-inset-top, 0px)); }
+    .header-row { gap:0; padding:6px max(6px, env(safe-area-inset-right, 0px)) 6px max(6px, env(safe-area-inset-left, 0px)); flex-wrap:nowrap; justify-content:space-between; }
     .header-row > .header-brand, .header-row > .header-actions { display:contents !important; }
     .header-row #brand-header, .header-row #conn-status, .header-row #notif-btn,
     .header-row .header-add-btn, .header-row .settings-btn, .header-row .btn-active,
@@ -6511,7 +6515,7 @@ input.mdai-edge-path-input:focus { border-color: var(--accent); box-shadow: 0 0 
 .header-row .btn-rate-limit:hover { background:rgba(248,81,73,0.22); }
 @media (min-width:601px) { .header-row .header-actions { gap:10px !important; } .header-row .settings-btn,.header-row .btn-active,.header-row .btn-rate-limit,.header-row .header-add-btn { min-height:44px; } }
 @media (max-width:600px) {
- .header-row { gap:1px; }
+ .header-row { gap:0; }
  .header-row > #interaction-feedback { margin-left:auto; }
  .header-row #conn-status::before { width:9px; height:9px; }
  .header-row #rate-limit-pill-count { font-size:0.85rem; }

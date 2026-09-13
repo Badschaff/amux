@@ -6695,6 +6695,14 @@ function _headerLayoutCheck() {
     const b = badge.getBoundingClientRect(), r = bell.getBoundingClientRect();
     if (b.left < r.left - 1 || b.right > r.right + 1 || b.top < r.top - 1 || b.bottom > r.bottom + 1) clipped.push('notif-badge');
   }
+  // A wrapped row used to pass the clipping probe while consuming twice the
+  // phone's header height. Report that regression through the same log path.
+  if (innerWidth <= 600) {
+    const tops = _headerControlIds.filter(id => id !== 'interaction-feedback')
+      .map(id => document.getElementById(id)).filter(el => el?.getClientRects().length)
+      .map(el => el.getBoundingClientRect().top);
+    if (tops.length > 1 && Math.max(...tops) - Math.min(...tops) > 1) clipped.push('header-row-wrapped');
+  }
   return clipped;
 }
 (function observeMobileHeader() {
@@ -10623,7 +10631,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.937';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.938';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
