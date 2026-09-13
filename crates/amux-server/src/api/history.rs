@@ -767,7 +767,7 @@ async fn link_card(
             Some((_,Some(existing))) if existing!=target =>
                 (StatusCode::CONFLICT,json!({"error":"message already has a different card; reconcile that existing work first","message_id":nid,"card_id":existing})),
             Some((_,Some(existing))) =>
-                (StatusCode::OK,json!({"message_id":nid,"card_id":existing,"changed":false,"command_resent":false})),
+                (StatusCode::OK,json!({"message_id":nid,"card_id":existing,"changed":false,"applied":false,"command_resent":false})),
             Some((_,None)) => match bs::get_issue(conn,&target)? {
                 None => (StatusCode::NOT_FOUND,json!({"error":"card not found","card_id":target})),
                 Some(card) if card.archived!=0 =>
@@ -780,7 +780,7 @@ async fn link_card(
                     bs::save_patched(conn,&mut card)?;
                     events.push(ev(&nid.to_string(),MutationKind::Updated));
                     events.push(PendingEvent {entity_type:EntityType::Task,entity_id:card.id.clone(),mutation:MutationKind::Updated,payload:Some(card.snapshot())});
-                    (StatusCode::OK,json!({"message_id":nid,"card_id":card.id,"changed":true,"command_resent":false}))
+                    (StatusCode::OK,json!({"message_id":nid,"card_id":card.id,"changed":true,"applied":true,"command_resent":false}))
                 }
             }
         };
@@ -987,6 +987,32 @@ mod tests {
         (status, v)
     }
 
+    fn capture_log() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard, tracing::Dispatch) {
+        #[derive(Clone)]
+        struct LogBytes(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for LogBytes {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = LogBytes(bytes.clone());
+        // Avoid tracing-core's single-dispatch first-use cache across parallel tests.
+        let _registration_peer =
+            tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let scope = tracing::subscriber::set_default(subscriber);
+        (bytes, scope, _registration_peer)
+    }
+
     #[tokio::test]
     async fn explicit_card_link_preserves_history_and_does_not_claim_or_resend() {
         let (app, state, _dir) = app_with_state();
@@ -1058,28 +1084,7 @@ mod tests {
     #[tokio::test]
     async fn explicit_card_link_refuses_mistargeting_and_rolls_back_on_failure() {
         let (app, state, _dir) = app_with_state();
-        #[derive(Clone)]
-        struct LogBytes(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for LogBytes {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let bytes = Arc::new(Mutex::new(Vec::new()));
-        let writer = LogBytes(bytes.clone());
-        // Avoid tracing-core's single-dispatch first-use cache across parallel tests.
-        let _registration_peer =
-            tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        let _scope = tracing::subscriber::set_default(subscriber);
+        let (bytes, _scope, _peer) = capture_log();
         state.store.write(|conn| {
             conn.execute("INSERT INTO cmd_history(id,text,type,session,ts) VALUES (1,'original context','user','source-lane',1000)",[])?;
             for (id,session,archived) in [("FIX-1","source-lane",0),("FIX-2","source-lane",0),("OLD-1","source-lane",1)] {
@@ -1219,6 +1224,37 @@ mod tests {
         );
         let (_, row) = send(&app, "GET", "/api/history/1", None).await;
         assert_eq!(row["card_id"], "FIX-1");
+    }
+
+    #[tokio::test]
+    async fn explicit_card_link_has_known_receipts_through_the_full_router() {
+        let (_, state, _dir) = app_with_state();
+        let (bytes, _scope, _peer) = capture_log();
+        state.store.write(|conn| {
+            conn.execute("INSERT INTO cmd_history(id,text,type,session,ts) VALUES (1,'reviewed original','user','source-lane',1000)", [])?;
+            conn.execute("INSERT INTO issues(id,title,desc,status,session,creator,created,updated,owner_type,type) VALUES ('LINK-1','Existing work','Scope unchanged','todo','existing-owner','test',1,1,'agent','code')", [])?;
+            Ok(WriteOutcome {applied:true,events:vec![]})
+        }).unwrap();
+        let app = crate::api::router(state.clone());
+        for (id, target, expected_status, expected_phase) in [
+            ("link-first", "LINK-1", StatusCode::OK, "applied"),
+            ("link-repeat", "LINK-1", StatusCode::OK, "noop"),
+            ("link-refused", "OTHER-1", StatusCode::CONFLICT, "refused"),
+        ] {
+            let request = axum::http::Request::builder().method("PUT").uri("/api/history/MSG-1/card")
+                .header("content-type", "application/json").header("x-amux-interaction-id", id)
+                .body(Body::from(json!({"session":"source-lane","card_id":target,"reason":"Reviewed original request"}).to_string())).unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), expected_status);
+            assert_eq!(response.headers()["x-amux-interaction-id"], id);
+            let (status, receipt) = send(&app, "GET", &format!("/api/interactions/{id}"), None).await;
+            assert_eq!(status, StatusCode::OK, "{receipt}");
+            assert_eq!(receipt["phase"], expected_phase, "the full middleware must classify the actual endpoint response: {receipt}");
+            assert_eq!(receipt["measured"], true, "{receipt}");
+        }
+        let log = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(!log.lines().any(|line| line.contains("interaction_outcome") && (line.contains("link-first") || line.contains("link-repeat"))), "successful calls must not emit unknown-outcome warnings: {log}");
+        assert!(log.lines().any(|line| line.contains("interaction_outcome") && line.contains("link-refused") && line.contains("refused")), "positive control: the real refusal must reach the same collector: {log}");
     }
 
     async fn seed(app: &axum::Router) {
