@@ -73,7 +73,8 @@ try {
   assert(device, 'A booted simulator is required');
   const status = await api('status');
   assert(!status.running && !status.owned, 'Stop the previous owned audit before starting this isolated run');
-  await api('start', {udid: device, url: page}); started = true;
+  started = true; // A failed Go can still persist our driver ownership.
+  await api('start', {udid: device, url: page});
   await until('window.fixtureRun', v => v === run);
   assert.equal(await evaluate('document.visibilityState'), 'visible');
   await api('action', {action: 'input', selector: '#text', text: 'native fixture'});

@@ -275,14 +275,24 @@ async fn navigate(d: &Driver, url: &str) -> Result<()> {
             "args":[{"url":url,"bundleId":"com.apple.mobilesafari"}]})).await?;
         let contexts = d.post("/execute/sync", json!({"script":"mobile: getContexts","args":[]})).await?;
         let contexts = contexts.as_array().ok_or(failure("Safari contexts unavailable"))?;
+        // Old hidden tabs can have dead debugger contexts. Prefer the URL Go
+        // just opened, then the newest contexts (also covers redirects), rather
+        // than letting an unrelated old page consume the alignment deadline.
+        let mut candidates: Vec<_> = contexts.iter().rev()
+            .filter(|c| c["bundleId"] == "com.apple.mobilesafari").collect();
+        candidates.sort_by_key(|c| c["url"].as_str()
+            .is_none_or(|actual| actual.split('#').next() != url.split('#').next()));
+        let candidate_count = candidates.len();
         let mut considered = 0;
-        for context in contexts.iter().filter(|c| c["bundleId"] == "com.apple.mobilesafari") {
+        for context in candidates {
             let Some(id) = context["id"].as_str() else { continue };
             considered += 1;
             d.post("/context", json!({"name":id})).await?;
             if d.eval("document.visibilityState === 'visible'", json!([])).await? == true {
                 tracing::info!(target:"amux::browser_ios",session=%d.owner,verdict="native_tab_aligned",
-                    measured=true,n_considered=considered,"Safari foreground and debugger tab aligned");
+                    measured=true,n_considered=considered,n_candidates=candidate_count,
+                    requested_url_match=context["url"].as_str().is_some_and(|actual| actual.split('#').next() == url.split('#').next()),
+                    "Safari foreground and debugger tab aligned");
                 return Ok(());
             }
         }
@@ -750,8 +760,9 @@ mod tests {
                             },
                             "mobile: getContexts" => json!([
                                 {"id":"WEBVIEW_other","bundleId":"other.app"},
-                                {"id":"WEBVIEW_hidden","bundleId":"com.apple.mobilesafari"},
-                                {"id":"WEBVIEW_front","bundleId":"com.apple.mobilesafari"}]),
+                                {"id":"WEBVIEW_hidden","bundleId":"com.apple.mobilesafari","url":"https://old.test/"},
+                                {"id":"WEBVIEW_front","bundleId":"com.apple.mobilesafari","url":"https://example.test/redirect#landed"},
+                                {"id":"WEBVIEW_newer","bundleId":"com.apple.mobilesafari","url":"https://different.test/"}]),
                             _ => { assert!(script.contains("document.visibilityState"));
                                 json!(available && *context.lock().unwrap() == "WEBVIEW_front") }
                         };
@@ -762,7 +773,11 @@ mod tests {
                     let changes=changes.clone(); let active=active.clone();
                     async move {
                         let id=v["name"].as_str().unwrap().to_owned();
-                        changes.lock().unwrap().push(id.clone()); *active.lock().unwrap()=id;
+                        changes.lock().unwrap().push(id.clone());
+                        if available && id != "WEBVIEW_front" {
+                            return Json(json!({"value":{"error":"old debugger context unavailable"}}));
+                        }
+                        *active.lock().unwrap()=id;
                         Json(json!({"value":null}))
                     }
                 }));
@@ -770,7 +785,9 @@ mod tests {
             let d=Driver {owner:"test-owner".into(),port,pid:0,id:"test".into(),udid:"device".into(),capabilities:Value::Null,native:true,child:None};
             let result=navigate(&d,"https://example.test/redirect").await;
             assert_eq!(result.is_ok(),available);
-            assert_eq!(*calls.lock().unwrap(),["navigate","WEBVIEW_hidden","WEBVIEW_front"]);
+            let expected = if available { vec!["navigate","WEBVIEW_front"] }
+                else { vec!["navigate","WEBVIEW_front","WEBVIEW_newer","WEBVIEW_hidden"] };
+            assert_eq!(*calls.lock().unwrap(),expected, "Go must not touch unrelated stale contexts before its requested URL");
             assert_eq!(require_visible_tab(&d).await.is_ok(),available);
             *selected.lock().unwrap()="WEBVIEW_hidden".into();
             // No input route is installed: a missing guard would dispatch and
@@ -780,7 +797,7 @@ mod tests {
                 assert_eq!(error.0,StatusCode::CONFLICT);
                 assert!(error.1.contains("No input was dispatched"));
             }
-            assert_eq!(calls.lock().unwrap().len(),3,"No retry or input after hidden-tab refusal");
+            assert_eq!(calls.lock().unwrap().len(),expected.len(),"No retry or input after hidden-tab refusal");
             server.abort();
         }
     }

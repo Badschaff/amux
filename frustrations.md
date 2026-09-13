@@ -2696,3 +2696,14 @@ CARD: AF-732
 SYMPTOM: Go changed a background WebKit page while Safari still displayed a different tab. Native taps acknowledged without opening the requested dialog, or fell into calibration that timed out. The debugger reported document.visibilityState hidden and focus false while a native screenshot showed a different origin/page.
 COST: Repeated mobile header and modal audits failed ambiguously; API dispatch acknowledgements were insufficient to establish which page received input.
 FIX: Explicit Go opens the URL through native Safari and selects its visible debugger context; hidden tabs refuse native input before dispatch with hidden_native_tab. native_tab_aligned records successful alignment. Prototype alignment passed seven actual header open/close interactions; adapter unit and deployed native tests pending.
+
+## Go probes stale Safari tabs before the page it just opened
+AREA: browser
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-732
+SYMPTOM: After two successful native modal cases, Go exceeded its 35-second foreground-alignment deadline. A staged probe then measured native open at 114ms and context inventory at 9ms, but an old context returned 500 for its visibility read before the requested page was tried.
+COST: Board-focus and channel could not complete in the four-modal audit despite Safari displaying the requested app; earlier tab history poisoned new navigation.
+FIX: Prioritize the requested URL from Appium context metadata, then recent Safari contexts for redirects; do not scan oldest-first. Regression refuses unrelated contexts before the requested target. native_tab_aligned logs candidate count and URL-match verdict without URL contents. Native follow-up pending.
