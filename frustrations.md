@@ -2609,3 +2609,14 @@ CARD: AMUX-4486
 SYMPTOM: A test holding the real intake lane lock observes the committed cmd_history row, cancels cmd_hist_record_full, and finds that original row still unlinked. Pre-fix result: 0 passed, 1 failed. The six historical messages named by AMUX-4486 also remain unlinked, but this reproduction does not prove their historical cause.
 COST: The board audit cannot honestly close six original delivered-message outcomes; it required a cancellation reproduction and durable-recovery implementation instead of trusting the current-uptime invariant PASS.
 FIX: Save the pending board consequence in the message transaction and resume existing semantic intake after cancellation/restart without resending commands; preserve pending rows through retention, retry failed links, and emit counted recovery/failure logs. Original six need individual reconciliation before this entry can be retired.
+
+## Retained unlinked messages have no audited repair operation
+AREA: board
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AMUX-4486
+SYMPTOM: Six exact original delivered messages survive with no card_id, but existing history append/import creates new rows and automatic semantic recapture can claim historical work as newly active. The reviewer can identify existing work but cannot record that judgment against the original source with the supported history API.
+COST: The original-operand reconciliation remains blocked after the bounded cancellation fix; a missing-route negative control fails with404, and a draft retry action had to be replaced because it could create false current task claims.
+FIX: Add an explicit audited PUT history/{id}/card that preserves owner/status/delivery, rejects conflicting linkage, and atomically records original source plus rationale. Transaction failure produces a measured WARN and rolls back the link. Publication and live six-message reconciliation remain pending.
