@@ -36,8 +36,11 @@ test('loaded fleet header controls stay visible and operable at phone widths',as
   })).toBe(true);
 });
 
-test('header badge and controls fit both themes from phone through desktop',async({page},info)=>{
- await page.addInitScript(()=>localStorage.setItem('amux_walkthrough_done','1'));
+test('header badge, controls and text tabs fit both themes from phone through desktop',async({page},info)=>{
+ // Four text tabs fit at 375px; icon-plus-label is intentionally horizontally scrollable.
+ // Pin both the initial cache and async preference so live owner settings cannot race this assertion.
+ await page.addInitScript(()=>{localStorage.setItem('amux_walkthrough_done','1');localStorage.setItem('amux_tabs_display','text');});
+ await page.route(/\/api\/prefs\?key=tabs_display$/,r=>r.fulfill({json:{value:'text'}}));
  await page.route(/\/api\/sessions(?:\?.*)?$/,r=>r.fulfill({json:Array.from({length:52},(_,i)=>({name:'header-test-'+i,running:true,dir:'/workspace',provider:'codex',rate_limited_until:i<23?Date.now()/1000+3600:null}))}));
  await page.goto('/');await expect(page.locator('#active-count')).toHaveText('52');
  for(const light of [true,false])for(const width of [375,600,601,768,1440]){
