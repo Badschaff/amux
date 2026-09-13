@@ -5,7 +5,9 @@
 The protocol rests on this field. `.claude/rules/frustrations.md` requires every entry to
 link a card ("a frustration without a CARD: is a complaint, with one it is work somebody
 can pick up"), and the deletion protocol keys an author's confirmation to the entry->card
-pair. Nothing validated it, so on 2026-08-09 five of thirty-four entries queued for
+pair. AF-352 now also permits independent retirement of objective claims from
+unreachable authors, with the actual verifier recorded. Nothing originally validated
+the pointer, so on 2026-08-09 five of thirty-four entries queued for
 deletion pointed at cards about something else entirely — one of them another session's
 OPEN card, which was seconds from receiving "validated, deleting" text.
 
@@ -148,8 +150,10 @@ def fetch_sessions():
     identically for AC-227 (amux-cloud, a live lane here — ask them and the entry
     drains) and AEAB-18 (amux-errors-and-bugs, absent from all 120 sessions, working
     out of a `~/Developer/amux` that does not exist on this machine). The deletion
-    protocol keys removal to the ORIGINATING SESSION's sign-off, so those two states
-    need opposite handling and the ledger could not tell them apart.
+    protocol originally required the originating session's sign-off. AF-352 now
+    permits independent retirement of objective claims from unreachable authors;
+    these states still distinguish reachable-author review from evidence review,
+    but absence is not a permanent retirement veto.
 
     Returns None rather than an empty set when the fetch fails: an empty set would
     make EVERY entry look stranded, which is the loud-wrong-probe failure — a
@@ -457,19 +461,21 @@ def main():
         if stranded:
             # ROLLED UP, not left as N scattered CHECK lines (AF-229). The argument
             # this file makes is a COUNT — "three entries sharing an AREA" — so the
-            # thing a reader needs is how much of the open set is permanently
-            # undrainable, which no per-entry line delivers. By session, because the
-            # remedy is per-session (reach that lane, or retire its entries), not
-            # per-entry.
+            # thing a reader needs is how much provenance needs independent review.
+            # AF-352 permits objective evidence review when the author is absent;
+            # this count must not turn missing provenance into a retirement veto.
             by_who = defaultdict(list)
             for cid, who, _t in stranded:
                 by_who[who].append(cid)
-            print("  STRANDED  %d entr(ies) cite a card no one in this fleet can reach."
+            print("  STRANDED  %d entr(ies) have no card or author on this instance."
                   % len(stranded))
             for who, ids in sorted(by_who.items()):
                 print("              %-24s %d :: %s" % (who, len(ids), ", ".join(sorted(set(ids)))))
-            print("              These cannot leave the file by the sanctioned path: deletion")
-            print("              needs the ORIGINATING session's sign-off and it is not here.")
+            print("  retirement_review measured=true n_considered=%d policy=AF-352" % len(stranded))
+            print("              AF-352 permits independent retirement of objective claims on evidence.")
+            print("              Record the actual verifier and preserve the original text with")
+            print("              scripts/frustrations-archive.py; missing provenance is not proof of a fix.")
+            print("              Subjective author decisions remain open; do not answer on their behalf.")
         elif sessions is None:
             # Absence of a STRANDED block must not read as "none stranded" when the
             # question was never asked (ethos rule 7 — a passing check and an absent

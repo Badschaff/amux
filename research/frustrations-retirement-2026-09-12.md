@@ -53,6 +53,26 @@ Screenshots remain outside public source because they can contain workspace data
 The earlier missing-journal native invocation and unpinned header-preference test
 failure remain in their logs; corrected results do not erase failed specimens.
 
+## Audit policy correction — AF-755
+
+The live structural audit still prohibited every retirement when the original
+session was absent, contradicting the owner's newer AF-352 decision. The audit now
+points to independent evidence for objective claims, names the actual-verifier and
+archive requirements, and keeps subjective decisions open. Missing provenance is
+still reported; it is not proof of a fix.
+
+The existing audit emits `retirement_review measured=true n_considered=<count>
+policy=AF-352`, so its output identifies the affected population. The live ledger
+reported **6** such entries. Four new assertions in the existing fixture suite failed
+before the correction (**29 passed, 4 failed**) and all passed afterward
+(**33 passed, 0 failed**). Evidence: `retire-af746/audit-policy-before.log`,
+`audit-policy-after.log` and `audit-policy-live.log` under the local evidence folder.
+No entry was automatically archived by the audit, and structural exit codes are unchanged.
+This newly discovered finding is separately preserved and validated in the archive as
+AF-755. Thus this review moves 15 pre-existing entries and records one additional
+fixed defect; the remaining ledger count stays 118. The utility is repository-scoped;
+this does not claim every stale checkout has refreshed its script.
+
 ## Remaining work and review request
 
 Review the 15 archive moves against their named evidence and check that no claim

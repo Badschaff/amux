@@ -9999,3 +9999,15 @@ CARD: AF-749
 SYMPTOM: Closing an edited scope/memory form called native confirm rather than the shared confirmation UI. Native Safari surfaced an alert outside the app and interrupted subsequent modal interactions.
 COST: The scope dismissal path interrupted the native audit and required dismissing a browser alert before continuing.
 FIX: AF-749, dashboard 0.9.929. Use showConfirm; cancellation preserves edits and explicit discard closes both dialogs. scope-discard-choice records the boolean choice without draft text. Deployment and exact-commit evidence are recorded on the card.
+
+## Ledger audit forbids evidence-based retirement after the owner permitted it
+VALIDATED: amux-frustrations | Originating verifier amux-frustrations, 2026-09-12. FRUSTRATIONS_AUDIT=<owned-checkout>/scripts/frustrations_audit.py bash scripts/test-frustrations-audit.sh -> before 29 passed/4 failed, after 33 passed/0 failed. python3 scripts/frustrations_audit.py -> retirement_review measured=true n_considered=6 policy=AF-352, objective evidence path and subjective exception visible. Output: scratch/ios-simulator-review/retire-af746/audit-policy-before.log, audit-policy-after.log, audit-policy-live.log. Scope is the current repository utility; no claim that every stale checkout has refreshed it. Source and regression are published with this archive move under AF-755; no independent peer-Verified claim.
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-755
+SYMPTOM: The live audit counted six entries with absent authors and unresolved card namespaces, then said they could never leave the ledger because originating-session sign-off was mandatory. AF-352 had already authorized independent evidence-based retirement of objective claims, and the written protocol was updated, but its executable audit still contradicted it.
+COST: The AF-746 retirement review encountered a false permanent blocker; checking the rule, adding a failing fixture and correcting the audit required another review cycle.
+FIX: The audit names AF-352, preserves subjective author decisions and actual-verifier/archive requirements, and emits retirement_review with measured population. Four new assertions failed on the old policy; all 33 existing/new fixture checks pass after correction. No automatic archival or structural-gate change.
