@@ -317,13 +317,17 @@ fn iso_utc(secs: i64) -> String {
 /// The oldest row's timestamp, normalised to SECONDS, for guard 2. `IsoText`
 /// returns None: the ISO column is compared lexicographically and cannot land
 /// 1000x off, so the mismatch this guard exists to catch cannot occur there.
+fn retention_eligible(spec: &SweepSpec) -> &'static str {
+    if spec.table == "cmd_history" { "capture_pending=0" } else { "1=1" }
+}
+
 fn oldest_secs(conn: &Connection, spec: &SweepSpec) -> Option<f64> {
     match spec.unit {
         TsUnit::IsoText => None,
         TsUnit::Secs | TsUnit::Millis => {
             let raw: f64 = conn
                 .query_row(
-                    &format!("SELECT MIN({}) FROM {}", spec.ts_col, spec.table),
+                    &format!("SELECT MIN({}) FROM {} WHERE {}", spec.ts_col, spec.table, retention_eligible(spec)),
                     [],
                     |r| r.get(0),
                 )
@@ -377,10 +381,13 @@ pub fn sweep_one(conn: &Connection, spec: &SweepSpec, now_secs: f64) -> SweepRes
     }
 
     match conn.execute(
-        &format!("DELETE FROM {} WHERE {} < ?1", spec.table, spec.ts_col),
+        &format!("DELETE FROM {} WHERE {} < ?1 AND {}", spec.table, spec.ts_col, retention_eligible(spec)),
         rusqlite::params![&cutoff],
     ) {
         Ok(rows) => {
+            // Include protected unfinished message consequences in the actual
+            // survivor count without weakening the timestamp-unit guard above.
+            let kept = total - rows as i64;
             if rows > 0 {
                 tracing::info!(
                     table = spec.table,
@@ -1414,6 +1421,21 @@ mod tests {
     /// GUARD 1, in the direction that actually destroys data: a SECONDS table
     /// mis-declared as `Millis` builds a cutoff 1000x too large, so every row
     /// looks ancient and the sweep would empty the table.
+    #[test]
+    fn age_retention_keeps_pending_capture_but_prunes_completed_history() {
+        let dir=tempfile::tempdir().unwrap();
+        let store=crate::db::Store::open(&dir.path().join("retention.db")).unwrap();
+        store.write(|conn| {
+            let now=unix_now();
+            conn.execute("INSERT INTO cmd_history(id,text,type,session,ts,capture_pending) VALUES (1,'unfinished task','user','fixture',1,1),(2,'old completed','user','fixture',2,0),(3,'recent','user','fixture',?1,0)",[(now*1000.0) as i64])?;
+            let spec=SweepSpec {table:"cmd_history",ts_col:"ts",unit:TsUnit::Millis,env:"AMUX_TEST_CAPTURE_RETAIN_DAYS_UNUSED",default_days:90.0};
+            assert!(matches!(sweep_one(conn,&spec,now),SweepResult::Deleted {rows:1,kept:2}));
+            assert_eq!(conn.query_row("SELECT capture_pending FROM cmd_history WHERE id=1",[],|r| r.get::<_,i64>(0))?,1);
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM cmd_history WHERE id=2",[],|r| r.get::<_,i64>(0))?,0);
+            Ok(crate::db::WriteOutcome {applied:true,events:vec![]})
+        }).unwrap();
+    }
+
     #[test]
     fn a_cutoff_that_would_empty_the_table_is_refused() {
         let c = mem();

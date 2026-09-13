@@ -2597,3 +2597,15 @@ CARD: AMUX-3757
 SYMPTOM: Current-source audit of the reopened manual-claim report found PATCH and the ready frontier still count an unanswered capture in Doing, while automatic pickup and status-update claims exempt it. Two isolated API regressions on bc0003b8 failed: PATCH refused with WC-1 as its sole holder, and the frontier advertised zero capacity for the ready real task. This is the manual-path recurrence, distinct from the old automatic-pickup entry retained in the archive.
 COST: The reopened card remained actionable despite its earlier fix and archive; the audit required two failing API specimens and inspection of five independently maintained holder queries before the mismatch was bounded.
 FIX: Share the canonical WIP-holder predicate across all five consumers, retain reshaped work as WIP, and emit measured capture-exemption and failed-query signals. Draft regressions pass; publication, independent review and live adoption remain to be recorded on the card.
+
+
+## Cancelling semantic intake leaves an already recorded owner message without a card
+AREA: board
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AMUX-4486
+SYMPTOM: A test holding the real intake lane lock observes the committed cmd_history row, cancels cmd_hist_record_full, and finds that original row still unlinked. Pre-fix result: 0 passed, 1 failed. The six historical messages named by AMUX-4486 also remain unlinked, but this reproduction does not prove their historical cause.
+COST: The board audit cannot honestly close six original delivered-message outcomes; it required a cancellation reproduction and durable-recovery implementation instead of trusting the current-uptime invariant PASS.
+FIX: Save the pending board consequence in the message transaction and resume existing semantic intake after cancellation/restart without resending commands; preserve pending rows through retention, retry failed links, and emit counted recovery/failure logs. Original six need individual reconciliation before this entry can be retired.

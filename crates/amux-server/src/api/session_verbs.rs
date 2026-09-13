@@ -4753,6 +4753,9 @@ pub(crate) async fn cmd_hist_record_full(
         _ if !landed => None,
         _ => Some(now_ms),
     };
+    let capture_pending = task_bearing && landed
+        && amux_core::board::title_from_prompt(&text).is_some()
+        && !amux_core::board::is_informational_query(&text);
     let msg_row_id_w = msg_row_id.clone();
     let cap_session = session.clone();
     let truth_session = cap_session.clone();
@@ -4771,17 +4774,17 @@ pub(crate) async fn cmd_hist_record_full(
                 dup_prior_ts_w.store(pts, std::sync::atomic::Ordering::SeqCst);
             }
             conn.execute(
-                "INSERT INTO cmd_history (text, type, session, ts, origin, delivery, queued_at, delivered_at, submit_verdict) \
-                 VALUES (?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO cmd_history (text, type, session, ts, origin, delivery, queued_at, delivered_at, submit_verdict, capture_pending) \
+                 VALUES (?,?,?,?,?,?,?,?,?,?)",
                 rusqlite::params![
                     text, ctype, session, now_ms, origin,
-                    delivery, queued_at_ms, delivered_at_ms, submit_verdict
+                    delivery, queued_at_ms, delivered_at_ms, submit_verdict, capture_pending
                 ],
             )?;
             let row_id = conn.last_insert_rowid();
             msg_row_id_w.store(row_id, std::sync::atomic::Ordering::SeqCst);
             conn.execute(
-                "DELETE FROM cmd_history WHERE session=?1 AND id NOT IN \
+                "DELETE FROM cmd_history WHERE session=?1 AND capture_pending=0 AND id NOT IN \
                  (SELECT id FROM cmd_history WHERE session=?1 ORDER BY ts DESC LIMIT ?2)",
                 rusqlite::params![session, CMD_HIST_KEEP],
             )?;
@@ -4859,152 +4862,9 @@ pub(crate) async fn cmd_hist_record_full(
     // keeping; the card is a consequence that did not happen.
     let substantive = amux_core::board::title_from_prompt(&cap_text).is_some()
         && !amux_core::board::is_informational_query(&cap_text);
-    if task_bearing && landed && substantive {
+    if capture_pending {
         let row_id = msg_row_id.load(std::sync::atomic::Ordering::SeqCst);
-        if row_id > 0 {
-            let cap_isolated = session_is_isolated(&cap_session);
-            let cap_text_for_capture = cap_text.clone();
-            let associated: std::sync::Arc<std::sync::Mutex<Option<CaptureAssociation>>> =
-                std::sync::Arc::new(std::sync::Mutex::new(None));
-            let associated_w = associated.clone();
-            let sess_log = cap_session.clone();
-            let peer_requester = (cap_ctype == "session" && !cap_origin.trim().is_empty())
-                .then(|| cap_origin.clone());
-            let _intake_guard = super::board_intake::lock(&cap_session, "agent").await;
-            let intake = super::board_intake::plan(&state.store, &cap_session, "agent",
-                &amux_core::board::title_from_prompt(&cap_text_for_capture).unwrap_or_default(), &cap_text_for_capture).await;
-            let res = state
-                .store
-                .write_async(move |conn| match associate_capture_card(
-                    conn,
-                    &cap_session,
-                    &cap_text_for_capture,
-                    now_ms,
-                    &intake,
-                )? {
-                    Some(mut association) => {
-                        if let Some(requester) = peer_requester.as_deref() {
-                            arm_peer_callback(conn, &mut association.row, requester)?;
-                        }
-                        conn.execute(
-                            "UPDATE cmd_history SET card_id = ?1 WHERE id = ?2",
-                            rusqlite::params![association.row.id, row_id],
-                        )?;
-                        let ev = if association.created {
-                            crate::db::PendingEvent {
-                                entity_type: amux_core::revision::EntityType::Task,
-                                entity_id: association.row.id.clone(),
-                                mutation: amux_core::revision::MutationKind::Created,
-                                payload: Some(association.row.snapshot()),
-                            }
-                        } else {
-                            crate::db::PendingEvent {
-                                entity_type: amux_core::revision::EntityType::Message,
-                                entity_id: format!("MSG-{row_id}"),
-                                mutation: amux_core::revision::MutationKind::Updated,
-                                payload: None,
-                            }
-                        };
-                        let mut events = vec![ev];
-                        if !association.created {
-                            events.push(crate::db::PendingEvent {
-                                entity_type: amux_core::revision::EntityType::Task,
-                                entity_id: association.row.id.clone(),
-                                mutation: amux_core::revision::MutationKind::Updated,
-                                payload: Some(association.row.snapshot()),
-                            });
-                        }
-                        *associated_w.lock().unwrap() = Some(association);
-                        Ok(crate::db::WriteOutcome { applied: true, events })
-                    }
-                    None => Ok(crate::db::WriteOutcome { applied: false, events: vec![] }),
-                })
-                .await;
-            match res {
-                // Positive log signal (two-fixes rule): if auto-capture silently
-                // stops again, the absence of these lines while user prompts keep
-                // arriving — plus the cmd_history.card_id NULL rate — is the
-                // detector. grep "ledger: auto-captured".
-                Ok(_) => {
-                    let association = associated.lock().ok().and_then(|mut value| value.take());
-                    if let Some(association) = association {
-                        let created = association.created;
-                        let cid = association.row.id;
-                        let status = association.row.status;
-                        if created {
-                            tracing::info!(session = %sess_log, card_id = %cid,
-                                owner_isolated = cap_isolated,
-                                requested_no_board = skip_board,
-                                "ledger: auto-captured board card from delivered prompt");
-                        } else {
-                            tracing::info!(session = %sess_log, card_id = %cid, %status,
-                                owner_isolated = cap_isolated,
-                                requested_no_board = skip_board,
-                                measured = true, n_considered = 1,
-                                verdict = "substantive_prompt_linked_existing_card",
-                                "ledger: linked substantive delivered prompt to its unique live owned card");
-                        }
-                        let (event, reason, verdict, receipt) = match (created, status.as_str()) {
-                            (true, "doing") => (
-                                "task.claimed",
-                                "delivered-owner-prompt",
-                                "capture-claimed",
-                                format!("prompt-card:{row_id}"),
-                            ),
-                            (true, _) => (
-                                "task.captured",
-                                "delivered-owner-prompt-pending-active-claim",
-                                "capture-pending-active-claim",
-                                format!("prompt-card:{row_id}"),
-                            ),
-                            (false, "doing") => (
-                                "task.claimed",
-                                "delivered-owner-prompt-existing-card",
-                                "linked-doing-card",
-                                format!("prompt-card:{row_id}"),
-                            ),
-                            (false, _) => (
-                                "task.attribution_pending",
-                                "substantive-prompt-references-non-doing-card",
-                                "existing-card-must-be-claimed",
-                                format!("prompt-attribution:{row_id}"),
-                            ),
-                        };
-                        emit_event(
-                            state,
-                            &sess_log,
-                            event,
-                            Some(json!({
-                                "issue": cid,
-                                "status": status,
-                                "reason": reason,
-                                "measured": true,
-                                "n_considered": 1,
-                                "verdict": verdict,
-                            })),
-                            Some(receipt),
-                            "prompt-capture",
-                        )
-                        .await;
-                        if !created && status != "doing" {
-                            tracing::warn!(
-                                target: "amux::sessions",
-                                session = %sess_log,
-                                card_id = %cid,
-                                %status,
-                                measured = true,
-                                n_considered = 1,
-                                verdict = "existing_card_must_be_claimed",
-                                "substantive prompt linked to an existing non-Doing card; runtime WORKING withheld until it is claimed"
-                            );
-                        }
-                    }
-                }
-                Err(e) => tracing::warn!(session = %sess_log, error = %e,
-                    owner_isolated = cap_isolated,
-                    "ledger auto-capture FAILED; prompt recorded without a board card"),
-            }
-        }
+        if row_id > 0 { capture_recorded_message(state, row_id).await; }
     }
     if task_bearing && landed {
         let cardless_reason = if amux_core::board::is_informational_query(&cap_text) {
@@ -5041,6 +4901,230 @@ pub(crate) async fn cmd_hist_record_full(
             )
             .await;
         }
+    }
+}
+
+/// Resume only explicitly pending message consequences. This does not deliver a
+/// command, insert history, or infer work from arbitrary old cardless messages.
+pub(crate) async fn capture_recorded_message(state: &AppState, row_id: i64) {
+    use rusqlite::OptionalExtension;
+    let session = (|| -> anyhow::Result<Option<String>> {
+        let conn = state.store.read()?;
+        Ok(conn
+            .query_row(
+                "SELECT session FROM cmd_history WHERE id=?1 AND capture_pending!=0",
+                [row_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    })();
+    let cap_session = match session {
+        Ok(Some(session)) => session,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(message_id=row_id, %error, measured=false, n_considered=0,
+                verdict="capture_recovery_unmeasured", "ledger: pending message could not be read");
+            return;
+        }
+    };
+    let _intake_guard = super::board_intake::lock(&cap_session, "agent").await;
+    let loaded = (|| -> anyhow::Result<Option<(String, String, String, i64)>> {
+        let conn = state.store.read()?;
+        Ok(conn.query_row("SELECT text,type,origin,ts FROM cmd_history WHERE id=?1 AND capture_pending!=0 AND card_id IS NULL",
+            [row_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?)
+    })();
+    let (cap_text, cap_ctype, cap_origin, now_ms) = match loaded {
+        Ok(Some(row)) => row,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(message_id=row_id, %error, measured=false, n_considered=0,
+                verdict="capture_recovery_unmeasured", "ledger: pending capture snapshot unavailable");
+            return;
+        }
+    };
+    let cap_isolated = session_is_isolated(&cap_session);
+    let cap_text_for_capture = cap_text.clone();
+    let associated: std::sync::Arc<std::sync::Mutex<Option<CaptureAssociation>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let associated_w = associated.clone();
+    let sess_log = cap_session.clone();
+    let peer_requester =
+        (cap_ctype == "session" && !cap_origin.trim().is_empty()).then(|| cap_origin.clone());
+    let intake = super::board_intake::plan(
+        &state.store,
+        &cap_session,
+        "agent",
+        &amux_core::board::title_from_prompt(&cap_text_for_capture).unwrap_or_default(),
+        &cap_text_for_capture,
+    )
+    .await;
+    let res = state
+        .store
+        .write_async(move |conn| {
+            let pending: bool = conn
+                .query_row(
+                    "SELECT capture_pending!=0 AND card_id IS NULL FROM cmd_history WHERE id=?1",
+                    [row_id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if !pending {
+                return Ok(crate::db::WriteOutcome {
+                    applied: false,
+                    events: vec![],
+                });
+            }
+            match associate_capture_card(
+                conn,
+                &cap_session,
+                &cap_text_for_capture,
+                now_ms,
+                &intake,
+            )? {
+                Some(mut association) => {
+                    if let Some(requester) = peer_requester.as_deref() {
+                        arm_peer_callback(conn, &mut association.row, requester)?;
+                    }
+                    conn.execute(
+                        "UPDATE cmd_history SET card_id = ?1, capture_pending=0 WHERE id = ?2",
+                        rusqlite::params![association.row.id, row_id],
+                    )?;
+                    let ev = if association.created {
+                        crate::db::PendingEvent {
+                            entity_type: amux_core::revision::EntityType::Task,
+                            entity_id: association.row.id.clone(),
+                            mutation: amux_core::revision::MutationKind::Created,
+                            payload: Some(association.row.snapshot()),
+                        }
+                    } else {
+                        crate::db::PendingEvent {
+                            entity_type: amux_core::revision::EntityType::Message,
+                            entity_id: format!("MSG-{row_id}"),
+                            mutation: amux_core::revision::MutationKind::Updated,
+                            payload: None,
+                        }
+                    };
+                    let mut events = vec![ev];
+                    if !association.created {
+                        events.push(crate::db::PendingEvent {
+                            entity_type: amux_core::revision::EntityType::Task,
+                            entity_id: association.row.id.clone(),
+                            mutation: amux_core::revision::MutationKind::Updated,
+                            payload: Some(association.row.snapshot()),
+                        });
+                    }
+                    *associated_w.lock().unwrap() = Some(association);
+                    Ok(crate::db::WriteOutcome {
+                        applied: true,
+                        events,
+                    })
+                }
+                None => {
+                    conn.execute(
+                        "UPDATE cmd_history SET capture_pending=0 WHERE id=?1",
+                        [row_id],
+                    )?;
+                    tracing::info!(
+                        message_id = row_id,
+                        measured = true,
+                        n_considered = 1,
+                        verdict = "capture_predicate_declined",
+                        "ledger: pending capture resolved without a task"
+                    );
+                    Ok(crate::db::WriteOutcome {
+                        applied: true,
+                        events: vec![],
+                    })
+                }
+            }
+        })
+        .await;
+    match res {
+        // Positive log signal (two-fixes rule): if auto-capture silently
+        // stops again, the absence of these lines while user prompts keep
+        // arriving — plus the cmd_history.card_id NULL rate — is the
+        // detector. grep "ledger: auto-captured".
+        Ok(_) => {
+            let association = associated.lock().ok().and_then(|mut value| value.take());
+            if let Some(association) = association {
+                let created = association.created;
+                let cid = association.row.id;
+                let status = association.row.status;
+                if created {
+                    tracing::info!(session = %sess_log, card_id = %cid,
+                                owner_isolated = cap_isolated,
+                                message_id = row_id,
+                                "ledger: auto-captured board card from delivered prompt");
+                } else {
+                    tracing::info!(session = %sess_log, card_id = %cid, %status,
+                                owner_isolated = cap_isolated,
+                                message_id = row_id,
+                                measured = true, n_considered = 1,
+                                verdict = "substantive_prompt_linked_existing_card",
+                                "ledger: linked substantive delivered prompt to its unique live owned card");
+                }
+                let (event, reason, verdict, receipt) = match (created, status.as_str()) {
+                    (true, "doing") => (
+                        "task.claimed",
+                        "delivered-owner-prompt",
+                        "capture-claimed",
+                        format!("prompt-card:{row_id}"),
+                    ),
+                    (true, _) => (
+                        "task.captured",
+                        "delivered-owner-prompt-pending-active-claim",
+                        "capture-pending-active-claim",
+                        format!("prompt-card:{row_id}"),
+                    ),
+                    (false, "doing") => (
+                        "task.claimed",
+                        "delivered-owner-prompt-existing-card",
+                        "linked-doing-card",
+                        format!("prompt-card:{row_id}"),
+                    ),
+                    (false, _) => (
+                        "task.attribution_pending",
+                        "substantive-prompt-references-non-doing-card",
+                        "existing-card-must-be-claimed",
+                        format!("prompt-attribution:{row_id}"),
+                    ),
+                };
+                emit_event(
+                    state,
+                    &sess_log,
+                    event,
+                    Some(json!({
+                        "issue": cid,
+                        "status": status,
+                        "reason": reason,
+                        "measured": true,
+                        "n_considered": 1,
+                        "verdict": verdict,
+                    })),
+                    Some(receipt),
+                    "prompt-capture",
+                )
+                .await;
+                if !created && status != "doing" {
+                    tracing::warn!(
+                        target: "amux::sessions",
+                        session = %sess_log,
+                        card_id = %cid,
+                        %status,
+                        measured = true,
+                        n_considered = 1,
+                        verdict = "existing_card_must_be_claimed",
+                        "substantive prompt linked to an existing non-Doing card; runtime WORKING withheld until it is claimed"
+                    );
+                }
+            }
+        }
+        Err(e) => tracing::warn!(session = %sess_log, error = %e,
+                    message_id = row_id, measured = true, n_considered = 1,
+                    verdict = "capture_retry_pending",
+                    owner_isolated = cap_isolated,
+                    "ledger auto-capture FAILED; durable prompt remains pending for retry"),
     }
 }
 
@@ -12609,7 +12693,7 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                             // Link the most recent uncarded cmd_history row for this
                             // prompt, if the enqueue recorded one without carding it.
                             conn.execute(
-                                "UPDATE cmd_history SET card_id = ?1 WHERE id = \
+                                "UPDATE cmd_history SET card_id = ?1, capture_pending=0 WHERE id = \
                                  (SELECT id FROM cmd_history WHERE session = ?2 AND text = ?3 \
                                   AND card_id IS NULL ORDER BY id DESC LIMIT 1)",
                                 rusqlite::params![association.row.id, sess3, text3],
@@ -22326,6 +22410,70 @@ mod tests {
             assert_eq!(status,StatusCode::CONFLICT,"{body}");
             assert_ne!(body["deduped"],true,"a refusal is not an acceptance receipt");
         }
+    }
+
+    /// AMUX-4486: cancellation after the durable message write must not erase
+    /// its board consequence while semantic intake is waiting for this lane.
+    #[tokio::test]
+    async fn cancelling_intake_after_recording_keeps_the_owner_prompt_linked() {
+        let (st, _dir) = state();
+        st.store.write(|conn| {
+            ensure_fleet_tables(conn)?;
+            Ok(crate::db::WriteOutcome { applied: false, events: vec![] })
+        }).unwrap();
+        let lane = "cancelled-intake-fixture";
+        let gate = super::super::board_intake::lock(lane, "agent").await;
+        let recording_state = st.clone();
+        let recording = tokio::spawn(async move {
+            cmd_hist_record_full(&recording_state, lane,
+                "implement the missing parser validation", "user", "", false,
+                DeliveryMeta::direct()).await;
+        });
+        let message_id = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let id = {
+                    let conn = st.store.read().unwrap();
+                    conn.query_row("SELECT id FROM cmd_history WHERE session=?1", [lane],
+                        |r| r.get::<_, i64>(0)).ok()
+                };
+                if let Some(id) = id { break id; }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("positive precondition: the message must really be committed");
+        assert!(!recording.is_finished(), "the lane intake lock must hold the consequence path");
+        recording.abort();
+        assert!(recording.await.unwrap_err().is_cancelled());
+        drop(gate);
+        assert_eq!(st.store.read().unwrap().query_row(
+            "SELECT capture_pending FROM cmd_history WHERE id=?1", [message_id],
+            |r| r.get::<_, i64>(0)).unwrap(), 1);
+        // Reopen the database: the recovery input must survive loss of all
+        // request state, not just a detached future in this runtime.
+        drop(st);
+        let restarted = AppState {
+            store: std::sync::Arc::new(crate::db::Store::open(&_dir.path().join("t.db")).unwrap()),
+            started: std::time::Instant::now(), build_hash: "restarted".into(), auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        crate::runtime_jobs::message_capture::tick(&restarted).await;
+        let conn = restarted.store.read().unwrap();
+        let (count, linked, pending): (i64, Option<String>, i64) = conn.query_row(
+            "SELECT COUNT(*), card_id, capture_pending FROM cmd_history WHERE id=?1", [message_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        assert_eq!(count, 1, "the original durable message must survive cancellation exactly once");
+        assert!(linked.is_some(),
+            "capture_consequence_lost_after_cancellation: durable MSG-{message_id} remains unlinked after its request was cancelled during intake");
+        assert_eq!(pending, 0);
+        let cards: i64 = conn.query_row("SELECT COUNT(*) FROM issues WHERE session=?1", [lane], |r| r.get(0)).unwrap();
+        assert_eq!(cards, 1);
+        drop(conn);
+        let ((), ()) = tokio::join!(
+            crate::runtime_jobs::message_capture::tick(&restarted),
+            capture_recorded_message(&restarted, message_id));
+        let conn = restarted.store.read().unwrap();
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM cmd_history WHERE session=?1", [lane], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM issues WHERE session=?1", [lane], |r| r.get::<_, i64>(0)).unwrap(), cards);
+        assert_eq!(conn.query_row("SELECT card_id FROM cmd_history WHERE id=?1", [message_id], |r| r.get::<_, Option<String>>(0)).unwrap(), linked);
     }
 
     // The column ALIGNMENT, which submit_verdict_of's unit tests cannot catch:

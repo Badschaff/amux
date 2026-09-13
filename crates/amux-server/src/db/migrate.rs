@@ -388,6 +388,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0066_send_receipt_identity",
         sql: include_str!("../../migrations/0066_send_receipt_identity.sql"),
     },
+    Migration {
+        version: 67,
+        name: "0067_message_capture_pending",
+        sql: include_str!("../../migrations/0067_message_capture_pending.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.
