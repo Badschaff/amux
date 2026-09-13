@@ -73,10 +73,16 @@ export function messageScenarios() {
     await until('document.querySelector("#active-count").textContent',v=>v==='52');
     await until('!document.querySelector("#peek-overlay").classList.contains("active")',v=>v);
     assert.deepEqual(await evaluate('_headerLayoutCheck()'),[]);
-    const header=await evaluate(`(()=>{const ids=['brand-header','conn-status','notif-btn','rate-limit-pill','active-btn','add-btn','settings-btn','interaction-feedback'];return {brand:getComputedStyle(document.querySelector('#brand-name-header'),'::after').content,connection:getComputedStyle(document.querySelector('#conn-status')).fontSize,limited:document.querySelector('#rate-limit-pill-count').textContent,height:document.querySelector('.header-row').getBoundingClientRect().height,controls:ids.map(id=>{const e=id==='interaction-feedback'?document.querySelector('#interaction-feedback > summary'):document.getElementById(id);const r=e.getBoundingClientRect();const hit=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);return {id,width:r.width,height:r.height,visible:r.left>=0&&r.right<=innerWidth,clickable:e===hit||e.contains(hit)}})}})()`);
+    const header=await evaluate(`(()=>{const ids=['brand-header','conn-status','notif-btn','rate-limit-pill','active-btn','add-btn','settings-btn'];return {brand:getComputedStyle(document.querySelector('#brand-name-header'),'::after').content,connection:getComputedStyle(document.querySelector('#conn-status')).fontSize,limited:document.querySelector('#rate-limit-pill-count').textContent,height:document.querySelector('.header-row').getBoundingClientRect().height,controls:ids.map(id=>{const e=document.getElementById(id);const r=e.getBoundingClientRect();const hit=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);return {id,width:r.width,height:r.height,visible:r.left>=0&&r.right<=innerWidth,clickable:e===hit||e.contains(hit)}})}})()`);
     assert.equal(header.brand,'"a"');assert.equal(header.connection,'0px');assert.equal(header.limited,'18');assert(header.height<=64);
     for(const control of header.controls){assert(control.width>=44&&control.height>=44,JSON.stringify(control));assert(control.visible&&control.clickable,JSON.stringify(control));}
     await shot('simulator-compact-header');
+    assert.equal(await evaluate('document.querySelector(".header-row > #interaction-feedback")'),null,'Receipt inspection must not add a header control');
+    await api('action',{action:'click',selector:'#notif-btn'});
+    const inspector=await until(`(()=>{const e=document.querySelector('#notif-panel #interaction-feedback > summary');if(!e)return null;const r=e.getBoundingClientRect(),hit=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);return {width:r.width,height:r.height,visible:r.left>=0&&r.right<=innerWidth&&r.top>=0&&r.bottom<=innerHeight,clickable:e===hit||e.contains(hit)}})()`,v=>v?.clickable);
+    assert(inspector.width>=44&&inspector.height>=44&&inspector.visible,JSON.stringify(inspector));
+    await shot('simulator-loaded-header-notifications');
+    await api('action',{action:'click',selector:'#notif-btn'});
     await api('action',{action:'click',selector:'#settings-btn'});
     await until('document.querySelector("#settings-menu").classList.contains("open")',v=>v);
     await shot('simulator-loaded-header-settings');

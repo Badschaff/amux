@@ -170,6 +170,8 @@ try {
       await until('document.querySelector('+JSON.stringify(details)+').open',value=>value===true);
       await evaluate('_interactionReconcile('+JSON.stringify(id)+')');
       assert.equal(await evaluate('document.querySelector('+JSON.stringify(details)+').open'),true);
+      await api('action',{action:'scroll',x:200,y:420,dy:300});
+      await until('(()=>{const e=document.querySelector('+JSON.stringify(details+' > p')+'),r=e.getBoundingClientRect(),p=document.querySelector("#notif-panel").getBoundingClientRect();return {visible:r.width>0&&r.height>0&&r.top>=p.top&&r.bottom<=p.bottom,text:e.textContent}})()',value=>value.visible&&value.text.includes(id)&&value.text.includes('1 recorded changes'));
       await shot('simulator-notifications-details');
       await api('action',{action:'click',selector:'#notif-btn'});
       assert.equal(await evaluate('document.querySelector("#notif-panel").classList.contains("active")'),false);
