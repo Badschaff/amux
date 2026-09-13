@@ -2756,3 +2756,15 @@ CARD: AF-774
 SYMPTOM: Receipt rendering replaces the focused Details summary, moving focus to body while its disclosure remains open; Enter then no longer operates the receipt.
 COST: Independent review rejected the candidate; two browser probes exposed a keyboard continuity gap missed by the 69-case matrix.
 FIX: Restore only the retained focused receipt summary within the active panel with preventScroll; record measured focus restoration/loss and exercise real effects reads plus outside-focus/dismissal controls.
+
+
+## Golden offline replay test stops at obsolete generic operation wording
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-775
+SYMPTOM: All three golden offline CI cases expected 3 ops while the current banner says 3 queued, will send on reconnect, so the retained real replay/uniqueness assertions were never reached.
+COST: Three persistent CI failures and loss of downstream offline replay coverage in the full matrix until this fixture was corrected.
+FIX: Assert the current explicit queued state/count, retain original real UI replay and uniqueness checks, and publish measured banner/queue/operation evidence in CI and amux client-debug. Working-tree six-case golden suite passes; clean gates/review/publication pending.

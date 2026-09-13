@@ -218,7 +218,19 @@ test('golden_offline_queue_and_replay', async ({ page, request }, testInfo) => {
   // always carries the exact queue count. Neither legitimate state says Live.
   await expect(page.locator('#conn-status').first()).toHaveText(/^(3 pending|Sync error)$/);
   await expect(page.locator('#offline-banner')).toHaveClass(/active/);
-  await expect(page.locator('#offline-banner-title')).toContainText('3 ops');
+  const offlineEvidence = {
+    kind: 'golden-offline-replay', verdict: 'offline_queue_inspected', measured: true,
+    n_considered: titles.length, queued: queued.length,
+    banner: await page.locator('#offline-banner-title').innerText(),
+    operations: queued.map(op => ({ method: op.options?.method, url: op.url })),
+  };
+  console.log('[golden offline evidence]', JSON.stringify(offlineEvidence));
+  await testInfo.attach('offline-queue-evidence', { body: JSON.stringify(offlineEvidence), contentType: 'application/json' });
+  const diagnostic = await request.post('/api/client-debug', {
+    headers: authHeaders(token), data: offlineEvidence,
+  });
+  expect(diagnostic.ok(), 'offline queue measurement reaches amux logs').toBe(true);
+  await expect(page.locator('#offline-banner-title')).toContainText('3 queued, will send on reconnect');
 
   // The queue really is local: nothing reached the server yet.
   const during = await serverTitles(request, token);
