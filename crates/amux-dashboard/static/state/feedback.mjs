@@ -88,6 +88,9 @@ export function installFeedback(interactions, ui, diagnostic = () => {}) {
     status.textContent = pending.length ? pending.length + ' active' : last ? phaseLabels[last.phase] : 'Actions';
     hub.dataset.phase = pending.some(r => ['unknown','blocked'].includes(r.phase)) ? 'blocked' : pending.length ? 'running' : last?.phase || 'idle';
     const visible = [...pending, ...receipts.filter(r => settled.has(r.phase)).slice(-20)].reverse();
+    const focused = document.activeElement;
+    const focusedReceipt = panel?.classList.contains('active') && list.contains(focused)
+      && focused.matches('article > details > summary') ? focused.closest('article').dataset.interactionId : null;
     const expanded = new Set([...list.querySelectorAll('article > details[open]')]
       .map(details => details.parentElement.dataset.interactionId));
     list.replaceChildren();
@@ -142,6 +145,15 @@ export function installFeedback(interactions, ui, diagnostic = () => {}) {
       if (remedy) { const text = document.createElement('p'); text.textContent = typeof remedy === 'string' ? remedy : JSON.stringify(remedy); explanation.append(text); }
       row.append(explanation);
       list.append(row);
+    }
+    if (focusedReceipt && visible.some(item => item.id === focusedReceipt)) {
+      const replacement = [...list.querySelectorAll('article')]
+        .find(row => row.dataset.interactionId === focusedReceipt)?.querySelector('details > summary');
+      if (panel.classList.contains('active') && document.activeElement === document.body)
+        replacement?.focus({preventScroll:true});
+      const restored = document.activeElement === replacement;
+      diagnostic({verdict:restored ? 'interaction_focus_restored' : 'interaction_focus_lost',
+        measured:true, n_considered:1, interaction_id:focusedReceipt, restored});
     }
     const retainedExpanded = visible.filter(item => expanded.has(item.id));
     if (retainedExpanded.length) {

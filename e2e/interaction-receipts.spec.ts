@@ -388,23 +388,52 @@ test('Notifications exposes scrollable receipts without adding a header control 
   await expect.poll(() => beacons.some(b => b.verdict === 'interaction_inspector_visible' && b.measured && b.n_considered === 1)).toBe(true);
   await page.screenshot({path:testInfo.outputPath('notifications-receipts-top.png')});
   const last = panel.locator('.interaction-list article').last();
-  await last.locator('details > summary').click();
+  const detailsSummary = last.locator('details > summary');
+  await detailsSummary.focus();
+  await page.keyboard.press('Enter');
   await expect(last.locator('details > p')).toBeVisible();
   const scrollBeforeUpdate = await panel.evaluate(element => element.scrollTop);
   expect(scrollBeforeUpdate).toBeGreaterThan(0);
   const lastId = await last.getAttribute('data-interaction-id');
-  await page.route('**/api/interactions/' + lastId + '/effects', route => route.fulfill({json:{
-    measured:true,n_considered:1,effects:[{id:'view-refresh-effect',kind:'pref.updated'}],more:false,
-  }}));
+  let effectsReads = 0;
+  await page.route('**/api/interactions/' + lastId + '/effects', route => {
+    effectsReads++;
+    return route.fulfill({json:{measured:true,n_considered:1,
+      effects:[{id:'view-refresh-effect-' + effectsReads,kind:'pref.updated'}],more:false}});
+  });
+  // Successful effects are cached for 60s. Make this synthetic receipt due
+  // before subsequent reads so the outside-focus controls actually rerender.
+  const readEffectsAgain = () => page.evaluate(id => {
+    const app = window as any;
+    app._interactionSet(id, {effect_sync:{...app.__amuxInteractions.get(id).effect_sync, next_attempt_at:0}});
+    return app._interactionReconcile(id);
+  }, lastId);
   await page.evaluate(id => (window as any)._interactionReconcile(id), lastId);
   await expect(last.locator('details'), 'a receipt update must preserve the disclosure being read').toHaveAttribute('open', '');
   await expect(last.locator('details > p')).toContainText('1 recorded changes');
   expect(Math.abs(await panel.evaluate(element => element.scrollTop) - scrollBeforeUpdate)).toBeLessThanOrEqual(2);
+  await expect(detailsSummary, 'receipt reconciliation preserves the keyboard control being used').toBeFocused();
+  await page.keyboard.press('Enter');
+  await expect(last.locator('details')).not.toHaveAttribute('open', '');
+  await page.keyboard.press('Enter');
+  await expect(last.locator('details')).toHaveAttribute('open', '');
+  await expect.poll(() => beacons.some(b => b.verdict === 'interaction_focus_restored' && b.measured && b.n_considered === 1)).toBe(true);
   await page.screenshot({path:testInfo.outputPath('notifications-receipts-bottom.png')});
+  await page.locator('#settings-btn').focus();
+  const beforeOutsideRead = effectsReads;
+  await readEffectsAgain();
+  expect(effectsReads).toBeGreaterThan(beforeOutsideRead);
+  await expect(page.locator('#settings-btn'), 'updates must not steal focus from another control').toBeFocused();
+  await detailsSummary.focus();
   await page.keyboard.press('Escape');
   await expect(panel).toBeHidden();
   await expect(page.locator('#notif-btn')).toBeFocused();
   await expect(page.locator('#notif-btn')).toHaveAttribute('aria-expanded', 'false');
+  const beforeDismissedRead = effectsReads;
+  await readEffectsAgain();
+  expect(effectsReads).toBeGreaterThan(beforeDismissedRead);
+  await expect(panel).toBeHidden();
+  await expect(page.locator('#notif-btn'), 'a dismissed inspector must not reclaim focus').toBeFocused();
   await openRecentActions(page);
   await page.mouse.click(2, geometry.bottom + 4);
   await expect(panel).toBeHidden();

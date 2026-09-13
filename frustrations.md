@@ -2744,3 +2744,15 @@ CARD: AF-774
 SYMPTOM: After opening the last retained receipt Details in Safari and reading one effects response through the actual reconciler, the disclosure lost its open attribute. feedback.mjs replaces every article on each receipt update and did not preserve disclosure state.
 COST: One failed targeted Safari regression after the inspector became reachable; a person reading the remedy would have to reopen it after updates.
 FIX: Preserve expanded receipt identities across rendering, log measured retained/restored counts, and verify open Details plus reading position through a real effects read. Full matrix/native/review still pending on AF-774.
+
+
+## Receipt updates discard keyboard focus while retaining open Details
+AREA: browser
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-774
+SYMPTOM: Receipt rendering replaces the focused Details summary, moving focus to body while its disclosure remains open; Enter then no longer operates the receipt.
+COST: Independent review rejected the candidate; two browser probes exposed a keyboard continuity gap missed by the 69-case matrix.
+FIX: Restore only the retained focused receipt summary within the active panel with preventScroll; record measured focus restoration/loss and exercise real effects reads plus outside-focus/dismissal controls.
