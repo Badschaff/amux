@@ -1886,9 +1886,9 @@ fn backlog_by_type_count(conn: &Connection, session: &str) -> usize {
     .max(0) as usize
 }
 
-/// How many drainable backlog cards remain. Reported beside the promotion so
-/// the trace answers "is this lane about to run dry" without a second query.
-fn drainable_backlog_ids(conn: &Connection, session: &str, now: f64) -> Vec<String> {
+/// The dispatch-eligible backlog rows, shared with the nudge population.
+/// Keep database failures distinct from a measured empty selection.
+fn drainable_backlog_rows(conn: &Connection, session: &str, now: f64) -> rusqlite::Result<Vec<bs::IssueRow>> {
     // AMUX-4228: a parked capture is an already-delivered prompt, not an
     // external condition that eventually goes stale. Only an explicit claim
     // (or an intentional move to Todo) should dispatch that work again.
@@ -1912,23 +1912,30 @@ fn drainable_backlog_ids(conn: &Connection, session: &str, now: f64) -> Vec<Stri
             st.query_map(rusqlite::params![session, reclaim_cut, verified_cut], |r| {
                 r.get::<_, String>(0)
             })
-            .map(|rows| rows.flatten().collect::<Vec<_>>())
-        })
-        .unwrap_or_default();
+            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+        })?;
 
     // A dependency-blocked backlog card is parked just as surely as a fresh
     // external trigger. Counting or promoting it as drainable only moves the
     // blockage sideways into To Do, where it can prevent independent backlog
     // work from ever being considered (the live MR-14/MR-27 topology).
-    candidates
-        .into_iter()
-        .filter(|id| {
-            bs::get_issue(conn, id)
-                .ok()
-                .flatten()
-                .is_some_and(|row| deps_blocking(conn, &row).is_empty())
-        })
-        .collect()
+    let mut eligible = Vec::new();
+    for id in candidates {
+        let row = bs::get_issue(conn, &id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        if deps_blocking(conn, &row).is_empty() { eligible.push(row); }
+    }
+    Ok(eligible)
+}
+
+fn drainable_backlog_ids(conn: &Connection, session: &str, now: f64) -> Vec<String> {
+    match drainable_backlog_rows(conn, session, now) {
+        Ok(rows) => rows.into_iter().map(|row| row.id).collect(),
+        Err(error) => {
+            tracing::warn!(marker = "backlog_selection_unmeasured", session, measured = false,
+                n_considered = 0, why_unmeasured = %error, "backlog selection failed; refusing dispatch");
+            Vec::new()
+        }
+    }
 }
 
 fn drainable_backlog_count(conn: &Connection, session: &str, now: f64) -> usize {
@@ -3768,56 +3775,45 @@ fn stale_backlog_candidates(
     .unwrap_or_default()
 }
 
-/// Backlog cards of ANY age, OLDEST FIRST — the candidates for the idle-drain
-/// nudge (a lane sitting on a fresh backlog with nothing in todo).
-///
-/// This comment said "newest first" three times, and gave the reason (a
-/// just-arrived batch is the likeliest thing the worker meant to act on), for as
-/// long as AMUX-3779 has been shipped — which reversed the order to `created ASC`
-/// so the drain reads the same way as the todo scorer. The query below is the
-/// truth; the prose was describing the code it replaced. Found 2026-09-04 while
-/// checking a dispatch-ordering report from ts-gke, where the stale comment was
-/// the first thing that made the behaviour look wrong.
+/// One selection supplies the nudge denominator, display and escalation input.
+/// Reuse dispatch eligibility, including parked causes, needs:you, captures,
+/// recent claims and dependencies. Truncate only the rendered list, never count.
+fn backlog_nudge_population(
+    conn: &Connection, session: &str, now: i64,
+) -> rusqlite::Result<Vec<(String, String, i64)>> {
+    let result = (|| {
+        let considered: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM issues WHERE session=?1 AND status='backlog' \
+             AND deleted IS NULL AND COALESCE(archived,0)=0 AND owner_type='agent'",
+            [session], |row| row.get(0),
+        )?;
+        let cards: Vec<_> = drainable_backlog_rows(conn, session, now as f64)?
+            .into_iter().map(|row| (row.id, row.title, (now - row.created) / 86400)).collect();
+        if considered > 0 {
+            tracing::info!(marker = "backlog_nudge_population", session, measured = true,
+                n_considered = considered, eligible = cards.len(),
+                excluded = considered.saturating_sub(cards.len() as i64),
+                listed = cards.len().min(8), "backlog nudge uses one eligibility population");
+        }
+        Ok(cards)
+    })();
+    if let Err(error) = &result {
+        tracing::warn!(marker = "backlog_nudge_population_unmeasured", session, measured = false,
+            n_considered = 0, why_unmeasured = %error, "backlog nudge read failed; no empty-success verdict");
+    }
+    result
+}
+
+#[cfg(test)]
 fn backlog_candidates(conn: &Connection, session: &str, now: i64) -> Vec<(String, String, i64)> {
-    // DRAINABLE only — mirror the exclusions in the idle_drain gate so the cards
-    // the nudge lists are exactly the ones it claims are un-worked: no dormant
-    // types (tripwire/watch), no card parked on a LIVE source_ref trigger, and
-    // no card with `blocked_on` set (AF-516 — added to BOTH predicates in the
-    // same commit, because a nudge listing a card the drain will not take is the
-    // same disagreement one surface along, and this comment's promise to mirror
-    // is the only thing keeping them together).
-    // "Live" means re-verified within SOURCE_REF_STALE_S — a trigger nobody has
-    // re-checked in 24h+ is treated as if it were never set, so `--trigger`
-    // cannot be used to permanently exit the drain nudge on a card the owner
-    // is not actually revisiting (see SOURCE_REF_STALE_S doc for the incident).
-    // OLDEST-first (AMUX-3779): the idle-drain nudge now lists the same
-    // oldest-first order the todo scorer works in, so "what gets attention next"
-    // reads one way across todo and backlog instead of newest-here/oldest-there.
-    conn.prepare(
-        "SELECT id, title, created FROM issues \
-         WHERE session=?1 AND status='backlog' AND deleted IS NULL \
-         AND COALESCE(archived,0)=0 AND owner_type='agent' \
-         AND type NOT IN ('tripwire','watch','epic') \
-         AND (COALESCE(source_ref,'')='' OR COALESCE(last_verified_at,0) < ?2) \
-         AND COALESCE(blocked_on,'')='' \
-         ORDER BY created ASC LIMIT 8",
-    )
-    .and_then(|mut st| {
-        st.query_map(rusqlite::params![session, now - SOURCE_REF_STALE_S], |r| {
-            let created: i64 = r.get(2)?;
-            let age_days = (now - created) / 86400;
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, age_days))
-        })
-        .map(|rows| rows.flatten().collect())
-    })
-    .unwrap_or_default()
+    backlog_nudge_population(conn, session, now).unwrap().into_iter().take(8).collect()
 }
 
 /// The idle-drain prompt: a lane is doing nothing while it holds a backlog. The
 /// action is the WORKER'S to choose (which cards, in what order) — amux only
 /// surfaces the stall (D1 exit: the model drives, the harness reports).
 fn backlog_drain_text(cards: &[(String, String, i64)], drainable: i64) -> String {
-    let list = cards
+    let mut list = cards
         .iter()
         .map(|(id, title, _)| {
             let t: String = title.chars().take(70).collect();
@@ -3825,6 +3821,9 @@ fn backlog_drain_text(cards: &[(String, String, i64)], drainable: i64) -> String
         })
         .collect::<Vec<_>>()
         .join("\n");
+    if drainable > cards.len() as i64 {
+        list.push_str(&format!("\n  ... and {} more eligible card(s)", drainable - cards.len() as i64));
+    }
     // `drainable` is the DRAINABLE count (source_ref-parked, dormant and epic
     // cards already excluded — same predicate as the list), NOT the raw backlog.
     // Ask for a batch proportional to it: a lane idle on 200 cards should pull a
@@ -6761,16 +6760,11 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 // almost everywhere despite hundreds of un-worked backlog cards.
                 // If nothing drainable remains, the lane's backlog is all
                 // correctly and CURRENTLY parked, and the drain nudge stays quiet.
-                let drainable_backlog: i64 = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM issues WHERE session=?1 AND status='backlog' \
-                         AND deleted IS NULL AND COALESCE(archived,0)=0 AND owner_type='agent' \
-                         AND type NOT IN ('tripwire','watch','epic') \
-                         AND (COALESCE(source_ref,'')='' OR COALESCE(last_verified_at,0) < ?2)",
-                        rusqlite::params![lane, now_i - SOURCE_REF_STALE_S],
-                        |r| r.get(0),
-                    )
-                    .unwrap_or(0);
+                let drain_population = match backlog_nudge_population(&conn, lane, now_i) {
+                    Ok(cards) => cards,
+                    Err(error) => break 'triage Some(format!("backlog nudge unmeasured: {error}")),
+                };
+                let drainable_backlog = drain_population.len() as i64;
                 // TWO shapes of the same "backlog isn't moving" problem:
                 //  * STALE TRIAGE: 10+ cards over 14 days old — archive cruft /
                 //    promote the still-actionable ones (72h cooldown).
@@ -6885,7 +6879,7 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                     ));
                 }
                 let cards = if idle_drain {
-                    backlog_candidates(&conn, lane, now_i)
+                    drain_population.into_iter().take(8).collect()
                 } else {
                     stale_backlog_candidates(&conn, lane, now_i)
                 };
@@ -6957,6 +6951,10 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                     event_type,
                     Some(json!({
                         "idle_drain": idle_drain,
+                        "measured": true,
+                        "n_considered": total_backlog,
+                        "drainable_backlog": drainable_backlog,
+                        "listed": cards.len(),
                         "stale_count": stale_count,
                         "total_backlog": total_backlog,
                         "cards": cards.iter().map(|(id,_,_)| id.as_str()).collect::<Vec<_>>(),
@@ -9930,6 +9928,9 @@ mod tests {
         let listed: Vec<String> =
             backlog_candidates(&conn, "blk", now as i64).into_iter().map(|c| c.0).collect();
         assert!(listed.is_empty(), "the drain NUDGE offered a blocked card: {listed:?}");
+        let counted = backlog_nudge_population(&conn, "blk", now as i64).unwrap().len() as i64;
+        assert_eq!(counted, 0, "the actual nudge denominator must exclude blocked cards too");
+        assert!(!should_drain_nudge(0, 0, counted, 0), "blocked-only backlog cannot trigger escalation");
         assert!(
             drainable_backlog_ids(&conn, "blk", now).is_empty(),
             "the DRAIN itself offered a blocked card"
@@ -9964,6 +9965,70 @@ mod tests {
             backlog_candidates(&conn, "blk", now as i64).into_iter().map(|c| c.0).collect();
         assert_eq!(listed, vec!["BL-2".to_string()], "an unblocked card must still drain");
         assert_eq!(drainable_backlog_ids(&conn, "blk", now), vec!["BL-2".to_string()]);
+    }
+
+    #[test]
+    fn nudge_population_uses_dispatch_rules_and_discloses_display_truncation() {
+        let conn = board_db();
+        let now = now_f64() as i64;
+        for i in 0..12 {
+            add_card(&conn, &format!("READY-{i:02}"), "lane", "backlog", "ready", "SCOPE: x");
+        }
+        for id in ["BLOCKED", "FRESH", "STALE", "CAPTURE", "HUMAN", "WATCH", "EPIC", "DEPENDENT", "CLAIMED"] {
+            add_card(&conn, id, "lane", "backlog", "parked", "SCOPE: x");
+        }
+        conn.execute("UPDATE issues SET blocked_on='waiting on peer', source_ref='condition', last_verified_at=0 WHERE id='BLOCKED'", []).unwrap();
+        conn.execute("UPDATE issues SET source_ref='condition', last_verified_at=?1 WHERE id='FRESH'", [now]).unwrap();
+        conn.execute("UPDATE issues SET source_ref='condition', last_verified_at=?1 WHERE id='STALE'", [now - SOURCE_REF_STALE_S - 1]).unwrap();
+        conn.execute("UPDATE issues SET source='capture', source_ref='delivered', last_verified_at=0 WHERE id='CAPTURE'", []).unwrap();
+        tag(&conn, "HUMAN", "needs:you", now as f64);
+        conn.execute("UPDATE issues SET type='watch' WHERE id='WATCH'", []).unwrap();
+        conn.execute("UPDATE issues SET type='epic' WHERE id='EPIC'", []).unwrap();
+        conn.execute("UPDATE issues SET depends_on='[\"MISSING\"]' WHERE id='DEPENDENT'", []).unwrap();
+        conn.execute("INSERT INTO session_events (ts,session,type,data,source) VALUES (?1,'lane','task.claimed','{\"issue\":\"CLAIMED\"}','test')", [now as f64]).unwrap();
+        let population = backlog_nudge_population(&conn, "lane", now).unwrap();
+        let ids: Vec<_> = population.iter().map(|row| row.0.clone()).collect();
+        assert_eq!(ids.len(), 13, "12 ready plus one stale unblocked trigger: {ids:?}");
+        assert!(ids.contains(&"STALE".to_string()));
+        assert!(ids.iter().all(|id| id.starts_with("READY-") || id == "STALE"));
+        assert_eq!(ids, drainable_backlog_ids(&conn, "lane", now as f64));
+        let display = &population[..8];
+        let text = backlog_drain_text(display, population.len() as i64);
+        assert!(text.contains("13 drainable") && text.contains("5 more eligible card(s)"), "{text}");
+        assert!(should_drain_nudge(0, 0, population.len() as i64, 0));
+    }
+
+    #[test]
+    fn nudge_population_logs_exclusions_and_refuses_unreadable_input() {
+        #[derive(Clone)]
+        struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes); Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let output = bytes.clone();
+        let subscriber = tracing_subscriber::fmt().with_ansi(false).without_time()
+            .with_max_level(tracing::Level::INFO).with_writer(move || Sink(output.clone())).finish();
+        let conn = board_db();
+        add_card(&conn, "READY", "lane", "backlog", "ready", "SCOPE: x");
+        add_card(&conn, "PARKED", "lane", "backlog", "parked", "SCOPE: x");
+        conn.execute("UPDATE issues SET blocked_on='peer reply' WHERE id='PARKED'", []).unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            assert_eq!(backlog_nudge_population(&conn, "lane", now_f64() as i64).unwrap().len(), 1);
+            assert!(backlog_nudge_population(&Connection::open_in_memory().unwrap(), "lane", now_f64() as i64).is_err());
+            // The population query itself works, but its dependency on tags does not.
+            conn.execute("ALTER TABLE issue_tags RENAME TO unavailable_tags", []).unwrap();
+            assert!(backlog_nudge_population(&conn, "lane", now_f64() as i64).is_err());
+        });
+        let log = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("backlog_nudge_population") && log.contains("measured=true")
+            && log.contains("n_considered=2") && log.contains("eligible=1")
+            && log.contains("excluded=1") && log.contains("listed=1"), "{log}");
+        assert!(log.contains("backlog_nudge_population_unmeasured") && log.contains("measured=false")
+            && log.contains("why_unmeasured="), "{log}");
     }
 
     #[test]

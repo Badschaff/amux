@@ -2653,3 +2653,14 @@ CARD: AF-768
 SYMPTOM: ecd36b56 job 103697706086 cancelled after 30 minutes; 1,011 tests started with two workers but no final summary or failure-only artifact upload survived. Deadline is consistent with the observed timing, not independently proven as the only cancellation cause.
 COST: One 30-minute CI attempt produced no complete browser verdict and blocked honest verification of AF-762, AF-766 and AMUX-4487.
 FIX: Four unchanged-population shards, a shorter runner deadline and incremental completion evidence with full-union validation; local 13/0 controls and 1,011-test disjoint union pass. Fresh complete GitHub execution and independent review remain outstanding.
+
+## Native backlog nudge counts blocked cards that its own list excludes
+AREA: notices
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-770
+SYMPTOM: Native MSG-59704 says five drainable cards but lists only TG-3705. The runtime count omits blocked_on while the list excludes it; deterministic blocked-only fixture counted 1 with an empty list. ts-gke also reported separate orchestrator messages listing parked cards; those remain AF-771, not proof of this native mechanism.
+COST: Inflated workload and escalation input; investigating the peer report required separating two generators before identifying the count/list disagreement. The repeated external re-measurement cost belongs to the still-open orchestrator investigation.
+FIX: One shared dispatch-eligible population for native count/list/cadence, explicit display truncation and measured selection/error logs. Red control 0 passed / 1 failed; corrected gates, review and deployment pending.
