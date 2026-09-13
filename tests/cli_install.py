@@ -228,8 +228,14 @@ class InstallCLI(unittest.TestCase):
         publisher.chmod(0o755)
         (repo / "amux").write_bytes(self.source.read_bytes())
         self.shim("install", "exit 0\n")
+        # Stage 2 owns these Rust-only operands. This fixture starts at stage 3;
+        # provide the private stage and stub only Rust artifact verification,
+        # while executing the real Bash publisher and its syntax refusal.
+        rust_stage = self.root / "private-rust-stage"
+        rust_stage.mkdir()
+        (repo / "scripts/install-artifact-manifest.py").write_text("raise SystemExit(0)\n")
         env = {**self.env, "BIN_DIR": str(self.bin), "SCRIPT_DIR": str(repo),
-               "TARGET_DIR": str(self.root / "unused")}
+               "TARGET_DIR": str(self.root / "unused"), "INSTALL_ARTIFACT_DIR": str(rust_stage)}
         result = subprocess.run(["/bin/bash", "-ec", "say() { :; };\n" + stanza],
                                 env=env, text=True, capture_output=True, timeout=15)
         self.assertNotEqual(result.returncode, 0)

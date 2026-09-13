@@ -2968,3 +2968,14 @@ CARD: AF-889
 SYMPTOM: The frustration scan labeled MSG-59389 and MSG-59393 delivered even though each stored submit_verdict=stuck. The same shortcut in GET /api/history/{id} returned delivered beside a stuck verdict. Both readers treated direct transport selection as proof of successful submission.
 COST: The message sweep was told the two repeated RTSP requests had landed, concealing the delivery failure behind a success-shaped annotation. Extra source and exact-ID checks were required before judging the repeat.
 FIX: In both readers derive direct delivery from the existing durable submission verdict: confirmed/retried delivered, stuck not delivered, unverified/missing/unknown values unknown. Exercise the actual scanner query/output and actual history endpoint, with confirmed positive controls and explicit failure diagnostics. Queued steering-history inference is separate; no production send or retry is needed for this read-path correction. Originating-session validation and resolved verification gates remain required before retirement.
+
+## A sliced installer fixture reaches an uninitialized Rust stage before the Bash guard
+AREA: testing
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-891
+SYMPTOM: After private Rust artifact staging shipped, tests/cli_install.py executed only installer stage3 without the INSTALL_ARTIFACT_DIR created in stage2. It tried mkdir /publish and failed before reaching the real Bash syntax-refusal guard, reddening CI despite the new Rust publication checks passing.
+COST: The checks gate failed on eefc294f and could not test the Bash publisher boundary it claimed to exercise. The isolated fixture had drifted from the caller's required inputs.
+FIX: Supply a private Rust stage and stub only Rust artifact validation in this Bash-boundary fixture; retain the actual guarded Bash publisher and old-installed sentinel checks. The full Rust artifact path remains covered by its separate actual-installer matrix. Existing test and CI refusal output makes a recurrence visible. Origin validation and resolved gates remain required before retirement.
