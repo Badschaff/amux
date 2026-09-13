@@ -2508,6 +2508,20 @@ if "rev mismatch" in e:
 sys.exit(1)' "${1:-}" "${2:-}" "${3:-}"
 }
 
+_board_archive_arg_error() {
+  local operation="$1" item="$2" reason="$3" hint="$4" payload
+  echo "error: amux board $operation: $hint. No board change was sent." >&2
+  # Argument values can contain private outcome text. Emit only the validated
+  # item identity and a fixed reason, through the existing diagnostic surface.
+  payload=$(OP="$operation" ITEM="$item" WHY="$reason" python3 -c 'import json,os
+print(json.dumps({"kind":"cli-argument-refused","operation":os.environ["OP"],
+ "item":os.environ["ITEM"],"reason":os.environ["WHY"],"measured":True,"n_considered":1}))')
+  command curl -sk --connect-timeout 1 --max-time 2 -X POST \
+    -H 'Content-Type: application/json' -d "$payload" \
+    "$AMUX_API/api/client-debug" >/dev/null 2>&1 || true
+  exit 2
+}
+
 cmd_board() {
   local AMUX_API="${AMUX_API:-https://localhost:8824}"
   local subcmd="${1:-help}"; shift 2>/dev/null || true
@@ -2931,21 +2945,32 @@ print(json.dumps(b))')
       local _av=1; [[ "$subcmd" == "unarchive" ]] && _av=0
       local id="${1:-}"
       _board_id_guard "archive" "$id"
-      [[ -n "$id" ]] || die "Usage: amux board $sub <ISSUE-ID> [--authorized-by <who>] [--archive-outcome <why>]
+      [[ -n "$id" ]] || die "Usage: amux board $subcmd <ISSUE-ID> [--authorized-by <who>] [--archive-outcome <why>]
 archive   hides a card from every board view AND every autonomy loop (advance, pickup, rot)
 unarchive brings it back — this is the un-do that did not exist before AMUX-2492
 --authorized-by   required to archive a card owned by a DIFFERENT lane (AMUX-2492)
 --archive-outcome required to archive a card whose status is still needsyou (AF-701) —
                   someone is owed an answer, so archiving it needs to say what the answer was"
       shift
-      local _auth="" _outcome=""
+      local _auth="" _outcome="" _value=""
       # AF-701: order-independent, since a needsyou card owned by another lane
       # can need BOTH flags at once (cross-lane AND the outcome gate).
       while [[ $# -gt 0 ]]; do
         case "$1" in
-          --authorized-by) _auth="${2:-}"; shift 2 ;;
-          --archive-outcome) _outcome="${2:-}"; shift 2 ;;
-          *) break ;;
+          --authorized-by|--archive-outcome)
+            _value="${2:-}"
+            [[ $# -ge 2 && "$_value" != --* && "${_value//[[:space:]]/}" != "" ]] || \
+              _board_archive_arg_error "$subcmd" "$id" missing_value "$1 requires a nonempty value"
+            if [[ "$1" == --authorized-by ]]; then
+              _auth="$2"
+            else
+              [[ "$_av" == 1 ]] || _board_archive_arg_error "$subcmd" "$id" outcome_on_unarchive \
+                '--archive-outcome is only valid for archive'
+              _outcome="$2"
+            fi
+            shift 2 ;;
+          *) _board_archive_arg_error "$subcmd" "$id" unexpected_argument \
+               'unexpected argument; supported flags are --authorized-by and --archive-outcome' ;;
         esac
       done
       local result

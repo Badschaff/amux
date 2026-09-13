@@ -2779,3 +2779,14 @@ CARD: AF-777
 SYMPTOM: Published ec76baf7 CI has two Chromium sw-fail-bar positive failures: the actual hit target at Save is the warning. The shared keyboard max-height rule overrides the board editor's earlier subtraction of its measured warning height. A source geometry probe additionally shows a negative modal top and partially covered button edges even where the centre remains tappable.
 COST: Two failing CI cases and another browser/native audit to reconcile the keyboard and offline-warning fixes; a user can see Save while its tap area is covered.
 FIX: Preserve the measured warning subtraction in keyboard-sized board boxes, and report actual partial footer coverage through the existing measured modal-layout diagnostic. Owned draft has 33 browser passes plus two native iOS 26.5 checks covering real Save/readback, fully visible warning/buttons, broken-height diagnostic and dismissal; screenshots personally inspected. Independent review, clean integration gates and publication remain pending.
+
+## Board archive silently ignores unsupported flags and hides the card without its reason
+AREA: cli
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-729
+SYMPTOM: Four authorized historical-review archives used --outcome-stdin, a flag supported by status verbs but not archive. The archive parser broke on the unknown flag, sent archived=true anyway and returned exit0. Readback found no supplied reason in any of the four logs. A regression against the actual CLI reproduced invalid-argv PATCHes; this is separate from the already-landed API archive_outcome fix.
+COST: Four missing audit reasons, four readbacks, and eight corrective unarchive/rearchive operations before all exact reasons were present; the first success reports hid incomplete writes.
+FIX: Refuse unknown/trailing or missing-value archive arguments before any board PATCH, retain supported flag behavior, and emit a bounded privacy-safe cli-argument-refused diagnostic. Candidate and tests are in research/archive-cli-argument-refusal-2026-09-13.md; keep open until reviewed client installation and readback.
