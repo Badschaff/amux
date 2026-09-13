@@ -2685,3 +2685,14 @@ CARD: AF-732
 SYMPTOM: After a native audit pause/restart, iOS status returned running:false and owned:true. Repeated Go requests reused the saved session id and returned 502 invalid session id; only explicit Stop released it. The installed Appium base driver defaults to a 60-second new-command timeout.
 COST: Native header/modal audits were interrupted and required manual Stop before they could restart; retaining ownership had been mistaken for retaining a live browser session.
 FIX: Keep explicitly owned Appium sessions alive until Stop; on explicit Go probe the saved session and release only a proven invalid session id. Preserve ownership on ambiguous transport failures, never replay commands, and emit expired_session_released with measured population. Regression covers live/expired/unknown outcomes plus wrong-worker/device refusal; deployment verification pending.
+
+## Debugger drives a hidden Safari tab while native input hits another
+AREA: browser
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-732
+SYMPTOM: Go changed a background WebKit page while Safari still displayed a different tab. Native taps acknowledged without opening the requested dialog, or fell into calibration that timed out. The debugger reported document.visibilityState hidden and focus false while a native screenshot showed a different origin/page.
+COST: Repeated mobile header and modal audits failed ambiguously; API dispatch acknowledgements were insufficient to establish which page received input.
+FIX: Explicit Go opens the URL through native Safari and selects its visible debugger context; hidden tabs refuse native input before dispatch with hidden_native_tab. native_tab_aligned records successful alignment. Prototype alignment passed seven actual header open/close interactions; adapter unit and deployed native tests pending.

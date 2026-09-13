@@ -263,6 +263,46 @@ async fn prepare_reuse(
     Ok(true)
 }
 
+// Remote WebKit navigation can select a hidden Safari tab. Native gestures
+// target the foreground tab instead, so explicit Go must align both surfaces.
+async fn navigate(d: &Driver, url: &str) -> Result<()> {
+    if !d.native {
+        d.post("/url", json!({"url":url})).await?;
+        return Ok(());
+    }
+    let result = tokio::time::timeout(Duration::from_secs(35), async {
+        d.post("/execute/sync", json!({"script":"mobile: deepLink",
+            "args":[{"url":url,"bundleId":"com.apple.mobilesafari"}]})).await?;
+        let contexts = d.post("/execute/sync", json!({"script":"mobile: getContexts","args":[]})).await?;
+        let contexts = contexts.as_array().ok_or(failure("Safari contexts unavailable"))?;
+        let mut considered = 0;
+        for context in contexts.iter().filter(|c| c["bundleId"] == "com.apple.mobilesafari") {
+            let Some(id) = context["id"].as_str() else { continue };
+            considered += 1;
+            d.post("/context", json!({"name":id})).await?;
+            if d.eval("document.visibilityState === 'visible'", json!([])).await? == true {
+                tracing::info!(target:"amux::browser_ios",session=%d.owner,verdict="native_tab_aligned",
+                    measured=true,n_considered=considered,"Safari foreground and debugger tab aligned");
+                return Ok(());
+            }
+        }
+        tracing::warn!(target:"amux::browser_ios",session=%d.owner,verdict="native_tab_unavailable",
+            measured=true,n_considered=considered,"No visible Safari debugger tab after explicit Go");
+        Err((StatusCode::CONFLICT,"Safari opened the URL but its visible tab is unavailable to WebDriver; inspect the simulator before retrying Go".into()))
+    }).await;
+    result.unwrap_or_else(|_| Err((StatusCode::GATEWAY_TIMEOUT,
+        "Safari foreground alignment exceeded 35s; navigation outcome may be unknown".into())))
+}
+
+async fn require_visible_tab(d: &Driver) -> Result<()> {
+    if d.native && d.eval("document.visibilityState === 'visible'", json!([])).await? != true {
+        tracing::warn!(target:"amux::browser_ios",session=%d.owner,verdict="hidden_native_tab",
+            measured=true,n_considered=1,"Native input refused: debugger tab is not the visible Safari tab");
+        return Err((StatusCode::CONFLICT,"The debugger tab is hidden; use Go to align Safari before native input. No input was dispatched".into()));
+    }
+    Ok(())
+}
+
 async fn start(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -279,7 +319,7 @@ async fn start(
         let recovered = prepare_reuse(&mut slot, &session, udid, &record_path()).await?;
         if slot.is_some() {
             let d = owned(&mut slot, &session)?;
-            d.post("/url", json!({"url":url})).await?;
+            navigate(d, url).await?;
         } else {
             let devices = inventory(&simctl(&["list","--json"]).await?);
             let target = devices.iter().find(|d| d["udid"] == udid).ok_or((StatusCode::BAD_REQUEST,"Simulator no longer available; refresh targets".into()))?;
@@ -340,7 +380,7 @@ async fn start(
             persist(&d).await?;
             *slot = Some(d);
             owned(&mut slot,&session)?.post("/timeouts",json!({"pageLoad":30000,"script":30000,"implicit":0})).await?;
-            owned(&mut slot,&session)?.post("/url",json!({"url":url})).await?;
+            navigate(owned(&mut slot,&session)?, url).await?;
         }
         let d = owned(&mut slot,&session)?;
         let landed = d.command(reqwest::Method::GET,"/url",None).await?;
@@ -553,6 +593,9 @@ async fn clear_native_keyboard(d: &Driver) -> Result<bool> {
 
 async fn perform(d: &Driver, body: &Value) -> Result<Value> {
     let action = body["action"].as_str().unwrap_or("");
+    if matches!(action, "back" | "scroll" | "click" | "key" | "type" | "input") {
+        require_visible_tab(d).await?;
+    }
     match action {
         "eval"=> {
             let script=body["script"].as_str().filter(|s|!s.trim().is_empty()).ok_or((StatusCode::BAD_REQUEST,"script expression required".into()))?;
@@ -684,6 +727,65 @@ pub(super) fn routes() -> Router<AppState> {
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn native_go_selects_visible_safari_and_hidden_input_never_dispatches() {
+        use std::sync::{Arc, Mutex};
+        for available in [true, false] {
+            let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+            let selected = Arc::new(Mutex::new(String::new()));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let events = calls.clone();
+            let context = selected.clone();
+            let changes = calls.clone();
+            let active = selected.clone();
+            let app = Router::new()
+                .route("/session/test/execute/sync", post(move |Json(v):Json<Value>| {
+                    let events=events.clone(); let context=context.clone();
+                    async move {
+                        let script=v["script"].as_str().unwrap();
+                        let value=match script {
+                            "mobile: deepLink" => {
+                                assert_eq!(v["args"][0],json!({"url":"https://example.test/redirect","bundleId":"com.apple.mobilesafari"}));
+                                events.lock().unwrap().push("navigate".into()); Value::Null
+                            },
+                            "mobile: getContexts" => json!([
+                                {"id":"WEBVIEW_other","bundleId":"other.app"},
+                                {"id":"WEBVIEW_hidden","bundleId":"com.apple.mobilesafari"},
+                                {"id":"WEBVIEW_front","bundleId":"com.apple.mobilesafari"}]),
+                            _ => { assert!(script.contains("document.visibilityState"));
+                                json!(available && *context.lock().unwrap() == "WEBVIEW_front") }
+                        };
+                        Json(json!({"value":value}))
+                    }
+                }))
+                .route("/session/test/context", post(move |Json(v):Json<Value>| {
+                    let changes=changes.clone(); let active=active.clone();
+                    async move {
+                        let id=v["name"].as_str().unwrap().to_owned();
+                        changes.lock().unwrap().push(id.clone()); *active.lock().unwrap()=id;
+                        Json(json!({"value":null}))
+                    }
+                }));
+            let server=tokio::spawn(async move {axum::serve(listener, app).await.unwrap()});
+            let d=Driver {owner:"test-owner".into(),port,pid:0,id:"test".into(),udid:"device".into(),capabilities:Value::Null,native:true,child:None};
+            let result=navigate(&d,"https://example.test/redirect").await;
+            assert_eq!(result.is_ok(),available);
+            assert_eq!(*calls.lock().unwrap(),["navigate","WEBVIEW_hidden","WEBVIEW_front"]);
+            assert_eq!(require_visible_tab(&d).await.is_ok(),available);
+            *selected.lock().unwrap()="WEBVIEW_hidden".into();
+            // No input route is installed: a missing guard would dispatch and
+            // return 404, instead of the required explicit pre-dispatch refusal.
+            for action in ["click","input","type","key","scroll","back"] {
+                let error=perform(&d,&json!({"action":action,"selector":"button","text":"x","key":"Enter","dy":1})).await.unwrap_err();
+                assert_eq!(error.0,StatusCode::CONFLICT);
+                assert!(error.1.contains("No input was dispatched"));
+            }
+            assert_eq!(calls.lock().unwrap().len(),3,"No retry or input after hidden-tab refusal");
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn go_releases_only_a_proven_expired_owned_session_without_replaying_actions() {
         use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
         for mode in ["live", "expired", "unknown"] {
@@ -737,6 +839,8 @@ mod tests {
                     assert_eq!(v["args"][0]["toY"], 100.0);
                     assert_eq!(v["args"][0]["duration"], 0.15);
                     Json(json!({"value":null}))
+                } else if v["script"].as_str().unwrap().contains("document.visibilityState") {
+                    Json(json!({"value":true}))
                 } else {
                     Json(json!({"value":{"width":402,"height":874}}))
                 }
