@@ -1748,6 +1748,46 @@ mod tests {
         send_with(app, method, path, body, &[]).await
     }
 
+    // AF-766: both phases of the sticky truth fixture share this bounded
+    // response policy. Other tests may invalidate the process-wide epoch.
+    async fn read_fixture_sessions(app: &axum::Router, stage: &str) -> (StatusCode, HeaderMap, Value) {
+        for attempt in 0..5 {
+            let result = send(app, "GET", "/api/sessions", None).await;
+            if result.0 != StatusCode::INTERNAL_SERVER_ERROR
+                || result.2["error"].as_str() != Some("sessions list changed during discovery; retry")
+                || attempt == 4
+            {
+                return result;
+            }
+            eprintln!("{}", json!({"verdict":"fixture_session_discovery_retry", "stage":stage,
+                "attempt":attempt + 1, "max_attempts":5, "measured":true, "n_considered":1}));
+            tokio::time::sleep(std::time::Duration::from_millis(50 * (attempt + 1))).await;
+        }
+        unreachable!("the final attempt returns its actual response")
+    }
+
+    #[tokio::test]
+    async fn fixture_session_reader_preserves_errors_and_bounds_epoch_churn() {
+        for (error, expected_reads) in [
+            ("database query failed", 1),
+            ("sessions list changed during discovery; retry", 5),
+        ] {
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = calls.clone();
+            let app = axum::Router::new().route("/api/sessions", axum::routing::get(move || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error":error})))
+                }
+            }));
+            let (status, _, body) = read_fixture_sessions(&app, "negative-control").await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+            assert_eq!(body["error"], error);
+            assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), expected_reads);
+        }
+    }
+
     async fn send_with(
         app: &axum::Router,
         method: &str,
@@ -2353,6 +2393,21 @@ mod tests {
         crate::api::sessions_legacy::SUPPRESS_FLEET_FOR_TEST
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let (app, dir) = app();
+        // Deterministic counterpart of CI's shared discovery-epoch race: the
+        // idle read must retain the same retry policy as the initial read.
+        let idle_race = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let injected = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (race, count) = (idle_race.clone(), injected.clone());
+        let app = app.layer(axum::middleware::from_fn(move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let (race, count) = (race.clone(), count.clone());
+            async move {
+                if request.uri().path() == "/api/sessions" && race.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error":"sessions list changed during discovery; retry"}))).into_response();
+                }
+                next.run(request).await
+            }
+        }));
         let now = chrono::Utc::now().timestamp();
         let marker_ts = now as f64 + 60.0;
         let conn = rusqlite::Connection::open(dir.path().join("amux-test.db")).unwrap();
@@ -2452,20 +2507,7 @@ mod tests {
         drop(conn);
         crate::api::sessions_legacy::invalidate_sessions_cache();
 
-        let (mut status, _, mut payload) = send(&app, "GET", "/api/sessions", None).await;
-        // Other tests mutate the shared discovery epoch. Retry only the
-        // route's explicit concurrent-change response, retaining all other
-        // failures and the complete board-truth assertions below.
-        for attempt in 1..5 {
-            if status != StatusCode::INTERNAL_SERVER_ERROR
-                || payload["error"].as_str()
-                    != Some("sessions list changed during discovery; retry")
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50 * attempt)).await;
-            (status, _, payload) = send(&app, "GET", "/api/sessions", None).await;
-        }
+        let (status, _, payload) = read_fixture_sessions(&app, "active").await;
         assert_eq!(status, StatusCode::OK, "{payload}");
         let rows = payload.as_array().expect("legacy session array");
         let linked = rows.iter().find(|row| row["name"] == "linked").expect("linked row");
@@ -2533,7 +2575,9 @@ mod tests {
         .unwrap();
         drop(conn);
         crate::api::sessions_legacy::invalidate_sessions_cache();
-        let (status, _, idle_payload) = send(&app, "GET", "/api/sessions", None).await;
+        idle_race.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (status, _, idle_payload) = read_fixture_sessions(&app, "idle").await;
+        assert_eq!(injected.load(std::sync::atomic::Ordering::SeqCst), 1, "idle discovery-race control must execute");
         assert_eq!(status, StatusCode::OK, "{idle_payload}");
         let idle_tubescience = idle_payload
             .as_array()

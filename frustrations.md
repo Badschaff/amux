@@ -2631,3 +2631,14 @@ CARD: AMUX-4487
 SYMPTOM: Live c6242e22/build36e3f03eb7487ab1 registers message-capture with interval30s and stale_after90s but allows120s per attempt. A read shows in_flight true, last_tick_age90.96s, last_tick_ms120003.61 and status hung; its missing catalog row also reports documented false and purpose null.
 COST: The first deployment verification found a falsely unhealthy job during its own permitted runtime and an undocumented background loop, requiring a follow-up before the feature can be described as operationally coherent.
 FIX: Use a90s cadence whose existing health budget240s covers both a90s idle interval and the120s attempt bound, share the job ID with its catalog and publish the real disable control. Regression checks the actual registry budget against the source constants; startup INFO records both budgets with measured/count. Pending work success and original six-link reconciliation remain separate.
+
+## Sticky session fixture retries its first discovery race but fails its second
+AREA: gates
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-766
+SYMPTOM: Final ecd36b56 Rust CI failed2376passed1failed8ignored: the idle follow-up GET returned the explicit concurrent discovery epoch500 at workers.rs2537. Only the first GET had bounded retries. A one-shot idle middleware refusal reproduced0passed1failed locally.
+COST: Published corrections cannot satisfy their CI verification gate; required a fresh deterministic reproduction and another clean publication.
+FIX: Use one bounded fixture reader for both phases, retain unrelated500 and exhausted-churn failures, and emit stage/attempt test-log diagnostics. Keep AF-757 quota fixture contamination separate. Validation and independent review pending.
