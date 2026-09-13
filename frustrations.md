@@ -2674,3 +2674,14 @@ CARD: AF-750
 SYMPTOM: Owner desktop/mobile screenshots showed an overflowing notification badge beside an oversized red status panel and mixed emoji controls. The header diagnostic ignored desktop widths entirely.
 COST: The owner requested repeated desktop/mobile visual corrections; fitting the overall header width had not ensured clean individual control boundaries.
 FIX: AF-750 / AF-751, dashboard 0.9.930: contain the badge, use consistent line icons and lighter status controls, align desktop actions, preserve 44px mobile targets and fit the four primary mobile navigation labels. The existing mobile-header-clipped beacon now measures both desktop and mobile, includes the actual visible control count and detects escaping badges. A deliberate desktop badge overflow requires the real diagnostic request in the regression test.
+
+## Go reuses an expired iOS WebDriver session forever
+AREA: browser
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-732
+SYMPTOM: After a native audit pause/restart, iOS status returned running:false and owned:true. Repeated Go requests reused the saved session id and returned 502 invalid session id; only explicit Stop released it. The installed Appium base driver defaults to a 60-second new-command timeout.
+COST: Native header/modal audits were interrupted and required manual Stop before they could restart; retaining ownership had been mistaken for retaining a live browser session.
+FIX: Keep explicitly owned Appium sessions alive until Stop; on explicit Go probe the saved session and release only a proven invalid session id. Preserve ownership on ambiguous transport failures, never replay commands, and emit expired_session_released with measured population. Regression covers live/expired/unknown outcomes plus wrong-worker/device refusal; deployment verification pending.

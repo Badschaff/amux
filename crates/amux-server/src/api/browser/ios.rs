@@ -229,6 +229,40 @@ async fn targets() -> Response {
     }
 }
 
+// Only an explicit WebDriver "invalid session id" proves the saved session is
+// gone. Transport failures and unknown outcomes preserve ownership and never
+// cause a command to be retried on a newly created browser.
+async fn prepare_reuse(
+    slot: &mut Option<Driver>,
+    session: &str,
+    udid: &str,
+    record: &std::path::Path,
+) -> Result<bool> {
+    if slot.is_none() {
+        return Ok(false);
+    }
+    let d = owned(slot, session)?;
+    if d.udid != udid {
+        return Err((StatusCode::CONFLICT,
+            "Stop your current iOS browser before changing simulator devices".into()));
+    }
+    match d.command(reqwest::Method::GET, "/url", None).await {
+        Ok(_) => return Ok(false),
+        Err((status, error)) if status == StatusCode::BAD_GATEWAY
+            && error.ends_with(": invalid session id") => {}
+        Err(error) => return Err(error),
+    }
+    match tokio::fs::remove_file(record).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(failure(error)),
+    }
+    *slot = None;
+    tracing::warn!(target:"amux::browser_ios",session,verdict="expired_session_released",
+        measured=true,n_considered=1,"expired iOS WebDriver session released before explicit Go; no browser action replayed");
+    Ok(true)
+}
+
 async fn start(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -242,9 +276,9 @@ async fn start(
             return Err((StatusCode::BAD_REQUEST, "url must be http(s) or about:blank".into()));
         }
         let mut slot = lock_driver().await?;
+        let recovered = prepare_reuse(&mut slot, &session, udid, &record_path()).await?;
         if slot.is_some() {
             let d = owned(&mut slot, &session)?;
-            if d.udid != udid { return Err((StatusCode::CONFLICT,"Stop your current iOS browser before changing simulator devices".into())); }
             d.post("/url", json!({"url":url})).await?;
         } else {
             let devices = inventory(&simctl(&["list","--json"]).await?);
@@ -278,6 +312,7 @@ async fn start(
             let mut caps = if native { json!({
                 "platformName":"iOS","browserName":"Safari","appium:automationName":"XCUITest",
                 "appium:udid":udid,"appium:platformVersion":target["version"],"appium:nativeWebTap":true,
+                "appium:newCommandTimeout":0,
                 "appium:noReset":true,"appium:forceAppLaunch":false,"appium:shouldTerminateApp":false,
                 "appium:safariInitialUrl":url,"appium:waitForIdleTimeout":1
             }) } else { json!({"platformName":"iOS","browserName":"Safari","safari:useSimulator":true,"safari:deviceUDID":udid,"acceptInsecureCerts":true}) };
@@ -309,7 +344,7 @@ async fn start(
         }
         let d = owned(&mut slot,&session)?;
         let landed = d.command(reqwest::Method::GET,"/url",None).await?;
-        let result = json!({"ok":true,"backend":"ios-simulator","session":session,"launch_url":landed,"capabilities":d.capabilities,"limitations":LIMITATIONS});
+        let result = json!({"ok":true,"backend":"ios-simulator","session":session,"launch_url":landed,"recovered_expired_session":recovered,"capabilities":d.capabilities,"limitations":LIMITATIONS});
         drop(slot);
         record_browser_event(&state,Some(&session),&session,"started",json!({"backend":"ios-simulator","requested_url":audit_url(url)})).await;
         Ok(result)
@@ -648,6 +683,47 @@ pub(super) fn routes() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn go_releases_only_a_proven_expired_owned_session_without_replaying_actions() {
+        use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
+        for mode in ["live", "expired", "unknown"] {
+            let reads = Arc::new(AtomicUsize::new(0));
+            let calls = reads.clone();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let app = Router::new().route("/session/test/url", get(move || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    match mode {
+                        "live" => (StatusCode::OK, Json(json!({"value":"about:blank"}))),
+                        "expired" => (StatusCode::NOT_FOUND, Json(json!({"value":{"error":"invalid session id"}}))),
+                        _ => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"value":{"error":"unknown error"}}))),
+                    }
+                }
+            }));
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let mut slot = Some(Driver { owner:"test-owner".into(), port, pid:0,
+                id:"test".into(), udid:"test-device".into(), capabilities:Value::Null,
+                native:true, child:None });
+            let temp = tempfile::tempdir().unwrap();
+            let record = temp.path().join("browser-ios.json");
+            let original = serde_json::to_vec(slot.as_ref().unwrap()).unwrap();
+            std::fs::write(&record, &original).unwrap();
+            assert_eq!(prepare_reuse(&mut slot, "other-worker", "test-device", &record).await.unwrap_err().0, StatusCode::CONFLICT);
+            assert_eq!(prepare_reuse(&mut slot, "test-owner", "other-device", &record).await.unwrap_err().0, StatusCode::CONFLICT);
+            assert_eq!(reads.load(Ordering::SeqCst), 0, "ownership and device checks must precede driver access");
+            let result = prepare_reuse(&mut slot, "test-owner", "test-device", &record).await;
+            assert_eq!(reads.load(Ordering::SeqCst), 1, "only a read probe is sent; no navigation, click or command replay");
+            match mode {
+                "expired" => { assert!(result.unwrap()); assert!(slot.is_none()); assert!(!record.exists()); }
+                "live" => { assert!(!result.unwrap()); assert!(slot.is_some()); assert_eq!(std::fs::read(&record).unwrap(), original); }
+                _ => { assert!(result.is_err()); assert!(slot.is_some()); assert_eq!(std::fs::read(&record).unwrap(), original); }
+            }
+            server.abort();
+        }
+    }
+
     #[tokio::test]
     async fn native_scroll_dispatches_a_bounded_device_gesture() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
