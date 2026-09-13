@@ -6,7 +6,7 @@
 # What it does, in order:
 #   1. checks prerequisites (rust toolchain, tmux; herdr is optional) —
 #      prompts before installing anything, never silently
-#   2. cargo build --release the workspace from a pinned committed snapshot
+#   2. compile Rust binaries from a pinned commit into private verified artifacts
 #   3. installs the server, Rust CLI and validated Bash CLI into ~/.local/bin
 #   4. writes + loads the launchd agents (macOS): com.amux.server-rs on
 #      port 8824, and com.amux.server-rs-builder (auto-rebuild on new
@@ -174,21 +174,26 @@ EOF
 fi
 
 echo ""
-echo "Building (cargo build --release --workspace) …"
-# AF-783: the shared checkout may contain another lane's uncommitted Rust,
-# migrations or embedded assets. Build a pinned HEAD snapshot, never those drafts.
-"$SCRIPT_DIR/scripts/build-install-from-head.sh" "$SCRIPT_DIR" "$TARGET_DIR"
-[[ -x "$TARGET_DIR/release/amux-server" ]] || die "build finished but $TARGET_DIR/release/amux-server is missing"
-[[ -x "$TARGET_DIR/release/amux-rs" ]]     || die "build finished but $TARGET_DIR/release/amux-rs is missing"
-say "built server + CLI"
+echo "Building committed Rust server + CLI with private publication artifacts …"
+# The dependencies still share TARGET_DIR. Final compiler outputs and the
+# publication candidates belong only to this invocation, never release/.
+mkdir -p "$BIN_DIR"
+INSTALL_ARTIFACT_DIR="$(mktemp -d "$BIN_DIR/.amux-rust-install.XXXXXX")"
+cleanup_install_artifacts() { rm -rf -- "$INSTALL_ARTIFACT_DIR"; }
+trap cleanup_install_artifacts EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+"$SCRIPT_DIR/scripts/build-install-from-head.sh" "$SCRIPT_DIR" "$TARGET_DIR" "$INSTALL_ARTIFACT_DIR"
+python3 "$SCRIPT_DIR/scripts/install-artifact-manifest.py" verify "$INSTALL_ARTIFACT_DIR" "$INSTALL_ARTIFACT_DIR/manifest.json"
+say "built server + CLI from pinned source"
 
 # ── 3. Install binaries ─────────────────────────────────────────────────────
-mkdir -p "$BIN_DIR"
-# install(1) replaces the file atomically enough for the server's
-# self-adoption watcher: a running server notices its binary changed and
-# exits for launchd to relaunch the new build.
-install -m 0755 "$TARGET_DIR/release/amux-server" "$BIN_DIR/amux-server-rs"
-install -m 0755 "$TARGET_DIR/release/amux-rs" "$BIN_DIR/amux-rs"
+# Prepare and verify BOTH replacements before changing either live path. The
+# second verification detects a source mutation during either copy as well.
+mkdir "$INSTALL_ARTIFACT_DIR/publish"
+install -m 0755 "$INSTALL_ARTIFACT_DIR/amux-server" "$INSTALL_ARTIFACT_DIR/publish/amux-server"
+install -m 0755 "$INSTALL_ARTIFACT_DIR/amux-rs" "$INSTALL_ARTIFACT_DIR/publish/amux-rs"
+python3 "$SCRIPT_DIR/scripts/install-artifact-manifest.py" publish "$INSTALL_ARTIFACT_DIR/publish" "$INSTALL_ARTIFACT_DIR/manifest.json" "$BIN_DIR"
 say "installed $BIN_DIR/amux-server-rs"
 say "installed $BIN_DIR/amux-rs"
 "$SCRIPT_DIR/scripts/install-cli.sh" "$BIN_DIR"

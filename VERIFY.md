@@ -43,19 +43,29 @@ applies one exact string, runs the command, and reverts in a trap even if the
 command is killed. Do not use `cp file bak` on this shared checkout; it is a
 whole-file write and has reverted a peer's in-flight work twice.
 
-## Installer Rust source isolation (`install.sh`)
+## Installer Rust source and artifact isolation (`install.sh`)
 
 ```bash
 python3 scripts/test-install-committed-source.py
 ```
 
-Pass: `install committed source: 33 passed, 0 failed`. This executes the actual
-installer in disposable Git fixtures, replacing only the compiler and first binary
-publication with controlled specimens. It covers committed/dirty/untracked source,
-a source HEAD change during compilation, a relative target, an unresolved index,
-missing Git and a failed build with stale artifacts. It does not deploy a server.
-The selected commit and excluded drafts self-announce in
-`~/.amux/logs/server-install.log` (or `$AMUX_HOME/logs/server-install.log`).
+Pass: `install committed source: 79 passed, 0 failed`. The actual installer runs
+through both Rust binary publications in eleven disposable Git fixtures; the
+compiler reads committed/dirty specimen files and installation targets temporary
+paths. The fixture stops before Bash CLI installation, hooks, services or databases.
+It covers dirty/untracked source, HEAD advance, relative target, unresolved index,
+missing Git, failed build, shared-output replacement at compiler return and at
+publication, replacement between binaries, and altered private artifact refusal.
+Old installed sentinels must survive every refusal. Private stages are cleaned.
+
+Dependencies still use the shared Cargo target. Final executables are linked
+straight into a private directory using `cargo rustc -- --emit=link=<private>`;
+both publication candidates must match a pinned-commit SHA256 manifest before
+any live rename. Each rename is atomic; the pair is not a filesystem transaction.
+Source decisions, artifact identities, mismatches, partial publication failures and
+successful publication self-announce in `$AMUX_HOME/logs/server-install.log`
+(default `~/.amux/logs/server-install.log`). The fixture does not deploy a server
+or substitute for a real compiler check of the private link-output path.
 
 ## Dashboard client JS (`crates/amux-dashboard/static`)
 

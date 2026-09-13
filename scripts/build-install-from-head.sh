@@ -4,11 +4,13 @@
 set -euo pipefail
 source_repo="${1:?source checkout required}"
 target_dir="${2:?Cargo target directory required}"
+artifact_dir="${3:?private artifact directory required}"
 audit_dir="${AMUX_HOME:-$HOME/.amux}/logs"
 source_commit=unmeasured
 stage=source
 snapshot_root=
 snapshot=
+compiler_root=
 log() {
   local line
   line="$(date -u '+%Y-%m-%dT%H:%M:%SZ') $* commit=$source_commit"
@@ -26,6 +28,7 @@ finish() {
     fi
   fi
   if [[ -n "$snapshot_root" ]]; then rmdir "$snapshot_root" 2>/dev/null || true; fi
+  if [[ -n "$compiler_root" ]]; then rm -rf -- "$compiler_root"; fi
   if [[ "$rc" != 0 ]]; then log "WARN installer_source_failed stage=$stage exit=$rc"; fi
   exit "$rc"
 }
@@ -55,9 +58,26 @@ git -C "$source_repo" worktree add --detach "$snapshot" "$source_commit"
 [[ "$(git -C "$snapshot" rev-parse HEAD)" == "$source_commit" ]]
 [[ -z "$(git -C "$snapshot" status --porcelain --untracked-files=no)" ]]
 
+# rustc writes final link outputs DIRECTLY into this private directory while
+# Cargo still holds its dependency/build lock. Never copy release/ after Cargo
+# exits: another writer could already have replaced those shared output names.
+# This fixed ASCII /tmp prefix also keeps commas out of rustc's --emit grammar.
+compiler_root="$(mktemp -d /tmp/amux-install-link.XXXXXX)"
 stage=build
-(cd "$snapshot" && CARGO_TARGET_DIR="$target_dir" \
-  CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-${AMUX_CARGO_JOBS:-2}}" \
-  ./scripts/safe-cargo.sh build --release --workspace --locked)
-[[ -x "$target_dir/release/amux-server" && -x "$target_dir/release/amux-rs" ]]
-log 'INFO installer_source_built measured=true n_considered=1 source=committed_snapshot'
+for entry in 'amux-server:amux-server' 'amux-cli:amux-rs'; do
+  package="${entry%%:*}"
+  binary="${entry#*:}"
+  (cd "$snapshot" && CARGO_TARGET_DIR="$target_dir" \
+    CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-${AMUX_CARGO_JOBS:-2}}" \
+    ./scripts/safe-cargo.sh rustc --release --locked --package "$package" --bin "$binary" \
+    -- "--emit=link=$compiler_root/$binary")
+  [[ -x "$compiler_root/$binary" ]]
+done
+stage=artifact_capture
+mkdir -p "$artifact_dir"
+for binary in amux-server amux-rs; do
+  [[ ! -e "$artifact_dir/$binary" ]]
+  cp "$compiler_root/$binary" "$artifact_dir/$binary"
+done
+python3 "$source_repo/scripts/install-artifact-manifest.py" record "$artifact_dir" "$source_commit"
+log 'INFO installer_source_built measured=true n_considered=1 source=committed_snapshot artifacts=private_compiler_outputs'
