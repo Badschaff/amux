@@ -44,30 +44,6 @@ needs rebuilding. No single entry makes that argument, and free-form prose canno
 counted.
 
 ---
-## e2e auth tests flip green->red mid-session: the server under test is rebuilt from a shared checkout that moves between runs
-AREA: instruments
-SEVERITY: slows
-STATUS: open
-DATE: 2026-08-09
-SESSION: no-silent-actions agent (subagent; no $AMUX_SESSION in env)
-CARD: ARE-5
-SYMPTOM: three consecutive runs of `npx playwright test --config e2e/playwright.config.ts`
-on the same working tree: run 1 = 83 passed / 0 failed; run 2 = 12 failed; run 3 =
-5 failed, all in phase0 auth ("protected API rejects a bad bearer token" expected
-401, got 200) + settings_missing_endpoint_probe. Nothing in the diff between runs
-was mine — the config's webServer runs `cargo run -p amux-server`, so every run
-rebuilds whatever the concurrent lane has landed in crates/ since the last one.
-The 401->200 flip itself looks like a REAL auth regression landing upstream while
-I was testing the SPA layer.
-COST: ~15 minutes ruling out my own SPA-only changes as the cause of server-side
-auth failures; and a possible live auth regression (bad bearer accepted with 200)
-observed but not attributable to a commit from here (NEVER-run-git constraint).
-FIX: same instrument the CLAUDE.md /health-build bracket prescribes, applied to e2e:
-have playwright.config.ts record the server build hash (GET /health .build) into the
-run report so a mid-session flip names "the binary moved" instead of reading as
-flaky tests; separately, someone with git access should bisect the 401->200 auth
-behavior on current crates/amux-server HEAD.
-
 ## Ghost-rescue can only rescue the messages that happen to carry a timestamp prefix
 AREA: instruments
 SEVERITY: slows

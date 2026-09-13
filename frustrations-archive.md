@@ -9794,3 +9794,28 @@ COST: ~30 minutes of incident reconstruction chasing a phantom second actor, bec
   artifacts (env header, session log markers, session_events).
 FIX: request-log middleware should stamp arrival ts and wall-clock latency around the
   WHOLE handler future; a restart choreography should be a visibly long row.
+
+## e2e auth tests flip green->red mid-session: the server under test is rebuilt from a shared checkout that moves between runs
+VALIDATED: amux-frustrations | Independent verification under AF-352 RETIRE ON EVIDENCE, actual verifier amux-frustrations (2026-09-12). Current e2e/playwright.config.ts starts e2e/serve-head.sh with stdout/stderr piped, and serve-head.sh selects committed HEAD, labels source in every branch, reports excluded dirty Rust, and pins AMUX_NO_SELF_ADOPT=1. python3 scratch/ios-simulator-review/probe-e2e-source.py -> RESULT 2 source-selection cases passed. The probe executes an exact copy of the current launcher in a disposable Git repo with COMMITTED source and a BROKEN DRAFT, replacing cargo with a specimen-check stub: default selects committed bytes and exits 0; AMUX_E2E_WORKING_TREE=1 selects the draft and exits 1; both expose source/no-adopt/isolation state. Output: scratch/ios-simulator-review/drain-are5-source-proof.log. This verifies source selection, not a Rust compilation or all authentication behavior. ARE-5 itself records the AMUX-2924 fix and contemporaneous planted-compile-error verification. The entry's default shared-draft build mechanism is retired; explicit dirty opt-in, loudly reported worktree failure fallback, and changes between different commits remain intentional limits. No general auth/no-regression or board Verified claim.
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-09
+SESSION: no-silent-actions agent (subagent; no $AMUX_SESSION in env)
+CARD: ARE-5
+SYMPTOM: three consecutive runs of `npx playwright test --config e2e/playwright.config.ts`
+on the same working tree: run 1 = 83 passed / 0 failed; run 2 = 12 failed; run 3 =
+5 failed, all in phase0 auth ("protected API rejects a bad bearer token" expected
+401, got 200) + settings_missing_endpoint_probe. Nothing in the diff between runs
+was mine — the config's webServer runs `cargo run -p amux-server`, so every run
+rebuilds whatever the concurrent lane has landed in crates/ since the last one.
+The 401->200 flip itself looks like a REAL auth regression landing upstream while
+I was testing the SPA layer.
+COST: ~15 minutes ruling out my own SPA-only changes as the cause of server-side
+auth failures; and a possible live auth regression (bad bearer accepted with 200)
+observed but not attributable to a commit from here (NEVER-run-git constraint).
+FIX: same instrument the CLAUDE.md /health-build bracket prescribes, applied to e2e:
+have playwright.config.ts record the server build hash (GET /health .build) into the
+run report so a mid-session flip names "the binary moved" instead of reading as
+flaky tests; separately, someone with git access should bisect the 401->200 auth
+behavior on current crates/amux-server HEAD.
