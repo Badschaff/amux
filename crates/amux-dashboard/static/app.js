@@ -3140,7 +3140,7 @@ function _interactionDiagnostic(event) {
 let _receiptStorage;
 try { _receiptStorage = localStorage; } catch (_) {}
 const _interactions = AmuxState.createInteractions({storage:_receiptStorage, diagnostic:_interactionDiagnostic});
-const _stateFeedback = AmuxState.installFeedback(_interactions, _stateUI);
+const _stateFeedback = AmuxState.installFeedback(_interactions, _stateUI, _interactionDiagnostic);
 const _effectReconciler = AmuxState.createEffectReconciler({interactions:_interactions,
   read:async (id, signal) => {
     const response = await fetch(API + '/api/interactions/' + encodeURIComponent(id) + '/effects', {signal});
@@ -3738,7 +3738,10 @@ function toggleNotifPanel() {
   const panel = document.getElementById('notif-panel');
   if (!panel) return;
   panel.classList.toggle('active', _notifPanelOpen);
+  document.getElementById('notif-btn')?.setAttribute('aria-expanded', String(_notifPanelOpen));
   if (_notifPanelOpen) {
+    panel.scrollTop = 0;
+    _positionNotifPanel();
     _notifRenderPanel();
     _notifUpdateNativeBtn();
     _notifUpdateBannerBtn();
@@ -3747,6 +3750,25 @@ function toggleNotifPanel() {
     setTimeout(() => _notifUpdateBadge(), 300);
   }
 }
+
+function _positionNotifPanel() {
+  const panel = document.getElementById('notif-panel');
+  const button = document.getElementById('notif-btn');
+  if (!panel || !button || !_notifPanelOpen) return;
+  const anchor = button.getBoundingClientRect();
+  const width = panel.getBoundingClientRect().width;
+  const top = Math.min(anchor.bottom + 8, Math.max(12, innerHeight - 120));
+  panel.style.left = Math.max(12, Math.min(anchor.left, innerWidth - width - 12)) + 'px';
+  panel.style.top = top + 'px';
+  panel.style.maxHeight = Math.max(80, Math.min(520, innerHeight - top - 12)) + 'px';
+}
+window.addEventListener('resize', _positionNotifPanel);
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && _notifPanelOpen) {
+    toggleNotifPanel();
+    document.getElementById('notif-btn')?.focus();
+  }
+});
 
 function _notifRenderPanel() {
   const list = document.getElementById('notif-panel-list');
@@ -3783,9 +3805,7 @@ function _notifClearAll() {
 
 document.addEventListener('click', (e) => {
   if (_notifPanelOpen && !e.target.closest('#notif-panel') && !e.target.closest('#notif-btn')) {
-    _notifPanelOpen = false;
-    const panel = document.getElementById('notif-panel');
-    if (panel) panel.classList.remove('active');
+    toggleNotifPanel();
   }
 });
 

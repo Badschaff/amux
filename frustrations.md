@@ -2720,3 +2720,27 @@ CARD: AMUX-4417
 SYMPTOM: Fresh desktop/mobile/WebKit transport tests pass, but opened screenshots show the expanded worker-list error panel that Ethan requested inside the sync modal, raw HTTP operation labels, and a five-operation count above a seven-operation checklist including files.
 COST: Nine green automated cases did not establish the requested visual behavior; eight screenshots were inspected and the missing acceptance requirements recorded as LW-12. No data loss was observed in this selected run.
 FIX: Pending: modal-only detailed errors with reachable retry/discard, readable operation labels, and consistently scoped pending totals; retain individual acknowledgement checks.
+
+
+## Header declutter hid the only durable action inspector
+AREA: browser
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-774
+SYMPTOM: AMUX-4475 removed header clutter with display:none!important on the sole interaction-feedback hub. Receipt retry/recovery continued, but users could not inspect pending/completed/refused actions or remedies; the full CI population retained18 hidden-summary failures.
+COST: Eighteen failed receipt cases in the completed1011-case CI run and a separate exact Safari reproduction to distinguish hidden feedback from failed effects recovery.
+FIX: Move the existing receipt inspector into Notifications with visible access, viewport bounds, scrolling and dismissal, preserving the compact header. Measure visibility in client-debug, retain receipt semantics/no-resend tests and validate native iOS; draft implementation under AF-774.
+
+
+## An incoming receipt update collapses the Details section being read
+AREA: browser
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-774
+SYMPTOM: After opening the last retained receipt Details in Safari and reading one effects response through the actual reconciler, the disclosure lost its open attribute. feedback.mjs replaces every article on each receipt update and did not preserve disclosure state.
+COST: One failed targeted Safari regression after the inspector became reachable; a person reading the remedy would have to reopen it after updates.
+FIX: Preserve expanded receipt identities across rendering, log measured retained/restored counts, and verify open Details plus reading position through a real effects read. Full matrix/native/review still pending on AF-774.

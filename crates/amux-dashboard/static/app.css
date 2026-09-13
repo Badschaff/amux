@@ -1445,12 +1445,9 @@
     border-bottom: 1px solid var(--border);
   }
   .header-row h1 { margin-bottom: 0; }
-  /* AMUX-4475: the interaction-feedback "Actions/Confirmed" hub (injected into
-     .header-row by state/feedback.mjs) orphaned itself at the far-right edge and
-     left the toolbar cramped in the corner with dead space between. Removed from
-     the header; action outcomes still surface via toasts. Hiding rather than not
-     injecting keeps feedback.mjs's element lookups non-null. */
-  #interaction-feedback { display: none !important; }
+  /* AMUX-4475 / AF-774: receipts belong inside Notifications. Keep the
+     primary header free of a separate Actions control. */
+  .header-row > #interaction-feedback { display: none; }
   .btn-create {
     font-size: 0.85rem; padding: 8px 14px; border-radius: 8px;
     border: 1px solid var(--accent); background: var(--accent); color: #fff;
@@ -1605,10 +1602,10 @@
     .header-row .btn-rate-limit { max-width:44px; overflow:visible; white-space:nowrap; }
     .header-row #rate-limit-pill-text { display:none; }
     .header-row #rate-limit-pill-count { display:inline-block; font-size:0.85rem; font-weight:600; }
-    .header-row #interaction-feedback { flex:0 0 44px; margin-left:auto; }
-    .header-row #interaction-feedback > summary { box-sizing:border-box; width:44px; height:44px; min-height:44px; padding:0; justify-content:center; }
-    .header-row #interaction-feedback > summary > span { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); white-space:nowrap; }
-    .header-row #interaction-feedback > summary > svg:last-child { display:none; }
+    .header-row > #interaction-feedback { flex:0 0 44px; margin-left:auto; }
+    .header-row > #interaction-feedback > summary { box-sizing:border-box; width:44px; height:44px; min-height:44px; padding:0; justify-content:center; }
+    .header-row > #interaction-feedback > summary > span { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); white-space:nowrap; }
+    .header-row > #interaction-feedback > summary > svg:last-child { display:none; }
 
   }
 
@@ -2915,8 +2912,8 @@
 
   /* Notification panel */
   .notif-panel {
-    position: absolute; top: 100%; left: 0; z-index: 510;
-    width: 340px; max-height: 420px; overflow-y: auto;
+    position: fixed; top: 80px; left: 12px; z-index: 510;
+    width: min(340px, calc(100vw - 24px)); max-height: min(70dvh, 520px); overflow-y: auto; overscroll-behavior: contain;
     background: var(--card); border: 1px solid var(--border); border-radius: 10px;
     box-shadow: 0 8px 32px rgba(0,0,0,0.4);
     display: none; flex-direction: column;
@@ -2949,7 +2946,7 @@
   }
   @media (max-width: 600px) {
     .notif-banners { right: 8px; max-width: calc(100% - 16px); }
-    .notif-panel { width: calc(100vw - 24px); left: -120px; }
+    .notif-panel { width: calc(100vw - 24px); }
   }
 
   /* Confirm / alert modal — replaces native confirm()/alert() which PWA blocks */
@@ -6492,7 +6489,7 @@ input.mdai-edge-path-input:focus { border-color: var(--accent); box-shadow: 0 0 
 /* AF-750 / AF-751: balanced status controls at desktop and phone widths. */
 .header-row { gap:12px; }
 .header-row > .header-actions { margin-left:auto; }
-.header-row #interaction-feedback { margin-left:0; }
+.header-row > #interaction-feedback { margin-left:0; }
 .header-row #brand-header { font-size:1.3rem; }
 /* AMUX-4475: toolbar icon buttons get a consistent bordered box (Ethan,
    2026-09-12: "borders around buttons too" + "make the components all
@@ -6509,7 +6506,7 @@ input.mdai-edge-path-input:focus { border-color: var(--accent); box-shadow: 0 0 
 @media (min-width:601px) { .header-row .header-actions { gap:10px !important; } .header-row .settings-btn,.header-row .btn-active,.header-row .btn-rate-limit,.header-row .header-add-btn { min-height:44px; } }
 @media (max-width:600px) {
  .header-row { gap:1px; }
- .header-row #interaction-feedback { margin-left:auto; }
+ .header-row > #interaction-feedback { margin-left:auto; }
  .header-row #conn-status::before { width:9px; height:9px; }
  .header-row #rate-limit-pill-count { font-size:0.85rem; }
  .header-row .header-add-btn { border-radius:12px; font-size:1.35rem; }

@@ -1,0 +1,31 @@
+# Receipt access through Notifications (AF-774)
+
+AMUX-4475 deliberately removed the separate Actions control from the header to preserve its compact layout. The durable receipt renderer still injected only into that header and a global display:none!important rule hid it entirely. Toasts remained, but pending status, uncertainty, recovery and refusal remedies could not be inspected. AF-768's complete CI run had eighteen receipt failures at the hidden summary. The exact d5293449 Safari completed-effects case reproduced the hidden-control timeout while effects recovery itself was logged.
+
+The draft moves the existing details inspector into the existing Notifications panel, before the notification list. No additional header control or state primitive is introduced. The label is Recent actions with the existing live status summary. Pending receipts and the latest twenty settled receipts retain their existing order, effects status, uncertainty, progress and remedy content. Opening or dismissing the panel never resends commands.
+
+Notifications anchors below its bell within viewport bounds, uses one scroll container, resets to the top on opening, and closes on Escape or an outside click. Escape returns focus to the bell and aria-expanded tracks dismissal. Inspector selectors formerly scoped to header descendants now scope direct header children so nested receipts keep readable labels. Details targets are at least44px high; receipt status colors use the existing light/dark theme tokens.
+
+Opening Notifications or toggling its inspector schedules a measured visibility beacon through the existing interaction diagnostic/client-debug path. A missing host reports measured:false/n_considered:0; summary measurements report one considered control, its rectangle and viewport. The callback rechecks that the panel is still open, so dismissal before the next frame does not manufacture a clipped-inspector warning.
+
+## Evidence and limits
+
+Artifacts under scratch/af748-board-drain:
+
+- af774-hidden-hub-red.log: exact d529 Safari effects-recovery test fails clicking the hidden summary; effects retry/recovery logs retained.
+- af774-source-checks.log: state27/0, bundle generation/freshness0, JS syntax0 and diff check0 on the initial draft.
+- af774-safari-first.log: focused recovery1pass; the new scroll/dismissal journey completed its UI assertions but failed the route-use guard because an unrelated effects stub never fired before the1.2-second view journey ended. The unused stub was removed, not exempted from the guard. This is not a green two-test run.
+- First personally viewed top/bottom Safari screenshots show bounded panel, readable last-row details and visible bell/plus/gear. This inspection motivated using established theme status colors and retaining one outer scroller. This is browser WebKit evidence, not a native gesture claim.
+- af774-lint.log: zero errors,48 existing warnings; current generated state assets rebuilt after the dismissal diagnostic correction.
+
+The final all-project receipt/feedback/header matrix, clean committed gates, independent review, publication and native iOS interaction audit remain outstanding. Do not treat this draft report as their result. Full AF-748/AF-768 work remains unfinished.
+
+## Preserve the reading state during updates
+
+A follow-up real Safari effects-read probe exposed an inherited renderer issue: each receipt update replaced every article, collapsing an open Details disclosure. The first attempted probe called a deliberately read-only debug projection's nonexistent update method; af774-disclosure-probe-error.log is an instrument error, not the reproduction. The corrected probe uses the existing _interactionReconcile read and a route that demonstrably returns one effect. af774-disclosure-red.log then fails at the open disclosure assertion after the successful read.
+
+The renderer now snapshots expanded receipt identities before rebuilding and restores those still in the retained visible population. It logs interaction_disclosures_preserved/lost with measured:true, the retained open population and actual restored count. It does not retain expired receipts or create another persistence primitive. The browser test also requires the same scroll position, visible updated Details content and zero command resends.
+
+Native baseline on the local iPhone17/iOS26.5 used the actual amux XCUITest click path to close the owned worker peek and open Notifications. Stable live d5293449/buildb5c5f49866477e8b bracketed both reads. At402px viewport width the existing panel occupied left:-22/right:356, and the receipt hub had zero area. Personally viewed af774-native-baseline.png: the Notifications heading and row icons are clipped at the left edge. Raw actions, capability/runtime record, screenshot metadata and verdict are saved as af774-native-baseline-*; automation was released after closing the panel. This is a pre-fix native specimen, not post-fix verification.
+
+Full working-tree receipt/feedback/header matrix ->69 passed,0 failed across desktop/mobile/ios-safari (af774-matrix.log). This includes the new real-reconciler read preserving last-row Details and scroll position. Personally viewed final Safari Details, desktop panel and loaded-fleet375px header screenshots. Added the existing ChevronDown icon to Details so its disclosure affordance remains visible with a44px target; final clean candidate rerun includes that visual adjustment. Native harness now uses the same Notifications entry path and adds a28-receipt native down/up/details/reconcile/dismiss/no-resend scenario while retaining all prior cases. The native script has passed syntax only at this point; its execution remains a separate gate.
