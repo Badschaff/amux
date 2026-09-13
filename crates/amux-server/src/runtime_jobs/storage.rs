@@ -101,6 +101,23 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::RwLock;
 
+/// Shared snapshot context for disk-pressure findings and the reclaim view.
+pub(crate) fn apfs_snapshot_note(n: usize) -> String {
+    if n == 0 {
+        return "No local Time Machine snapshots were observed. This probe does not \
+                establish snapshot retention as the cause of unrecovered space. \
+                Remeasure free space before deciding on further deletion."
+            .into();
+    }
+    format!(
+        "{n} local Time Machine snapshots may retain blocks shared with deleted files. \
+         Their count does not measure retained bytes, prove that every deletion is \
+         blocked, or establish how long a backup disk has been absent. macOS can \
+         remove snapshots automatically as they age or storage is needed. Check \
+         backup status and remeasure free space before deciding on further deletion."
+    )
+}
+
 /// Default tick: hourly. Retention is not time-critical; the only thing that
 /// matters is that it happens without traffic.
 pub const STORAGE_TICK_SECS: u64 = 3600;

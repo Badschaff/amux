@@ -10631,7 +10631,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.938';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.939';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -37504,12 +37504,12 @@ function _reclaimRender() {
   const snapFinding = findings.find(f => f.category === 'snapshot');
   if (snapFinding) {
     html += `<div class="reclaim-warn">
-      <div style="font-weight:600;margin-bottom:4px;">⚠ ${scan.snapshot_count} APFS local snapshots are holding deleted space</div>
+      <div style="font-weight:600;margin-bottom:4px;">${scan.snapshot_count} local snapshots observed</div>
       <div style="font-size:0.78rem;line-height:1.55;">
-        Until these expire or are thinned, <b>deleting files will not increase your free space</b>.
-        The blocks stay referenced by the snapshot. This is why a cleanup can look like it did nothing.
-        <div style="margin-top:6px;">Release them from a terminal (needs sudo, so amux will not run it for you):</div>
-        <code class="reclaim-code">sudo tmutil thinlocalsnapshots / 21474836480 4</code>
+        Snapshots may retain blocks shared with deleted files. Their count does not show
+        how much space they hold or how long a backup disk has been absent.
+        macOS can remove snapshots as they age or storage is needed.
+        Check backup status and remeasure free space before deciding on further deletion.
       </div>
     </div>`;
   }

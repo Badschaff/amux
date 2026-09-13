@@ -4860,6 +4860,31 @@ fn bounded_output(program: &str, args: &[&str], budget: std::time::Duration) -> 
     }
 }
 
+fn parse_local_snapshot_count(stdout: &[u8]) -> Option<usize> {
+    let mut lines = std::str::from_utf8(stdout)
+        .ok()?
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty());
+    let header = lines.next()?;
+    if !header.starts_with("Snapshots for ") || !header.ends_with(':') {
+        return None;
+    }
+    // A recognized empty listing is zero. Empty stdout, localized/changed
+    // formats and unexpected diagnostics are unmeasured, even after exit 0.
+    let mut count = 0;
+    for line in lines {
+        if line
+            .strip_prefix("com.apple.TimeMachine.")
+            .is_none_or(str::is_empty)
+        {
+            return None;
+        }
+        count += 1;
+    }
+    Some(count)
+}
+
 fn local_snapshot_count() -> Option<usize> {
     // 5s: `tmutil listlocalsnapshots /` answers in well under a second on a
     // healthy machine. It talks to backupd, so a wedged Time Machine can hang it
@@ -4870,11 +4895,43 @@ fn local_snapshot_count() -> Option<usize> {
         &["listlocalsnapshots", "/"],
         std::time::Duration::from_secs(5),
     )?;
-    Some(
-        String::from_utf8_lossy(&stdout)
-            .matches("com.apple.TimeMachine")
-            .count(),
-    )
+    parse_local_snapshot_count(&stdout)
+}
+
+fn disk_snapshot_evidence(snaps: Option<usize>) -> Vec<(String, String)> {
+    let retention = match snaps {
+        Some(0) => "absent",
+        Some(_) => "possible",
+        None => "unknown",
+    };
+    let why = "snapshot probe did not produce a successful recognized listing \
+               (unsupported platform/output, command failure, or timeout)";
+    tracing::info!(
+        measured = snaps.is_some(),
+        n_considered = snaps.unwrap_or(0),
+        retention,
+        why_unmeasured = if snaps.is_none() { why } else { "" },
+        "disk_snapshot_context"
+    );
+    let mut evidence = vec![
+        ("apfs_local_snapshots_measured".into(), snaps.is_some().to_string()),
+        (
+            "apfs_local_snapshots_n_considered".into(),
+            snaps.unwrap_or(0).to_string(),
+        ),
+        ("apfs_retention".into(), retention.into()),
+        (
+            "apfs_local_snapshots".into(),
+            snaps.map(super::storage::apfs_snapshot_note).unwrap_or_else(|| {
+                "Local snapshot retention is unmeasured. Do not infer that snapshots \
+                 are absent or that deleting them is necessary.".into()
+            }),
+        ),
+    ];
+    if snaps.is_none() {
+        evidence.push(("apfs_local_snapshots_why_unmeasured".into(), why.into()));
+    }
+    evidence
 }
 
 pub fn detect_disk(now: f64, home: &std::path::Path) -> (Vec<Finding>, Vec<Suppressed>) {
@@ -4979,25 +5036,14 @@ pub fn detect_disk(now: f64, home: &std::path::Path) -> (Vec<Finding>, Vec<Suppr
         ),
         ("top_consumers".into(), format!("\n{listing}")),
     ];
-    if let Some(n) = snaps {
-        evidence.push((
-            "apfs_local_snapshots".into(),
-            format!(
-                "{n} — READ THIS BEFORE DELETING ANYTHING. Each hourly Time Machine snapshot \
-                 pins the blocks of every file deleted since it was taken, so with snapshots \
-                 present, deleting files frees NOTHING until they age out (24h) or are thinned. \
-                 On 2026-08-10, 450GB was deleted and free space moved 8GB for exactly this \
-                 reason. Thin them first: sudo tmutil thinlocalsnapshots / 500000000000 4"
-            ),
-        ));
-    }
+    evidence.extend(disk_snapshot_evidence(snaps));
 
     out.push(Finding {
         kind: DetectorKind::DiskPressure,
         signature,
         title,
         evidence,
-        recheck: "df -h /System/Volumes/Data; tmutil listlocalsnapshots / | wc -l; \
+        recheck: "df -h /System/Volumes/Data; tmutil listlocalsnapshots /; \
                   curl -sk $AMUX_URL/api/debug/storage"
             .into(),
         owner: None,
@@ -7823,6 +7869,56 @@ fn parse_ts(s: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn snapshot_listing_requires_a_measured_listing_before_counting_zero() {
+        let header = "Snapshots for volume group containing disk /:\n";
+        assert_eq!(parse_local_snapshot_count(header.as_bytes()), Some(0));
+        assert_eq!(parse_local_snapshot_count(format!("{header}com.apple.TimeMachine.2026-09-13-010000.local\ncom.apple.TimeMachine.2026-09-13-020000.local\n").as_bytes()), Some(2));
+        for output in ["", "\n", "backupd unavailable", "error com.apple.TimeMachine.failure", "Snapshots for /"] {
+            assert_eq!(parse_local_snapshot_count(output.as_bytes()), None, "{output:?}");
+        }
+        assert_eq!(parse_local_snapshot_count(format!("{header}permission denied\n").as_bytes()), None);
+        assert_eq!(parse_local_snapshot_count(b"\xff"), None);
+    }
+
+    #[test]
+    fn snapshot_context_distinguishes_zero_positive_and_unmeasured_without_deletion_advice() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        for (count, verdict) in [(Some(0), "absent"), (Some(24), "possible"), (None, "unknown")] {
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            let writer = Writer(bytes.clone());
+            let subscriber = tracing_subscriber::fmt().with_ansi(false).without_time()
+                .with_writer(move || writer.clone()).finish();
+            let evidence: std::collections::BTreeMap<_, _> =
+                tracing::subscriber::with_default(subscriber, || disk_snapshot_evidence(count))
+                    .into_iter().collect();
+            let note = evidence.get("apfs_local_snapshots").expect("missing measurement is explicit");
+            assert!(!note.contains("Thin them first"), "a snapshot count cannot justify backup deletion: {note}");
+            assert!(!note.contains("deleting files frees NOTHING"), "count is not retained bytes: {note}");
+            assert_eq!(evidence["apfs_local_snapshots_measured"], count.is_some().to_string());
+            assert_eq!(evidence["apfs_local_snapshots_n_considered"], count.unwrap_or(0).to_string());
+            assert_eq!(evidence["apfs_retention"], verdict);
+            if count.is_none() {
+                assert!(!evidence["apfs_local_snapshots_why_unmeasured"].is_empty());
+            } else {
+                assert!(!evidence.contains_key("apfs_local_snapshots_why_unmeasured"));
+            }
+            let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+            assert!(logs.contains("disk_snapshot_context"), "{logs}");
+            assert!(logs.contains(&format!("measured={}", count.is_some())), "{logs}");
+            assert!(logs.contains(&format!("n_considered={}", count.unwrap_or(0))), "{logs}");
+            assert!(logs.contains(&format!("retention=\"{verdict}\"")), "{logs}");
+        }
+    }
 
     fn schedule_health_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();

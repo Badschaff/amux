@@ -1484,10 +1484,8 @@ fn run_scan(store: crate::db::SharedStore, scan_id: String, cfg: ScanCfg, cancel
                     sid,
                     snaps.len() as i64,
                     format!(
-                        "{} hourly local Time Machine snapshots retain blocks from deleted files. \
-                         Until these expire or are thinned, deleting files will NOT increase free space. \
-                         Oldest: {}",
-                        snaps.len(),
+                        "{} Oldest: {}",
+                        crate::runtime_jobs::storage::apfs_snapshot_note(snaps.len()),
                         snaps.first().map(|s| s.as_str()).unwrap_or("?")
                     )
                 ],
@@ -1881,9 +1879,9 @@ async fn list_snapshots(State(_state): State<AppState>) -> Response {
         "count": snaps.len(),
         "df_free": free,
         "df_total": total,
-        "note": "Local APFS snapshots retain blocks from deleted files. While these exist, \
-                 deleting files can free `du` space without freeing `df` space.",
+        "note": crate::runtime_jobs::storage::apfs_snapshot_note(snaps.len()),
         "thin_command": "sudo tmutil thinlocalsnapshots / 21474836480 4",
+        "thin_command_requires_backup_review": true,
     }))
     .into_response()
 }
@@ -2222,9 +2220,8 @@ async fn purge_quarantine(
         // Say it at the moment the number disappoints, not in a doc nobody
         // reads: this is exactly where a user concludes the feature is broken.
         "note": if snaps > 0 && freed < 1024 * 1024 * 64 {
-            format!("Files are deleted, but free space barely moved because {snaps} APFS local snapshots \
-                     still reference the blocks. Run `sudo tmutil thinlocalsnapshots / 21474836480 4` \
-                     to release them.")
+            format!("Files were deleted and free space moved little. {}",
+                crate::runtime_jobs::storage::apfs_snapshot_note(snaps))
         } else {
             String::new()
         }
