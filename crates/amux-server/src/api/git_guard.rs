@@ -2924,10 +2924,13 @@ pub(crate) fn classify(
                 "staged, but NO session has an edit record for it in the last {}m — including \
                  you — AND a cotenant on this checkout is invisible to the guard right now, so \
                  the likeliest owner is the lane we cannot see. Committing it ships their work \
-                 under your message. If it is genuinely yours, AMUX_VERIFIED_SOLO=1 after \
-                 checking `git diff --cached -- {}`",
-                (window / 60.0) as i64,
-                rel
+                 under your message. Use AMUX_VERIFIED_SOLO=1 only after reviewing the actual \
+                 candidate. A refused pathspec commit discards its temporary index: for a \
+                 pathspec retry inspect `git diff HEAD -- {rel}`. For a staged commit, stage \
+                 only intended changes first, then inspect `git diff --cached -- {rel}`. \
+                 An empty diff is not ownership verification: require the expected path/hunks \
+                 and a successful comparison (a missing HEAD or command error is not proof).",
+                (window / 60.0) as i64
             ),
         }));
     }
@@ -3815,6 +3818,10 @@ pub async fn staged_guard_inner(
         let newest = inputs.mine.values().copied().fold(0.0_f64, f64::max);
         tracing::warn!(
             target: "staged_guard",
+            measured = true,
+            n_considered = pairs.len(),
+            n_review_required = v.foreign.len(),
+            candidate_review = "require expected path and nonempty hunks; pathspec retry uses working tree against HEAD",
             // `newest_any`, not `newest` (renamed 2026-08-14). It is the newest entry
             // across the committer's WHOLE claim set, which is NOT what classify()
             // compares — classify uses inputs.mine[path], per-path on both sides. The
@@ -7646,6 +7653,8 @@ mod tests {
             why.contains("git diff --cached"),
             "no way to check it: {why}"
         );
+        assert!(why.contains("git diff HEAD") && why.contains("temporary index"), "{why}");
+        assert!(why.contains("empty diff is not ownership verification"), "{why}");
         // It blocks via `foreign` specifically, because that is the only field
         // installed hooks act on (module docs). A new key would be ignored by
         // every hook already on disk.

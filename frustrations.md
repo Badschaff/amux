@@ -2552,3 +2552,14 @@ CARD: AF-746
 SYMPTOM: mixpeek-frustrations reported six studio paths labeled as carrying its edit record despite zero worktree edits. The current local observation store contains none of those historical studio records, so that incident's exact provenance is unconfirmed. Source inspection independently found apply_observed promoting requester-only mtimes into GuardInputs.mine when peers are visible and have no recorded claim. The nudge interprets omission from foreign/unclaimed as authorship. Its decoder also reads the boolean undecided field as an array and cannot detect paths omitted by the guard's cap.
 COST: The reporter declined every remedy to avoid sweeping another lane's work. This investigation required separate guard-to-nudge boundary reproductions because the existing peer-observation regressions did not cover self-attribution. No foreign worktree changes or reported sweep occurred.
 FIX: Keep observation-only paths unclaimed and committable under the existing visible-cotenant policy; preserve real writer/blind protection. Require a complete, decided guard population before the nudge derives ownership. Retain measured diagnostics and tests at the real consumer boundary. Historical six-path provenance remains unconfirmed until its original verdict is available.
+
+## A refused pathspec commit leaves the recommended ownership check looking empty
+AREA: gates
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-746
+SYMPTOM: ts-gke reported overriding the ownership guard after an empty git diff --cached on a path that was not staged in the ordinary index. A real disposable Git reproduction confirms that git commit <path> gives the hook a temporary index and discards it on refusal. The emitted cached-diff hint then produces the same empty output for a legitimate append and a peer-style full rewrite. The report's eventual 66-line append was correct, but this check could not distinguish it.
+COST: One reported override used an unmeasured comparison; no incorrect commit was reported. Reproducing both append and rewrite through the actual hook required a separate fixture because ordinary staged-hook tests retained the index and missed the timing gap.
+FIX: Explain temporary-index lifetime in both the server refusal and installed hook. For pathspec retries compare the working tree against HEAD, the actual commit baseline; for staged commits first stage intended changes and inspect the cached diff. Require expected path/hunks and successful comparison; empty output, missing HEAD and errors are not ownership verification. Log measured review-required populations without claiming the user performed a review.

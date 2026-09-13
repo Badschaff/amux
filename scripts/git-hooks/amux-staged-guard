@@ -33,7 +33,7 @@
 # Blocking commits on a server hiccup would be worse, so fail-open stays; what
 # changes is that a failure now SAYS SO, loudly, with the reason. A guard that
 # cannot report its own absence is indistinguishable from a guard that passed.
-import json, os, ssl, subprocess, sys, time, urllib.error, urllib.request
+import json, os, shlex, ssl, subprocess, sys, time, urllib.error, urllib.request
 
 # Bump on ANY change to this file, not only on a request/response contract
 # change. It is what the installed-copy inventory greps
@@ -50,7 +50,7 @@ import json, os, ssl, subprocess, sys, time, urllib.error, urllib.request
 # `^`-anchored, because an unanchored match now finds the comment line first
 # (checked: it returned empty, which would have made `grep -L` match nothing and
 # report a clean fleet).
-GUARD_VERSION = 16
+GUARD_VERSION = 17
 
 
 def amux_base_url():
@@ -1212,12 +1212,20 @@ def main():
     #    required asserting the commit was cross-session when it was not — ethos
     #    rule 3. The honest case now has an honest name.
     w("\nVERIFY BEFORE OVERRIDING — this verdict uses edit records and cotenant\n"
-      "visibility, not the staged diff. Check whether each staged change is yours:\n")
+      "visibility, not the candidate diff. A refused pathspec commit discards its\n"
+      "temporary index; your normal index can still be empty. For a pathspec retry,\n"
+      "review the working-tree changes that git commit <path> will stage:\n")
     for f in foreign:
-        w("  git diff --cached -- %s        # is any of this theirs?\n" % f.get("path", ""))
+        w("  git diff HEAD -- %s\n" % shlex.quote(f.get("path", "")))
+    w("For an ordinary staged commit, stage only your intended changes first, then review:\n")
+    for f in foreign:
+        w("  git diff --cached -- %s\n" % shlex.quote(f.get("path", "")))
+    w("Confirm the expected path and hunks are present and the comparison succeeded.\n"
+      "An empty diff is not ownership verification; a missing HEAD or command error\n"
+      "does not verify anything either. New files need staging before a cached diff.\n")
     w("\nThen take the exit that is TRUE:\n"
       "  AMUX_ALLOW_FOREIGN=1 git commit ...   # yes, their work is in it, and I mean to ship it\n"
-      "  AMUX_VERIFIED_SOLO=1 git commit ...   # I checked the staged diff: none of it is theirs\n\n")
+      "  AMUX_VERIFIED_SOLO=1 git commit ...   # I reviewed the actual candidate: none of it is theirs\n\n")
     # AF-127: anchor the episode. The marker carries THIS verdict's row id so
     # the eventual outcome attaches by id; on a retry-block the marker moves to
     # the newest verdict and the server closes the older row as superseded.
