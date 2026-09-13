@@ -1,5 +1,6 @@
 import { type Route } from '@playwright/test';
 import { test, expect, type Page, allowUnusedRoute } from './fixtures';
+import { readEarlier } from './reader-scroll';
 
 const worker = 'terminal-contract';
 
@@ -37,8 +38,15 @@ async function boot(page: Page, options?: {
       ? { key, value: persistedLayout }
       : { key, value: null } });
   });
-  await page.route(`**/api/history?limit=200&offset=0&session=${worker}`,
-    route => route.fulfill({ json: historyRows }));
+  // This fixture supplies the worker's first page; page size is not its contract.
+  // Match the actual scoped request (currently 60 rows), never waive the hit guard.
+  await page.route(url => url.pathname === '/api/history'
+    && url.searchParams.get('session') === worker
+    && url.searchParams.get('offset') === '0' && url.searchParams.has('limit'), route => {
+    const size = Number(new URL(route.request().url()).searchParams.get('limit'));
+    expect(Number.isInteger(size) && size > 0 && size <= 200, 'bounded first history page').toBe(true);
+    return route.fulfill({ json: historyRows.slice(0, size) });
+  });
   const sendRoute = `**/api/sessions/${worker}/send`;
   await page.route(sendRoute, async (route: Route) => {
     const body = route.request().postDataJSON() as { text?: string };
@@ -74,24 +82,6 @@ async function boot(page: Page, options?: {
     setLive(value: string) { live = value; },
     getPersistedLayout() { return persistedLayout; },
   };
-}
-
-// A scrollTop assignment is also used by the product's bottom-follow logic;
-// it is not a reader gesture. Supply wheel/touch intent before positioning a
-// specimen; the native Simulator test separately exercises an actual swipe.
-async function readEarlier(page: Page, touch: boolean) {
-  const body = page.locator('#peek-body');
-  const before = await body.evaluate(el => el.scrollTop);
-  if (touch) {
-    // Playwright mobile WebKit has no wheel API. A real tap on the body's
-    // padding supplies touch intent; the native Simulator suite owns swipes.
-    await body.tap({ position: { x: 5, y: 5 } });
-    await body.evaluate(el => { el.scrollTop -= 400; });
-  } else {
-    await body.hover();
-    await page.mouse.wheel(0, -400);
-  }
-  await expect.poll(() => body.evaluate(el => el.scrollTop)).toBeLessThan(before - 10);
 }
 
 test('history/live seam renders every submitted prompt exactly once', async ({ page }) => {

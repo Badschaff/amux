@@ -2664,3 +2664,14 @@ CARD: AF-770
 SYMPTOM: Native MSG-59704 says five drainable cards but lists only TG-3705. The runtime count omits blocked_on while the list excludes it; deterministic blocked-only fixture counted 1 with an empty list. ts-gke also reported separate orchestrator messages listing parked cards; those remain AF-771, not proof of this native mechanism.
 COST: Inflated workload and escalation input; investigating the peer report required separating two generators before identifying the count/list disagreement. The repeated external re-measurement cost belongs to the still-open orchestrator investigation.
 FIX: One shared dispatch-eligible population for native count/list/cadence, explicit display truncation and measured selection/error logs. Red control 0 passed / 1 failed; corrected gates, review and deployment pending.
+
+## Terminal browser fixtures kept testing retired request and input contracts
+AREA: gates
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-772
+SYMPTOM: Full CI run34749407249 finished every test but terminal fixtures stubbed limit=200 while the client requested60, expected Tabs after a grid icon shipped, called unsupported mouse.wheel in mobile WebKit, and clicked an existing-install menu beneath a fresh walkthrough. A local all-project correction run also caught delayed history arriving before Safari dispatched the fixture's scroll event.
+COST: 39 terminal-product,3 tab-label,1 wheel and1 onboarding failures in the complete CI matrix; local evidence retained1 failing history reproduction,44/1 Safari and134/1 all-project runs before the final ordering correction. No elapsed-time estimate or product regression count inferred.
+FIX: AF-772 repairs scoped request/context/input prerequisites while retaining route-hit guards, attribution/buffering/visibility assertions and all3projects; measured input-method diagnostics distinguish positioned browser specimens from separately checked native Simulator swipes. Remaining browser failure families stay open under AF-748.
