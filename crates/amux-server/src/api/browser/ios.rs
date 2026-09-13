@@ -271,6 +271,15 @@ async fn navigate(d: &Driver, url: &str) -> Result<()> {
         return Ok(());
     }
     let result = tokio::time::timeout(Duration::from_secs(35), async {
+        // Safari deep links create tabs. Reuse the aligned foreground tab so
+        // repeated Go does not retain old pages and their streaming connections.
+        if d.eval("document.visibilityState === 'visible'", json!([])).await? == true {
+            d.post("/url", json!({"url":url})).await?;
+            require_visible_tab(d).await?;
+            tracing::info!(target:"amux::browser_ios",session=%d.owner,verdict="native_tab_reused",
+                measured=true,n_considered=1,"Safari navigation reused the visible debugger tab");
+            return Ok(());
+        }
         d.post("/execute/sync", json!({"script":"mobile: deepLink",
             "args":[{"url":url,"bundleId":"com.apple.mobilesafari"}]})).await?;
         let contexts = d.post("/execute/sync", json!({"script":"mobile: getContexts","args":[]})).await?;
@@ -736,6 +745,40 @@ pub(super) fn routes() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn native_go_reuses_visible_tab_without_accumulating_tabs() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let navigations = Arc::new(AtomicUsize::new(0));
+        let count = navigations.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/test/execute/sync", post(|Json(v): Json<Value>| async move {
+                // Any deep link here would open another native tab instead of
+                // reusing the visible one, retaining its streaming connections.
+                if v["script"] == "return (document.visibilityState === 'visible');" {
+                    Json(json!({"value":true}))
+                } else {
+                    Json(json!({"value":{"error":"unexpected native tab creation"}}))
+                }
+            }))
+            .route("/session/test/url", post(move |Json(v): Json<Value>| {
+                let count = count.clone();
+                async move {
+                    assert!(v["url"].as_str().unwrap().starts_with("https://example.test/"));
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"value":null}))
+                }
+            }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let d = Driver {owner:"test-owner".into(),port,pid:0,id:"test".into(),udid:"device".into(),capabilities:Value::Null,native:true,child:None};
+        for n in 0..12 {
+            navigate(&d, &format!("https://example.test/{n}")).await.unwrap();
+        }
+        assert_eq!(navigations.load(Ordering::SeqCst), 12);
+        server.abort();
+    }
+
     #[tokio::test]
     async fn native_go_selects_visible_safari_and_hidden_input_never_dispatches() {
         use std::sync::{Arc, Mutex};

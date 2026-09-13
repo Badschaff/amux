@@ -2707,3 +2707,14 @@ CARD: AF-732
 SYMPTOM: After two successful native modal cases, Go exceeded its 35-second foreground-alignment deadline. A staged probe then measured native open at 114ms and context inventory at 9ms, but an old context returned 500 for its visibility read before the requested page was tried.
 COST: Board-focus and channel could not complete in the four-modal audit despite Safari displaying the requested app; earlier tab history poisoned new navigation.
 FIX: Prioritize the requested URL from Appium context metadata, then recent Safari contexts for redirects; do not scan oldest-first. Regression refuses unrelated contexts before the requested target. native_tab_aligned logs candidate count and URL-match verdict without URL contents. Native follow-up pending.
+
+## Repeated Simulator Go accumulates streaming Safari tabs
+AREA: browser
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-732
+SYMPTOM: Every explicit Go deep link opened another native Safari tab. Six test-origin connections remained open and later modal audit pages stalled blank, while the proxy still answered HTTP 200. Native alignment reported visible without proving page load success.
+COST: Complete modal audit stopped after three passes followed by repeated blank-page failures; native fixture tabs needed cleanup before further measurements.
+FIX: Reuse an already-visible debugger tab for URL navigation; retain native alignment only for hidden tabs. native_tab_reused logs measured population. Repeated-navigation regression first failed on unexpected deep-link creation; native proof pending.

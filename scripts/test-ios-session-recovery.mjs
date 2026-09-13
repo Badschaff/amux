@@ -77,6 +77,16 @@ try {
   await api('start', {udid: device, url: page});
   await until('window.fixtureRun', v => v === run);
   assert.equal(await evaluate('document.visibilityState'), 'visible');
+  const repeatedDriver = await ownedDriver();
+  const tabsBefore = await wd(repeatedDriver, '/window/handles', 'GET');
+  for (let index = 0; index < 12; index++) {
+    await api('start', {udid: device, url: page + '&repeat=' + index});
+    await until('window.fixtureRun', v => v === run);
+    assert.equal(await evaluate('document.visibilityState'), 'visible');
+  }
+  const tabsAfter = await wd(repeatedDriver, '/window/handles', 'GET');
+  assert.deepEqual(tabsAfter, tabsBefore, 'Repeated Go must reuse its visible Safari tab');
+  pass('Twelve repeated Go navigations load the fixture without adding Safari tabs');
   await api('action', {action: 'input', selector: '#text', text: 'native fixture'});
   await api('action', {action: 'click', selector: '#counter'});
   await until('document.querySelector("#value").textContent', v => v === 'native fixture');
