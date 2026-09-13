@@ -1510,3 +1510,25 @@ fn the_toolbar_icons_render_as_consistent_emoji() {
         "the bell must not carry an inline border:none — it beats the toolbar box border (AMUX-4475); got: {notif}"
     );
 }
+
+/// AMUX-4477: the MDAI viewer built a file's absolute path by joining the list
+/// path onto _AMUX_HOME ($HOME). But the list returns paths relative to the
+/// `.mdai` SCAN ROOT, which a `mdai_root` pref can move into a sub-vault (e.g.
+/// ~/.amux/local). There, joining onto $HOME produced /Users/x/Foo.mdai for a
+/// file at /Users/x/.amux/local/Foo.mdai, so EVERY open hit "no such path". The
+/// fix serves the real root as window._AMUX_MDAI_ROOT and _mdaiAbs prefers it.
+/// Pin both halves so a refactor cannot silently reintroduce the $HOME-only join.
+#[test]
+fn the_mdai_viewer_resolves_paths_against_the_scan_root() {
+    let js = asset("app.js");
+    let abs = regex::Regex::new(r"(?s)function _mdaiAbs\([^)]*\)\s*\{(.*?)\n\}")
+        .unwrap()
+        .captures(&js)
+        .map(|c| c[1].to_string())
+        .expect("_mdaiAbs must exist");
+    assert!(
+        abs.contains("_AMUX_MDAI_ROOT"),
+        "_mdaiAbs must join list paths onto _AMUX_MDAI_ROOT (the scan root), not just \
+         _AMUX_HOME, or every open under a mdai_root sub-vault hits 'no such path' (AMUX-4477)"
+    );
+}

@@ -10631,7 +10631,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.939';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.940';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -20411,8 +20411,13 @@ let _mdaiLastRun = null;  // last successful RunResult (for the upstream-node ch
 function _mdaiAbs(p) {
   if (!p) return p;
   if (p.charAt(0) === '/') return p;
-  const h = (window._AMUX_HOME || '').replace(/\/+$/, '');
-  return (h || '') + '/' + p.replace(/^\/+/, '');
+  // List paths are relative to the .mdai SCAN ROOT (_AMUX_MDAI_ROOT), which is
+  // $HOME unless a `mdai_root` pref points into a sub-vault (e.g. ~/.amux/local).
+  // Joining onto $HOME there produced /Users/x/Foo.mdai for a file that actually
+  // lives at /Users/x/.amux/local/Foo.mdai, so every open hit "no such path"
+  // (AMUX-4477). Prefer the real scan root; fall back to $HOME when unset.
+  const root = ((window._AMUX_MDAI_ROOT || window._AMUX_HOME || '')).replace(/\/+$/, '');
+  return (root || '') + '/' + p.replace(/^\/+/, '');
 }
 // Root-relative path (under the files root, $HOME) for the upload endpoint, which
 // is how a .mdai file is WRITTEN: PUT /api/file refuses the .mdai extension (its

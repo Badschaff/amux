@@ -221,6 +221,17 @@ fn mdai_root() -> PathBuf {
         .unwrap_or_else(|_| "/".into())
 }
 
+/// The resolved `.mdai` root as a string, for the serve-time client bootstrap
+/// (`window._AMUX_MDAI_ROOT`). The list endpoint returns paths relative to THIS
+/// root, but the Files API (`/api/file`) is rooted at `$HOME`; when a
+/// `mdai_root` pref moves the scan into a sub-vault (e.g. `~/.amux/local`), the
+/// client must join list paths onto this root, not `$HOME`, or every open hits
+/// "no such path" (AMUX-4477). Empty string is a safe signal to fall back to
+/// `_AMUX_HOME`.
+pub fn mdai_root_str() -> String {
+    mdai_root().to_string_lossy().into_owned()
+}
+
 /// The live `mdai_root` pref (a path), read with a short-lived read-only
 /// connection so this stays a sync free function; any error (no DB, no row,
 /// empty) returns None and the env/$HOME default applies.
