@@ -2675,3 +2675,14 @@ CARD: AF-772
 SYMPTOM: Full CI run34749407249 finished every test but terminal fixtures stubbed limit=200 while the client requested60, expected Tabs after a grid icon shipped, called unsupported mouse.wheel in mobile WebKit, and clicked an existing-install menu beneath a fresh walkthrough. A local all-project correction run also caught delayed history arriving before Safari dispatched the fixture's scroll event.
 COST: 39 terminal-product,3 tab-label,1 wheel and1 onboarding failures in the complete CI matrix; local evidence retained1 failing history reproduction,44/1 Safari and134/1 all-project runs before the final ordering correction. No elapsed-time estimate or product regression count inferred.
 FIX: AF-772 repairs scoped request/context/input prerequisites while retaining route-hit guards, attribution/buffering/visibility assertions and all3projects; measured input-method diagnostics distinguish positioned browser specimens from separately checked native Simulator swipes. Remaining browser failure families stay open under AF-748.
+
+## Lifecycle teardown refused its own delete and hid the original failure
+AREA: gates
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-773
+SYMPTOM: All6 worker-lifecycle failures in completed CI run34749407249 reported only left-worker-behind. The test asserted bareDELETE403, repeated that forbidden call in finally, then threw over the original error. Exact historical-body fault control lost ORIGINAL_MID_FLOW_FAILURE and kept its fixture worker. Corrected teardown exposed a hidden receipt-target span selected ahead of the visible worker card.
+COST: Six original CI failure causes were hidden, and refused cleanup could leave test-owned provider panes on the shared host. A fresh real desktop run spent30s on the hidden locator; its cleanup is independently confirmed absent with an exact tmux control. No claim about how many historical orphans remain.
+FIX: AF-773 gives exact-fixture teardown a separate budget and guarded POST, retains primary and cleanup errors, emits measured client-debug/CI evidence, and scopes the worker visibility assertion to its real fleet card. Five installed-runner controls pass; all-project product lifecycle results remain separately required.

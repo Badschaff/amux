@@ -21,10 +21,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Browser CI completion evidence controls (AF-768)
+      - name: Browser evidence and lifecycle cleanup controls (AF-768, AF-773)
         run: |
           npm ci --ignore-scripts
-          node --test tests/ci-e2e-evidence.test.mjs
+          node --test tests/ci-e2e-evidence.test.mjs tests/worker-lifecycle-cleanup.test.mjs
       # AF-148 / AMUX-3524 follow-up: a client JS change that ships WITHOUT a
       # version bump reaches no browser holding the cached script, and nothing
       # said so. dashboard_assets.rs pins that APP_VER and CACHE AGREE — but

@@ -7,7 +7,8 @@
 import type { Page } from '@playwright/test';
 // Use the shared fixture so isolated runs exercise candidate dashboard assets,
 // not whichever bundle the installed API binary happens to contain.
-import { test, expect } from './fixtures';
+import { expect } from './fixtures';
+import { test } from './worker-lifecycle-fixture';
 
 async function appToken(page: Page): Promise<string> {
   await page.goto('/');
@@ -17,7 +18,7 @@ async function appToken(page: Page): Promise<string> {
 }
 
 for (const modelFamily of ['sonnet', 'haiku']) {
-  test(`${modelFamily} worker goes create → run → prompt → peek → delete, and the board gates hold`, async ({ page, request }, testInfo) => {
+  test(`${modelFamily} worker goes create → run → prompt → peek → delete, and the board gates hold`, async ({ page, request, workerCleanup }, testInfo) => {
     // First-run boot is deliberately part of this journey. WebKit under the
     // full six-worker matrix once reached guarded delete at 30.1s, so the
     // generic 30s whole-test limit would make host load the verdict. Every
@@ -31,8 +32,9 @@ for (const modelFamily of ['sonnet', 'haiku']) {
     const prompt = `Lifecycle ${modelFamily} delivery probe ${worker}`;
     const workerAuth = { ...auth, 'X-Amux-Worker': worker };
     let card = '';
+    Object.assign(workerCleanup, { worker, auth, uiToken });
 
-    try {
+    {
       // ── CREATE, through the real dialog, on a named model ────────────────
       await page.addInitScript(() => {
         try { localStorage.setItem('amux_walkthrough_done', '1'); } catch (e) {}
@@ -73,11 +75,18 @@ for (const modelFamily of ['sonnet', 'haiku']) {
         message: 'the create-time prompt must be durably attributed to this worker',
         timeout: 30_000,
       }).toContain(prompt);
+      // Explicit negative-control invocation: fail after the real create/prompt
+      // boundary and require teardown to retain this error and remove the worker.
+      if (process.env.AMUX_E2E_LIFECYCLE_FAIL_AFTER_CREATE === '1') {
+        throw new Error(`INJECTED_LIFECYCLE_FAILURE_AFTER_CREATE ${worker}`);
+      }
 
       // ── VISIBLE WORKER AND STABLE TERMINAL ──────────────────────────────
       await page.reload();
       await page.waitForFunction(() => typeof (window as any).fetchSessions === 'function');
-      await expect(page.locator(`text=${worker}`).first()).toBeVisible({ timeout: 30_000 });
+      // The receipt panel also contains this name, including while collapsed.
+      // Assert the actual worker card, not the first matching text in the page.
+      await expect(page.locator(`.card[data-session="${worker}"] .card-name`)).toBeVisible({ timeout: 30_000 });
       await page.evaluate(name => (window as any).openPeek(name), worker);
       await expect.poll(async () => page.evaluate(
         () => (document.getElementById('peek-body') as HTMLElement).textContent!.length),
@@ -123,6 +132,7 @@ for (const modelFamily of ['sonnet', 'haiku']) {
       if (seen.size > 1) console.log('TERMINAL_LAYOUT_SAMPLES', JSON.stringify(samples));
       expect([...seen], `the terminal box must hold still while output streams\n${JSON.stringify(samples, null, 2)}`)
         .toHaveLength(1);
+      await page.screenshot({ path: testInfo.outputPath('worker-terminal.png') });
       await page.evaluate(() => (window as any).closePeek());
 
       // ── OWN-BOARD BOUNDARY AND RESOLVED COLUMN GATES ───────────────────
@@ -140,6 +150,7 @@ for (const modelFamily of ['sonnet', 'haiku']) {
       });
       expect(made.ok(), 'backlog must always accept a card').toBeTruthy();
       card = (await made.json()).id;
+      workerCleanup.card = card;
 
       const statuses = await (await request.get('/api/board/statuses', { headers: auth })).json();
       const contract = await (await request.get(
@@ -244,23 +255,7 @@ for (const modelFamily of ['sonnet', 'haiku']) {
       await page.reload();
       await page.waitForFunction(() => typeof (window as any).fetchSessions === 'function');
       await expect(page.locator('text=/Unsaved changes/')).toHaveCount(0);
-    } finally {
-      if (card) await request.delete(`/api/board/${card}`, { headers: auth }).catch(() => {});
-      // CLEANUP THAT CANNOT REPORT FAILURE IS NOT CLEANUP.
-      // This swallowed every error with `.catch(() => {})`, so a delete that
-      // never happened looked identical to one that did. Measured 2026-09-10:
-      // 25 `e2e-life-*` tmux panes were still alive on the host from earlier
-      // runs of this very spec, part of 40 orphans holding claude processes on
-      // a box at 95% swap where macOS was killing real workers. The runs went
-      // green the whole time.
-      const gone = await request
-        .delete(`/api/sessions/${worker}`, { headers: auth })
-        .then(() => request.get(`/api/sessions/${worker}`, { headers: auth }))
-        .then(r => r.status() === 404)
-        .catch(() => false);
-      // Fails the test rather than the host: a leaked worker is this spec's
-      // own defect, and the next run inherits it.
-      expect(gone, `left worker ${worker} behind — it holds a tmux pane and a claude process`).toBe(true);
+      await page.screenshot({ path: testInfo.outputPath('worker-deleted.png') });
     }
   });
 }

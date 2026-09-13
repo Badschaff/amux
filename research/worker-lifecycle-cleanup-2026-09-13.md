@@ -1,0 +1,27 @@
+# Worker lifecycle cleanup and original failures (AF-773)
+
+AF-768's complete CI matrix reported six worker-lifecycle failures only as leftover-worker errors. The spec asserted that UI-token-less DELETE is forbidden, then used the same forbidden DELETE in its finally block. The throwing cleanup assertion replaced earlier failures. This correction retains the actual UI create/delete and authorization refusals and makes teardown independently accountable.
+
+## Root correction
+
+worker-lifecycle-fixture.ts owns one exact generated e2e-life worker identity, browser API authorization/UI token and the card returned by this test's create. After the test, a separate 30-second Playwright fixture budget reads the worker, uses POST /api/sessions/<worker>/delete with the fixture UI token if present, then confirms GET404. An already-absent worker is measured without an unnecessary delete. Product authorization is unchanged. The old negative-control DELETE403 and real dashboard confirmation remain in the journey.
+
+The runner records test and teardown failures separately. A failed cleanup never overwrites the primary failure and cannot turn green. It records exact action/identity/status/body excerpts in the worker-lifecycle-cleanup attachment, stdout and the existing /api/client-debug primitive (kind e2e-worker-cleanup, measured, n_considered, verdict, errors). Beacon failures are visible warnings. Card cleanup errors are no longer swallowed. Namespace validation refuses ordinary fleet names.
+
+The first actual run with corrected teardown failed at the original selector: text=<worker>.first() found a hidden span.interaction-target in the collapsed receipt panel. The page snapshot also contained the visible fleet worker. Scope the visibility assertion to .card[data-session=<worker>] .card-name, preserving the same visible-worker requirement. Save terminal and post-delete screenshots for review.
+
+## Measured controls and remaining limits
+
+Artifacts are under scratch/af748-board-drain.
+
+- af773-legacy-control.test.mjs embeds the exact historical finally body from258e380b^ in an installed-Playwright HTTP control with an injected ORIGINAL_MID_FLOW_FAILURE. The preservation assertion fails:0 passed,1 failed. Its error list contains only left-worker-behind; bareDELETE is refused and the fixture worker remains. af773-legacy-red.log retains requests, report and residual identities.
+- node --test tests/worker-lifecycle-cleanup.test.mjs ->5 passed,0 failed. Actual installed Playwright runs test+teardown against a local HTTP fault fixture: original error plus successful removal; original and403 cleanup errors both preserved; cleanup-only refusal fails; alreadyabsent no delete; timeout still removed in separate teardown. A foreign sentinel survives every case with zero requests to its identity. These controls start no provider or browser and do not prove product authorization by themselves. checks.yml runs them alongside AF-768's actual-runner evidence controls.
+- First real isolated desktop Sonnet journey:1 failed at the hidden receipt selector, original error preserved. Actual cleanup log contains workerGET200, guardedPOST200 and subsequentGET404; same verdict appears in the isolated server log. Exact tmux has-session -t =amux-e2e-life-sonnet-desktop-1789294453169 ->exit1/cannotfindsession; live exact control =amux-amux-frustrations ->exit0. This verifies the first fixture's pane is gone, not all historical e2e orphans.
+- The real provider transcript hit the host's session limit. The lifecycle checks worker creation/model flags/durable prompt/terminal/board/delete behavior; it does not assert a completed model answer. No successful paid-model response or full production agent lifecycle is inferred from those assertions.
+- Full six-case all-project run after selector correction ->6 passed,0 failed (2.3m); each retained unauthorizedDELETE403, actual UI-confirmed delete, board refusals and exact gate acknowledgements. Exact host tmux readbacks ->6/6 test targets absent with a live positive control. First-run screenshot preservation was incomplete: the concurrent new runner controls inherited the repository cwd and default test-results output, overwriting three browser artifacts. The controls now pin both cwd and outputDir to their own temporary directory and assert the reported output path. The clean exact-commit lifecycle run will retain a fresh complete screenshot set.
+- Workflow control command node --test tests/ci-e2e-evidence.test.mjs tests/worker-lifecycle-cleanup.test.mjs ->18 passed,0 failed on final control bytes, including explicit output isolation (af773-workflow-final.log).
+- AMUX_E2E_LIFECYCLE_FAIL_AFTER_CREATE=1 with desktop Sonnet on the actual isolated server ->expected exit1 /1 failed, retaining INJECTED_LIFECYCLE_FAILURE_AFTER_CREATE. Cleanup read200/guardedPOST200/confirm404; no cleanup error. Subsequent exact tmux target absent with a live positive control, measured1/1 (af773-injected-real.log, af773-injected-verdict.json). The flag throws rather than skipping and never changes product behavior.
+
+Personally viewed the Safari Sonnet terminal and deleted-worker images: controls are visible and the final fleet is empty. The terminal image is a stopped/startup-command frame, not evidence of an actual model response; that limit remains explicit.
+
+No product runtime/deletion-policy change, fleet-worker cleanup, test skip or retry was added. AF-748's broader board drain and other browser failures remain unfinished.
