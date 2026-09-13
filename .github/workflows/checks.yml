@@ -305,6 +305,8 @@ jobs:
         run: |
           set -uo pipefail
           bash scripts/test-install-hook-source-ref.sh
+      - name: installer Rust builds exclude uncommitted shared-checkout sources
+        run: python3 scripts/test-install-committed-source.py
       - name: install advice does not linger after the install actually lands
         run: |
           set -uo pipefail

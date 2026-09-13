@@ -43,6 +43,20 @@ applies one exact string, runs the command, and reverts in a trap even if the
 command is killed. Do not use `cp file bak` on this shared checkout; it is a
 whole-file write and has reverted a peer's in-flight work twice.
 
+## Installer Rust source isolation (`install.sh`)
+
+```bash
+python3 scripts/test-install-committed-source.py
+```
+
+Pass: `install committed source: 33 passed, 0 failed`. This executes the actual
+installer in disposable Git fixtures, replacing only the compiler and first binary
+publication with controlled specimens. It covers committed/dirty/untracked source,
+a source HEAD change during compilation, a relative target, an unresolved index,
+missing Git and a failed build with stale artifacts. It does not deploy a server.
+The selected commit and excluded drafts self-announce in
+`~/.amux/logs/server-install.log` (or `$AMUX_HOME/logs/server-install.log`).
+
 ## Dashboard client JS (`crates/amux-dashboard/static`)
 
 ```bash

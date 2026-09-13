@@ -6,7 +6,7 @@
 # What it does, in order:
 #   1. checks prerequisites (rust toolchain, tmux; herdr is optional) —
 #      prompts before installing anything, never silently
-#   2. cargo build --release the workspace
+#   2. cargo build --release the workspace from a pinned committed snapshot
 #   3. installs the server, Rust CLI and validated Bash CLI into ~/.local/bin
 #   4. writes + loads the launchd agents (macOS): com.amux.server-rs on
 #      port 8824, and com.amux.server-rs-builder (auto-rebuild on new
@@ -60,6 +60,8 @@ PLIST_DIR="${AMUX_LAUNCHD_DIR:-$HOME/Library/LaunchAgents}"
 # empirically, not read off a doc), so this mirrors that order exactly.
 SHARED_TARGET_DIR="$AMUX_HOME/rust-build-target"
 TARGET_DIR="${CARGO_TARGET_DIR:-$SHARED_TARGET_DIR}"
+# Resolve a relative target against the checkout before the build changes cwd.
+case "$TARGET_DIR" in /*) ;; *) TARGET_DIR="$SCRIPT_DIR/$TARGET_DIR" ;; esac
 OS="$(uname -s)"
 
 echo "${BOLD}amux installer${RESET} (Rust server, port $PORT)"
@@ -173,9 +175,9 @@ fi
 
 echo ""
 echo "Building (cargo build --release --workspace) …"
-(cd "$SCRIPT_DIR" && CARGO_TARGET_DIR="$TARGET_DIR" \
-  CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-${AMUX_CARGO_JOBS:-2}}" \
-  ./scripts/safe-cargo.sh build --release --workspace)
+# AF-783: the shared checkout may contain another lane's uncommitted Rust,
+# migrations or embedded assets. Build a pinned HEAD snapshot, never those drafts.
+"$SCRIPT_DIR/scripts/build-install-from-head.sh" "$SCRIPT_DIR" "$TARGET_DIR"
 [[ -x "$TARGET_DIR/release/amux-server" ]] || die "build finished but $TARGET_DIR/release/amux-server is missing"
 [[ -x "$TARGET_DIR/release/amux-rs" ]]     || die "build finished but $TARGET_DIR/release/amux-rs is missing"
 say "built server + CLI"
