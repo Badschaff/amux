@@ -778,7 +778,7 @@
     "id": "LC-SYNC-PROGRESS",
     "surface": "Offline reconnect receipts",
     "actions": "Persist three edits offline. Reconnect and pause each transport step; acknowledge the first, conflict the second and acknowledge the third. Review the retained failure, retry it explicitly and reload. Also return uncertain native message submission.",
-    "expected": "Only acknowledged operations receive checkmarks. Running and failed rows remain distinct; failed results stay visible for review. Uncertain message text, attachment references and client identity remain durable without a false synced receipt. Earlier acknowledged rows remain visible across retries; a removed operation is skipped without a success checkmark.",
+    "expected": "Only acknowledged operations receive checkmarks. Running and failed rows remain distinct; failed results stay visible for review. Uncertain message text, attachment references and client identity remain durable without a false synced receipt. Earlier acknowledged rows remain visible across retries; a removed operation is skipped without a success checkmark. Detailed sync errors and retry/discard actions belong in the connection/sync modal, not an expanded worker-list panel. Operation labels describe the board edit or worker message without exposing raw HTTP methods/API paths. Include pending file uploads in any total that claims to cover all pending work. This visual requirement remains failed in the September 13 rerun (LW-12); transport assertions alone do not cover it.",
     "sources": [
       "e2e/lifecycle/sync-progress.spec.ts",
       "tests/dashboard-outage-recovery.mjs"

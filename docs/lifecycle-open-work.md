@@ -1,6 +1,6 @@
 # Lifecycle status and closure checklist
 
-Updated September 12, 2026. See the [steering and sync validation](lifecycle-validation-2026-09-12.md) for the latest candidate, runtime fixes and explicit native-run limits. Tracking work: **AMUX-4417**.
+Updated September 13, 2026. See the [steering and sync validation](lifecycle-validation-2026-09-12.md) for the latest candidate, runtime fixes and explicit native-run limits. Tracking work: **AMUX-4417**.
 The expanded [cold offline reconnect validation](lifecycle-offline-validation-2026-09-12.md) covers cached UI edits, messages, large files and per-operation checkmarks.
 Overall status: **INCOMPLETE**. This register covers all known unresolved items
 from the mobile messaging, board, Sonnet and Gemini lifecycle work. It is not a
@@ -171,3 +171,9 @@ worker consumption or a fully reconciled server effect graph. Their classificati
 remains open. The September 12 offline artifact logs preserve the observations.
 
 September 12 continuation: the live server at `fb7d746c` remained healthy but admission still denied new workers (memory pressure warn, approximately 42 GB of swap). No fresh native worker was launched or counted as a pass. See [helper failure validation](lifecycle-helper-validation-2026-09-12.md).
+
+## September 13 transport rerun and visual gap
+
+The [fresh pinned-release run](lifecycle-offline-validation-2026-09-13.md) passed nine selected browser cases and 46 outbox contracts. It does not certify the full lifecycle.
+
+**LW-12 — FAILED: offline error presentation.** Opened screenshots show an expanded worker-list error panel in addition to the reconnect checklist. Raw PATCH/POST paths appear as operation labels; the upper panel counts five JSON operations while the checklist includes seven operations with two files. Move detailed errors/retry/discard actions into the connection/sync modal, use task/message labels, and clearly scope or unify counts. Assert the worker list stays usable offline, modal actions still work, and file/message/edit checkmarks remain truthful. LC-SYNC-PROGRESS now names these visual requirements; no presentation repair is claimed here.

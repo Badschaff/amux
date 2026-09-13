@@ -2709,3 +2709,14 @@ CARD: AMUX-4417
 SYMPTOM: Real child regressions show a large unread prompt blocks before the timeout starts, full stdout/stderr pipes deadlock before exit, and inherited pipes block after the parent exits. All three tests failed before the transport fix.
 COST: Capture/classification calls can occupy helper slots beyond their promised deadline; all three failures were reproduced without launching a native worker.
 FIX: Nonblocking concurrent stdin/stdout/stderr under one deadline, isolated helper-group cleanup, explicit bounded output retention and partial-input failure; LC-HELPER-FAILURE now includes these cases.
+
+## Offline recovery passes transport checks while its error UI still dominates Workers
+AREA: ui
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: codex-server-sync
+CARD: AMUX-4417
+SYMPTOM: Fresh desktop/mobile/WebKit transport tests pass, but opened screenshots show the expanded worker-list error panel that Ethan requested inside the sync modal, raw HTTP operation labels, and a five-operation count above a seven-operation checklist including files.
+COST: Nine green automated cases did not establish the requested visual behavior; eight screenshots were inspected and the missing acceptance requirements recorded as LW-12. No data loss was observed in this selected run.
+FIX: Pending: modal-only detailed errors with reachable retry/discard, readable operation labels, and consistently scoped pending totals; retain individual acknowledgement checks.
