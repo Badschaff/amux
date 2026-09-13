@@ -2586,3 +2586,14 @@ CARD: AF-397
 SYMPTOM: The scan-cap test sets process-wide AMUX_LATENCY_SCAN_CAP=200 while other tests use the same environment. A clean0c79fc53 rollup test given that value reproduces the reported empty findings: expected1, got0. Only20 baseline rows survive, below the detector's per-family minimum. An earlier separate window override was removed, but this fixture still changed global state.
 COST: Historical CI failures were charged to unrelated pushes; this audit needed a clean controlled reproduction and a scoped134-test run before the old flaky-test card could be assessed honestly.
 FIX: Pass the fixture's scan cap directly to the shared detector implementation, snapshot the production limit once, and include scan_cap with the considered/excluded population in the INFO log. Awaiting commit, clean gates and independent review.
+
+## Manual board claims still count a capture that automatic pickup exempts
+AREA: board
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AMUX-3757
+SYMPTOM: Current-source audit of the reopened manual-claim report found PATCH and the ready frontier still count an unanswered capture in Doing, while automatic pickup and status-update claims exempt it. Two isolated API regressions on bc0003b8 failed: PATCH refused with WC-1 as its sole holder, and the frontier advertised zero capacity for the ready real task. This is the manual-path recurrence, distinct from the old automatic-pickup entry retained in the archive.
+COST: The reopened card remained actionable despite its earlier fix and archive; the audit required two failing API specimens and inspection of five independently maintained holder queries before the mismatch was bounded.
+FIX: Share the canonical WIP-holder predicate across all five consumers, retain reshaped work as WIP, and emit measured capture-exemption and failed-query signals. Draft regressions pass; publication, independent review and live adoption remain to be recorded on the card.

@@ -1692,6 +1692,54 @@ pub(crate) fn doing_is_unblocked(conn: &Connection, row: &bs::IssueRow) -> bool 
         && deps_blocking(conn, row).is_empty()
 }
 
+/// AMUX-3757: manual claims, status claims, frontier capacity and pickup must
+/// agree about which Doing rows hold a slot. Read the real capture predicate,
+/// including its whitespace handling, instead of maintaining SQL lookalikes.
+pub(crate) fn wip_holding_ids(
+    conn: &Connection,
+    session: &str,
+    excluding: Option<&str>,
+) -> rusqlite::Result<Vec<String>> {
+    let result = (|| {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM issues WHERE session=?1 AND status='doing' \
+             AND deleted IS NULL AND COALESCE(archived,0)=0 \
+             AND (?2 IS NULL OR id<>?2) ORDER BY id",
+        )?;
+        let ids = stmt.query_map(rusqlite::params![session, excluding], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let n_considered = ids.len();
+        let mut capture_shells = 0usize;
+        let mut holding = Vec::new();
+        for id in ids {
+            let Some(row) = bs::get_issue(conn, &id)? else { continue };
+            if bs::is_capture_shell(&row) {
+                capture_shells += 1;
+                continue;
+            }
+            if matches!(row.item_type.as_str(), "tripwire" | "watch" | "epic")
+                || row.tags.iter().any(|t| t.to_ascii_lowercase().starts_with("needs:you"))
+                || !doing_is_unblocked(conn, &row)
+            {
+                continue;
+            }
+            holding.push(id);
+        }
+        if capture_shells > 0 {
+            tracing::info!(session, measured = true, n_considered, capture_shells,
+                n_holding = holding.len(), verdict = "capture_shells_exempt",
+                "board WIP: unanswered captures do not occupy work slots");
+        }
+        Ok(holding)
+    })();
+    if let Err(ref error) = result {
+        tracing::warn!(session, measured = false, n_considered = 0,
+            why_unmeasured = %error, verdict = "wip_unmeasured",
+            "board WIP: capacity could not be read");
+    }
+    result
+}
+
 /// For a set of blocking dep ids, return the subset that are `backlog` cards
 /// owned by `session`. These are self-resolvable: the lane can promote them
 /// to `todo` itself without any human or cross-lane action.
@@ -3232,29 +3280,13 @@ pub fn select_pickup_with(
     // matching and start counting again, which is correct: at that point it IS
     // a unit of work.
     let cap = wip_cap();
-    let holding: Vec<String> = conn
-        .prepare(
-            "SELECT id FROM issues WHERE session=?1 AND status='doing' AND deleted IS NULL \
-             AND COALESCE(archived,0)=0 AND COALESCE(type,'') NOT IN ('tripwire','watch','epic') \
-             AND NOT (creator='amux' AND substr(COALESCE(\"desc\",''), 1, 11) = '**Prompt:**') \
-             AND COALESCE(blocked_on,'') = '' \
-             AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=issues.id \
-                             AND lower(t.tag) LIKE 'needs:you%') \
-             ORDER BY id",
-        )
-        .and_then(|mut st| {
-            st.query_map(rusqlite::params![session], |r| r.get::<_, String>(0))
-                .map(|rows| rows.flatten().collect::<Vec<_>>())
-        })
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|id| {
-            bs::get_issue(conn, id)
-                .ok()
-                .flatten()
-                .is_some_and(|row| doing_is_unblocked(conn, &row))
-        })
-        .collect();
+    let holding = match wip_holding_ids(conn, session, None) {
+        Ok(holding) => holding,
+        Err(error) => return Pickup::None {
+            reason: "wip-unmeasured",
+            detail: format!("could not measure WIP capacity: {error}"),
+        },
+    };
     if holding.len() as i64 >= cap {
         // AT THE CAP IS NOT A REASON TO LEAVE THE QUEUE BROKEN (AMUX-4040).
         // This promotion claims nothing and takes no slot; skipping it is what
@@ -5878,14 +5910,7 @@ async fn reconcile_child_task_claim(state: &AppState, lane: &str) -> ChildClaimR
             {
                 return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
             }
-            let other_wip: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM issues WHERE session=?1 AND id<>?2 \
-                 AND status='doing' AND deleted IS NULL AND COALESCE(archived,0)=0 \
-                 AND COALESCE(type,'') NOT IN ('tripwire','watch','epic')",
-                rusqlite::params![&lane_w, &card],
-                |row| row.get(0),
-            )?;
-            if other_wip > 0 {
+            if !wip_holding_ids(conn, &lane_w, Some(&card))?.is_empty() {
                 return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
             }
             let opts = crate::db::advance::AdvanceOpts {
@@ -11000,6 +11025,60 @@ mod tests {
                 claimed(&other)
             ),
         }
+    }
+
+    #[test]
+    fn wip_capacity_uses_the_capture_predicate_and_rejects_an_unreadable_population() {
+        let conn = board_db();
+        add_card(&conn, "C-1", "lane", "doing", "Unanswered", "\n  **Prompt:** continue");
+        conn.execute("UPDATE issues SET creator='amux' WHERE id='C-1'", []).unwrap();
+        assert!(wip_holding_ids(&conn, "lane", None).unwrap().is_empty(),
+            "WIP must use is_capture_shell's whitespace handling too");
+        conn.execute("UPDATE issues SET \"desc\"='SCOPE: real work' WHERE id='C-1'", []).unwrap();
+        assert_eq!(wip_holding_ids(&conn, "lane", None).unwrap(), vec!["C-1"]);
+        assert!(wip_holding_ids(&conn, "lane", Some("C-1")).unwrap().is_empty());
+
+        let unreadable = Connection::open_in_memory().unwrap();
+        assert!(wip_holding_ids(&unreadable, "lane", None).is_err(),
+            "a missing population must not masquerade as free capacity");
+        match select_pickup_with(&unreadable, "lane", now_f64(), false) {
+            Pickup::None { reason, .. } => assert_eq!(reason, "wip-unmeasured"),
+            _ => panic!("unreadable WIP must not permit a pickup"),
+        }
+    }
+
+    #[test]
+    fn wip_exemptions_and_failed_measurements_write_distinct_log_signals() {
+        #[derive(Clone)]
+        struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = bytes.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || Sink(sink.clone()))
+            .finish();
+        let conn = board_db();
+        add_card(&conn, "C-1", "lane", "doing", "Unanswered", "**Prompt:** continue");
+        conn.execute("UPDATE issues SET creator='amux' WHERE id='C-1'", []).unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(wip_holding_ids(&conn, "lane", None).unwrap().is_empty());
+            assert!(wip_holding_ids(&Connection::open_in_memory().unwrap(), "lane", None).is_err());
+        });
+        let log = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("capture_shells_exempt") && log.contains("measured=true")
+            && log.contains("n_considered=1") && log.contains("capture_shells=1")
+            && log.contains("n_holding=0"), "{log}");
+        assert!(log.contains("wip_unmeasured") && log.contains("measured=false")
+            && log.contains("why_unmeasured="), "{log}");
     }
 
     /// AMUX-3758. The number that answers "we need to rethink how we do amux

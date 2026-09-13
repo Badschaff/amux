@@ -6033,3 +6033,67 @@ async fn changed_verified_gate_preserves_history_and_rejects_the_old_checklist()
     let (_, _, checked) = send(&app, "GET", &other_path, None).await;
     assert_eq!(checked["verification"]["state"], "current");
 }
+
+fn capture_wip_fixture() -> (axum::Router, std::sync::Arc<Store>, tempfile::TempDir) {
+    let (app, store, dir) = app_with_store();
+    store.write(|conn| {
+        // Seed both rows directly so create's capture-folding cannot erase the
+        // specimen before the claim path under test sees it.
+        conn.execute_batch(
+            "INSERT INTO issues (id,title,\"desc\",status,session,type,creator,owner_type,created,updated)
+             VALUES ('WC-1','Unanswered prompt','**Prompt:** keep working','doing','capture-wip-api','code','amux','agent',1000,1000),
+                    ('WC-2','Real next task','SCOPE: fix the parser','todo','capture-wip-api','code','capture-wip-api','agent',1001,1001);"
+        )?;
+        Ok(amux_server::db::WriteOutcome { applied: true, events: vec![] })
+    }).unwrap();
+    (app, store, dir)
+}
+
+/// AMUX-3757: manual claims must use the same WIP exemption as pickup.
+#[tokio::test]
+async fn capture_shell_does_not_block_patch_claim_but_reshaped_work_does() {
+    let (app, store, _dir) = capture_wip_fixture();
+    let (st, _, body) = send_with(
+        &app, "PATCH", "/api/board/WC-2",
+        Some(json!({"status":"doing", "gate_ack":true})),
+        &[("X-Amux-Worker", "capture-wip-api")],
+    ).await;
+    assert_eq!(st, StatusCode::OK, "an unanswered capture must not block PATCH: {body}");
+    let (_, _, capture) = send(&app, "GET", "/api/board/WC-1", None).await;
+    assert_eq!(capture["status"], json!("doing"), "exemption must not discard the prompt");
+    assert_eq!(capture["desc"], json!("**Prompt:** keep working"));
+
+    store.write(|conn| {
+        conn.execute("UPDATE issues SET status='todo' WHERE id='WC-2'", [])?;
+        conn.execute("UPDATE issues SET \"desc\"='SCOPE: implement the first task' WHERE id='WC-1'", [])?;
+        Ok(amux_server::db::WriteOutcome { applied: true, events: vec![] })
+    }).unwrap();
+    let (st, _, body) = send_with(
+        &app, "PATCH", "/api/board/WC-2",
+        Some(json!({"status":"doing", "gate_ack":true})),
+        &[("X-Amux-Worker", "capture-wip-api")],
+    ).await;
+    assert_eq!(st, StatusCode::CONFLICT, "reshaped work must retain WIP: {body}");
+    assert_eq!(body["holding"], json!(["WC-1"]));
+    let (_, _, next) = send(&app, "GET", "/api/board/WC-2", None).await;
+    assert_eq!(next["status"], json!("todo"), "a refused claim must not mutate status");
+}
+
+#[tokio::test]
+async fn capture_shell_frontier_and_status_claim_agree_with_patch() {
+    let (app, _store, _dir) = capture_wip_fixture();
+    let (st, _, ready) = send(&app, "GET", "/api/board/ready?session=capture-wip-api", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(ready["measured"], json!(true), "{ready}");
+    assert_eq!(ready["wip"]["holding"], json!([]), "frontier must exempt the same capture: {ready}");
+    assert_eq!(ready["wip"]["available"], json!(1), "{ready}");
+    assert_eq!(ready["claimable_now"], json!(1), "the ready view must offer the real task: {ready}");
+    let (st, _, claim) = send_with(
+        &app, "POST", "/api/board/WC-2/status-update",
+        Some(json!({"text":"Implementing the parser now."})),
+        &[("X-Amux-Worker", "capture-wip-api")],
+    ).await;
+    assert_eq!(st, StatusCode::OK, "{claim}");
+    assert_eq!(claim["claimed"], json!(true), "status update must agree with the frontier: {claim}");
+    assert_eq!(claim["status"], json!("doing"));
+}

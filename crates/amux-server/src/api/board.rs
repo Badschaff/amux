@@ -719,7 +719,8 @@ async fn ready_frontier(
         "ready": f.ready,
         "claimable_now": f.claimable_now,
         "wip": {"doing": f.holding.len(), "cap": f.wip_cap, "available": f.wip_available,
-                "holding": f.holding},
+                "holding": f.holding, "measured": f.wip_measured,
+                "why_unmeasured": if f.wip_measured { None } else { Some("WIP capacity query failed; claims are unavailable") }},
         "excluded": {
             "blocked_by_deps": f.blocked_by_deps,
             "blocked_by_parked_dep": f.blocked_by_parked_dep,
@@ -984,6 +985,7 @@ pub(crate) struct LaneFrontier {
     pub claimable_now: usize,
     pub wip_cap: usize,
     pub wip_available: usize,
+    pub wip_measured: bool,
     pub holding: Vec<String>,
     pub blocked_by_deps: usize,
     /// Of `blocked_by_deps`, the ones whose blocker CANNOT clear on its own:
@@ -1004,19 +1006,11 @@ pub(crate) fn lane_frontier(
     // same type exclusions, same archived/deleted filter. A frontier that
     // disagreed with the gate would offer cards the gate then refuses, which is
     // the view/mechanism split ethos rule 1 is about.
-    let holding: Vec<String> = conn
-        .prepare(
-            "SELECT id FROM issues WHERE session = ?1 AND status = 'doing' \
-               AND deleted IS NULL AND COALESCE(archived,0) = 0 \
-               AND COALESCE(type,'') NOT IN ('tripwire','watch','epic') ORDER BY id",
-        )
-        .and_then(|mut st| {
-            st.query_map(rusqlite::params![lane], |r| r.get::<_, String>(0))
-                .map(|rows| rows.filter_map(Result::ok).collect())
-        })
-        .unwrap_or_default();
+    let holding_result = crate::runtime_jobs::board_drive::wip_holding_ids(conn, lane, None);
+    let wip_measured = holding_result.is_ok();
+    let holding = holding_result.unwrap_or_default();
     let cap = crate::runtime_jobs::board_drive::wip_cap().max(0) as usize;
-    let available = cap.saturating_sub(holding.len());
+    let available = if wip_measured { cap.saturating_sub(holding.len()) } else { 0 };
 
     // Candidates: claimable cards this lane owns. `todo` only — `backlog` is
     // parked on a trigger and `review` is somebody else's turn.
@@ -1103,6 +1097,7 @@ pub(crate) fn lane_frontier(
         ready,
         wip_cap: cap,
         wip_available: available,
+        wip_measured,
         holding,
         blocked_by_deps,
         blocked_by_parked_dep,
@@ -9710,21 +9705,9 @@ pub async fn patch_item(
                         && !override_doing
                     {
                         if let Some(sess) = next.session.as_deref().filter(|s| !s.is_empty()) {
-                            let holding: Vec<String> = conn
-                                .prepare(
-                                    "SELECT id FROM issues WHERE session = ?1 \
-                                     AND status = 'doing' AND id != ?2 \
-                                     AND deleted IS NULL AND COALESCE(archived,0) = 0 \
-                                     AND COALESCE(type,'') NOT IN ('tripwire','watch','epic') \
-                                     ORDER BY id",
-                                )
-                                .and_then(|mut st| {
-                                    st.query_map(rusqlite::params![sess, next.id], |r| {
-                                        r.get::<_, String>(0)
-                                    })
-                                    .map(|rows| rows.filter_map(Result::ok).collect())
-                                })
-                                .unwrap_or_default();
+                            let holding = crate::runtime_jobs::board_drive::wip_holding_ids(
+                                conn, sess, Some(&next.id),
+                            )?;
                             if !holding.is_empty() {
                                 return finish(
                                     &slot_w,
@@ -13555,15 +13538,9 @@ async fn apply_status_update(
         {
             "continuation_missing".to_string()
         } else {
-            let holding: Vec<String> = conn.prepare(
-                "SELECT id FROM issues WHERE session=?1 AND status='doing' AND id!=?2 \
-                 AND deleted IS NULL AND COALESCE(archived,0)=0 \
-                 AND COALESCE(type,'') NOT IN ('tripwire','watch','epic') \
-                 AND NOT (creator='amux' AND substr(COALESCE(\"desc\",''),1,11)='**Prompt:**') \
-                 AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=issues.id \
-                                 AND lower(t.tag) LIKE 'needs:you%') ORDER BY id"
-            )?.query_map(rusqlite::params![&actor, &id], |r| r.get::<_, String>(0))?
-                .filter_map(Result::ok).collect();
+            let holding = crate::runtime_jobs::board_drive::wip_holding_ids(
+                conn, &actor, Some(&id),
+            )?;
             if !holding.is_empty() {
                 "wip_conflict".to_string()
             } else {
