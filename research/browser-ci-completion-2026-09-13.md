@@ -1,0 +1,15 @@
+# AF-768: bounded browser CI with complete result accounting
+
+The ecd36b56 browser job 103697706086 ran from 08:19:29Z to 08:49:44Z, ending cancelled. Golden scenarios began at 08:24:11Z with 1,011 tests and two workers. No final test verdict or trace upload survived. This matches the workflow's 30-minute deadline; the retained evidence does not independently distinguish a manual cancellation from every timeout source. Injected browser error beacons are not failing test assertions.
+
+The workflow now splits the same suite into four Playwright shards, retains two workers per shard and disables matrix fail-fast. There are no project/testMatch filters, no new retries, and no fullyParallel change. File/test-group ordering stays under Playwright's existing policy. A 20-minute runner deadline inside the 30-minute job leaves about five minutes after the observed five-minute setup for finalization and upload. Cold setup or hard runner loss can still prevent uploads; missing artifacts fail the aggregate gate rather than imply success. The new budget is a candidate pending an actual complete GitHub run, not a measured performance guarantee.
+
+The reporter writes a full planned manifest at onBegin and appends started/finished operands during execution. It records project/title/id, actual and expected status, outcome, errors, retry and duration. A new run removes the prior final record. Hard interruption preserves the last complete events; a truncated line fails parsing visibly. Final status is separate from test completion. The aggregate e2e job collects the full unfiltered manifest anew and requires its exact identity union, every shard, unique completion for every planned case, passed final statuses and successful setup/test jobs. Expected failures and explicit skips are counted separately; all-skipped, list-only, zero, interrupted and incomplete runs fail. Diagnostics use e2e_evidence_started/e2e_evidence_verdict with measured and n_considered in CI logs and uploaded JSON, giving a sweep named unfinished operands instead of a missing summary.
+
+Local evidence:
+- node --test tests/ci-e2e-evidence.test.mjs: 13 passed, 0 failed. Twelve direct reporter/validator controls plus actual installed Playwright execution of pass, injected assertion failure, global timeout, and list-only modes. The latter three cannot bless completion.
+- Actual full and four sharded `npx playwright test --config e2e/playwright.config.ts --list`: 1,011 full; 254/253/266/238 shards; 1,011 unique IDs; exact disjoint union; desktop/mobile/ios-safari present. Saved scratch/af748-board-drain/af768-lists/coverage.json. Lists are coverage plans, not execution proof.
+
+This changes CI/reporting only. It does not fix product assertions exposed when the full matrix finally completes, certify native iOS lifecycle behavior, or close AF-748. Fresh GitHub completion and independent review remain required. Existing Rust host-admission failures and AF-757 are separate.
+
+Playwright primary references: https://playwright.dev/docs/test-sharding and https://playwright.dev/docs/api/class-reporter.

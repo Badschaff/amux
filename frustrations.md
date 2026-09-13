@@ -2642,3 +2642,14 @@ CARD: AF-766
 SYMPTOM: Final ecd36b56 Rust CI failed2376passed1failed8ignored: the idle follow-up GET returned the explicit concurrent discovery epoch500 at workers.rs2537. Only the first GET had bounded retries. A one-shot idle middleware refusal reproduced0passed1failed locally.
 COST: Published corrections cannot satisfy their CI verification gate; required a fresh deterministic reproduction and another clean publication.
 FIX: Use one bounded fixture reader for both phases, retain unrelated500 and exhausted-churn failures, and emit stage/attempt test-log diagnostics. Keep AF-757 quota fixture contamination separate. Validation and independent review pending.
+
+## Browser CI reaches its job deadline without a final test population verdict
+AREA: gates
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-768
+SYMPTOM: ecd36b56 job 103697706086 cancelled after 30 minutes; 1,011 tests started with two workers but no final summary or failure-only artifact upload survived. Deadline is consistent with the observed timing, not independently proven as the only cancellation cause.
+COST: One 30-minute CI attempt produced no complete browser verdict and blocked honest verification of AF-762, AF-766 and AMUX-4487.
+FIX: Four unchanged-population shards, a shorter runner deadline and incremental completion evidence with full-union validation; local 13/0 controls and 1,011-test disjoint union pass. Fresh complete GitHub execution and independent review remain outstanding.
