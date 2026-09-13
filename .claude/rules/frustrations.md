@@ -91,8 +91,8 @@ push blocked, a card closed that should not have been. "Annoying" is not a cost.
 
 ## Retiring an entry — the three dispositions
 
-An entry leaves `frustrations.md` only when the session that ORIGINATED it says the
-friction is gone. Use `scripts/frustrations-archive.py`, which moves it to
+An entry leaves `frustrations.md` when its originating session validates it, or
+under Ethan’s 2026-09-11 **RETIRE ON EVIDENCE** decision (AF-352) below. Use `scripts/frustrations-archive.py`, which moves it to
 `frustrations-archive.md`, stamps who signed off, and carries the SYMPTOM and COST onto
 the card (AF-38's rule — the card is where someone hitting it again looks).
 
@@ -133,19 +133,19 @@ lesson was encoded in a replacement, and because the card "closed on something e
 (three independent confirmations of that last shape). None of those are readable from a
 status field.
 
-**Some entries have no validatable author, and that is not yours to resolve.** A session
-that was a subagent, a one-off `claude` invocation, or a lane on another machine cannot
-sign anything off. Neither can an **isolated raw-agent worker** (the harness is stripped;
-sends carrying a worker origin are refused and only the owner can reach it from the
-dashboard), and that fourth kind is the one that fools you: it is RUNNING and it is right
-there in `/api/sessions`, so the natural test — is the author still alive? — answers yes
-and you plan a handoff that cannot be delivered. LIVE IS NOT VALIDATABLE. The session
-payload already carries `isolated`; read it, or discover it from a refused send after you
-have written the message (amux-frustrations, 2026-08-28, four `desktop` entries).
-A CARD IS NOT A SUBSTITUTE: both of those read `verified`, set by the author themselves,
-and the rule above still stands — card status is not evidence. Do not retire those on your
-own judgement — that is deciding another
-party's work is finished (ethos rule 8). Surface them and let the owner decide.
+**Gone or isolated author: retire objective claims on evidence (AF-352).** Ethan
+resolved this on 2026-09-11: independently check current code, actual command
+output, or whether the scoped fix landed. Archive an objectively satisfied claim
+with the actual verifier's name and command/result evidence; do not impersonate
+the author or use board status as proof. This supersedes the older instruction to
+leave every unreachable author's entry waiting for a decision.
+
+Subjective questions such as “is this still friction for you?” remain open: another
+worker cannot answer those on the author's behalf. A live isolated worker can still
+be unreachable; read `isolated` rather than attempting a prohibited peer send.
+Keep a disproven mechanism `SUPERSEDED`, a demonstrated fix `VALIDATED`, and a live
+or unmeasured claim in the ledger. Ledger retirement does not waive any board gate
+or constitute independent peer verification of the verifier's own code.
 
 ## Then act on it
 

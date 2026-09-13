@@ -12,11 +12,11 @@ restore/remove cycle run three times before anyone noticed. So the archive is no
 sentiment: it is the thing that makes "was this lost or was it finished?"
 answerable by a grep instead of by reading git history.
 
-Every archived entry carries a VALIDATED line naming WHO signed it off and when.
-The protocol's whole point is that the originating session is the only party who
-can say an entry is done (AC-227: an entry marked fixed by somebody who was not
-its author, over a card that had only half shipped), so an archive move with no
-name on it would launder exactly the thing the protocol forbids.
+Every archived entry names the actual verifier and evidence. Ethan's 2026-09-11
+RETIRE ON EVIDENCE decision (AF-352) permits independent verification of objective
+claims from gone or isolated authors. Subjective claims still need their author;
+board status alone is never evidence. This supersedes the original author-only
+rule quoted above. See `.claude/rules/frustrations.md` for the complete protocol.
 
 Usage:
     scripts/frustrations-archive.py <line> <validated-by> <evidence...>
@@ -47,9 +47,11 @@ ARCHIVE = ROOT / "frustrations-archive.md"
 
 ARCHIVE_HEADER = """# amux frustrations: archive
 
-Entries retired from [`frustrations.md`](frustrations.md). An entry lands here only
-when the session that ORIGINATED it said the friction is gone; the `VALIDATED:` line
-names who said so and on what evidence.
+Entries retired from [`frustrations.md`](frustrations.md). The originating session
+validates the claim, or an independent verifier checks an objective claim from a
+gone/isolated author under Ethan’s AF-352 decision (2026-09-11). `VALIDATED:` names
+the actual verifier and evidence; `SUPERSEDED:` preserves a disproven mechanism.
+Subjective claims remain open without their author’s validation.
 
 This file exists so that "was this entry lost, or was it finished?" is a grep rather
 than an archaeology exercise. A set-difference over the ledger alone cannot see a
@@ -181,7 +183,7 @@ def carry_to_card(block, who, superseded=False):
     if superseded:
         note = ("\n\n=== SUPERSEDED-ENTRY TEXT PRESERVED (AF-38's rule) ===\n"
                 f"Archived out of frustrations.md by {who}, marked SUPERSEDED — the entry's\n"
-                "MECHANISM was WRONG and a later entry carries the corrected diagnosis. It is\n"
+                "MECHANISM was WRONG and subsequent evidence corrects the diagnosis. It is\n"
                 "kept so the wrong theory stays visible as a DEAD HYPOTHESIS (ethos rule 7:\n"
                 "record which hypotheses are dead, not only which one was right), and so\n"
                 "nobody re-derives it. Do NOT read the text below as a confirmed defect.\n\n"

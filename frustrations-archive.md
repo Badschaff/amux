@@ -1,8 +1,10 @@
 # amux frustrations: archive
 
-Entries retired from [`frustrations.md`](frustrations.md). An entry lands here only
-when the session that ORIGINATED it said the friction is gone; the `VALIDATED:` line
-names who said so and on what evidence.
+Entries retired from [`frustrations.md`](frustrations.md). The originating session
+validates the claim, or an independent verifier checks an objective claim from a
+gone/isolated author under Ethan’s AF-352 decision (2026-09-11). `VALIDATED:` names
+the actual verifier and evidence; `SUPERSEDED:` preserves a disproven mechanism.
+Subjective claims remain open without their author’s validation.
 
 This file exists so that "was this entry lost, or was it finished?" is a grep rather
 than an archaeology exercise. A set-difference over the ledger alone cannot see a
@@ -9770,3 +9772,25 @@ CARD: AMUX-4409
 SYMPTOM: Two archive fixtures omitted the now-required authorizer; the Python boundary capture still expected env-only group membership. The browser error guard also found a new profile-merge join error rendered without the shared cause formatter, and the tmux target audit found a stale-pane cleanup using prefix matching.
 COST: Five integration failures obscured the mobile acceptance verdict; a stale cleanup target could match a sibling session. Mobile subagent fixtures also used 1970 timestamps despite the current freshness filter, and repeated large-file fixtures consumed test disk space.
 FIX: Name the fixture owner for intentional archive actions, retain the historical capture while explicitly pinning the evolved native-worker group contracts, use with_cause for the join error, and build the cleanup target with session_target for exact matching. Refresh active-agent fixture timestamps, keep a stale-agent negative control, and release generated large uploads after recording their hashes. Existing denial, error-chain and target-audit controls remain in place.
+
+## The rust request log recorded a ~15-second restart choreography as a 76ms request
+SUPERSEDED: amux-frustrations | SUPERSEDED on the recorded author's retraction, not certified as a fixed latency bug. amux board show AR-111 (2026-09-12) reads: ts=unix_now() is captured before next.run and latency_ms=started.elapsed() after; the 76ms row belonged to a different request after a mid-request restart. Author concluded no code change needed. Independent current-source probe at ff807707: CARGO_TARGET_DIR=/Users/ethan/.amux/rust-build-target scripts/safe-cargo.sh test --manifest-path scratch/modal-push-check/Cargo.toml -p amux-server --lib request_becomes_row_with_attribution_latency_and_answered_by -- --test-threads=1 -> 1 passed, 0 failed, 0.36s (scratch/ios-simulator-review/drain-request-timing-proof.log). This exercises a delayed handler and asserts the persisted latency; middleware brackets next.run. This does NOT certify preservation of an in-flight request row across process termination. Actual verifier: amux-frustrations, under AF-352 RETIRE ON EVIDENCE; no author signature forged and no board Verified transition.
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-09
+SESSION: amux-rust (lifecycle-fix subagent)
+CARD: AR-111
+SYMPTOM: Forensics on the amux start incident: `_amux_request_log` shows
+  `PATCH /api/sessions/amux/config` at ts 19:10:35 with latency 76.26ms — but the SAME
+  request wrote its "Captured before model swap" log marker at 19:10:20 and the env
+  header at 19:10:35.42, i.e. the handler ran a synchronous ~15s stop/relaunch
+  choreography that the request log renders as a sub-100ms call. Whatever the
+  middleware stamps (completion-time ts + an inner-layer latency, or a batched flush
+  clock), a long-running request is indistinguishable from a fast one.
+COST: ~30 minutes of incident reconstruction chasing a phantom second actor, because
+  the timeline read as "capture at :20 cannot belong to a 76ms request at :35" — the
+  instrument manufactured a contradiction that had to be disproved with three other
+  artifacts (env header, session log markers, session_events).
+FIX: request-log middleware should stamp arrival ts and wall-clock latency around the
+  WHOLE handler future; a restart choreography should be a visibly long row.
