@@ -274,6 +274,7 @@ for (const modelFamily of ['sonnet', 'haiku']) {
       await page.screenshot({ path: testInfo.outputPath('worker-deleted.png') });
       const beacon = await request.post('/api/client-debug', { headers: auth, data: deletionEvidence, timeout: 5000 });
       expect(beacon.ok(), 'deletion visibility diagnostic must reach amux logs').toBeTruthy();
+      expect(deletionEvidence.visible_cards, 'final measured view must exclude the deleted worker').toBe(0);
       expect(measured, 'deletion evidence requires a successful array list read').toBe(true);
       expect(deletionEvidence.list_contains_worker, 'deleted worker must be absent from the API list').toBe(false);
       await expect(page.locator('text=/Unsaved changes/')).toHaveCount(0);
