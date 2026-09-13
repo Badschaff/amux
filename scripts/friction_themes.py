@@ -648,6 +648,25 @@ def shingle(text, n=5):
     # the same instruction sent to five lanes.
 
 
+# An attachment's storage path is transport metadata, not repeated human prose.
+# Keep ordinary filesystem instructions intact; only strip amux @-upload refs.
+UPLOAD_REFERENCE = re.compile(r"@/(?:[^\s/]+/)*\.amux/uploads/[^\s]+")
+
+
+def log_attachment_exclusion(considered, excluded):
+    event = {"event": "friction_attachment_metadata_excluded", "measured": True,
+             "n_considered": considered, "ignored_upload_references": excluded,
+             "ts": int(time.time())}
+    try:
+        folder = os.path.join(os.environ.get("AMUX_HOME", os.path.expanduser("~/.amux")), "logs")
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, "friction-sweep.log"), "a") as stream:
+            stream.write(json.dumps(event, sort_keys=True) + "\n")
+    except OSError as error:
+        print(json.dumps({**event, "event": "friction_audit_unavailable",
+                          "reason": type(error).__name__}), file=sys.stderr)
+
+
 def signal_cross_lane_repeat(con, now_ms):
     if con is None:
         return [Signal("cross-lane-repeat", "both", "Same ask sent to multiple lanes",
@@ -662,8 +681,11 @@ def signal_cross_lane_repeat(con, now_ms):
                "The same instruction sent to two or more different lanes",
                n_considered=len(rows))
     shingles = defaultdict(list)
+    ignored_upload_references = 0
     for r in rows:
-        instr = instruction_of(r["text"])
+        own_text, excluded = UPLOAD_REFERENCE.subn("", r["text"] or "")
+        ignored_upload_references += excluded
+        instr = instruction_of(own_text)
         if len(instr) < 40:
             continue
         for sh in shingle(instr):
@@ -688,8 +710,14 @@ def signal_cross_lane_repeat(con, now_ms):
             "text": (hits[0]["text"] or "")[:200],
         })
     s.evidence.sort(key=lambda e: (not e["cross_repo"], -len(e["lanes"])))
+    evidence_repos = {repo for e in s.evidence for repo in e["repos"]}
+    s.repo_scope = "both" if {"amux", "mixpeek"} <= evidence_repos else (
+        "amux" if "amux" in evidence_repos else "mixpeek" if "mixpeek" in evidence_repos else "other")
     s.active = s.value > 0
-    s.detail = {"cross_repo_instances": sum(1 for e in s.evidence if e["cross_repo"])}
+    s.detail = {"cross_repo_instances": sum(1 for e in s.evidence if e["cross_repo"]),
+                "ignored_upload_references": ignored_upload_references}
+    if ignored_upload_references:
+        log_attachment_exclusion(len(rows), ignored_upload_references)
     return [s]
 
 

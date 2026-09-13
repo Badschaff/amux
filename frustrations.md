@@ -2946,3 +2946,14 @@ CARD: AF-785
 SYMPTOM: Creating explicit ledger fix records waited tens of seconds per request. create_item called semantic plan while holding the lane lock, then always discarded its decision when graph/gate/scheduling metadata required a separate structured record. The branch-order regression measured one comparison invocation where zero was required.
 COST: The ledger mapping paused after three creates instead of repeating this cost across the remaining100 records; an attempted atomic decomposition correctly refused the manually created epic and was not bypassed.
 FIX: Decide the existing structured-create policy before invoking its comparison closure; keep ordinary semantic reconciliation and WIP/ownership guards. Emit measured structured_create with model_called=false and candidate_population_measured=false; do not claim a semantic comparison ran. Red control0/1, corrected intake3/0; release and live adoption still pending under AF-785.
+
+## Upload storage paths masquerade as repeated instructions across repos
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-888
+SYMPTOM: friction_themes.py reported eight cross-lane repeated instructions, including three cross-repo groups, over 115 messages. Seven groups matched only common amux upload-path tokens in unrelated screenshot requests. Even after filtering those paths, the signal kept its literal both-repos scope for one genuine amux-only toolbar request.
+COST: The daily sweep would prescribe a global rule for a class manufactured from transport metadata. Extra manual message inspection was needed to reject the signal.
+FIX: Strip only amux @-upload references before phrase extraction, derive scope from all surviving evidence, and report excluded-reference counts in the signal and friction-sweep.log. Actual SQL-signal tests must retain genuine repeated instructions and ordinary filesystem prose while rejecting screenshot-only matches. Originating-session validation and resolved verification gates remain required before retirement.

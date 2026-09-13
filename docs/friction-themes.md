@@ -96,8 +96,8 @@ scope was assessed on amux evidence and is re-measured across both repos daily.
 SCOPE: both
 STATUS: open
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-09-08
-OCCURRENCES: 5
+LAST_SEEN: 2026-09-13
+OCCURRENCES: 6
 SIGNALS: board-resting:*, rule-restatement:backlog-growth
 FIX_SITE: crates/amux-server/src/api/board*, plus a runtime job
 CARDS: AF-317
@@ -124,6 +124,14 @@ Re-measured 2026-09-08: `board-resting:mixpeek:blocked` is 40 cards, median age
 `growing: true`. The median age keeps climbing (32.8d on 09-04, 34.9d on 09-06,
 36.8d today) and is again the oldest resting queue in this file, so the queue is
 not draining and turning over, it is aging in place.
+
+Re-measured 2026-09-13: `board-resting:mixpeek:todo` is 43 live cards versus
+40 seven days earlier (+3), median 15.9 days, 40/43 over a week, oldest 44.6
+days. This is a recurrence of the existing accumulation class, not proof that
+any particular blocked task should close or that AF-317's entry gate regressed.
+No peer cards or ownership changed. No new prose or duplicate mechanism card;
+AF-317 remains the existing entry-gate reference, with standing-population behavior
+still an open theme. The sweep records this bounded verdict on AF-887.
 
 ## `needsyou` is the cheap escape hatch, so the real asks are buried
 SCOPE: both
@@ -387,11 +395,11 @@ message seven hours before the complaint.
 SCOPE: both
 STATUS: open
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-09-08
-OCCURRENCES: 6
+LAST_SEEN: 2026-09-13
+OCCURRENCES: 7
 SIGNALS: ledger-cluster:instruments, rule-restatement:instrument-lies
 FIX_SITE: the `measured`/`n_considered` contract + `tests/diagnostic_contract.rs`
-CARDS: AF-320, AF-394
+CARDS: AF-320, AF-394, AF-888
 EVIDENCE: 41 of 83 amux ledger entries are an instrument that could not express
 its own failure. Re-measured 2026-08-30 across both repos: 99 open entries in
 this class, 19 amux / 80 Mixpeek. The contract is enforced for new amux
@@ -473,6 +481,19 @@ flag, including the top four by n. AF-585.
 
 This is the theme's own shape applied to the tool that measures the theme, and
 it is the reason today's two loudest signals did not increment as breadth.
+
+Re-measured 2026-09-13: the sweep instrument again supplied its own positive
+specimen. On one read transaction over 115 human messages, `cross-lane-repeat`
+reported 8 groups, including 3 crossing repos. Seven groups were amux attachment
+storage paths shared by unrelated requests, not repeated instructions. Excluding
+30 `@.../.amux/uploads/...` references leaves 1 real repeated toolbar request
+(MSG-59371/MSG-59372), confined to amux. The previous literal `both` scope would
+still have promoted that residual to a global concern; scope now derives from
+all surviving evidence. AF-888 fixes the extraction/scope mechanism, with actual
+SQL-signal negative controls and excluded-reference counts in `friction-sweep.log`.
+No extra global prose: the existing rule already says to separate metadata from
+evidence, and a regression test now holds the caller to that distinction.
+The false cross-repo groups do not increment the status-poller theme.
 
 ## A fix ships, its tests pass, and it does nothing in production
 SCOPE: amux
