@@ -91,8 +91,14 @@ push blocked, a card closed that should not have been. "Annoying" is not a cost.
 
 ## Retiring an entry — the three dispositions
 
-An entry leaves `frustrations.md` when its originating session validates it, or
-under Ethan’s 2026-09-11 **RETIRE ON EVIDENCE** decision (AF-352) below. Use `scripts/frustrations-archive.py`, which moves it to
+Ethan’s latest instruction (2026-09-13, AF-780) requires the originating session
+to validate the exact entry and explicitly agree it is complete. Every entry must
+retain its originating `SESSION` and link a concrete issue on the
+amux-frustrations board. Mark that issue Verified only after the agreement and
+all resolved board gates hold; then remove the active entry. This supersedes the
+older AF-352 independent-retirement exception for this drain. Preserve ambiguous
+original labels while investigating their identity; never substitute a publishing
+committer or a new worker as the original author. Use `scripts/frustrations-archive.py`, which moves it to
 `frustrations-archive.md`, stamps who signed off, and carries the SYMPTOM and COST onto
 the card (AF-38's rule — the card is where someone hitting it again looks).
 
@@ -133,19 +139,14 @@ lesson was encoded in a replacement, and because the card "closed on something e
 (three independent confirmations of that last shape). None of those are readable from a
 status field.
 
-**Gone or isolated author: retire objective claims on evidence (AF-352).** Ethan
-resolved this on 2026-09-11: independently check current code, actual command
-output, or whether the scoped fix landed. Archive an objectively satisfied claim
-with the actual verifier's name and command/result evidence; do not impersonate
-the author or use board status as proof. This supersedes the older instruction to
-leave every unreachable author's entry waiting for a decision.
-
-Subjective questions such as “is this still friction for you?” remain open: another
-worker cannot answer those on the author's behalf. A live isolated worker can still
-be unreachable; read `isolated` rather than attempting a prohibited peer send.
-Keep a disproven mechanism `SUPERSEDED`, a demonstrated fix `VALIDATED`, and a live
-or unmeasured claim in the ledger. Ledger retirement does not waive any board gate
-or constitute independent peer verification of the verifier's own code.
+**Gone or isolated author: retain the unresolved entry (AF-780).** Preserve any
+actual earlier originating-session validation and check what it covers. If no
+such agreement exists, continue independent implementation and evidence gathering,
+but leave Verified and retirement pending. Do not impersonate the author or infer
+agreement from card status. A live isolated worker can still be unreachable; read
+`isolated` rather than attempting a prohibited peer send. The former AF-352 policy
+allowed objective retirement by a different verifier; the latest owner instruction
+above supersedes that exception for this drain.
 
 ## Then act on it
 
