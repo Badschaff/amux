@@ -2990,3 +2990,14 @@ CARD: AF-890
 SYMPTOM: The nudge-no-movement theme signal counted 8 board-drive pickup messages plus 8 substantive peer messages as 16 nudges for mixpeek-security. It called zero terminal closures no queue movement even though cards moved to explicit external-wait states.
 COST: A collaboration-heavy lane was presented as a stuck nudge loop, inviting an unsupported fleet mechanism diagnosis and needless inspection of peer work.
 FIX: Count only the actual board-drive pickup producer toward the nudge threshold, retain peer traffic separately, and state that nonterminal movement is unmeasured. Actual SQL tests retain a ten-nudge positive control and a terminal-completion control; friction_nudge_population records both populations. Origin validation and resolved verification gates remain required before retirement.
+
+## A corruption fixture races the status hook's durable acknowledgement
+AREA: testing
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-892
+SYMPTOM: The status-hook durability fixture writes corrupt bytes directly into a live queue after observing the HTTP request, before the asynchronous acknowledgement is necessarily persisted. A controlled lock schedule shows the old raw write overwritten with an empty queue; the corruption assertion can then fail despite no production regression. CI5f036682 exited1 inside this section without naming its failed assertion; exact historical failing line remains unknown.
+COST: The checks gate is red and the log only says exit1 after the preceding successful cell, requiring source inspection and an independent concurrency control to discriminate fixture timing from hook behavior.
+FIX: Serialize corruption injection through the actual queue lock and atomically replace fixture bytes, retaining byte/schema preservation assertions. Add an ERR diagnostic naming the fixture line and command. The controlled old write loses the bytes; the corrected writer preserves them. This establishes a real fixture race, not the exact schedule of the historical CI failure. Origin validation and all resolved gates remain required before retirement.
