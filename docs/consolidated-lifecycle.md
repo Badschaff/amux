@@ -734,6 +734,16 @@ Pass requires: Unsuccessful classifier processes never count as measured decisio
 
 Supporting coverage: `crates/amux-server/src/api/mdai.rs`, `crates/amux-server/src/api/board_intake.rs`, `e2e/lifecycle/live-semantic-messages.spec.ts`.
 
+The pipe-I/O regression matrix also exercises two MiB prompts, simultaneous input
+and output, 512 KiB each on stdout/stderr, unread stdin, and descendants retaining
+pipes after their parent exits. Require one deadline for the whole exchange,
+explicit output-limit failure, preserved quota diagnostics after early input
+closure, and a live unrelated peer after cleanup. `AMUX_HELPER_OUTPUT_MAX_BYTES`
+sets the combined stdout/stderr retention budget (positive bytes, default 8 MiB).
+Over-budget output fails instead of becoming a truncated model decision. Helper
+process groups are isolated at spawn; timeout cleanup cannot target the server's
+or a worker's process group. No reader or writer thread outlives the call.
+
 ### LC-TOKEN-EFFICIENCY — Measured tokens per completed outcome
 
 Run matched scratch workloads before and after an optimization with the same provider/model, input files, gate criteria and output checks. Record native-worker and helper calls separately, input/output/cache tokens when reported, task/message growth and elapsed time. Include a completed coordination chain with three quiet board-driver cycles. This is guided measurement, not an existing automated benchmark.

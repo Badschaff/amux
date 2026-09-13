@@ -820,50 +820,48 @@ fn complete_cli(model: &str, prompt: &str, read_only: bool) -> Result<String, St
         run_cli_command(cmd, &cli, prompt, std::time::Duration::from_secs(MODEL_TIMEOUT_S))
 }
 
-fn run_cli_command(mut cmd: std::process::Command, cli: &str, prompt: &str, budget: std::time::Duration) -> Result<String, String> {
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| {
+mod helper_io;
+
+fn run_cli_command(cmd: std::process::Command, cli: &str, prompt: &str, budget: std::time::Duration) -> Result<String, String> {
+        let limit = std::env::var("AMUX_HELPER_OUTPUT_MAX_BYTES").ok()
+            .and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0)
+            .unwrap_or(8 * 1024 * 1024);
+        let out = match helper_io::run(cmd, prompt.as_bytes(), budget, limit) {
+            Ok(out) => out,
+            Err(helper_io::Error::Spawn(e)) => {
                 tracing::warn!(target: "amux::model_helper", helper = cli, error = %e,
                     verdict = "helper_spawn_failed", measured = false, n_considered = 0,
                     "model helper did not start");
-                format!("could not run {cli}: {e}")
-            })?;
-        // Write the prompt to stdin, then close it so the CLI knows input is done.
-        if let Some(mut stdin) = child.stdin.take() {
-            use std::io::Write;
-            // Write in a separate scope so stdin is dropped (closed) promptly.
-            let _ = stdin.write_all(prompt.as_bytes());
-        }
-        let deadline = std::time::Instant::now() + budget;
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) => {
-                    if std::time::Instant::now() >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        tracing::warn!(target: "amux::model_helper", helper = cli,
-                            verdict = "helper_timeout", measured = true, n_considered = 1,
-                            budget_ms = budget.as_millis() as u64,
-                            "model helper exceeded its deadline and was reaped");
-                        return Err(model_timeout_msg(cli));
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                Err(e) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    tracing::warn!(target: "amux::model_helper", helper = cli, error = %e,
-                        verdict = "helper_wait_failed", measured = true, n_considered = 1,
-                        "model helper status could not be read");
-                    return Err(format!("{cli} failed: {e}"));
-                }
+                return Err(format!("could not run {cli}: {e}"));
             }
-        }
-        let out = child
-            .wait_with_output()
-            .map_err(|e| format!("{cli} failed: {e}"))?;
+            Err(helper_io::Error::Timeout { written, stdout, stderr }) => {
+                tracing::warn!(target: "amux::model_helper", helper = cli,
+                    verdict = "helper_timeout", measured = true, n_considered = 1,
+                    budget_ms = budget.as_millis() as u64, stdin_bytes = written,
+                    stdout_bytes = stdout, stderr_bytes = stderr,
+                    "model helper exceeded its pipe I/O deadline");
+                return Err(model_timeout_msg(cli));
+            }
+            Err(helper_io::Error::OutputLimit { limit }) => {
+                tracing::warn!(target: "amux::model_helper", helper = cli,
+                    verdict = "helper_output_limit", measured = true, n_considered = 1,
+                    max_output_bytes = limit, "model helper exceeded its output retention budget");
+                return Err(format!("{cli} exceeded AMUX_HELPER_OUTPUT_MAX_BYTES ({limit} bytes); no answer accepted"));
+            }
+            Err(helper_io::Error::IncompleteInput { written, total }) => {
+                tracing::warn!(target: "amux::model_helper", helper = cli,
+                    verdict = "helper_stdin_incomplete", measured = true, n_considered = 1,
+                    stdin_bytes = written, prompt_bytes = total,
+                    "model helper exited before the complete prompt was written");
+                return Err(format!("{cli} exited before the complete prompt was written ({written}/{total} bytes)"));
+            }
+            Err(helper_io::Error::Io(e)) => {
+                tracing::warn!(target: "amux::model_helper", helper = cli, error = %e,
+                    verdict = "helper_io_failed", measured = true, n_considered = 1,
+                    "model helper pipe I/O failed");
+                return Err(format!("{cli} pipe I/O failed: {e}"));
+            }
+        };
         let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
         let stderr = String::from_utf8_lossy(&out.stderr);
         if !out.status.success() {
@@ -2107,7 +2105,7 @@ mod tests {
     #[cfg(unix)]
     fn helper_fixture(script: &str, budget: std::time::Duration) -> Result<String, String> {
         let mut cmd = std::process::Command::new("/bin/sh");
-        cmd.args(["-c", script]).stdin(std::process::Stdio::piped())
+        cmd.args(["-c", &format!("cat >/dev/null; {script}")]).stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
         run_cli_command(cmd, "fixture-helper", "classify this request", budget)
     }
@@ -2160,6 +2158,34 @@ mod tests {
         // SAFETY: status is writable; WNOHANG only inspects this fixture's child.
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) }, -1, "timed-out child was left unreaped");
         assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_io_drains_large_stdout_and_stderr_before_waiting_for_exit() {
+        let out = helper_fixture("dd if=/dev/zero bs=65536 count=8 2>/dev/null; dd if=/dev/zero bs=65536 count=8 2>/dev/null | cat >&2", std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(out.len(), 8 * 65536);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_io_deadline_covers_a_prompt_the_child_never_reads() {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "exec sleep 2"]).stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        let start = std::time::Instant::now();
+        let error = run_cli_command(cmd, "fixture-helper", &"x".repeat(2 * 1024 * 1024), std::time::Duration::from_millis(100)).unwrap_err();
+        assert!(start.elapsed() < std::time::Duration::from_millis(1500), "prompt write escaped the deadline");
+        assert!(matches!(classify_model_err(error), MdaiError::ModelTimeout(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_io_deadline_covers_inherited_output_after_parent_exit() {
+        let start = std::time::Instant::now();
+        let result = helper_fixture("sleep 2 & printf done", std::time::Duration::from_millis(100));
+        assert!(start.elapsed() < std::time::Duration::from_millis(1500), "inherited output escaped the deadline");
+        assert!(matches!(classify_model_err(result.unwrap_err()), MdaiError::ModelTimeout(_)));
     }
 
     #[cfg(unix)]

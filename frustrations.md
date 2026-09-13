@@ -2698,3 +2698,14 @@ CARD: AF-773
 SYMPTOM: Exact d5293449 lifecycle matrix reported6 passed, but Safari Haiku worker-deleted.png still showed the deleted worker as WORKING. The test waited for a function definition and absence of an unrelated modal after reload, without requiring fresh session data or the actual card to disappear.
 COST: One misleading deletion screenshot in a green six-case matrix; independent visual inspection and two focused browser probes were needed before closure.
 FIX: Await the current list refresh and assert exact UI/API absence, with measured deletion-view evidence in client-debug and screenshots. Frozen stale-list negative control fails expected0/received1 while API membership is false; clean matrix and independent review pending.
+
+## Helper pipe I/O escapes the model deadline
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-13
+SESSION: codex-server-sync
+CARD: AMUX-4417
+SYMPTOM: Real child regressions show a large unread prompt blocks before the timeout starts, full stdout/stderr pipes deadlock before exit, and inherited pipes block after the parent exits. All three tests failed before the transport fix.
+COST: Capture/classification calls can occupy helper slots beyond their promised deadline; all three failures were reproduced without launching a native worker.
+FIX: Nonblocking concurrent stdin/stdout/stderr under one deadline, isolated helper-group cleanup, explicit bounded output retention and partial-input failure; LC-HELPER-FAILURE now includes these cases.

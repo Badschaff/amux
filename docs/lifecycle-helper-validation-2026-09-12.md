@@ -118,3 +118,7 @@ bash scripts/mutate.sh run crates/amux-server/build.rs \
 [Portable gate counts, source hashes and native prerequisite receipt](evidence/lifecycle-helper-cargo-2026-09-12.json).
 The cache timing measures Cargo reuse, not native-model token savings. Both changes
 retain the host's worker admission guard and the configured Cargo resource bounds.
+
+The remaining pipe-I/O gap above is addressed in the
+[September 13 helper I/O validation](lifecycle-helper-io-validation-2026-09-13.md).
+Native provider recovery and semantic task outcomes remain separate prerequisites.
