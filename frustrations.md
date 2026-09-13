@@ -2620,3 +2620,14 @@ CARD: AMUX-4486
 SYMPTOM: Six exact original delivered messages survive with no card_id, but existing history append/import creates new rows and automatic semantic recapture can claim historical work as newly active. The reviewer can identify existing work but cannot record that judgment against the original source with the supported history API.
 COST: The original-operand reconciliation remains blocked after the bounded cancellation fix; a missing-route negative control fails with404, and a draft retry action had to be replaced because it could create false current task claims.
 FIX: Add an explicit audited PUT history/{id}/card that preserves owner/status/delivery, rejects conflicting linkage, and atomically records original source plus rationale. Transaction failure produces a measured WARN and rolls back the link. Publication and live six-message reconciliation remain pending.
+
+## Recovery health budget is shorter than its permitted attempt
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AMUX-4487
+SYMPTOM: Live c6242e22/build36e3f03eb7487ab1 registers message-capture with interval30s and stale_after90s but allows120s per attempt. A read shows in_flight true, last_tick_age90.96s, last_tick_ms120003.61 and status hung; its missing catalog row also reports documented false and purpose null.
+COST: The first deployment verification found a falsely unhealthy job during its own permitted runtime and an undocumented background loop, requiring a follow-up before the feature can be described as operationally coherent.
+FIX: Use a90s cadence whose existing health budget240s covers both a90s idle interval and the120s attempt bound, share the job ID with its catalog and publish the real disable control. Regression checks the actual registry budget against the source constants; startup INFO records both budgets with measured/count. Pending work success and original six-link reconciliation remain separate.

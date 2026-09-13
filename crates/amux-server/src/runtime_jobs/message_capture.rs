@@ -1,6 +1,10 @@
 //! Resume pending board consequences, never the commands that produced them.
 use crate::api::{session_verbs, AppState};
-const JOB: &str = "message-capture";
+const JOB: &str = super::registry::ids::MESSAGE_CAPTURE;
+// The registry's health budget must exceed one permitted recovery attempt.
+// A30s cadence had a90s budget and mislabeled bounded120s reads as hung.
+const TICK_SECONDS: u64 = 90;
+const ATTEMPT_SECONDS: u64 = 120;
 
 #[cfg(test)]
 pub(crate) async fn tick(state: &AppState) {
@@ -32,7 +36,7 @@ async fn tick_after(state: &AppState, after: i64) -> i64 {
                 let state = state.clone();
                 jobs.spawn(async move {
                     if tokio::time::timeout(
-                        std::time::Duration::from_secs(120),
+                        std::time::Duration::from_secs(ATTEMPT_SECONDS),
                         session_verbs::capture_recorded_message(&state, id),
                     )
                     .await
@@ -68,8 +72,12 @@ pub fn spawn(state: AppState) -> super::PeriodicTask {
     // Rotate across retained pending rows, including failed rows. A poisoned
     // first batch must not starve newer messages. Restart resets only the scan
     // cursor; the pending work itself lives in the database.
+    tracing::info!(job=JOB, interval_s=TICK_SECONDS, attempt_timeout_s=ATTEMPT_SECONDS,
+        health_budget_s=super::registry::stall_after_s(TICK_SECONDS as f64),
+        measured=true, n_considered=1, verdict="capture_recovery_configured",
+        "capture recovery cadence includes its bounded attempt budget");
     let cursor = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
-    super::spawn_periodic(JOB, 30, move || {
+    super::spawn_periodic(JOB, TICK_SECONDS, move || {
         let state = state.clone();
         let cursor = cursor.clone();
         async move {
@@ -87,6 +95,23 @@ mod tests {
     use crate::db::WriteOutcome;
     use std::sync::{Arc, Mutex};
     use tracing::instrument::WithSubscriber;
+
+    #[test]
+    fn bounded_attempt_fits_the_registered_health_budget() {
+        assert!(
+            super::super::registry::stall_after_s(TICK_SECONDS as f64) > (TICK_SECONDS + ATTEMPT_SECONDS) as f64,
+            "normal idle interval plus permitted attempt must fit the health budget"
+        );
+        assert_eq!(super::super::registry::doc_for(JOB).unwrap().name, "Message capture recovery");
+        let facts = super::super::registry::Facts {
+            spawned:true, interval_s:Some(TICK_SECONDS as f64), spawned_at:Some(0.0),
+            last_tick_at:Some(0.0), in_flight_since:Some(TICK_SECONDS as f64),
+            instrumented:true, ..Default::default()
+        };
+        assert_eq!(super::super::registry::classify(&facts, (TICK_SECONDS+ATTEMPT_SECONDS) as f64), "ok");
+        let deadline = TICK_SECONDS as f64 + super::super::registry::stall_after_s(TICK_SECONDS as f64);
+        assert_eq!(super::super::registry::classify(&facts, deadline+1.0), "hung", "a real overrun must still be detected");
+    }
 
     fn fixture() -> (AppState, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();

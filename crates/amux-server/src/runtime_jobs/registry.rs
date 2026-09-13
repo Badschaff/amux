@@ -117,6 +117,7 @@ pub mod ids {
     pub const TELEGRAM_POLL: &str = "telegram-poll";
     pub const TELEGRAM_RELAY: &str = "telegram-relay";
     pub const QUEUE_DISPOSITION: &str = "queue-disposition";
+    pub const MESSAGE_CAPTURE: &str = "message-capture";
     pub const MAC_HEALTH: &str = "mac-health";
     pub const ACCOUNTABILITY_NUDGE: &str = "accountability-nudge";
     pub const CONTEXT_HEALTH: &str = "context-health";
@@ -159,6 +160,7 @@ pub const ALL_IDS: &[&str] = &[
     ids::TELEGRAM_POLL,
     ids::TELEGRAM_RELAY,
     ids::QUEUE_DISPOSITION,
+    ids::MESSAGE_CAPTURE,
     ids::MAC_HEALTH,
     ids::ACCOUNTABILITY_NUDGE,
     ids::CONTEXT_HEALTH,
@@ -314,6 +316,18 @@ pub const CATALOG: &[Doc] = &[
         ],
         pref: None,
         detail: Some("/api/debug/downtime"),
+    },
+    Doc {
+        id: ids::MESSAGE_CAPTURE,
+        name: "Message capture recovery",
+        purpose: "Resumes durable pending message-to-card capture after interruption, using the original history row and semantic intake without resending commands. Historical unlinked messages require explicit reviewed attribution.",
+        env: &[EnvControl {
+            var: "AMUX_MESSAGE_CAPTURE_SECS",
+            effect: "0 disables recovery; otherwise the loop runs every 90 seconds (positive values do not change its interval)",
+            off: Some("0"),
+        }],
+        pref: None,
+        detail: Some("/api/history"),
     },
     Doc {
         id: ids::QUEUE_DISPOSITION,

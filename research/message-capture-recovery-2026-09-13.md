@@ -21,3 +21,11 @@ Validation so far:
 - Clean workspace gates and independent review are pending at this writing; durable board evidence will record exact results.
 
 Scope limits: reopening a temporary database is not a fresh OS-process lifecycle test. These are source/server tests, not mobile/desktop visual verification. The six original messages 59384, 59391, 59392, 59397, 59416 and 59446 require full-source review and explicit reconciliation; this migration deliberately does not backfill them. Neither AMUX-4486 nor the full AF-748 board drain is complete on this patch alone.
+
+## Live registry follow-up
+
+The pushed c6242e22 was observed live at stable build36e3f03eb7487ab1 with message-capture spawned and ticking. Runtime registration worked, but its catalog row was missing: documented=false, purpose=null and no displayed disable control. The follow-up centralizes the job ID in the existing registry and adds its purpose and AMUX_MESSAGE_CAPTURE_SECS=0 control. Positive values do not configure the fixed cadence.
+
+A subsequent same-build observation showed in_flight=true, last_tick_age_s90.96, last_tick_ms120003.61 and status=hung. The30second cadence implies a90second health threshold, shorter than the permitted120second attempt. A90second cadence gives the unchanged registry rule a240second budget, covering both a normal90second idle interval and the120second attempt. A60second draft was insufficient: its165second budget did not cover both periods. Attempt timeout remains120seconds; no global threshold is relaxed.
+
+Named source constants drive the runtime and a regression that calls the actual registry classifier. Normal idle+attempt must remain ok; a real overrun must still be hung. Restoring the old30second cadence must fail. A startup INFO records interval, attempt timeout, health budget and measured/count fields. This does not claim pending model work succeeded. Original six-link reconciliation and AF-758's inherited attribution boundary remain separate.
