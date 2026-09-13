@@ -1706,6 +1706,73 @@ function showToast(msg) {
   }, 3000);
 }
 
+// AF-754: the guide renders production classes, so it cannot quietly become a second theme.
+function openStyleGuide() {
+  closeSettings();
+  if (document.getElementById('ui-guide-overlay')) return;
+  const overlay = document.createElement('div');
+  overlay.id = 'ui-guide-overlay'; overlay.className = 'modal-overlay active';
+  overlay.dataset.originalLight = String(document.body.classList.contains('light'));
+  overlay.innerHTML = `<section class="modal ui-guide" role="dialog" aria-modal="true" aria-labelledby="ui-guide-title">
+    <header class="modal-header"><div><h3 id="ui-guide-title">Style guide</h3><p class="ui-help">The components used throughout amux</p></div><button class="modal-close" aria-label="Close style guide" onclick="closeStyleGuide()">×</button></header>
+    <div class="modal-body">
+      <section class="ui-guide-section"><h4>One shared visual language</h4><p class="ui-help">Original icons. Clear actions. Compact layouts with room to tap. These examples use the same CSS as the app; preview changes here before applying them across screens.</p><div class="ui-guide-row"><button id="ui-guide-theme" class="btn" onclick="_uiGuideTheme()">Preview other theme</button><span class="ui-help">Theme preview is restored when you close this guide.</span></div></section>
+      <section class="ui-guide-section"><h4>Color and surfaces</h4><div class="ui-guide-grid">${['bg','card','text','dim','accent','green','red','yellow'].map(token=>`<div class="ui-guide-swatch"><i style="background:var(--${token})" aria-hidden="true"></i><code>--${token}</code></div>`).join('')}</div><p class="ui-help">Use surface and text tokens in both themes. Pair accent fills with <code>--on-accent</code>. Status colors always have a text label.</p></section>
+      <section class="ui-guide-section"><h4>Actions</h4><div class="ui-guide-row"><button id="ui-guide-primary" class="btn primary" onclick="_uiGuideAction(this)">Primary action</button><button class="btn" onclick="_uiGuideAction(this)">Secondary action</button><button class="btn danger" onclick="_uiGuideAction(this)">Destructive example</button><button class="btn" disabled>Unavailable</button><button class="btn" aria-busy="true" disabled>Working…</button></div><p class="ui-help">Use one primary action per group. Destructive actions keep a clear label and require confirmation when they affect real data. Examples here change no account or worker data.</p><output id="ui-guide-feedback" class="ui-help" role="status" aria-live="polite">Try an action to preview feedback.</output></section>
+      <section class="ui-guide-section"><h4>Fields and validation</h4><div class="ui-guide-grid"><label class="ui-field">Name<input class="input" placeholder="Example name" autocomplete="off"><span class="ui-help">A label stays visible after typing.</span></label><label class="ui-field">Choice<select class="input"><option>First option</option><option>Second option</option></select><span class="ui-help">Use the native picker on mobile.</span></label><label class="ui-field">Invalid example<input class="input" value="Example" aria-invalid="true" aria-describedby="ui-guide-error"><span id="ui-guide-error" class="ui-error">Explain what to change, beside the field.</span></label><label class="ui-field">Notes<textarea class="input" rows="3" placeholder="An example draft"></textarea><span class="ui-help">Long content scrolls without hiding actions.</span></label></div></section>
+      <section class="ui-guide-section"><h4>Icons and status</h4><div class="ui-guide-row"><button class="settings-btn" aria-label="Example settings" onclick="_uiGuideAction(this)">&#x2699;</button><button class="btn" aria-label="Example notifications" onclick="_uiGuideAction(this)">&#x1F514;</button><span class="status-badge active">Working</span><span class="status-badge idle">Idle</span><span class="ui-help"><span style="color:var(--red)">18</span> limited</span></div><p class="ui-help">Keep the original toolbar symbols. Icon-only controls need an accessible label and a 44-pixel touch target. The compact mobile header uses a, a live dot, and counts.</p></section>
+      <section class="ui-guide-section"><h4>Dialogs and menus</h4><div class="ui-guide-rule">Use a heading, an obvious Close control, a scrolling body, and an action row that stays reachable above the keyboard. Menus anchor to their trigger and fit inside the viewport.</div><div class="ui-guide-row"><button class="btn" onclick="_uiGuideDialog()">Try confirmation dialog</button><code>.modal-overlay → .modal → .modal-header / .modal-body / .modal-footer</code></div></section>
+      <section class="ui-guide-section"><h4>Spacing and interaction</h4><div class="ui-guide-rule">Spacing: 4, 8, 12, 16, 24 pixels. Controls: 8-pixel corners. Dialogs: 12-pixel corners. Controls grow to at least 44 pixels on phones. Inputs use 16-pixel text on phones. Focus is visible; loading and disabled states explain why an action is unavailable.</div><p class="ui-help">Specialized editors, terminal output, maps, and media keep their own content layout. Their surrounding controls follow these same rules.</p></section>
+    </div><footer class="modal-footer"><span class="ui-help">Shared styles · live components</span><button class="btn" onclick="closeStyleGuide()">Close</button></footer>
+  </section>`;
+  overlay.onclick = event => { if (event.target === overlay) closeStyleGuide(); };
+  overlay.onkeydown = event => {
+    if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); closeStyleGuide(); }
+    if (event.key !== 'Tab') return;
+    const controls = [...overlay.querySelectorAll('button:not(:disabled),input,select,textarea')].filter(el=>el.getBoundingClientRect().height);
+    const first = controls[0], last = controls[controls.length - 1];
+    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+  };
+  document.body.appendChild(overlay);
+  overlay.querySelector('.modal-close').focus();
+}
+function closeStyleGuide() {
+  const overlay = document.getElementById('ui-guide-overlay');
+  if (!overlay) return;
+  document.body.classList.toggle('light', overlay.dataset.originalLight === 'true');
+  overlay.remove(); document.getElementById('settings-btn')?.focus();
+}
+function _uiGuideTheme() { document.body.classList.toggle('light'); }
+function _uiGuideAction(button) {
+  document.getElementById('ui-guide-feedback').textContent = (button.getAttribute('aria-label') || button.textContent) + ' completed. Example only; no data changed.';
+}
+async function _uiGuideDialog() {
+  const confirmed = await showConfirm('Example confirmation. This changes no account or worker data.');
+  const output = document.getElementById('ui-guide-feedback');
+  if (output) output.textContent = confirmed ? 'Example confirmed.' : 'Example cancelled.';
+}
+function _uiComponentCheck(root = document) {
+  let considered = 0;
+  const issues = [];
+  const luminance = color => color.slice(0,3).reduce((sum,value,index)=>{
+    value /= 255; return sum + [0.2126,0.7152,0.0722][index] * (value <= .04045 ? value / 12.92 : ((value + .055) / 1.055) ** 2.4);
+  },0);
+  root.querySelectorAll('.btn,.input,.modal-close').forEach(button=>{
+    const rect = button.getBoundingClientRect(), style = getComputedStyle(button);
+    if (!rect.width || !rect.height || style.visibility === 'hidden' || style.opacity === '0') return;
+    considered++;
+    if (innerWidth <= 600 && rect.height < 43.5) issues.push((button.id || button.tagName.toLowerCase()) + ':small-control');
+    if (!button.matches('.btn.primary:not(:disabled)')) return;
+    const rgb = value => (value.match(/[\d.]+/g) || []).map(Number);
+    const bg = rgb(style.backgroundColor), fg = rgb(style.color);
+    if (bg.length < 3 || fg.length < 3 || (bg.length === 4 && bg[3] !== 1)) return;
+    const a = luminance(bg), b = luminance(fg);
+    if ((Math.max(a,b)+.05)/(Math.min(a,b)+.05) < 4.5) issues.push((button.id || 'primary-button') + ':low-contrast');
+  });
+  return {measured:true,n_considered:considered,issues};
+}
+
 // AF-749: measure open dialogs against the keyboard-visible viewport. Keep
 // diagnostics free of dialog text (worker messages and credentials live here).
 const _dialogSelector = '.amux-dialog-backdrop,.amux-workspace-dialog,#cmd-history-modal,#filters-modal,#saved-messages-modal,#skill-edit-modal,#file-overlay,#mdai-overlay,#channel-drawer,#board-detail-overlay,#apikey-setup-modal,#upgrade-modal,#video-overlay,.modal-backdrop,.edit-overlay,.queue-overlay,.board-edit-overlay,.map-modal,.modal-overlay,#conn-hist-modal,#team-scope-modal,#jrnl-config-overlay,#peek-lookup-modal,[data-ical-modal],.chip-picker-overlay,.tts-overlay,.focus-overlay,.conn-picker-overlay,.mdai-picker-overlay';
@@ -1725,6 +1792,19 @@ function _modalLayoutCheck() {
     const r = box.getBoundingClientRect();
     if (!r.width || !r.height) return;
     n++;
+    if (root.id === 'modal-backdrop') {
+      const action = box.querySelector('.modal-btns button');
+      if (action) {
+        const a = action.getBoundingClientRect(), hit = document.elementFromPoint(a.left+a.width/2,a.top+a.height/2);
+        if (!root.contains(hit) && hit?.closest('.modal-overlay.active')) clipped.push('modal-backdrop:covered-actions');
+      }
+    }
+    const heading = box.querySelector('.modal-header h3');
+    if (heading) {
+      const h = heading.getBoundingClientRect();
+      const cover = document.elementFromPoint(h.left + h.width/2, h.top + Math.min(2,h.height/2));
+      if (cover?.closest('.chrome-tabs-bar')) clipped.push((root.id || root.classList[0]) + ':behind-tab-bar');
+    }
     const surface = box.matches('.conn-picker') || root.matches('#team-scope-modal,#jrnl-config-overlay,.amux-workspace-dialog,#upgrade-modal') ? getComputedStyle(box) : null;
     if (surface) {
       const rgb = value => (value.match(/[\d.]+/g) || []).map(Number);
@@ -1757,7 +1837,7 @@ function _modalLayoutCheck() {
   return { measured: true, n_considered: n, clipped, viewport_height: height };
 }
 (function observeDialogs() {
-  let timer, previous = '';
+  let timer, previous = '', previousComponents = '';
   const refresh = () => {
     const vv = window.visualViewport;
     // Pinch zoom is a reading action, not a keyboard layout change.
@@ -1775,12 +1855,19 @@ function _modalLayoutCheck() {
           body:JSON.stringify({kind:'modal-layout-clipped',...result,ver:APP_VER})}).catch(() => {});
       }
       previous = signature;
+      const components = _uiComponentCheck(), componentSignature = components.issues.join(',');
+      if (componentSignature && componentSignature !== previousComponents) {
+        console.warn('[amux] shared component drift', components);
+        fetch('/api/client-debug', {method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({kind:'ui-component-drift',...components,ver:APP_VER})}).catch(() => {});
+      }
+      previousComponents = componentSignature;
     }, 350);
   };
   new MutationObserver(records => {
     if (records.some(r => r.type === 'childList' ? r.target === document.body :
       r.target.matches?.(_dialogSelector) && !r.target.classList.contains('amux-dialog-viewport'))) refresh();
-    else if (records.some(r => r.type === 'attributes' && r.target.matches?.(_dialogSelector))) {
+    else if (records.some(r => r.type === 'attributes' && (r.target === document.body || r.target.matches?.(_dialogSelector)))) {
       clearTimeout(timer); timer = setTimeout(refresh, 50);
     }
   }).observe(document.body, {childList:true,subtree:true,attributes:true,attributeFilter:['class','style']});
@@ -10502,7 +10589,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.932';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.933';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.

@@ -2673,3 +2673,36 @@ CARD: AF-732
 SYMPTOM: Every explicit Go deep link opened another native Safari tab. Six test-origin connections remained open and later modal audit pages stalled blank, while the proxy still answered HTTP 200. Native alignment reported visible without proving page load success.
 COST: Complete modal audit stopped after three passes followed by repeated blank-page failures; native fixture tabs needed cleanup before further measurements.
 FIX: Reuse an already-visible debugger tab for URL navigation; retain native alignment only for hidden tabs. native_tab_reused logs measured population. Repeated-navigation regression first failed on unexpected deep-link creation; native proof pending.
+
+## Shared primary buttons use white text on a pale dark-theme accent
+AREA: browser
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-754
+SYMPTOM: The shared .btn.primary rule pairs white text with the dark theme's bright accent, so its text does not meet the existing 4.5 contrast threshold used by amux's modal diagnostics. Copies of the same control have no documented foreground token.
+COST: The component consistency audit found that a visually shared button could carry different readability failures between themes.
+FIX: Pair --accent with --on-accent and use the production-backed Style guide. _uiComponentCheck emits measured ui-component-drift with identifiers/counts when an enabled opaque primary button has low contrast; a deliberate equal foreground/background regression checks the beacon.
+
+## Native Safari select ignores a shared minimum control height
+AREA: browser
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-754
+SYMPTOM: The component gallery's native select rendered 23 pixels high in Safari although --control-height and min-height requested 44. The new real-browser control-size assertion failed while 32 other regression cases passed.
+COST: A shared sizing token alone falsely appeared to make phone controls consistent; the native select needed an explicit height.
+FIX: select.input uses the shared explicit control height and retains its native picker. _uiComponentCheck records small-control defects for visible shared controls on phones, with measured population and no field values.
+
+## Tall desktop dialogs appear underneath the application tab strip
+AREA: browser
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-754
+SYMPTOM: Visual inspection showed a tall Style guide heading partly covered by the fixed app tab strip despite a clean viewport-bounds check. Standard modal-overlay used z-index 300 and the tab strip 1000; confirmation overlays also need to remain above a parent dialog.
+COST: Geometry-only checks missed painted occlusion. Standardizing dialog layers exposed a covered confirmation in the interaction regression before shipping.
+FIX: Shared --layer-dialog and --layer-confirmation put dialogs above the app strip and confirmations above their parent. _modalLayoutCheck reports behind-tab-bar and covered-actions through the existing measured modal-layout-clipped beacon. Tests click the nested confirmation and hit-test the actual heading.

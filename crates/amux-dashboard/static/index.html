@@ -511,6 +511,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         </div>
         <div class="settings-sep"></div>
         <div class="settings-section" style="text-align:center;display:flex;flex-direction:column;gap:8px;">
+          <button class="btn" id="style-guide-btn" onclick="openStyleGuide()">Style guide</button>
           <span style="font-size:0.7rem;color:var(--dim);cursor:pointer;" onclick="openAbout();closeSettings()">About amux &amp; token stats</span>
           <span style="font-size:0.7rem;color:var(--dim);cursor:pointer;" onclick="openDevtools();closeSettings()">&#x1F6E0; Developer tools</span>
           <span id="logout-btn" style="font-size:0.7rem;color:var(--dim);cursor:pointer;display:none;" onclick="window.location='/api/cloud-logout'">&#x2192; Sign out</span>
