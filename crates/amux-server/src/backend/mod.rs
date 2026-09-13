@@ -169,6 +169,14 @@ pub trait SessionBackend: Send + Sync {
     async fn agent_states(&self) -> Result<std::collections::BTreeMap<String, String>> {
         Ok(std::collections::BTreeMap::new())
     }
+    /// Confirmed terminal process exits, keyed by backend ref, in one census.
+    /// Absence is not proof of exit. Backends without this evidence return an
+    /// empty map; failed probes return Err and must not stop workers.
+    async fn process_exits(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, amux_core::protocol::ExitStatus>> {
+        Ok(std::collections::BTreeMap::new())
+    }
     /// Type literal text into the session's terminal and submit it.
     ///
     /// This is KEYSTROKE DELIVERY, not the control plane — the same category

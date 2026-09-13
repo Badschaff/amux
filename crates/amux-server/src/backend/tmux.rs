@@ -148,6 +148,32 @@ impl Default for TmuxBackend {
 
 #[async_trait]
 impl SessionBackend for TmuxBackend {
+    async fn process_exits(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, amux_core::protocol::ExitStatus>> {
+        let out = self
+            .run(
+                &[
+                    "list-panes",
+                    "-a",
+                    "-F",
+                    "#{session_name}:#{pane_dead}:#{pane_dead_status}:#{pane_dead_signal}",
+                ],
+                OP_TIMEOUT,
+            )
+            .await?;
+        if !out.status.success() {
+            let error = String::from_utf8_lossy(&out.stderr);
+            if error.contains("no server") || error.contains("No such file") {
+                return Ok(std::collections::BTreeMap::new());
+            }
+            return Err(BackendError::CommandFailed(format!(
+                "tmux process-exit census: {error}"
+            )));
+        }
+        parse_process_exits(&String::from_utf8_lossy(&out.stdout))
+    }
+
     fn name(&self) -> &'static str {
         "tmux"
     }
@@ -173,7 +199,8 @@ impl SessionBackend for TmuxBackend {
         // -x/-y give the detached pane a real geometry so full-screen TUIs
         // (claude, etc.) render sanely before any client attaches.
         // -e per env var (tmux >= 3.2; this repo targets tmux 3.x).
-        let create_server = super::tmux_health::may_create_server().await
+        let create_server = super::tmux_health::may_create_server()
+            .await
             .map_err(BackendError::SpawnFailed)?;
         let mut args: Vec<String> = vec![
             "new-session".into(),
@@ -367,7 +394,10 @@ impl SessionBackend for TmuxBackend {
         // (scrollback). Pane-level command => pane target form (L2).
         let start = format!("-{lines}");
         let out = self
-            .run(&["capture-pane", "-t", &pt, "-p", "-S", &start], CAPTURE_TIMEOUT)
+            .run(
+                &["capture-pane", "-t", &pt, "-p", "-S", &start],
+                CAPTURE_TIMEOUT,
+            )
             .await?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -406,13 +436,63 @@ fn parse_pane_dead(line: &str) -> BackendStatus {
     BackendStatus::Crashed { signal: None }
 }
 
+fn parse_process_exits(
+    output: &str,
+) -> Result<std::collections::BTreeMap<String, amux_core::protocol::ExitStatus>> {
+    use amux_core::protocol::ExitStatus;
+    use std::collections::BTreeMap;
+    let mut panes: BTreeMap<String, Vec<BackendStatus>> = BTreeMap::new();
+    for line in output.lines() {
+        let fields: Vec<_> = line.rsplitn(4, ':').collect();
+        if fields.len() != 4 || fields[3].is_empty() || !matches!(fields[2], "0" | "1") {
+            return Err(BackendError::CommandFailed(
+                "malformed tmux process-exit census".into(),
+            ));
+        }
+        if fields[3].starts_with("amux-") {
+            let status = parse_pane_dead(&format!("{}:{}:{}", fields[2], fields[1], fields[0]));
+            panes.entry(fields[3].into()).or_default().push(status);
+        }
+    }
+    let mut exits = BTreeMap::new();
+    for (name, statuses) in panes {
+        if statuses.iter().any(|s| matches!(s, BackendStatus::Running)) {
+            continue; // A completed side pane cannot stop a live lane.
+        }
+        // A single pane (or agreeing panes) supplies an exact exit status.
+        // Different dead panes prove cessation but not one shared exit code.
+        let status = if statuses.iter().all(|s| s == &statuses[0]) {
+            match statuses[0] {
+                BackendStatus::Completed { exit_code } => ExitStatus {
+                    code: Some(exit_code),
+                    signal: None,
+                },
+                BackendStatus::Crashed { signal } => ExitStatus { code: None, signal },
+                _ => unreachable!("only confirmed dead panes remain"),
+            }
+        } else {
+            ExitStatus {
+                code: None,
+                signal: None,
+            }
+        };
+        exits.insert(name, status);
+    }
+    Ok(exits)
+}
+
 /// POSIX single-quote escaping — the command line is typed into a login shell
 /// via send-keys, so quoting is ours (identical rationale to herdr.rs; the
 /// two backends deliberately do not share private helpers across modules).
 fn sh_quote(s: &str) -> String {
     if !s.is_empty()
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b'=' | b':' | b'@' | b'%' | b'+' | b','))
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'_' | b'-' | b'.' | b'/' | b'=' | b':' | b'@' | b'%' | b'+' | b','
+                )
+        })
     {
         return s.to_string();
     }
@@ -421,6 +501,23 @@ fn sh_quote(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn process_exit_census_requires_every_pane_to_be_dead() {
+        let exits = super::parse_process_exits(
+            "amux-dead:1:1:\namux-live:0::\namux-mixed:1:1:\namux-mixed:0::\namux-signal:1::9\namux-ambiguous:1:1:\namux-ambiguous:1:2:\nforeign:1:1:\n"
+        ).unwrap();
+        assert_eq!(exits.len(), 3);
+        assert_eq!(exits["amux-dead"].code, Some(1));
+        assert_eq!(exits["amux-signal"].signal, Some(9));
+        assert_eq!(exits["amux-ambiguous"].code, None);
+        assert_eq!(exits["amux-ambiguous"].signal, None);
+        assert!(!exits.contains_key("amux-live"));
+        assert!(!exits.contains_key("amux-mixed"));
+        for unreadable in ["amux-dead:1", "amux-dead:?:1:", ":1:1:"] {
+            assert!(super::parse_process_exits(unreadable).is_err());
+        }
+        assert!(super::parse_process_exits("").unwrap().is_empty());
+    }
     use super::*;
 
     /// The L2 regression test: the two target forms must differ by exactly

@@ -1188,11 +1188,13 @@ pub fn outcome_for(id: &str) -> Option<String> {
         }),
         ids::SCAN => crate::orchestrator::scan::last_scan_state().map(|s| {
             format!(
-                "{} scanned, {} demoted (structured), {} demoted (native), {} capture failure(s)",
+                "{} scanned, {} demoted (structured), {} demoted (native), {} capture failure(s), {} process exit(s), {} exit probe/apply failure(s)",
                 s.report.scanned.len(),
                 s.report.demoted_structured.len(),
                 s.report.demoted_native.len(),
                 s.report.capture_failures.len(),
+                s.report.process_exits.len(),
+                s.report.process_exit_failures.len(),
             )
         }),
         _ => None,
