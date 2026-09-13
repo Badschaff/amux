@@ -54,3 +54,34 @@ launch or production worker kill. The historical originating session is `amux
 (cloud rust image, AMUX-2619)`. Its explicit agreement, independent review, full
 CI and resolved verification gates remain required. The original active ledger
 entry and original AMUX cards are preserved; this report does not retire them.
+
+## Independent review correction: bind exits to session identity
+
+amux-research independently reproduced a P1 race at `5e482da1`: the scan snapshots
+worker/backend-ref, but both survive a restart. Its old all-dead census could then
+end the replacement session. The two-case reviewer reproduction, rerun locally
+before this correction, gave 1 passed / 1 failed (`generation-red.log`).
+
+The scan now retains the session ID from its initial target read. Inside the
+Store's immediate writer transaction, it compares that ID and backend/ref to the
+current live session before invoking Exited. A replacement or already-ended
+session is a no-op: no state write, revision bump, event, or applied-exit count.
+`stale_process_exits` publishes observed/current session IDs and backend ref in
+`/api/debug/scan`; the system-job summary counts them separately. A measured
+`terminal_process_exit_stale` warning carries those operands and `applied=false`.
+Applied warnings now also name the exact session.
+
+`dead_pane_generation` preserves the independent reviewer reproduction and adds
+already-ended and overlapping-scan controls. A barrier forces both overlapping
+scans to observe the same generation; exactly one may apply the exit. The tests
+also capture actual writer-thread warnings, selecting unique worker IDs so
+parallel tests cannot satisfy each other's log assertions. Unchanged-session
+exit remains the positive control. Final generation/log suite: 4 passed / 0 failed. The real private-tmux
+router specimen still passes 1 / 0. Raw results are retained under
+`scratch/af784-evidence/generation-*.log` and on AF-784.
+
+A read-only production check bracketed by build `1f17e7091059a63a` confirmed
+adoption of the earlier `5e482da1`, but `/api/debug/scan` considered zero typed
+sessions. That is no production positive specimen and supplies no restart-race
+verification. The full parent CI's Rust check job passed; three browser shards
+failed. No full-CI, originating-session agreement, or ledger retirement claim.

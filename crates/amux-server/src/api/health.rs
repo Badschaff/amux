@@ -755,6 +755,7 @@ pub async fn debug_scan() -> axum::Json<serde_json::Value> {
             "native_status_failures": s.report.native_status_failures,
             "process_exits": s.report.process_exits,
             "process_exit_failures": s.report.process_exit_failures,
+            "stale_process_exits": s.report.stale_process_exits,
             "capture_failures": s.report.capture_failures,
             "events_applied": s.report.events_applied,
             "deduped": s.deduped,
@@ -762,7 +763,8 @@ pub async fn debug_scan() -> axum::Json<serde_json::Value> {
             s.report.scanned.len()
                 + s.report.demoted_structured.len()
                 + s.report.demoted_native.len()
-                + s.report.process_exits.len(),
+                + s.report.process_exits.len()
+                + s.report.stale_process_exits.len(),
         )),
         None => axum::Json(crate::api::measured::unmeasured(
             serde_json::json!({
@@ -777,6 +779,7 @@ pub async fn debug_scan() -> axum::Json<serde_json::Value> {
             "native_status_failures": Vec::<String>::new(),
             "process_exits": serde_json::Map::new(),
             "process_exit_failures": Vec::<String>::new(),
+            "stale_process_exits": serde_json::Map::new(),
             "capture_failures": Vec::<String>::new(),
             "events_applied": 0,
             "deduped": serde_json::Map::new(),

@@ -59,8 +59,17 @@ pub struct ScanReport {
     /// Backend-confirmed exits, distinct from text inferred by the adapter.
     pub process_exits: BTreeMap<String, ExitStatus>,
     pub process_exit_failures: Vec<String>,
+    /// Exit observations rejected atomically because their session ended or changed.
+    pub stale_process_exits: BTreeMap<String, StaleProcessExit>,
     pub events_applied: usize,
     pub capture_failures: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StaleProcessExit {
+    pub observed_session: String,
+    pub current_session: Option<String>,
+    pub backend_ref: String,
 }
 
 /// The last completed scan pass, published for `GET /api/debug/scan` (AF-80):
@@ -122,18 +131,19 @@ impl ScanLoop {
     /// One pass over live terminal sessions.
     pub async fn scan_once(&self) -> anyhow::Result<ScanReport> {
         let mut report = ScanReport::default();
-        // Live terminal-backed sessions: (worker_id, backend name, ref, provider).
-        let targets: Vec<(String, String, String, String)> = {
+        // Capture session identity BEFORE asynchronous backend reads. Backend refs
+        // survive restarts and cannot identify the generation an exit belongs to.
+        let targets: Vec<(String, String, String, String, String)> = {
             let conn = self.store.read()?;
             let mut stmt = conn.prepare(
                 "SELECT s.worker_id, s.backend, s.backend_ref,
-                        COALESCE(w.provider, 'claude')
+                        COALESCE(w.provider, 'claude'), s.id
                  FROM _amux_sessions s
                  LEFT JOIN _amux_workers w ON w.id = s.worker_id
                  WHERE s.ended_at IS NULL AND s.backend IN ('tmux', 'herdr')",
             )?;
             let rows = stmt.query_map([], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             })?;
             rows.collect::<Result<_, _>>()?
         };
@@ -165,7 +175,7 @@ impl ScanLoop {
             }
         }
 
-        for (wid_str, backend_name, backend_ref, provider) in targets {
+        for (wid_str, backend_name, backend_ref, provider, session_id) in targets {
             let Ok(worker) = WorkerId::parse(&wid_str) else { continue };
 
             // DEMOTION: a live structured session means the worker speaks
@@ -231,25 +241,53 @@ impl ScanLoop {
             if let Some(status) = exits.get(&backend_name).and_then(|m| m.get(&backend_ref)) {
                 let event = WorkerEvent::Exited(status.clone());
                 let w = worker.clone();
+                let observed = session_id.clone();
+                let expected_backend = backend_name.clone();
+                let expected_ref = backend_ref.clone();
+                let stale = Arc::new(Mutex::new(None));
+                let stale_write = stale.clone();
                 let applied = self
                     .store
                     .write_async(move |conn| {
+                        // Store executes this closure inside its authoritative writer
+                        // transaction. A pre-write read would leave the same race open.
+                        let current = crate::db::queries::live_session_for(conn, w.as_str())?;
+                        if !current.as_ref().is_some_and(|s| s.id == observed
+                            && s.backend == expected_backend && s.backend_ref == expected_ref)
+                        {
+                            let rejected = StaleProcessExit {
+                                observed_session: observed,
+                                current_session: current.map(|s| s.id),
+                                backend_ref: expected_ref,
+                            };
+                            tracing::warn!(worker = %w,
+                                observed_session = %rejected.observed_session,
+                                current_session = ?rejected.current_session,
+                                backend_ref = %rejected.backend_ref,
+                                measured = true, n_considered = 1, applied = false,
+                                "terminal_process_exit_stale: exit observation belongs to an ended or replaced session");
+                            *stale_write.lock().expect("exit result mutex") = Some(rejected);
+                            return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+                        }
                         crate::orchestrator::events::apply_event(
-                            conn,
-                            &w,
-                            &event,
-                            chrono::Utc::now(),
+                            conn, &w, &event, chrono::Utc::now(),
                         )
                     })
                     .await;
                 match applied {
-                    Ok(_) => {
+                    Ok(reply) if reply.applied => {
                         report.events_applied += 1;
                         report.process_exits.insert(wid_str.clone(), status.clone());
                         tracing::warn!(worker = %worker, backend_ref = %backend_ref,
+                            session = %session_id,
                             exit_code = ?status.code, signal = ?status.signal,
                             measured = true, n_considered = 1,
                             "terminal_process_exit: retained session no longer hosts a live process");
+                    }
+                    Ok(_) => {
+                        if let Some(rejected) = stale.lock().expect("exit result mutex").take() {
+                            report.stale_process_exits.insert(wid_str.clone(), rejected);
+                        }
                     }
                     Err(e) => report
                         .process_exit_failures
@@ -386,6 +424,7 @@ impl ScanLoop {
                         || !r.demoted_native.is_empty()
                         || !r.process_exits.is_empty()
                         || !r.process_exit_failures.is_empty()
+                        || !r.stale_process_exits.is_empty()
                         || !r.native_status_failures.is_empty() =>
                 {
                     tracing::debug!(
@@ -395,6 +434,7 @@ impl ScanLoop {
                         native_failures = r.native_status_failures.len(),
                         process_exits = r.process_exits.len(),
                         process_exit_failures = r.process_exit_failures.len(),
+                        stale_process_exits = r.stale_process_exits.len(),
                         events = r.events_applied,
                         failures = r.capture_failures.len(),
                         "terminal scan pass"
