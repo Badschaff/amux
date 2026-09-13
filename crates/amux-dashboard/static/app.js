@@ -10589,7 +10589,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.934';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.935';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -38298,9 +38298,18 @@ function _msgsRenderGroupChip() {
 let _msgsOffset = 0;
 const _MSGS_PAGE = 60;   // AMUX-4476: smaller first page for a fast click-to-display; page older on demand
 let _msgsDone = false;
+// A reset (tab switch, group/kind change) and the debounced SSE 'messages'
+// refresh can both be in flight at once — nothing cancelled either fetch.
+// Whichever concat lands SECOND used to run against the array left by the
+// other, so a message sent just before a stale fetch resolved could show
+// twice: once as the pre-capture snapshot (no card badge), once as the
+// fresh one. _msgsGen bumps on every reset; a response is only applied if
+// no newer reset has started since its fetch began.
+let _msgsGen = 0;
 
 async function _messagesLoad(reset, presetSession) {
-  if (reset !== false) { _msgsData = []; _msgsOffset = 0; _msgsDone = false; }
+  if (reset !== false) { _msgsData = []; _msgsOffset = 0; _msgsDone = false; _msgsGen++; }
+  const _gen = _msgsGen;
   try {
     // Kind-scoped at the SERVER. Filtering a mixed page client-side is what
     // showed 48 human messages out of 6547 — the human rows never made it into
@@ -38320,6 +38329,15 @@ async function _messagesLoad(reset, presetSession) {
     fetch(API + '/api/history?counts=1' + (_sf ? '&session=' + encodeURIComponent(_sf) : ''))
       .then(x => x.json()).then(c => { _msgsCounts = c; _msgsRenderChips(); }).catch(() => {});
     if (!Array.isArray(rows)) return;
+    // A newer reset (_msgsGen bumped) started and already replaced _msgsData
+    // while this fetch was in flight — applying this stale page would append
+    // a pre-capture duplicate of a row the newer load already rendered fresh.
+    if (_gen !== _msgsGen) {
+      if (typeof window._clientDebug === 'function') {
+        window._clientDebug('messages-load-stale-discarded', { gen: _gen, current: _msgsGen, rows: rows.length });
+      }
+      return;
+    }
     _msgsData = _msgsData.concat(rows.map(_msgNorm));
     _msgsOffset += rows.length;
     _msgsDone = rows.length < _MSGS_PAGE;
