@@ -6208,3 +6208,45 @@ async fn a_non_holder_worker_cannot_move_a_leased_card_except_by_audited_force()
     assert_eq!(last["outcome"], json!("released"), "{d}");
     assert_eq!(last["ended_by"], json!("lane-b"), "who ended the attempt is on the record: {d}");
 }
+
+// ---- RR-0052 Invariant 3: a worker receives one task, it does not browse ----
+
+#[tokio::test]
+async fn lease_next_hands_a_lane_one_task_then_the_same_one_then_says_why_there_is_none() {
+    let (app, _dir) = app();
+    // Refused without a worker identity, like /claim.
+    let (st, _, v) = send(&app, "POST", "/api/board/lease-next", None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+
+    let card = create(&app, json!({ "title": "Implement the leased unit", "session": "lane-l",
+        "desc": "SCOPE: work\n- [ ] do it", "next_action": "Implement the scoped work",
+        "type": "chore" })).await;
+    let id = card["id"].as_str().unwrap().to_string();
+    // Creation stamps `updated`; the pickup window excludes nothing this fresh.
+    let (st, _, v) = send_with(&app, "POST", "/api/board/lease-next", None, &[("X-Amux-Session", "lane-l")]).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["verdict"], json!("leased"), "{v}");
+    assert_eq!(v["card"], json!(id), "{v}");
+    assert!(v["prompt"].as_str().is_some_and(|p| p.contains(&id)), "the prompt names the card: {v}");
+
+    // The lease is real: doing, held by the lane, attempt 1.
+    let (_, _, d) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert_eq!(d["status"], json!("doing"), "{d}");
+    assert_eq!(d["lease"]["holder"], json!("lane-l"), "{d}");
+    assert_eq!(d["lease"]["attempt"], json!(1), "{d}");
+
+    // Asking again returns the SAME card: one worker, one task.
+    let (_, _, v) = send_with(&app, "POST", "/api/board/lease-next", None, &[("X-Amux-Session", "lane-l")]).await;
+    assert_eq!(v["verdict"], json!("already_holding"), "{v}");
+    assert_eq!(v["card"], json!(id), "{v}");
+    assert_eq!(v["drain"]["verdict"], json!("draining"), "{v}");
+
+    // Once the card leaves doing, nothing is runnable, and the answer says what remains.
+    move_as(&app, &id, "review", "lane-l").await;
+    let (_, _, v) = send_with(&app, "POST", "/api/board/lease-next", None, &[("X-Amux-Session", "lane-l")]).await;
+    assert_eq!(v["verdict"], json!("none"), "{v}");
+    assert!(v["card"].is_null(), "{v}");
+    assert!(v["reason"].as_str().is_some_and(|r| !r.is_empty()), "a none always carries a reason: {v}");
+    assert_eq!(v["drain"]["measured"], json!(true), "{v}");
+    assert_eq!(v["drain"]["verdict"], json!("waiting_on_review"), "{v}");
+}
