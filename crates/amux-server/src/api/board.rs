@@ -2172,6 +2172,41 @@ fn actor_from_headers(headers: &HeaderMap) -> (Actor, String) {
 /// Rides through slim on purpose: it is NOT in `SLIM_OMITS`, because a
 /// liveness verdict that disappears from the list payload is worse than one
 /// that was never there — `row.get("live")` returning None reads as an answer.
+/// RR-0052 Invariant 2: the 409 a non-holder worker gets for moving a leased
+/// card. Every constraint needs a truthful path in every legitimate state
+/// (ethos rule 3), so the body names all three: ask the holder, let the lease
+/// lapse (the reaper frees a silent holder's card), or override on the record.
+pub(crate) fn lease_held_409(row: &IssueRow, caller_lane: &str, target: &str, now: i64) -> Value {
+    let holder = row.lease_owner.as_deref().unwrap_or("");
+    json!({
+        "error": "lease_held",
+        "ok": false,
+        "blocked": true,
+        "card": row.id,
+        "holder": holder,
+        "caller": caller_lane,
+        "from": row.status,
+        "to": target,
+        "lease": {
+            "acquired_at": row.lease_acquired_at,
+            "heartbeat_at": row.lease_heartbeat_at,
+            "heartbeat_age_s": row.lease_heartbeat_at.map(|h| now - h),
+            "expires_at": row.lease_expires_at,
+            "generation": row.lease_generation,
+        },
+        "why": format!(
+            "{} holds the lease on {}: only the holder moves a card it is working. \
+             A move by another lane would strand the holder's attempt mid-work.",
+            holder, row.id
+        ),
+        "exits": {
+            "ask_the_holder": format!("amux send {holder} --stdin   (ask them to move {} to {target})", row.id),
+            "wait_for_expiry": "a holder that stops reporting loses the lease at expires_at; the board driver returns the card to todo and you can claim it",
+            "override_on_the_record": format!("amux board {target} {} --force --reason \"<why the holder cannot do this>\"", row.id),
+        },
+    })
+}
+
 /// RR-0052: who holds this card and how fresh the holding is, as one object on
 /// every row that carries a lease (absent otherwise, so "no lease" and "lease
 /// with a null field" never read the same). Kept OUT of `snapshot_fields` on
@@ -9653,6 +9688,51 @@ pub async fn patch_item(
                     };
                     let force = map.get("force").and_then(Value::as_bool).unwrap_or(false);
                     let reason = body_str(&map, "reason").unwrap_or_default();
+                    // RR-0052 Invariant 2: ONLY THE HOLDER MOVES A LEASED CARD.
+                    //
+                    // The first cut handed core an Actor::Worker only for NAMED,
+                    // non-Force transitions, and core's holder_guard sits in six of
+                    // those arms. So with enforcement on, another lane could still
+                    // release (doing->todo), park (doing->backlog, a pair PATCH maps
+                    // to Force), discard or quarantine a card mid-attempt. The guard
+                    // is asked HERE for every status move, with core's own predicate
+                    // (not a second copy of it). An explicit `force` stays the
+                    // override: it already requires attribution and a reason, and
+                    // it is audited. Humans and anonymous callers are not workers.
+                    //
+                    // FIRST, before every other refusal on this path: a non-holder
+                    // told "gate not acknowledged" would ack the gate and only then
+                    // learn the card is not theirs to move.
+                    let caller_wid = (!caller_lane.is_empty())
+                        .then(|| crate::orchestrator::runtime::foreign_worker_id(&caller_lane));
+                    if let (Some(wid), false) = (&caller_wid, force) {
+                        let as_worker = Actor::Worker { id: wid.clone() };
+                        if amux_core::board::holder_guard(&task, &as_worker).is_err() {
+                            if bs::lease_enforcement_enabled() {
+                                tracing::warn!(
+                                    target: "amux::board", card = %next.id, caller = %caller_lane,
+                                    holder = next.lease_owner.as_deref().unwrap_or(""),
+                                    from = %next.status, to = %bs::status_to_db(target, &next.status),
+                                    measured = true, n_considered = 1, verdict = "lease_held_refused",
+                                    "board: refused a non-holder status move on a leased card (RR-0052 Invariant 2)"
+                                );
+                                return finish(
+                                    &slot_w,
+                                    PatchOut::Refused(
+                                        StatusCode::CONFLICT,
+                                        lease_held_409(&next, &caller_lane, &bs::status_to_db(target, &next.status), chrono::Utc::now().timestamp()),
+                                    ),
+                                    no_write(),
+                                );
+                            }
+                            tracing::info!(
+                                target: "amux::board", card = %next.id,
+                                caller = %caller_lane, measured = true, n_considered = 1,
+                                verdict = "lease_would_refuse",
+                                "ledger: lease would-refuse (AMUX_LEASE_ENFORCE off): cross-lane transition on a leased card (AMUX-4498/RR-0052)"
+                            );
+                        }
+                    }
                     // A CAPTURE IS AN ENVELOPE, NOT A PARKABLE UNIT OF WORK
                     // (MR-174, mvs-research, 2026-09-09).
                     //
@@ -10749,32 +10829,14 @@ pub async fn patch_item(
                             })
                     };
 
-                    // RR-0052: for a real worker-lane caller, hand the transition
-                    // an Actor::Worker so core's holder_guard fires when a lease
-                    // held by a DIFFERENT lane is touched. Only when enforcement
-                    // is on; otherwise keep the System actor (no refusal) but log
-                    // what WOULD be refused, so the cross-lane rate is watchable
-                    // before the flag flips on. `Force` and empty callers (human,
-                    // anonymous, local member) are never gated.
-                    let transition_actor = if !caller_lane.is_empty()
-                        && !matches!(&tx, BoardTransition::Force { .. })
-                    {
-                        let caller_wid =
-                            crate::orchestrator::runtime::foreign_worker_id(&caller_lane);
-                        if bs::lease_enforcement_enabled() {
-                            Actor::Worker { id: caller_wid }
-                        } else {
-                            if task.worker.as_ref().is_some_and(|h| *h != caller_wid) {
-                                tracing::info!(
-                                    target: "amux::board", card = %next.id,
-                                    caller = %caller_lane, measured = true, n_considered = 1,
-                                    "ledger: lease would-refuse (AMUX_LEASE_ENFORCE off): cross-lane transition on a leased card (AMUX-4498/RR-0052)"
-                                );
-                            }
-                            actor.clone()
+                    let transition_actor = match (&caller_wid, &tx) {
+                        (Some(wid), t)
+                            if bs::lease_enforcement_enabled()
+                                && !matches!(t, BoardTransition::Force { .. }) =>
+                        {
+                            Actor::Worker { id: wid.clone() }
                         }
-                    } else {
-                        actor.clone()
+                        _ => actor.clone(),
                     };
 
                     match apply_transition(&task, tx, &transition_actor, &[], now) {

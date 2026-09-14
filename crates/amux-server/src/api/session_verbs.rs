@@ -2091,6 +2091,11 @@ pub const SESSION_SCOPED_FIELDS: &[(&str, RenameDisposition)] = &[
     ("issues.shepherd", RenameDisposition::Migrate),
     ("issues.requested_by", RenameDisposition::Migrate),
     ("issues.callback_session", RenameDisposition::Migrate),
+    // RR-0052: the lease holder is the lane's own live claim. Left on the old
+    // name, a renamed lane becomes a NON-holder of the card it is working, and
+    // with AMUX_LEASE_ENFORCE on it is refused on its own card until the
+    // reaper reclaims it.
+    ("issues.lease_owner", RenameDisposition::Migrate),
     ("schedules", RenameDisposition::Migrate),
     ("session_gates", RenameDisposition::Migrate),
     ("saved_messages", RenameDisposition::Migrate),
@@ -2164,7 +2169,7 @@ pub fn simple_rename_tables() -> Vec<&'static str> {
         .collect()
 }
 
-pub const RENAME_MIGRATIONS: [(&str, &str); 11] = [
+pub const RENAME_MIGRATIONS: [(&str, &str); 12] = [
     ("issues", "UPDATE issues SET session=?1 WHERE session=?2 AND deleted IS NULL"),
     // BEYOND PYTHON, and the reason AMUX-3749 exists: the cascade
     // migrated a card's OWNER and left the two columns that address
@@ -2188,6 +2193,10 @@ pub const RENAME_MIGRATIONS: [(&str, &str); 11] = [
     (
         "issues.callback_session",
         "UPDATE issues SET callback_session=?1 WHERE callback_session=?2 AND deleted IS NULL",
+    ),
+    (
+        "issues.lease_owner",
+        "UPDATE issues SET lease_owner=?1 WHERE lease_owner=?2 AND deleted IS NULL",
     ),
     ("schedules", "UPDATE schedules SET session=?1 WHERE session=?2"),
     ("session_gates", "UPDATE session_gates SET session=?1 WHERE session=?2"),

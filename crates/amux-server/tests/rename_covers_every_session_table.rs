@@ -29,6 +29,7 @@ fn is_session_column(column: &str) -> bool {
         || column == "reviewer"
         || column == "shepherd"
         || column == "requested_by"
+        || column == "lease_owner"
         || column.ends_with("_session")
 }
 

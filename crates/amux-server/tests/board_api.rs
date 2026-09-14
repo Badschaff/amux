@@ -6161,3 +6161,50 @@ async fn each_claim_opens_an_attempt_and_each_exit_closes_it_with_an_outcome() {
         (2, "lane-a".to_string(), "review".to_string()),
     ], "{d}");
 }
+
+// ---- RR-0052 Invariant 2: only the holder moves a leased card -------------
+
+/// Every status move a non-holder worker can make on a leased card, including
+/// the ones core has no named transition for (doing -> backlog maps to Force in
+/// the PATCH door) and the ones core's six guarded arms never covered (release,
+/// discard). Run with enforcement ON because that is what server.env ships.
+#[tokio::test]
+async fn a_non_holder_worker_cannot_move_a_leased_card_except_by_audited_force() {
+    std::env::set_var("AMUX_LEASE_ENFORCE", "1");
+    let (app, _dir) = app();
+    let card = create(&app, json!({ "title": "held", "session": "lane-a",
+        "desc": "artifact: crates/amux-server/src/api/board.rs" })).await;
+    let id = card["id"].as_str().unwrap().to_string();
+    move_as(&app, &id, "doing", "lane-a").await;
+
+    for target in ["todo", "backlog", "discarded", "review"] {
+        let (st, _, v) = send_with(
+            &app, "PATCH", &format!("/api/board/{id}"),
+            Some(json!({ "status": target, "reason": "taking it over" })),
+            &[("X-Amux-Session", "lane-b")],
+        ).await;
+        assert_eq!(st, StatusCode::CONFLICT, "lane-b moving a held card to {target}: {v}");
+        assert_eq!(v["error"], json!("lease_held"), "{v}");
+        assert_eq!(v["holder"], json!("lane-a"), "{v}");
+        assert!(v["exits"]["override_on_the_record"].as_str().unwrap().contains("--force"), "{v}");
+    }
+    let (_, _, d) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert_eq!(d["status"], json!("doing"), "no refused move may land: {d}");
+    assert_eq!(d["lease"]["holder"], json!("lane-a"));
+
+    // The holder itself is not gated.
+    move_as(&app, &id, "todo", "lane-a").await;
+    move_as(&app, &id, "doing", "lane-a").await;
+
+    // The override exists and is recorded: attributed force with a reason.
+    let (st, _, v) = send_with(
+        &app, "PATCH", &format!("/api/board/{id}"),
+        Some(json!({ "status": "todo", "force": true, "reason": "lane-a is gone, reassigning by hand" })),
+        &[("X-Amux-Session", "lane-b")],
+    ).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, _, d) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    let last = d["attempts"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["outcome"], json!("released"), "{d}");
+    assert_eq!(last["ended_by"], json!("lane-b"), "who ended the attempt is on the record: {d}");
+}
