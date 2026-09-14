@@ -4528,6 +4528,20 @@ pub async fn create_item(
             &body_str(&map, "desc").unwrap_or_default()).await
     }).await;
     let intake_response = intake.clone();
+    // AMUX-4603: a plain create inherits the prerequisites intake found among
+    // the lane's open cards. A request that named its own depends_on skipped
+    // intake (plan_create), so it is never overridden, and the writer's cycle
+    // check below still runs on the result.
+    let depends_on = if depends_on.is_empty() && !intake.decision.depends_on.is_empty() {
+        state
+            .store
+            .read()
+            .ok()
+            .and_then(|conn| super::board_intake::live_dependencies(&conn, &intake).ok())
+            .unwrap_or_default()
+    } else {
+        depends_on
+    };
     // A repeated/refined request should not be refused merely because the
     // existing queue is full; reconciliation adds no WIP slot.
     let intake_matches = intake.decision.action != "create";

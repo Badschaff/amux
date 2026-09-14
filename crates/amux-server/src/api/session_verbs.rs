@@ -4628,6 +4628,16 @@ fn associate_capture_card(
     }
     if let Some(mut row) = mint_capture_card(conn, session_name, body, now_ms, from_peer)? {
         row.log = Some(crate::db::board_store::append_log(row.log.as_deref(), &chrono::Local::now().format("%H:%M").to_string(), &format!("{}; disposition=create", intake.log_line())));
+        // AMUX-4603: the prerequisites intake found among this lane's open cards.
+        let deps = super::board_intake::live_dependencies(conn, intake)?;
+        if !deps.is_empty() {
+            tracing::info!(
+                session = %session_name, card = %row.id, links = deps.len(), measured = true,
+                n_considered = intake.decision.depends_on.len(), verdict = "capture_dependencies_linked",
+                "ledger: captured card linked to the open cards it depends on (AMUX-4603)"
+            );
+            row.depends_on = deps;
+        }
         crate::db::board_store::save_patched(conn, &mut row)?;
         return Ok(Some(CaptureAssociation { row, created: true }));
     }
@@ -25242,6 +25252,42 @@ CLAUDE-POSTFIX-COMPLETE
         let conn = state.store.read().unwrap();
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM send_dedup",[],|r|r.get::<_,i64>(0)).unwrap(),1);
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM cmd_history",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    }
+
+    /// AMUX-4603. A captured prompt's card carries the dependency intake proposed
+    /// among the lane's open cards, through the shipped capture path.
+    #[tokio::test]
+    async fn a_captured_card_carries_the_dependencies_intake_proposed() {
+        let (st, _dir) = state();
+        st.store
+            .write(|conn| {
+                let prereq = crate::db::board_store::create_issue(
+                    conn,
+                    &crate::db::board_store::NewIssue {
+                        title: "Record the three workflow videos".into(), desc: String::new(), status: "backlog".into(),
+                        session: Some("lane-dep".into()), item_type: "code".into(), creator: "test".into(), owner_type: "agent".into(),
+                        due: None, due_time: None, reviewer: None, shepherd: None, gate: vec![],
+                        depends_on: vec![], tags: vec![], ask_type: None, ask_question: None, ask_unblocks: None,
+                        ask_actor: None, source: Some("test".into()), requested_by: None, callback_session: None, callback_prompt: None,
+                    },
+                    1,
+                )?;
+                let decision = crate::api::board_intake::Decision {
+                    action: "create".into(), task_id: None, reason: "a new step after the videos".into(),
+                    title: None, confidence: 0.9, depends_on: vec![prereq.id.clone()],
+                };
+                let plan = crate::api::board_intake::plan_for_test(decision, &[(prereq.id.as_str(), prereq.rev)]);
+                let got = associate_capture_card(
+                    conn, "lane-dep", "Upload the finished videos to Google Drive", 1_789_400_000_000, &plan, false,
+                )?
+                .expect("a substantive prompt is captured");
+                assert!(got.created, "a new card was minted");
+                assert_eq!(got.row.depends_on, vec![prereq.id.clone()]);
+                let stored = crate::db::board_store::get_issue(conn, &got.row.id)?.unwrap();
+                assert_eq!(stored.depends_on, vec![prereq.id.clone()], "the link is saved, not only returned");
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
     }
 
     /// AMUX-4589. The client leaves while the send is parked on the lane lock,
