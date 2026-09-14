@@ -10797,7 +10797,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.946';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.947';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -23256,10 +23256,17 @@ function peekCheckSelection() {
 document.getElementById('peek-body').addEventListener('mousedown', () => { _peekStopFollowing(); peekSelecting = true; clearTimeout(peekSelectTimer); });
 document.getElementById('peek-body').addEventListener('touchstart', () => { peekSelecting = true; clearTimeout(peekSelectTimer); }, {passive: true});
 const _peekScrollBody = document.getElementById('peek-body');
-_peekScrollBody.addEventListener('wheel', _peekStopFollowing, {passive: true});
+// ONLY A GESTURE TOWARD EARLIER OUTPUT relinquishes following (AMUX-4601).
+// A resting trackpad sends zero-distance and sideways wheel events, and a
+// wheel or key moving down at the bottom asks for exactly what following
+// already shows. Treating those as "reading history" left the view parked
+// while new output grew under it, then locked it and flashed "New output"
+// (Ethan's recording, 2026-09-14, tubescience). bottom-follow-paused still
+// reports every real pause with its input and gap.
+_peekScrollBody.addEventListener('wheel', e => { if (e.deltaY < 0) _peekStopFollowing(e); }, {passive: true});
 _peekScrollBody.addEventListener('touchmove', _peekStopFollowing, {passive: true});
 _peekScrollBody.addEventListener('keydown', e => {
-  if (['ArrowUp','ArrowDown','PageUp','PageDown','Home','End',' '].includes(e.key)) _peekStopFollowing();
+  if (['ArrowUp','PageUp','Home'].includes(e.key)) _peekStopFollowing(e);
 });
 _peekScrollBody.addEventListener('pointerdown', e => {
   const bounds = _peekScrollBody.getBoundingClientRect();

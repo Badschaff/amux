@@ -175,6 +175,33 @@ test('terminal controls stay compact and the bottom affordance distinguishes nav
   await page.screenshot({ path: testInfo.outputPath('terminal-product-contract.png') });
 });
 
+test('a downward or sideways wheel at the bottom keeps the terminal following new output', async ({ page }, testInfo) => {
+  // AMUX-4601. A pointer resting on a trackpad over the terminal emits wheel
+  // events that are not a request to read history. The recording showed the
+  // view parking two lines above the newest output and "New output" flashing.
+  test.skip(!!testInfo.project.use.hasTouch, 'wheel input is a pointer-device contract');
+  await page.setViewportSize({ width: 1280, height: 800 });
+  const transcript = Array.from({ length: 220 }, (_, i) => `terminal output row ${i}`).join('\n');
+  const state = await boot(page, { transcript, live: 'latest output\n' });
+  const body = page.locator('#peek-body');
+  await expect.poll(() => page.evaluate('_peekFollowBottom')).toBe(true);
+  await body.hover();
+  await page.mouse.wheel(0, 240);
+  await body.evaluate(el => el.dispatchEvent(new WheelEvent('wheel', { deltaX: 4, deltaY: 0, bubbles: true })));
+  await body.press('ArrowDown');
+  for (let i = 1; i <= 4; i++) {
+    state.setLive(Array.from({ length: i * 3 }, (_, j) => `grown output ${i}.${j}`).join('\n') + '\n');
+    await page.evaluate(async () => {
+      await (window as any).refreshPeek(true);
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    });
+    const gap = await body.evaluate(el => el.scrollHeight - el.scrollTop - el.clientHeight);
+    expect(gap, `frame ${i} stays on the newest output`).toBeLessThanOrEqual(2);
+    await expect(page.locator('.scroll-lock-badge')).toBeHidden();
+  }
+  expect(await page.evaluate('_peekFollowBottom && !_peekScrollLocked')).toBe(true);
+});
+
 test('terminal chrome cannot inject navigation or slash-picker keys', async ({ page }) => {
   const keyRequests: string[] = [];
   page.on('request', request => {
