@@ -21,9 +21,13 @@
 #   - only names amux itself mints (exact prefixes below), never a glob of /tmp
 #   - only entries idle longer than --age-hours (default 6; these runs finish in
 #     minutes, so a live run's root is always far younger)
-#   - worktrees only under a scratch root, only when `git status` is clean, and
-#     removed through `git worktree remove` WITHOUT --force so git's own refusal
-#     is the last guard
+#   - worktrees only under a temp root or $REPO/scratch, and only when tracked
+#     files are clean, every untracked entry is a regenerable build dir
+#     (node_modules, target, .venv), HEAD is reachable from a remote-tracking
+#     ref (a clean detached worktree can hold the ONLY ref to its commits), and
+#     no live process has its cwd inside. `--force` is passed only in the state
+#     where the regenerable dirs are all that remain; the main worktree is never
+#     a candidate
 #   - /private/tmp/claude-501 is never touched: live scratchpad space for every
 #     running Claude Code session on this machine
 #   - dry run by default; --apply is required to delete anything
@@ -104,24 +108,73 @@ done
 # A finished session's detached worktree under a scratch root. Clean only: a
 # worktree with uncommitted work is somebody's in-flight change, and `git
 # worktree remove` (no --force) refuses it for us as the final guard.
-wt_removed=0; wt_dirty=0; wt_considered=0
+wt_removed=0; wt_dirty=0; wt_considered=0; wt_local_only=0; wt_in_use=0; wt_unprobed=0
+# Temp roots a finished session's detached worktree lands under. Overridable so
+# the test can prove the $REPO/scratch rule on its own: a fixture repo lives
+# under a temp root, which would otherwise match first.
+WT_TEMP_ROOTS="${AMUX_DEBRIS_WT_TEMP_ROOTS-/tmp:/private/tmp:/var/folders}"
+# Every live process's working directory, read once. A worktree somebody is
+# standing in is in use whatever its mtime says. launchd's PATH lacks /usr/sbin
+# (AF-861), so name lsof absolutely. An empty listing is a failed probe, never
+# "nobody is anywhere", and it fails closed: no worktree is removed.
+LSOF=/usr/sbin/lsof; [ -x "$LSOF" ] || LSOF=$(command -v lsof 2>/dev/null || true)
+cwds=""
+[ -n "$LSOF" ] && cwds=$("$LSOF" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')
 if [ -d "$REPO/.git" ] || [ -f "$REPO/.git" ]; then
+  repo_real=$(cd "$REPO" 2>/dev/null && pwd -P)
   while IFS= read -r wt; do
     [ -n "$wt" ] || continue
-    case "$wt" in
-      /tmp/*|/private/tmp/*|/var/folders/*) ;;
-      *) continue ;;
-    esac
-    case "$wt" in */claude-501*) continue ;; esac
+    # git records a worktree by its REAL path, so a mktemp worktree is listed
+    # under /private/var/folders while TMPDIR says /var/folders. Match both
+    # spellings of both sides, or no temp-root worktree is ever a candidate:
+    # the arm considered 0 worktrees on this Mac on 2026-09-14 for exactly that.
+    wt_real=$(cd "$wt" 2>/dev/null && pwd -P) || continue
+    in_root=no
+    for cand in "$wt" "$wt_real"; do case "$cand" in "$REPO"/scratch/*|"$repo_real"/scratch/*) in_root=yes ;; esac; done
+    if [ "$in_root" = no ]; then
+      while IFS= read -r r; do
+        [ -n "$r" ] || continue
+        r_real=$(cd "$r" 2>/dev/null && pwd -P) || r_real="$r"
+        for cand in "$wt" "$wt_real"; do
+          case "$cand" in "${r%/}"/*|"${r_real%/}"/*) in_root=yes ;; esac
+        done
+        [ "$in_root" = yes ] && break
+      done < <(printf '%s\n' "$WT_TEMP_ROOTS" | tr ':' '\n')
+    fi
+    [ "$in_root" = yes ] || continue
+    case "$wt:$wt_real" in *claude-501*) continue ;; esac
     [ -d "$wt" ] || continue
     # Older than the age floor? `find -maxdepth 0` tests the path itself.
     [ -n "$(find "$wt" -maxdepth 0 -mmin "+$((AGE_HOURS*60))" 2>/dev/null)" ] || continue
+    [ "$wt_real" = "$repo_real" ] && continue
     wt_considered=$((wt_considered+1))
-    if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
+    # Tracked changes, or any untracked entry other than a regenerable build
+    # dir, is somebody's work: leave it and count it.
+    tracked=$(git -C "$wt" status --porcelain --untracked-files=no 2>/dev/null)
+    other=$(git -C "$wt" status --porcelain 2>/dev/null | grep '^??' | grep -v -E '^\?\? (node_modules|target|\.venv)/?$')
+    if [ -n "$tracked" ] || [ -n "$other" ]; then
       wt_dirty=$((wt_dirty+1)); continue
     fi
+    # Clean is not the same as safe. A detached worktree can hold the ONLY ref
+    # to its commits, and removing it strands them for gc. Require HEAD to be
+    # reachable from a remote-tracking ref (DESKT-39 found 9 clean local-only
+    # worktrees on 2026-09-14).
+    head=$(git -C "$wt" rev-parse HEAD 2>/dev/null)
+    if [ -z "$head" ] || [ -z "$(git -C "$REPO" for-each-ref --count=1 --contains "$head" refs/remotes 2>/dev/null)" ]; then
+      wt_local_only=$((wt_local_only+1)); continue
+    fi
+    if [ -z "$cwds" ]; then
+      wt_unprobed=$((wt_unprobed+1)); continue
+    fi
+    if printf '%s\n' "$cwds" | awk -v a="$wt" -v b="$wt_real" '$0==a || $0==b || index($0, a"/")==1 || index($0, b"/")==1 {f=1} END {exit !f}'; then
+      wt_in_use=$((wt_in_use+1)); continue
+    fi
+    # Only regenerable untracked dirs can remain here, and plain removal
+    # refuses over them, so --force is reached only in that state.
+    force=""
+    [ -n "$(git -C "$wt" status --porcelain 2>/dev/null | grep '^??')" ] && force="--force"
     if [ "$APPLY" = "1" ]; then
-      git -C "$REPO" worktree remove "$wt" >/dev/null 2>&1 && wt_removed=$((wt_removed+1))
+      git -C "$REPO" worktree remove $force "$wt" >/dev/null 2>&1 && wt_removed=$((wt_removed+1))
     else
       wt_removed=$((wt_removed+1))
     fi
@@ -135,7 +188,8 @@ mode=$([ "$APPLY" = "1" ] && echo applied || echo "dry-run (pass --apply to recl
 mb=$((dirs_bytes / 1024))
 echo "amux-debris: mode=$mode age_floor=${AGE_HOURS}h"
 echo "amux-debris: temp dirs ${dirs_removed} (${mb} MB), kept ${dirs_kept_fresh} younger than the floor"
-echo "amux-debris: worktrees ${wt_removed} of ${wt_considered} considered, ${wt_dirty} left alone as dirty"
+echo "amux-debris: worktrees ${wt_removed} of ${wt_considered} considered, ${wt_dirty} left alone as dirty, ${wt_local_only} kept because HEAD is on no remote, ${wt_in_use} kept in use"
+[ -n "$cwds" ] || echo "amux-debris: cwd probe unavailable (lsof missing or empty), so ${wt_unprobed} worktree(s) were not removed"
 # Non-zero only on a real failure, so a scheduler run that reclaims nothing is
 # still a success. Reclaiming nothing is the healthy steady state.
 exit 0

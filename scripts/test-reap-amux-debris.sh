@@ -12,6 +12,10 @@ REAPER="$HERE/reap-amux-debris.sh"
 FIX=$(mktemp -d)                     # never a fixed name: /tmp is shared by every lane
 trap 'rm -rf -- "$FIX"' EXIT
 fails=0
+# Hermetic git: the cells assert what `git status` reports, and a developer's
+# global excludes (node_modules/ is a common one) would hide the untracked
+# entries cell 8 depends on, so it passed vacuously on one Mac and not in CI.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 # Setup and helper failures abort before a success verdict. Assertion failures
 # still accumulate because check() handles them explicitly rather than returning
 # a failing shell status. Keep the missing-helper diagnostic as well.
@@ -74,8 +78,87 @@ touch -t 202501010000 "$WT" 2>/dev/null
 # on macOS (/var/folders) and Linux (/tmp), which is why mktemp -d is used here.
 out=$(AMUX_DEBRIS_ROOTS="$FIX" "$REAPER" --apply --repo "$WTREPO" 2>&1)
 check "dirty worktree still present" "yes" "$([ -d "$WT" ] && echo yes || echo no)"
-case "$out" in *"left alone as dirty"*) echo "  ok   report names the dirty skip" ;;
-  *) echo "  FAIL report never mentions the dirty skip: $out"; fails=$((fails+1)) ;; esac
+# Assert the COUNT. Matching only the label passed while the arm considered no
+# worktree at all, because the label prints with a zero too.
+case "$out" in *"considered, 1 left alone as dirty"*) echo "  ok   report counts exactly one dirty skip" ;;
+  *) echo "  FAIL report does not count exactly one dirty skip: $out"; fails=$((fails+1)) ;; esac
+
+echo "5. a clean worktree whose HEAD is on no remote is kept"
+# A detached worktree can hold the only ref to its commits. Removing it because
+# `git status` is clean strands them for gc (DESKT-39: 9 such worktrees were
+# live on 2026-09-14). Asserts the COUNT, so the label alone cannot pass.
+ORIGIN="$FIX/origin.git"
+git init -q --bare "$ORIGIN" 2>/dev/null
+git -C "$WTREPO" remote add origin "$ORIGIN" 2>/dev/null
+git -C "$WTREPO" push -q origin HEAD:refs/heads/main 2>/dev/null
+git -C "$WTREPO" fetch -q origin 2>/dev/null
+WTL="$FIX/wt-local-only"
+git -C "$WTREPO" worktree add --detach "$WTL" -q 2>/dev/null
+git -C "$WTL" -c user.email=t@t -c user.name=t commit -q --allow-empty -m local-only 2>/dev/null
+touch -t 202501010000 "$WTL" 2>/dev/null
+out=$(AMUX_DEBRIS_ROOTS="$FIX" "$REAPER" --apply --repo "$WTREPO" 2>&1)
+check "local-only worktree still present" "yes" "$([ -d "$WTL" ] && echo yes || echo no)"
+case "$out" in *", 1 kept because HEAD is on no remote"*) echo "  ok   report counts the local-only skip" ;;
+  *) echo "  FAIL report does not count exactly one local-only skip: $out"; fails=$((fails+1)) ;; esac
+
+echo "6. a clean on-origin worktree under \$REPO/scratch is reclaimed"
+# Temp roots disabled, so only the scratch-root rule can select it.
+mkdir -p "$WTREPO/scratch"
+WTS="$WTREPO/scratch/wt-pushed"
+git -C "$WTREPO" worktree add --detach "$WTS" origin/main -q 2>/dev/null
+touch -t 202501010000 "$WTS" 2>/dev/null
+AMUX_DEBRIS_WT_TEMP_ROOTS="" AMUX_DEBRIS_ROOTS="$FIX/none" "$REAPER" --apply --repo "$WTREPO" >/dev/null 2>&1
+check "scratch-root worktree removed" "no" "$([ -d "$WTS" ] && echo yes || echo no)"
+
+echo "7. a worktree a live process is standing in is kept"
+WTU="$FIX/wt-in-use"
+git -C "$WTREPO" worktree add --detach "$WTU" origin/main -q 2>/dev/null
+touch -t 202501010000 "$WTU" 2>/dev/null
+( cd "$WTU" && exec sleep 60 ) &
+HOLDER=$!
+sleep 1
+out=$(AMUX_DEBRIS_ROOTS="$FIX" "$REAPER" --apply --repo "$WTREPO" 2>&1)
+kill "$HOLDER" 2>/dev/null || true; wait "$HOLDER" 2>/dev/null || true
+check "in-use worktree still present" "yes" "$([ -d "$WTU" ] && echo yes || echo no)"
+case "$out" in *", 1 kept in use"*) echo "  ok   report counts the in-use skip" ;;
+  *) echo "  FAIL report does not count exactly one in-use skip: $out"; fails=$((fails+1)) ;; esac
+case "$out" in *"cwd probe unavailable"*) echo "  FAIL the cwd probe did not run, so this cell proved nothing: $out"; fails=$((fails+1)) ;;
+  *) echo "  ok   cwd probe ran" ;; esac
+
+echo "8. untracked node_modules alone does not pin a worktree; any other untracked file does"
+WTN="$FIX/wt-node-modules"; WTX="$FIX/wt-untracked-file"
+git -C "$WTREPO" worktree add --detach "$WTN" origin/main -q 2>/dev/null
+git -C "$WTREPO" worktree add --detach "$WTX" origin/main -q 2>/dev/null
+mkdir -p "$WTN/node_modules/x" "$WTX/node_modules/x"
+# A FILE inside, or git lists no untracked entry at all (it ignores empty dirs)
+# and neither the allowlist nor the --force path is ever exercised.
+echo "module.exports = 1" > "$WTN/node_modules/x/index.js"
+echo "module.exports = 1" > "$WTX/node_modules/x/index.js"
+# Positive control: the cell is about an UNTRACKED node_modules. If git does not
+# report one, nothing below can fail, so fail here instead.
+case "$(git -C "$WTN" status --porcelain 2>/dev/null)" in *"?? node_modules"*) echo "  ok   fixture shows untracked node_modules" ;;
+  *) echo "  FAIL fixture has no untracked node_modules, so cell 8 would prove nothing"; fails=$((fails+1)) ;; esac
+echo keep > "$WTX/notes.local.ts"
+touch -t 202501010000 "$WTN" "$WTX" 2>/dev/null
+AMUX_DEBRIS_ROOTS="$FIX" "$REAPER" --apply --repo "$WTREPO" >/dev/null 2>&1
+check "node_modules-only worktree removed" "no" "$([ -d "$WTN" ] && echo yes || echo no)"
+check "worktree with another untracked file kept" "yes" "$([ -d "$WTX" ] && echo yes || echo no)"
+
+echo "9. --force removes a symlinked node_modules as a link and never follows it"
+# The real push-check worktrees link node_modules to the main checkout's copy.
+# --force must take the link and leave the shared tree whole, or one reap
+# empties node_modules for every lane on the machine.
+SHARED="$FIX/shared-node-modules"
+mkdir -p "$SHARED/pkg"; echo canary > "$SHARED/pkg/canary.js"
+WTY="$FIX/wt-symlinked-node-modules"
+git -C "$WTREPO" worktree add --detach "$WTY" origin/main -q 2>/dev/null
+ln -s "$SHARED" "$WTY/node_modules"
+touch -t 202501010000 "$WTY" 2>/dev/null
+case "$(git -C "$WTY" status --porcelain 2>/dev/null)" in *"?? node_modules"*) echo "  ok   fixture shows the node_modules symlink as untracked" ;;
+  *) echo "  FAIL fixture shows no untracked node_modules link, so cell 9 would prove nothing"; fails=$((fails+1)) ;; esac
+AMUX_DEBRIS_ROOTS="$FIX" "$REAPER" --apply --repo "$WTREPO" >/dev/null 2>&1
+check "worktree with symlinked node_modules removed" "no" "$([ -d "$WTY" ] && echo yes || echo no)"
+check "shared node_modules canary survives" "yes" "$([ -f "$SHARED/pkg/canary.js" ] && echo yes || echo no)"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "PASS: reap-amux-debris — all checks passed"; exit 0; fi
