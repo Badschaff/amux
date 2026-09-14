@@ -2654,6 +2654,11 @@ async function _runSyncBanner(quiet = false) {
   const blockedResources = new Set();
   const queue = offlineQueue.filter(q => {
     if (q.state === 'blocked' && !_outboxUncertainMessage(q)) blockedResources.add(q.url);
+    // Uncertain/checking items are surfaced by the connection badge and modal,
+    // not the sync banner. Including them here means every new send pops the
+    // full checklist showing the stuck item alongside the just-sent one
+    // (Ethan 2026-09-14: "this shouldn't be appearing when I send, too invasive").
+    if (_outboxUncertainMessage(q)) return false;
     return !blockedResources.has(q.url) && !_outboxActive.has(q.id);
   });
   let skipped = 0;
@@ -10792,7 +10797,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.945';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.946';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
