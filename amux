@@ -2741,6 +2741,64 @@ if "ask_type" in ign or "ask_actor" in ign:
       echo "$result" | _board_outcome "$id" "$status"
       return $?
       ;;
+    needs|report-blocker)
+      # report_blocker (RR-0052, Invariant 4): the worker hit a prerequisite it
+      # cannot satisfy itself. Instead of stalling on "I'm blocked because X does
+      # not exist", it files X as a NEW task on its own board and makes THIS card
+      # depend on it. The board driver then parks this card and auto-promotes it
+      # the moment the blocker reaches its completion boundary (promote_ready_
+      # backlog) — the swarm resolves the blocker without a human. Composes the
+      # existing create + depends_on primitives; adds no new endpoint.
+      local id="${1:-}"; shift 2>/dev/null || true
+      _board_id_guard "needs" "$id"
+      local title="${1:-}"
+      [[ -n "$id" && -n "$title" ]] || die "Usage: amux board needs <ISSUE-ID> \"<what this card needs first>\"
+Files the need as a NEW todo task on your board and makes <ISSUE-ID> depend on it,
+so the driver parks this card and resumes it when the blocker completes."
+      local worker="${AMUX_WORKER:-${AMUX_SESSION:-}}"
+      local api="${AMUX_API:-https://localhost:8824}"
+      local created bid
+      created=$(_curl -sk -X POST -H 'Content-Type: application/json' -H "X-Amux-Worker: $worker" \
+        -d "$(T="$title" S="$worker" python3 -c 'import json,os;print(json.dumps({"title":os.environ["T"],"session":os.environ["S"],"status":"todo"}))')" \
+        "$api/api/board") || die "cannot reach the board to create the blocker task"
+      bid=$(printf '%s' "$created" | python3 -c 'import sys,json
+try: print((json.load(sys.stdin).get("id") or ""))
+except Exception: print("")')
+      [[ -n "$bid" ]] || die "the blocker task was not created: $created"
+      # Append the new blocker to this card's existing depends_on (preserve them).
+      local newdeps linkresp
+      newdeps=$(_curl -sk "$api/api/board/$id" | B="$bid" python3 -c 'import sys,json,os
+d=json.load(sys.stdin); deps=list(d.get("depends_on") or []); b=os.environ["B"]
+deps.append(b) if b not in deps else None; print(json.dumps(deps))') || die "created blocker $bid but could not read $id to link it"
+      linkresp=$(_curl -sk -X PATCH -H 'Content-Type: application/json' -H "X-Amux-Worker: $worker" \
+        -d "$(D="$newdeps" python3 -c 'import json,os;print(json.dumps({"depends_on":json.loads(os.environ["D"])}))')" \
+        "$api/api/board/$id") || die "created blocker $bid but could not link it to $id"
+      echo "reported blocker: $id now depends on new task $bid (\"$title\"); it resumes when $bid completes."
+      return 0
+      ;;
+    fail|report-failure)
+      # report_failure (Invariant 4): the work could not be done. Route to the
+      # `quarantined` terminal (amux-core's anti-livelock terminal) with the
+      # reason, so the card leaves the active loop for the owner rather than
+      # sitting half-done. `fail` is the discoverable name for the FAILED outcome.
+      local id="${1:-}"; shift 2>/dev/null || true
+      _board_id_guard "fail" "$id"
+      local reason=""
+      while [[ $# -gt 0 ]]; do case "$1" in
+        --reason)       reason="${2:-}"; shift 2 ;;
+        --reason-stdin) reason="$(cat)"; shift ;;
+        *) shift ;;
+      esac; done
+      [[ -n "$id" ]] || die "Usage: amux board fail <ISSUE-ID> [--reason \"why\"]   (routes to the quarantined terminal)"
+      local result
+      if [[ -n "$reason" ]]; then
+        result=$(_board_transition "$id" "quarantined" --force "$reason")
+      else
+        result=$(_board_transition "$id" "quarantined")
+      fi
+      echo "$result" | _board_outcome "$id" "quarantined"
+      return $?
+      ;;
     status)
       local id="${1:-}"; local new_status="${2:-}";
       _board_id_guard "status" "$id"
@@ -3932,6 +3990,11 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
                                     REFUSED, not folded into the title — AEAB-17.)
   amux board claim <ID>            Atomically claim a todo/backlog card for this worker
   amux board assign <ID> <worker>  Reassign a card to a worker (the claim 409's sanctioned exit)
+  amux board needs <ID> "<title>"  Report a blocker: file <title> as a NEW task and make
+                                   <ID> depend on it. The driver parks <ID> and resumes it
+                                   when the blocker completes (the swarm clears it, no human).
+  amux board fail <ID> [--reason]  Report failure: route <ID> to the quarantined terminal
+                                   (the anti-livelock end state) with the reason.
   amux board needsyou <ID> --actor <name> --ask <type> --question "...?" --unblocks "..."
                                    Park a card on the human. The ask is TYPED:
                                    decision | access | credential | external | judgment
