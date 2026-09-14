@@ -146,8 +146,78 @@ for p in d.get('packages',[]):
         print(os.path.relpath(os.path.dirname(p['manifest_path']), d.get('workspace_root','.')));break" "$_pkg" 2>/dev/null)
   [ -n "$_pkg_dir" ] || { [ -d "crates/$_pkg" ] && _pkg_dir="crates/$_pkg"; }
 fi
+_safe="$(dirname "${_TC_ORIGIN:-$0}")/safe-cargo.sh"
+
+# AF-791: detect shared-target stale artifacts when source content changes but
+# mtime does not. On this repo's shared CARGO_TARGET_DIR, mtime-only freshness
+# can miss real source edits and reuse stale rlibs. Store a stable source digest
+# per package and, when it changes, proactively clear that package's cache before
+# running tests so the compile result cannot be stale.
+_source_fingerprint() {
+  python3 - "$1" <<'PY'
+import hashlib
+import os
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+h = hashlib.sha256()
+paths = []
+for rel in sorted(root.rglob('*.rs')):
+    if rel.is_file():
+        paths.append(rel)
+cargo_toml = root / 'Cargo.toml'
+if cargo_toml.is_file():
+    paths.append(cargo_toml)
+
+for path in paths:
+    rel = path.relative_to(root)
+    h.update(str(rel).encode())
+    with path.open('rb') as handle:
+        while True:
+            chunk = handle.read(10240)
+            if not chunk:
+                break
+            h.update(chunk)
+print(h.hexdigest())
+PY
+}
+
+_freshen_shared_package_cache() {
+  if [ -z "$_pkg_dir" ] || [ -z "$_pkg" ]; then
+    return 0
+  fi
+
+  _fp_root="$CARGO_TARGET_DIR/.amux-cargo-fingerprint"
+  _fp_file="$_fp_root/${_pkg}.sha256"
+  mkdir -p "$_fp_root"
+
+  _current_fp=$(_source_fingerprint "$_pkg_dir")
+  _previous_fp=""
+  if [ -f "$_fp_file" ]; then
+    _previous_fp="$(cat "$_fp_file")"
+  fi
+
+  if [ "$_previous_fp" = "$_current_fp" ]; then
+    return 0
+  fi
+
+  if [ -n "$_previous_fp" ]; then
+    echo "staleness: shared target cache for package $_pkg differs from source digest;"
+    echo "staleness: cleaning package cache before this test run to avoid stale artifacts."
+    if [ -x "$_safe" ]; then
+      "$_safe" clean --manifest-path "$(cd "$_pkg_dir" && pwd)/Cargo.toml" -p "$_pkg" --quiet
+    else
+      (cd "$_pkg_dir" && cargo clean --manifest-path Cargo.toml -p "$_pkg" --quiet)
+    fi
+  fi
+
+  printf '%s' "$_current_fp" > "$_fp_file"
+}
 
 DIRTY_BEFORE=$(dirty_now)
+
+_freshen_shared_package_cache
 
 # ── WHICH TARGETS DID THIS NOT RUN? (AF-346) ────────────────────────────────
 #
@@ -236,7 +306,6 @@ esac
 # `cargo test` here failed the pane's whole scope and took the interactive
 # session down with it, which is the exact hazard the wrapper prevents. On a
 # host with no systemd the wrapper execs cargo directly and this is a no-op.
-_safe="$(dirname "${_TC_ORIGIN:-$0}")/safe-cargo.sh"
 if [ -x "$_safe" ]; then
   # It writes its own receipt for a `test` run; this script writes one at the
   # end, so tell it not to. Two identical receipts would be harmless and
