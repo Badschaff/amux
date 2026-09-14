@@ -3,7 +3,7 @@ import { settled, phaseLabels } from './interactions.mjs';
 import registry from './control-registry.json';
 import { actionFromHandler } from './controls.mjs';
 
-export function installFeedback(interactions, ui) {
+export function installFeedback(interactions, ui, diagnostic = () => {}) {
   const controls = new Map();
   let source = null;
   const hub = document.createElement('details');
@@ -11,7 +11,11 @@ export function installFeedback(interactions, ui) {
   const summary = document.createElement('summary');
   summary.title = 'Action status';
   summary.append(createElement(Activity, {width:16, height:16}));
+  const heading = document.createElement('span');
+  heading.textContent = 'Recent actions';
+  summary.append(heading);
   const status = document.createElement('span');
+  status.className = 'interaction-summary-status';
   status.setAttribute('role', 'status');
   status.setAttribute('aria-live', 'polite');
   summary.append(status, createElement(ChevronDown, {width:14, height:14}));
@@ -19,8 +23,26 @@ export function installFeedback(interactions, ui) {
   list.className = 'interaction-list';
   list.setAttribute('aria-label', 'Recent actions');
   hub.append(summary, list);
-  (document.querySelector('.header-row') || document.body).append(hub);
-  hub.addEventListener('toggle', () => ui.setState({activityOpen:hub.open}));
+  const panel = document.getElementById('notif-panel');
+  if (panel) panel.insertBefore(hub, document.getElementById('notif-panel-list'));
+  else diagnostic({verdict:'interaction_inspector_host_missing', measured:false, n_considered:0,
+    why_unmeasured:'Notifications panel is missing'});
+  function reportVisibility() {
+    if (!panel?.classList.contains('active')) return;
+    requestAnimationFrame(() => {
+      // Opening and dismissing can both occur before this frame executes.
+      if (!panel.classList.contains('active')) return;
+      const rect = summary.getBoundingClientRect();
+      const visible = rect.width > 0 && rect.height > 0 && rect.left >= 0 && rect.right <= innerWidth
+        && rect.top >= 0 && rect.bottom <= innerHeight;
+      diagnostic({verdict:visible ? 'interaction_inspector_visible' : 'interaction_inspector_clipped',
+        measured:true, n_considered:1, open:hub.open, visible,
+        rect:{left:rect.left, top:rect.top, width:rect.width, height:rect.height},
+        viewport:{width:innerWidth, height:innerHeight}});
+    });
+  }
+  if (panel) new MutationObserver(reportVisibility).observe(panel, {attributes:true, attributeFilter:['class']});
+  hub.addEventListener('toggle', () => { ui.setState({activityOpen:hub.open}); reportVisibility(); });
   document.addEventListener('keydown', event => { if (event.key === 'Escape') hub.open = false; });
   const selectors = 'button, [role="button"], input, select, textarea, a[href], [onclick], [onchange]';
   function declare(element) {
@@ -66,6 +88,11 @@ export function installFeedback(interactions, ui) {
     status.textContent = pending.length ? pending.length + ' active' : last ? phaseLabels[last.phase] : 'Actions';
     hub.dataset.phase = pending.some(r => ['unknown','blocked'].includes(r.phase)) ? 'blocked' : pending.length ? 'running' : last?.phase || 'idle';
     const visible = [...pending, ...receipts.filter(r => settled.has(r.phase)).slice(-20)].reverse();
+    const focused = document.activeElement;
+    const focusedReceipt = panel?.classList.contains('active') && list.contains(focused)
+      && focused.matches('article > details > summary') ? focused.closest('article').dataset.interactionId : null;
+    const expanded = new Set([...list.querySelectorAll('article > details[open]')]
+      .map(details => details.parentElement.dataset.interactionId));
     list.replaceChildren();
     if (!visible.length) { const empty = document.createElement('p'); empty.textContent = 'No recent actions'; list.append(empty); }
     for (const item of visible) {
@@ -105,7 +132,9 @@ export function installFeedback(interactions, ui) {
       }
       if (item.why_unmeasured) { const why = document.createElement('p'); why.textContent = item.why_unmeasured; row.append(why); }
       const explanation = document.createElement('details');
-      const explainLabel = document.createElement('summary'); explainLabel.textContent = 'Details';
+      explanation.open = expanded.has(item.id);
+      const explainLabel = document.createElement('summary');
+      explainLabel.append(createElement(ChevronDown, {width:14, height:14}), document.createTextNode('Details'));
       const metadata = document.createElement('p');
       metadata.textContent = item.id + (item.acknowledgement?.status ? ' | HTTP ' + item.acknowledgement.status : '') + ' | ' + item.effects.length + ' recorded changes';
       explanation.append(explainLabel, metadata);
@@ -116,6 +145,21 @@ export function installFeedback(interactions, ui) {
       if (remedy) { const text = document.createElement('p'); text.textContent = typeof remedy === 'string' ? remedy : JSON.stringify(remedy); explanation.append(text); }
       row.append(explanation);
       list.append(row);
+    }
+    if (focusedReceipt && visible.some(item => item.id === focusedReceipt)) {
+      const replacement = [...list.querySelectorAll('article')]
+        .find(row => row.dataset.interactionId === focusedReceipt)?.querySelector('details > summary');
+      if (panel.classList.contains('active') && document.activeElement === document.body)
+        replacement?.focus({preventScroll:true});
+      const restored = document.activeElement === replacement;
+      diagnostic({verdict:restored ? 'interaction_focus_restored' : 'interaction_focus_lost',
+        measured:true, n_considered:1, interaction_id:focusedReceipt, restored});
+    }
+    const retainedExpanded = visible.filter(item => expanded.has(item.id));
+    if (retainedExpanded.length) {
+      const restored = list.querySelectorAll('article > details[open]').length;
+      diagnostic({verdict:restored === retainedExpanded.length ? 'interaction_disclosures_preserved' : 'interaction_disclosures_lost',
+        measured:true, n_considered:retainedExpanded.length, restored});
     }
   }
   interactions.subscribe(receipt => {

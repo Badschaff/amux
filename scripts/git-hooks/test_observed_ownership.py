@@ -147,6 +147,46 @@ class ObservedOwnershipTests(unittest.TestCase):
         self.assertNotIn("no other session edited it", output)
         self.assertNotIn("THEIR claim is a recorded write", output)
 
+    def test_pathspec_refusal_keeps_the_candidate_visible_after_its_temporary_index_disappears(self):
+        import shlex
+        hook = Path(os.environ.get("STAGED_GUARD_HOOK") or
+                    Path(__file__).with_name("amux-staged-guard")).resolve()
+        rel = self.paths[0]
+        response = {"ok": True, "foreign": [{"path": rel, "owner": "",
+                    "why": "A cotenant is invisible; ownership is unverified."}]}
+        wrapper = self.repo / ".git" / "hooks" / "pre-commit"
+        wrapper.write_text("#!/usr/bin/env python3\n"
+            "import io,json,runpy,urllib.request\n"
+            f"response={response!r}\n"
+            "urllib.request.urlopen=lambda request, **kwargs: io.BytesIO(json.dumps(response).encode())\n"
+            f"runpy.run_path({str(hook)!r},run_name='__main__')\n")
+        wrapper.chmod(0o755)
+        self.git("config", "core.hooksPath", str(wrapper.parent))
+        self.git("reset", "--quiet", "HEAD")
+        env = fixture_environment()
+        env.update(AMUX_SESSION="author-lane", AMUX_URL="https://guard.invalid",
+                   AMUX_HOME=str(Path(self.scratch.name) / "home"))
+        head = self.git("rev-parse", "HEAD").stdout
+        for content in ["baseline\nown append\n", "a peer replaced the whole file\n"]:
+            with self.subTest(content=content):
+                (self.repo / rel).write_text(content)
+                self.assertEqual(self.git("diff", "--cached", "--", rel).stdout, "")
+                attempt = subprocess.run(["git", "commit", "-m", "candidate", "--", rel],
+                    cwd=self.repo, env=env, capture_output=True, text=True)
+                self.assertNotEqual(attempt.returncode, 0, attempt.stdout)
+                self.assertIn("COMMIT BLOCKED", attempt.stderr)
+                self.assertEqual(self.git("rev-parse", "HEAD").stdout, head)
+                self.assertEqual(self.git("diff", "--cached", "--", rel).stdout, "",
+                                 "Git must discard the pathspec's temporary index on refusal")
+                commands = [line.strip().split(" #", 1)[0].strip()
+                            for line in attempt.stderr.splitlines()
+                            if line.strip().startswith("git diff HEAD -- ")]
+                self.assertEqual(len(commands), 1, attempt.stderr)
+                candidate = self.git(*shlex.split(commands[0])[1:]).stdout
+                self.assertIn("+" + content.splitlines()[-1], candidate)
+                self.assertIn("empty diff is not ownership verification", attempt.stderr)
+                self.assertIn("temporary index", attempt.stderr)
+
     def test_caller_git_variables_cannot_redirect_the_disposable_fixture(self):
         sentinel = Path(self.scratch.name) / "caller-repo"
         sentinel.mkdir()

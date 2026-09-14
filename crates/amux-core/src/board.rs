@@ -609,6 +609,27 @@ fn gate_check(
     }
 }
 
+/// A worker may not transition a card another worker holds.
+///
+/// The refusal fires only when the card has a lease holder AND the acting party
+/// is a different worker. A human, the system, the harness, and the holder
+/// itself all pass. This is the single enforcement path for the board's hard
+/// lease (RR-0052): the server populates `task.worker` from the lease holder and
+/// passes an `Actor::Worker`, so the WorkerId equality below becomes name
+/// equality via the shared `foreign_worker_id` mapping. `Force` never calls this,
+/// so the audited bypass stays exempt.
+pub fn holder_guard(task: &Task, actor: &Actor) -> Result<(), TransitionError> {
+    if let (Some(holder), Actor::Worker { id }) = (&task.worker, actor) {
+        if holder != id {
+            return Err(TransitionError::AlreadyClaimed {
+                task: task.id.clone(),
+                holder: holder.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The board's transactional state machine (Invariant 3): one function, one
 /// code path. Pure — the caller supplies `now`, persists the returned task,
 /// and emits the `DurableEvent` attributing the change to `actor`.
@@ -620,7 +641,8 @@ fn gate_check(
 ///   transition carries; `Force` bypasses gates but never attribution;
 /// - no-ops are refused, so version bumps always mean change (Invariant 37);
 /// - task state never encodes execution state (Invariant 19): there is no
-///   transition for "rate limited" or "crashed" on purpose.
+///   transition for "rate limited" or "crashed" on purpose;
+/// - a worker may not transition a card another worker holds ([`holder_guard`]).
 pub fn apply_transition(
     task: &Task,
     transition: BoardTransition,
@@ -698,14 +720,7 @@ pub fn apply_transition(
         T::Start => match task.status {
             S::Todo => {
                 // A worker may not start a card another worker holds.
-                if let (Some(holder), Actor::Worker { id }) = (&task.worker, actor) {
-                    if holder != id {
-                        return Err(TransitionError::AlreadyClaimed {
-                            task: task.id.clone(),
-                            holder: holder.clone(),
-                        });
-                    }
-                }
+                holder_guard(task, actor)?;
                 gate_check(task, S::Doing, effective_gates, &[])?;
                 Ok(finish(task, now, |t| {
                     t.status = S::Doing;
@@ -725,6 +740,7 @@ pub fn apply_transition(
 
         T::Submit => match task.status {
             S::Doing => {
+                holder_guard(task, actor)?;
                 gate_check(task, S::Review, effective_gates, &[])?;
                 Ok(finish(task, now, |t| t.status = S::Review))
             }
@@ -736,6 +752,7 @@ pub fn apply_transition(
 
         T::RequestReview { reviewer } => match task.status {
             S::Doing => {
+                holder_guard(task, actor)?;
                 gate_check(task, S::Review, effective_gates, &[])?;
                 Ok(finish(task, now, |t| {
                     t.status = S::Review;
@@ -763,6 +780,7 @@ pub fn apply_transition(
 
         T::Complete { evidence } => match task.status {
             S::Doing => {
+                holder_guard(task, actor)?;
                 gate_check(task, S::Done, effective_gates, &evidence)?;
                 Ok(finish(task, now, |t| t.status = S::Done))
             }
@@ -795,6 +813,7 @@ pub fn apply_transition(
 
         T::RequestInput { .. } => match task.status {
             S::Doing => {
+                holder_guard(task, actor)?;
                 gate_check(task, S::NeedsYou, effective_gates, &[])?;
                 Ok(finish(task, now, |t| t.status = S::NeedsYou))
             }
@@ -815,6 +834,7 @@ pub fn apply_transition(
 
         T::Block { .. } => match task.status {
             S::Todo | S::Doing => {
+                holder_guard(task, actor)?;
                 gate_check(task, S::Blocked, effective_gates, &[])?;
                 Ok(finish(task, now, |t| t.status = S::Blocked))
             }
@@ -1157,6 +1177,75 @@ const CAPTURE_FILLER: [&str; 19] = [
 /// never a model call (ethos rule 2: the Python system paid a full
 /// `claude -p` boot, ~12-15k input tokens, for a 3-word label, and the
 /// throttle that cost forced is why most commands never reached the board).
+/// Strip ONE leading bare clock-time prefix, returning the remainder, or `None`
+/// if `t` does not open with one. Some workers prefix every peer message with a
+/// UTC time like `11:2xZ.` (the minute may be masked with `x`), which then became
+/// the card TITLE ("11:2xZ") and, sitting in the first clause, hid the real
+/// content from every capture classifier (AMUX-4498, 23 timestamp-titled cards
+/// across the fleet). Grammar: `HH:MM`, optional `:SS`, each minute/second
+/// character a digit or `x`; an optional single trailing letter (a zone like `Z`);
+/// then a separator (`.`, space, `,`, `;`, `:`, `-`). No regex, so amux-core
+/// stays dependency-light.
+fn strip_leading_time_prefix(t: &str) -> Option<&str> {
+    let b = t.as_bytes();
+    let mut i = 0;
+    let digit = |c: u8| c.is_ascii_digit();
+    let mm = |c: u8| c.is_ascii_digit() || c == b'x' || c == b'X';
+    // HH: 1-2 digits
+    if i < b.len() && digit(b[i]) {
+        i += 1;
+        if i < b.len() && digit(b[i]) {
+            i += 1;
+        }
+    } else {
+        return None;
+    }
+    // :MM
+    if i < b.len() && b[i] == b':' && i + 2 < b.len() && mm(b[i + 1]) && mm(b[i + 2]) {
+        i += 3;
+    } else {
+        return None;
+    }
+    // optional :SS
+    if i + 2 < b.len() && b[i] == b':' && mm(b[i + 1]) && mm(b[i + 2]) {
+        i += 3;
+    }
+    // optional single zone letter
+    if i < b.len() && b[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    // must be followed by a separator, or the "time" was really the whole word.
+    if i < b.len() && matches!(b[i], b'.' | b' ' | b',' | b';' | b':' | b'-') {
+        Some(t[i..].trim_start_matches(['.', ' ', ',', ';', ':', '-']))
+    } else {
+        None
+    }
+}
+
+/// Strip the leading capture prefixes a message accretes before its real
+/// content: `[HH:MM AM]` / `[amux-origin: ...]` bracket stamps and bare clock
+/// times (see [`strip_leading_time_prefix`]), repeatedly and in any order.
+/// Shared by every capture classifier so a stamped/timestamped message is judged
+/// on its content, not its prefix. Does NOT handle `[no-board]`, which is
+/// `title_from_prompt`'s early-return concern.
+pub(crate) fn strip_capture_prefixes(text: &str) -> &str {
+    let mut t = text.trim().trim_start_matches('❯').trim_start();
+    loop {
+        if t.starts_with('[') {
+            if let Some(i) = t.find(']') {
+                t = t[i + 1..].trim_start();
+                continue;
+            }
+        }
+        if let Some(rest) = strip_leading_time_prefix(t) {
+            t = rest;
+            continue;
+        }
+        break;
+    }
+    t
+}
+
 /// Mirrors Python `_autotask_title` + the `_AUTOTASK_SKIP` guards.
 ///
 /// Returns `None` when the text is NOT a task: a control word steering the
@@ -1175,13 +1264,23 @@ pub fn title_from_prompt(text: &str) -> Option<String> {
         if lower.starts_with("[no-board]") || lower.starts_with("[no_board]") {
             return None;
         }
-        if !t.starts_with('[') {
-            break;
+        if t.starts_with('[') {
+            match t.find(']') {
+                Some(i) => {
+                    t = t[i + 1..].trim_start();
+                    continue;
+                }
+                None => break,
+            }
         }
-        match t.find(']') {
-            Some(i) => t = t[i + 1..].trim_start(),
-            None => break,
+        // A bare leading clock time ("11:2xZ.") is a prefix, not a title
+        // (AMUX-4498). Strip it here too, after the [no-board] check so the
+        // opt-out still wins.
+        if let Some(rest) = strip_leading_time_prefix(t) {
+            t = rest;
+            continue;
         }
+        break;
     }
     let collapsed = t.split_whitespace().collect::<Vec<_>>().join(" ");
     let bare = collapsed
@@ -1303,15 +1402,9 @@ fn capture_has_task_followup(lower: &str) -> bool {
 /// question ("can you fix X?", "does this build?") does not start with a status
 /// opener and is left to card as normal.
 pub fn is_status_query(text: &str) -> bool {
-    let mut t = text.trim();
-    // Drop the same leading "[03:47 PM] " / "[amux-origin: ...]" stamps
-    // title_from_prompt strips, so a stamped status query still matches.
-    while t.starts_with('[') {
-        match t.find(']') {
-            Some(i) => t = t[i + 1..].trim_start(),
-            None => break,
-        }
-    }
+    // Drop the same leading "[03:47 PM] " / "[amux-origin: ...]" stamps and bare
+    // clock times title_from_prompt strips, so a stamped query still matches.
+    let t = strip_capture_prefixes(text);
     let collapsed = t.split_whitespace().collect::<Vec<_>>().join(" ");
     // A long prompt is not a bare query, whatever it opens with.
     if collapsed.chars().count() > 100 {
@@ -1355,13 +1448,7 @@ pub fn is_status_query(text: &str) -> bool {
 /// that require running work ("does this build?") remain cardable. Unknown
 /// shapes fail open to a card so the classifier can never silently lose work.
 pub fn is_informational_query(text: &str) -> bool {
-    let mut t = text.trim();
-    while t.starts_with('[') {
-        match t.find(']') {
-            Some(i) => t = t[i + 1..].trim_start(),
-            None => break,
-        }
-    }
+    let t = strip_capture_prefixes(text);
     let collapsed = t.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.is_empty() {
         return false;
@@ -1540,13 +1627,7 @@ fn is_non_mutating_answer_tail(tail: &str) -> bool {
 /// matches a known ack pattern are suppressed. Unknown shapes fail open to a
 /// card so the filter cannot silently lose work.
 pub fn is_conversational_ack(text: &str) -> bool {
-    let mut t = text.trim();
-    while t.starts_with('[') {
-        match t.find(']') {
-            Some(i) => t = t[i + 1..].trim_start(),
-            None => break,
-        }
-    }
+    let t = strip_capture_prefixes(text);
     let collapsed: String = t.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.chars().count() >= 50 {
         return false;
@@ -1576,6 +1657,214 @@ pub fn is_conversational_ack(text: &str) -> bool {
         "sounds good",
     ];
     ACK_PREFIXES.iter().any(|p| lower.starts_with(p))
+}
+
+/// A message whose primary content is a STATUS REPORT, a detailed
+/// acknowledgment, or a broadcast coordination announcement — peer coordination
+/// chatter, not a deliverable the receiving worker owns. Carding these put
+/// acks, CI/status updates and fleet announcements on every recipient's board:
+/// measured 2026-09-13, 2,691 auto-captured cards discarded fleet-wide and a
+/// single broadcast ("start all non-archived workers") minted on 55 boards at
+/// once (Ethan: "some of these tasks are a) not tasks for that worker and b)
+/// not really tasks ... be better about amux task creation").
+///
+/// Returning true means "do not mint a board WORK card"; the message still lands
+/// in `cmd_history`, so the Messages ledger keeps every message — exactly like
+/// [`is_conversational_ack`] and [`is_informational_query`] already decline.
+///
+/// Precision is asymmetric, the same way [`is_status_query`] documents: a false
+/// positive silences a real task (the worst failure), a false negative is one
+/// manual discard. So a real routed defect or delegated task from a peer MUST
+/// still card. Two guards keep that true: an opener that carries a genuine task
+/// follow-up (`capture_has_task_followup`, e.g. "main is green again; now cut
+/// the release") is NOT suppressed, and this matches report / ack / broadcast
+/// SHAPES rather than merely "a peer sent it". Unknown shapes fall through to a
+/// card (fail open).
+pub fn is_status_report(text: &str) -> bool {
+    let t = strip_capture_prefixes(text);
+    let collapsed = t.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return false;
+    }
+    let lower = collapsed.to_lowercase();
+
+    // A genuine task stacked after the report/ack keeps the card ("shipped the
+    // fix; now add a changelog", "thanks, now build the tab"). This is tighter
+    // than capture_has_task_followup in two ways it must be here: it also treats
+    // a comma-led "..., now fix Y" as a break, and it does NOT read "Run 34762
+    // completed" (a CI run id) as the imperative "run", which the shared helper
+    // does — that misread would leave every "CHECKS GREEN. Run <id> …" report
+    // carded.
+    if report_has_task_request(&lower) {
+        return false;
+    }
+
+    // The first clause carries the intent.
+    let first_end = lower.find(['.', '!', '?', ';']).unwrap_or(lower.len());
+    let first = lower[..first_end].trim();
+    // Same clause in original case, for board-id tokens (MS-1496, not ms-1496).
+    let first_orig = collapsed[..first_end.min(collapsed.len())].trim();
+
+    // D. Dispatch relays: "Go: <worker> MS-1496, then MS-1497 in sequence ..." —
+    //    an orchestrator sequencing a worker's OWN existing cards. The work is
+    //    those referenced cards; the relay is not a new task. Requires a board
+    //    reference so a bare imperative ("go: fix the bug") still cards.
+    if (first.starts_with("go:") || first.starts_with("go ahead:")) && contains_card_ref(first_orig)
+    {
+        return true;
+    }
+
+    // A. Acknowledgments / receipts, at ANY length. is_conversational_ack caps
+    //    at 50 chars and so misses detailed acks like "Received, and it is mine.
+    //    Carded BACKE-4266. Thanks for the isolation ...".
+    const ACK_OPENERS: &[&str] = &[
+        "received,", "received ", "received.", "both taken", "both applies",
+        "both received", "got it", "all clear", "all-clear", "acknowledged",
+        "noted", "roger", "copy that", "understood", "will do", "standing by",
+        "thanks for", "thank you", "thanks,", "reaffirmed", "reaffirming",
+    ];
+    if ACK_OPENERS.iter().any(|p| first.starts_with(p)) {
+        return true;
+    }
+
+    // B. Broadcast / fleet-coordination announcements. One send is relayed to
+    //    many boards, so each is coordination, not one task per recipient.
+    const BROADCAST_OPENERS: &[&str] = &[
+        "quiesce", "heads-up", "heads up", "fyi ", "fyi:", "override from",
+        "override:", "override,", "do not push", "do not pull", "do not merge",
+        "hold any new", "hold all", "it is already restored", "ethan asked at",
+        "ethan asked to",
+    ];
+    if BROADCAST_OPENERS.iter().any(|p| first.starts_with(p)) {
+        return true;
+    }
+    // "ALL-CLEAR from <origin>", "HEADS-UP from <origin>, <date>:", etc.
+    if (first.contains(" from ") || first.contains(" by "))
+        && (first.starts_with("all clear")
+            || first.starts_with("all-clear")
+            || first.starts_with("heads-up")
+            || first.starts_with("heads up"))
+    {
+        return true;
+    }
+
+    // C. Completion / status reports — the clause asserts a DONE state, not an
+    //    imperative to reach it ("deployed to prod" reports; "deploy to prod" is
+    //    a task). A first clause that OPENS with a task verb is a brief that
+    //    merely mentions a report word ("Build the dashboard showing which checks
+    //    are green"), so it is left to card.
+    if capture_clause_starts_task(first) {
+        return false;
+    }
+    // Specific, unambiguous completion phrases — no length limit.
+    const REPORT_PHRASES: &[&str] = &[
+        "confirmed green", "verified on origin", "verified on main",
+        "verified in prod", "landed on origin", "landed on main", "merged to main",
+        "is refused", "was refused", "is settled in git", "is already settled",
+        "completed success", "run succeeded",
+    ];
+    if REPORT_PHRASES.iter().any(|p| first.contains(p)) {
+        return true;
+    }
+    // The bare "<subject> is green" family is looser, so it only counts in a
+    // SHORT declarative clause ("main is GREEN again", "FAST CHECKS IS GREEN"),
+    // never buried in a longer sentence.
+    const GREEN_PHRASES: &[&str] =
+        &[" is green", " are green", "back to green", "green again", "ci is green"];
+    if first.chars().count() <= 45 && GREEN_PHRASES.iter().any(|p| first.contains(p)) {
+        return true;
+    }
+
+    false
+}
+
+/// True if `s` contains a board-id token: 2+ uppercase ASCII letters, a `-`,
+/// then digits (e.g. `MS-1496`, `BACKE-4266`). No regex, so amux-core stays
+/// dependency-light. Used only to keep the dispatch-relay branch precise.
+fn contains_card_ref(s: &str) -> bool {
+    s.split(|c: char| c != '-' && !c.is_ascii_alphanumeric())
+        .any(|tok| match tok.split_once('-') {
+            Some((a, b)) => {
+                a.len() >= 2
+                    && a.chars().all(|c| c.is_ascii_uppercase())
+                    && !b.is_empty()
+                    && b.chars().all(|c| c.is_ascii_digit())
+            }
+            None => false,
+        })
+}
+
+/// An explicit task stacked after a status/ack clause, e.g. "shipped it; now
+/// fix the flake" or "thanks, then add a test". Distinct from
+/// [`capture_has_task_followup`] on purpose: it also treats a comma-led
+/// "..., now <verb>" as a clause break, and it does NOT read "Run 34762983943
+/// completed" (a CI run id) as the imperative "run".
+fn report_has_task_request(lower: &str) -> bool {
+    const MARKERS: &[&str] =
+        &["; ", " — ", " -- ", ". ", "! ", "? ", ", now ", ", then ", ", also "];
+    for marker in MARKERS {
+        for clause in lower.split(marker).skip(1) {
+            let clause = clause.trim_start_matches("now ").trim_start_matches("then ");
+            // "run <digits/hash>" is a noun (a CI run), not the imperative verb.
+            if let Some(rest) = clause.strip_prefix("run ") {
+                if rest.chars().next().is_some_and(|c| !c.is_ascii_alphabetic()) {
+                    continue;
+                }
+            }
+            if capture_clause_starts_task(clause) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Does an inbound PEER message carry a genuine ask — a request or delegation
+/// the recipient is expected to act on — as opposed to status, acknowledgment,
+/// review, approval, or coordination chatter?
+///
+/// Provenance is the reliable discriminator the capture path was missing.
+/// Workers talk to each other constantly ("LANDED <sha>", "verified on origin",
+/// "read and recorded", "correcting myself", "all three landed"), and every such
+/// message was minting a `code` work card on the RECIPIENT's board (Ethan,
+/// 2026-09-14: "workers are populating their board with bogus [tasks] ... be
+/// better about amux task creation"). Measured on 200 recent peer capture cards:
+/// 82% carried no ask.
+///
+/// Used to gate the MINT path for peer-origin messages only: a peer message with
+/// no ask stays in Messages and mints no card. HUMAN and SCHEDULE prompts never
+/// pass through this gate, so Ethan's own instructions are unaffected. A peer
+/// message that references a card the recipient already owns is still linked by
+/// `associate_capture_card`'s reuse path, which runs before the mint.
+///
+/// The error is asymmetric and biased toward carding: a false "wants action"
+/// mints a discardable card (recoverable), a false "no action" drops a peer's
+/// routed task from the board (but it is still in Messages, and the peer can
+/// re-ping). So the ask markers are generous, and a `?` always counts.
+pub fn peer_message_wants_action(text: &str) -> bool {
+    let t = strip_capture_prefixes(text);
+    let lower = t.to_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    // A direct question to the recipient is an ask.
+    if lower.contains('?') {
+        return true;
+    }
+    // Explicit request / delegation / hand-off markers. Generous on purpose
+    // (see the doc above): carding a borderline is the safe direction.
+    const ASK_MARKERS: &[&str] = &[
+        "please ", "can you", "could you", "would you", "will you",
+        "request", "requesting", "route ", "routing ", "reroute", "assign",
+        "attach ", "action needed", "action required", "your action",
+        "your call", "you need to", "you have to", "you must", "you should ",
+        "needs your", "need your", "need you to", "want you to",
+        "hand off", "handing ", "handoff", "hand this", "take over", "take this",
+        "own this", "pick up", "picking this up", "to you:", "for you to",
+        "yours to ", "over to you", "your turn", "waiting on you", "blocked on you",
+        "at risk", "heads up:", "please review", "review request", "approve ",
+    ];
+    ASK_MARKERS.iter().any(|m| lower.contains(m))
 }
 
 /// AF-699 (reported by mixpeek-orchestrator/gtm-engine, GE-896): a captured
@@ -1883,6 +2172,118 @@ mod capture_tests {
             "Acceptance check only: what provider is active? Answer in one sentence. Do not create a board task, then update the docs.",
         ] {
             assert!(!is_informational_query(s), "{s:?} produces work and needs a card");
+        }
+    }
+
+    #[test]
+    fn status_reports_and_acks_are_message_only_but_real_tasks_still_card() {
+        // Live specimens pulled from the board on 2026-09-13 (AMUX-4498): peer
+        // coordination that had minted `code` cards on recipient boards.
+        for s in [
+            // Detailed acks (past the 50-char is_conversational_ack cap).
+            "Received, and it is mine. Carded BACKE-4266. Thanks for the isolation: proving the string half is gone.",
+            "Both taken, and thank you for closing it end to end.",
+            "Both applies received, and you were right to rank them.",
+            "Got it, and thanks for the exact dict shape: snapshot_id first.",
+            // Status / completion reports.
+            "[ops-server] Contract verified on origin. Names are right, no renames wanted. Wiring MOS-154 against it.",
+            "mixpeek-ops-server: FAST CHECKS IS GREEN. Run 34762983943 on b9c07d1d9e completed success.",
+            "Gtm-playbooks: main is GREEN again",
+            "GCA-210 CI confirmed GREEN: canvas-build-gate run 34788 passed.",
+            "BACKE-4200 foundation landed on origin/main",
+            // Broadcast / fleet coordination announcements.
+            "QUIESCE, one slot: hold any NEW graft until backend's push clears.",
+            "HEADS-UP from mixpeek-orchestrator, 2026-09-10 00:14: pausing grafts.",
+            "ALL-CLEAR from mixpeek-orchestrator, 2026-09-10 00:41: resume normal work.",
+            "DO NOT PUSH TO main UNTIL THIS CLEARS",
+            "IT IS ALREADY RESTORED",
+            // Dispatch relays that sequence a worker's own existing cards.
+            "Go: mixpeek-studio MS-1496, then MS-1497, then MS-1492, in sequence, tip df822085a9 at 13:15Z.",
+            "Go: gtm-playbooks GP-167 red repair (8871c25c8e), then GP-168.",
+            // Composer prompt glyph must not defeat the detector.
+            "❯ Received, and it is mine. Carded BACKE-4266.",
+        ] {
+            assert!(is_status_report(s), "{s:?} should read as a status report / ack / broadcast");
+        }
+        // Real work MUST still card — a false positive here silences a task.
+        for s in [
+            // Peer-routed defects and delegated tasks (the population to leave alone).
+            "Routing a filter-path defect that is yours, measured, and reproducible: fix the archived-card 500.",
+            "@backend please fix the OAuth redirect on the staging gateway",
+            "Contract verified on origin; add a regression test for the rename path",
+            "main is green again; ship the 0.9 release",
+            "verified on origin — please add a regression test for the rename path",
+            // Ethan's own genuine tasks from this session.
+            "make an MDAI file that checks a free public weather API every time I open it",
+            "go back to the old icon aesthetic in the toolbar",
+            "thanks for the context, now build the connectors tab and ship it",
+            // A plain human brief that merely contains a report word later.
+            "Build the CI dashboard that shows which checks are green per worker",
+            // "go:" with a real imperative and NO card reference is still work.
+            "Go: fix the archived-card 500 in the board API",
+        ] {
+            assert!(!is_status_report(s), "{s:?} is real work, must still card");
+        }
+    }
+
+    #[test]
+    fn a_bare_leading_clock_time_is_a_prefix_not_a_title() {
+        // AMUX-4498: workers prefix peer messages with a UTC time ("11:2xZ.",
+        // minute masked with x), which became the card title and hid the content.
+        assert_eq!(
+            title_from_prompt("11:2xZ. Read and recorded the fix shape, it is the right one"),
+            Some("Read and recorded the fix shape, it is the right one".into()),
+            "the time prefix must be stripped before the title"
+        );
+        assert_eq!(
+            title_from_prompt("08:15Z. deploy the gateway change to staging and verify"),
+            Some("Deploy the gateway change to staging and verify".into())
+        );
+        assert_eq!(
+            title_from_prompt("[mixpeek-cicd] 07:3xZ. fix the flaky auth test on CI"),
+            Some("Fix the flaky auth test on CI".into()),
+            "a time after a bracket stamp is also stripped"
+        );
+        // A real title that merely CONTAINS a time is untouched.
+        assert_eq!(
+            title_from_prompt("Add a 9:30 standup reminder to the scheduler"),
+            Some("Add a 9:30 standup reminder to the scheduler".into())
+        );
+        // The opt-out still wins over a time prefix.
+        assert_eq!(
+            title_from_prompt("[no-board] 11:24Z. what is the status of the deploy?"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_peer_message_cards_only_when_it_carries_an_ask() {
+        // Peer status/ack/coordination (no ask) — must NOT card. Live 2026-09-14.
+        for s in [
+            "11:2xZ. Read, and the fix shape is the right one: UNVERIFIABLE with the missing source named",
+            "LANDED: 24610b2acc1aed. My half of the red is in. Verified on origin.",
+            "11:3xZ. Recorded: dd0511188f, a150e1279d, each prefix compiled on its own disp",
+            "mvs-pitr. All three landed, tags cleaned, final gate hash posted to MO-3344.",
+            "CORRECTING MYSELF ON MHC-800: do not retire it.",
+            "ON THE RAIL NOW: f5f5a07d81. Mine to un-red.",
+            "RC-163 fix noted (95e0f254b4). Root matches my split.",
+            "905cd71b21 verified through to the live page. The eight 404s are gone.",
+            "[ops-server] LAND IT as-is. Reviewed the diff. APPROVED, no changes wanted.",
+        ] {
+            assert!(!peer_message_wants_action(s), "{s:?} carries no ask; a peer must not card it");
+        }
+        // Genuine peer requests / delegations — must still card.
+        for s in [
+            "Push window request: one AEO fix, 08fa4653b9, +12/-0, homepage only.",
+            "mvs-pitr: REQUEST, under Ethan's rule of 2026-09-10, pick up MO-3344.",
+            "slot? mixpeek-frustrations sweep-test-isolation-hardening code",
+            "Two of your commits are at risk from a local commit; you have to rebase.",
+            "Please attach the exact hardened test candidate path plus sha256 now.",
+            "Routing SP-868 to you: a gate whose input set changed.",
+            "BACKE-4286 plan review: ownership accepted; please tighten the timestamp contract.",
+            "Can you verify the OAuth redirect on staging?",
+        ] {
+            assert!(peer_message_wants_action(s), "{s:?} is a genuine ask and must card");
         }
     }
 
@@ -2232,6 +2633,53 @@ mod tests {
         let err = apply_transition(&t, BoardTransition::Start, &worker_actor("CCCC"), &[], t0())
             .unwrap_err();
         assert!(matches!(err, TransitionError::AlreadyClaimed { .. }));
+    }
+
+    #[test]
+    fn a_leased_doing_card_only_its_holder_may_transition() {
+        // RR-0052: a card in Doing held by worker BBBB. A different worker cannot
+        // submit/complete/block it; the holder, a human, and the system all can.
+        let doing = {
+            let mut t = mk(TaskStatus::Todo);
+            t.worker = Some(wid("BBBB"));
+            t.status = TaskStatus::Doing;
+            t
+        };
+        // holder_guard is the single enforcement point.
+        assert!(holder_guard(&doing, &worker_actor("BBBB")).is_ok(), "the holder passes");
+        assert!(holder_guard(&doing, &sys()).is_ok(), "the system passes");
+        assert!(
+            holder_guard(&doing, &Actor::Human { name: "ethan".into() }).is_ok(),
+            "a human passes"
+        );
+        assert!(
+            matches!(
+                holder_guard(&doing, &worker_actor("CCCC")),
+                Err(TransitionError::AlreadyClaimed { ref holder, .. }) if *holder == wid("BBBB")
+            ),
+            "a different worker is refused, naming the holder"
+        );
+        // And it fires through the real transition arms (Submit / Complete / Block).
+        for tr in [
+            BoardTransition::Submit,
+            BoardTransition::Complete { evidence: vec![] },
+            BoardTransition::Block { reason: "x".into() },
+        ] {
+            let err = apply_transition(&doing, tr, &worker_actor("CCCC"), &[], t1()).unwrap_err();
+            assert!(
+                matches!(err, TransitionError::AlreadyClaimed { .. }),
+                "a non-holder worker must not transition a leased Doing card"
+            );
+        }
+        // Force is never holder-gated (the audited bypass stays exempt).
+        assert!(apply_transition(
+            &doing,
+            BoardTransition::Force { status: TaskStatus::Todo, reason: "override".into() },
+            &worker_actor("CCCC"),
+            &[],
+            t1(),
+        )
+        .is_ok());
     }
 
     #[test]

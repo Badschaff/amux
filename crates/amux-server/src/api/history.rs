@@ -56,6 +56,7 @@ pub fn routes() -> Router<AppState> {
         // Look up ONE message by its id. `/import` is a literal POST above, so
         // this GET capture never swallows it.
         .route("/{id}", get(get_history_item))
+        .route("/{id}/card", axum::routing::put(link_card))
 }
 
 /// Attach every non-deleted task in the message card's durable epic lineage.
@@ -159,7 +160,7 @@ async fn get_history_item(
     let joined = crate::db::interactions::spawn_blocking(move || -> anyhow::Result<Option<Value>> {
         let conn = store.read()?;
         let sql = "SELECT id, text, type, session, ts, origin, card_id, \
-                   delivery, queued_at, delivered_at, submit_verdict, \
+                   delivery, queued_at, delivered_at, submit_verdict, capture_pending, \
                    (SELECT title FROM issues WHERE issues.id=cmd_history.card_id) AS card_title, \
                    (SELECT status FROM issues WHERE issues.id=cmd_history.card_id) AS card_status, \
                    (SELECT archived FROM issues WHERE issues.id=cmd_history.card_id) AS card_archived, \
@@ -190,7 +191,13 @@ async fn get_history_item(
                 )
                 .ok()
             };
-            let (verdict, source) = delivery_truth(&delivery, steering);
+            let submit_verdict = d.get("submit_verdict").and_then(Value::as_str);
+            let (verdict, source) = delivery_truth(&delivery, submit_verdict, steering);
+            if delivery == "direct" && verdict != "delivered" {
+                tracing::warn!(message_id = nid, ?submit_verdict, delivered = verdict,
+                    measured = true, n_considered = 1,
+                    "history_delivery_not_confirmed: direct record does not prove submission");
+            }
             d["delivered"] = json!(verdict);
             d["delivered_source"] = json!(source);
             if let Some(Some(t)) = steering {
@@ -230,12 +237,15 @@ async fn get_history_item(
 /// `steering` encodes THREE input states, because collapsing the last two is the
 /// whole defect: None = no matching row; Some(None) = row found, unstamped;
 /// Some(Some(t)) = row found, delivered at t.
-fn delivery_truth(cmd_delivery: &str, steering: Option<Option<f64>>) -> (&'static str, &'static str) {
-    // A DIRECT send really was delivered when it was recorded — AMUX-3541 kept
-    // `now_ms` there for exactly that reason, so cmd_history is authoritative
-    // for this case and no join is needed.
+fn delivery_truth(cmd_delivery: &str, submit_verdict: Option<&str>, steering: Option<Option<f64>>) -> (&'static str, &'static str) {
+    // Direct is a transport choice. The same durable record can say its
+    // submission stuck, was unverified, or has no outcome evidence at all.
     if cmd_delivery == "direct" {
-        return ("delivered", "cmd_history — a direct send is delivered when it is recorded");
+        return match submit_verdict {
+            Some("confirmed" | "retried") => ("delivered", "cmd_history.submit_verdict — submission confirmed"),
+            Some("stuck") => ("not delivered", "cmd_history.submit_verdict — submission remained stuck"),
+            _ => ("unknown", "cmd_history.submit_verdict — submission is not confirmed; direct alone is not evidence"),
+        };
     }
     match steering {
         Some(Some(_)) => ("delivered", "steering_history — stamped by the deliverer when it landed"),
@@ -651,7 +661,7 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
             // NULL — the UI distinguishes "not recorded" from "direct", and
             // coalescing here would assert a delivery path nobody observed.
             "SELECT id, text, type, session, ts, origin, card_id, \
-             delivery, queued_at, delivered_at, submit_verdict, \
+             delivery, queued_at, delivered_at, submit_verdict, capture_pending, \
              (SELECT title FROM issues WHERE issues.id=cmd_history.card_id) AS card_title, \
              (SELECT status FROM issues WHERE issues.id=cmd_history.card_id) AS card_status, \
              (SELECT archived FROM issues WHERE issues.id=cmd_history.card_id) AS card_archived, \
@@ -701,6 +711,108 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
         }
         Ok(Err(e)) => internal(e),
         Err(e) => internal(e),
+    }
+}
+
+/// Attribute one reviewed original message to an existing card without
+/// delivering a command or claiming historical work as newly active.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MessageCardLink {
+    session: String,
+    card_id: String,
+    reason: String,
+}
+
+async fn link_card(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<MessageCardLink>,
+) -> Response {
+    use crate::db::board_store as bs;
+    use rusqlite::OptionalExtension;
+    let raw = id
+        .trim()
+        .strip_prefix("MSG-")
+        .or_else(|| id.trim().strip_prefix("msg-"))
+        .unwrap_or(id.trim());
+    let Some(nid) = raw.parse::<i64>().ok().filter(|id| *id > 0) else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({"error":"expected a positive message ID or MSG-<id>"}),
+        );
+    };
+    let session = body.session.trim().to_owned();
+    let card_id = body.card_id.trim().to_owned();
+    let reason = body.reason.trim().to_owned();
+    if session.is_empty()
+        || card_id.is_empty()
+        || reason.is_empty()
+        || reason.chars().count() > 2000
+    {
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({"error":"session, card_id and a nonempty reason (at most 2000 characters) are required"}),
+        );
+    }
+    let actor = super::request_log::caller_from_headers(&headers);
+    let (expected_session, target, why, who) = (
+        session.clone(),
+        card_id.clone(),
+        reason.clone(),
+        actor.clone(),
+    );
+    let reply = Arc::new(Mutex::new(None));
+    let reply_w = reply.clone();
+    let result=state.store.write_async(move |conn| {
+        let source=conn.query_row("SELECT session,card_id FROM cmd_history WHERE id=?1",[nid],
+            |r| Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?))).optional()?;
+        let mut events=vec![];
+        let (status,value)=match source {
+            None => (StatusCode::NOT_FOUND,json!({"error":"message not found","message_id":nid})),
+            Some((actual,_)) if actual!=expected_session =>
+                (StatusCode::CONFLICT,json!({"error":"message session does not match the reviewed request","message_id":nid})),
+            Some((_,Some(existing))) if existing!=target =>
+                (StatusCode::CONFLICT,json!({"error":"message already has a different card; reconcile that existing work first","message_id":nid,"card_id":existing})),
+            Some((_,Some(existing))) =>
+                (StatusCode::OK,json!({"message_id":nid,"card_id":existing,"changed":false,"applied":false,"command_resent":false})),
+            Some((_,None)) => match bs::get_issue(conn,&target)? {
+                None => (StatusCode::NOT_FOUND,json!({"error":"card not found","card_id":target})),
+                Some(card) if card.archived!=0 =>
+                    (StatusCode::CONFLICT,json!({"error":"card must be unarchived; reconcile archived work through the board first","card_id":target})),
+                Some(mut card) => {
+                    conn.execute("UPDATE cmd_history SET card_id=?1,capture_pending=0 WHERE id=?2 AND card_id IS NULL",rusqlite::params![target,nid])?;
+                    card.log=Some(bs::append_log(card.log.as_deref(),&chrono::Local::now().format("%H:%M").to_string(),
+                        &format!("Original MSG-{nid} linked by {}: {why}",if who.is_empty() {"api"} else {&who})));
+                    card.updated=chrono::Utc::now().timestamp(); card.rev+=1; card.version+=1;
+                    bs::save_patched(conn,&mut card)?;
+                    events.push(ev(&nid.to_string(),MutationKind::Updated));
+                    events.push(PendingEvent {entity_type:EntityType::Task,entity_id:card.id.clone(),mutation:MutationKind::Updated,payload:Some(card.snapshot())});
+                    (StatusCode::OK,json!({"message_id":nid,"card_id":card.id,"changed":true,"applied":true,"command_resent":false}))
+                }
+            }
+        };
+        *reply_w.lock().expect("message link reply")=Some((status,value));
+        Ok(WriteOutcome {applied:!events.is_empty(),events})
+    }).await;
+    match result {
+        Ok(_) => {
+            let (status, value) = reply
+                .lock()
+                .expect("message link reply")
+                .take()
+                .expect("message link result");
+            tracing::info!(message_id=nid, %session, %card_id, %actor, %reason, status=status.as_u16(),
+                measured=true, n_considered=1, verdict="explicit_message_card_link",
+                "reviewed original message attribution handled without delivery or task status change");
+            (status, Json(value)).into_response()
+        }
+        Err(error) => {
+            tracing::warn!(message_id=nid, %card_id, %error, measured=false, n_considered=0,
+                verdict="message_card_link_failed", "original message attribution transaction failed");
+            internal(error)
+        }
     }
 }
 
@@ -844,6 +956,11 @@ mod tests {
     use tower::ServiceExt;
 
     fn app() -> (axum::Router, tempfile::TempDir) {
+        let (router, _, dir) = app_with_state();
+        (router, dir)
+    }
+
+    fn app_with_state() -> (axum::Router, AppState, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::db::Store::open(&dir.path().join("history-test.db")).unwrap();
         let state = AppState {
@@ -853,8 +970,8 @@ mod tests {
             auth_token: None,
             reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
-        let router = Router::new().nest("/api/history", routes()).with_state(state);
-        (router, dir)
+        let router = Router::new().nest("/api/history", routes()).with_state(state.clone());
+        (router, state, dir)
     }
 
     async fn send(
@@ -877,6 +994,276 @@ mod tests {
         let v = serde_json::from_slice(&bytes)
             .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
         (status, v)
+    }
+
+    fn capture_log() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard, tracing::Dispatch) {
+        #[derive(Clone)]
+        struct LogBytes(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for LogBytes {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = LogBytes(bytes.clone());
+        // Avoid tracing-core's single-dispatch first-use cache across parallel tests.
+        let _registration_peer =
+            tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let scope = tracing::subscriber::set_default(subscriber);
+        (bytes, scope, _registration_peer)
+    }
+
+    #[tokio::test]
+    async fn explicit_card_link_preserves_history_and_does_not_claim_or_resend() {
+        let (app, state, _dir) = app_with_state();
+        state.store.write(|conn| {
+            super::super::session_verbs::ensure_fleet_tables(conn)?;
+            conn.execute("INSERT INTO cmd_history(id,text,type,session,ts,delivery,delivered_at,submit_verdict) VALUES (1,'Implement missing parser validation','user','old-capture',1000,'direct',1000,'confirmed')",[])?;
+            conn.execute("INSERT INTO issues(id,title,desc,status,session,creator,created,updated,owner_type,type) VALUES ('FIX-1','Parser validation','Reviewed original work','backlog','existing-owner','test',1,1,'agent','code')",[])?;
+            Ok(WriteOutcome {applied:true,events:vec![]})
+        }).unwrap();
+        let request = json!({"session":"old-capture","card_id":"FIX-1","reason":"Reviewed original unlinked assignment"});
+        let (status, body) = send(
+            &app,
+            "PUT",
+            "/api/history/MSG-1/card",
+            Some(request.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["changed"], true);
+        assert_eq!(body["command_resent"], false);
+        let (status, body) = send(&app, "PUT", "/api/history/1/card", Some(request)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["changed"], false);
+        let (_, message) = send(&app, "GET", "/api/history/MSG-1", None).await;
+        assert_eq!(message["card_id"], "FIX-1");
+        assert_eq!(message["text"], "Implement missing parser validation");
+        assert_eq!(message["ts"], 1000);
+        assert_eq!(message["capture_pending"], 0);
+        let conn = state.store.read().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM cmd_history", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM issues", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        let (status, desc, log): (String, String, String) = conn
+            .query_row(
+                "SELECT status,desc,log FROM issues WHERE id='FIX-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "backlog");
+        assert_eq!(conn.query_row("SELECT session FROM issues WHERE id='FIX-1'", [], |r| r.get::<_,String>(0)).unwrap(), "existing-owner", "linking source context must not reassign work");
+        assert_eq!(desc, "Reviewed original work");
+        assert_eq!(log.matches("Original MSG-1 linked").count(), 1);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM steering_queue", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM session_events WHERE type='task.claimed'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_card_link_refuses_mistargeting_and_rolls_back_on_failure() {
+        let (app, state, _dir) = app_with_state();
+        let (bytes, _scope, _peer) = capture_log();
+        state.store.write(|conn| {
+            conn.execute("INSERT INTO cmd_history(id,text,type,session,ts) VALUES (1,'original context','user','source-lane',1000)",[])?;
+            for (id,session,archived) in [("FIX-1","source-lane",0),("FIX-2","source-lane",0),("OLD-1","source-lane",1)] {
+                conn.execute("INSERT INTO issues(id,title,desc,status,session,creator,created,updated,owner_type,type,archived) VALUES (?1,'Reviewed work','Scope unchanged','todo',?2,'test',1,1,'agent','code',?3)",rusqlite::params![id,session,archived])?;
+            }
+            Ok(WriteOutcome {applied:true,events:vec![]})
+        }).unwrap();
+        for (path, session, card, reason, status) in [
+            (
+                "/api/history/999/card",
+                "source-lane",
+                "FIX-1",
+                "reviewed",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "/api/history/nope/card",
+                "source-lane",
+                "FIX-1",
+                "reviewed",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "/api/history/1/card",
+                "wrong-lane",
+                "FIX-1",
+                "reviewed",
+                StatusCode::CONFLICT,
+            ),
+            (
+                "/api/history/1/card",
+                "source-lane",
+                "OLD-1",
+                "reviewed",
+                StatusCode::CONFLICT,
+            ),
+            (
+                "/api/history/1/card",
+                "source-lane",
+                "ABSENT-1",
+                "reviewed",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "/api/history/1/card",
+                "source-lane",
+                "FIX-1",
+                "",
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let (got, body) = send(
+                &app,
+                "PUT",
+                path,
+                Some(json!({"session":session,"card_id":card,"reason":reason})),
+            )
+            .await;
+            assert_eq!(got, status, "{path} {card}: {body}");
+            assert_eq!(
+                state
+                    .store
+                    .read()
+                    .unwrap()
+                    .query_row("SELECT card_id FROM cmd_history WHERE id=1", [], |r| r
+                        .get::<_, Option<
+                        String,
+                    >>(
+                        0
+                    ))
+                    .unwrap(),
+                None
+            );
+        }
+        state.store.write(|conn| {
+            conn.execute_batch("CREATE TRIGGER refuse_link_audit BEFORE UPDATE ON issues BEGIN SELECT RAISE(ABORT,'fixture audit write unavailable'); END;")?;
+            Ok(WriteOutcome {applied:true,events:vec![]})
+        }).unwrap();
+        let request = json!({"session":"source-lane","card_id":"FIX-1","reason":"Review complete"});
+        let (status, body) = send(&app, "PUT", "/api/history/1/card", Some(request.clone())).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        let log = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        let failure = log
+            .lines()
+            .find(|line| line.contains("message_card_link_failed"))
+            .expect("failed transaction must announce itself in amux logs");
+        assert!(
+            failure.contains("message_id=1")
+                && failure.contains("card_id=FIX-1")
+                && failure.contains("measured=false"),
+            "{failure}"
+        );
+        assert_eq!(
+            state
+                .store
+                .read()
+                .unwrap()
+                .query_row("SELECT card_id FROM cmd_history WHERE id=1", [], |r| r
+                    .get::<_, Option<
+                    String,
+                >>(
+                    0
+                ))
+                .unwrap(),
+            None,
+            "card link must roll back with its audit write"
+        );
+        state
+            .store
+            .write(|conn| {
+                conn.execute_batch("DROP TRIGGER refuse_link_audit")?;
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
+            })
+            .unwrap();
+        assert_eq!(
+            send(&app, "PUT", "/api/history/1/card", Some(request))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        let (status,body)=send(&app,"PUT","/api/history/1/card",Some(json!({"session":"source-lane","card_id":"FIX-2","reason":"Try overwriting original attribution"}))).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            state
+                .store
+                .read()
+                .unwrap()
+                .query_row("SELECT card_id FROM cmd_history WHERE id=1", [], |r| r
+                    .get::<_, String>(
+                    0
+                ))
+                .unwrap(),
+            "FIX-1"
+        );
+        let (_, row) = send(&app, "GET", "/api/history/1", None).await;
+        assert_eq!(row["card_id"], "FIX-1");
+    }
+
+    #[tokio::test]
+    async fn explicit_card_link_has_known_receipts_through_the_full_router() {
+        let (_, state, _dir) = app_with_state();
+        let (bytes, _scope, _peer) = capture_log();
+        state.store.write(|conn| {
+            conn.execute("INSERT INTO cmd_history(id,text,type,session,ts) VALUES (1,'reviewed original','user','source-lane',1000)", [])?;
+            conn.execute("INSERT INTO issues(id,title,desc,status,session,creator,created,updated,owner_type,type) VALUES ('LINK-1','Existing work','Scope unchanged','todo','existing-owner','test',1,1,'agent','code')", [])?;
+            Ok(WriteOutcome {applied:true,events:vec![]})
+        }).unwrap();
+        let app = crate::api::router(state.clone());
+        for (id, target, expected_status, expected_phase) in [
+            ("link-first", "LINK-1", StatusCode::OK, "applied"),
+            ("link-repeat", "LINK-1", StatusCode::OK, "noop"),
+            ("link-refused", "OTHER-1", StatusCode::CONFLICT, "refused"),
+        ] {
+            let request = axum::http::Request::builder().method("PUT").uri("/api/history/MSG-1/card")
+                .header("content-type", "application/json").header("x-amux-interaction-id", id)
+                .body(Body::from(json!({"session":"source-lane","card_id":target,"reason":"Reviewed original request"}).to_string())).unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), expected_status);
+            assert_eq!(response.headers()["x-amux-interaction-id"], id);
+            let (status, receipt) = send(&app, "GET", &format!("/api/interactions/{id}"), None).await;
+            assert_eq!(status, StatusCode::OK, "{receipt}");
+            assert_eq!(receipt["phase"], expected_phase, "the full middleware must classify the actual endpoint response: {receipt}");
+            assert_eq!(receipt["measured"], true, "{receipt}");
+        }
+        let log = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(!log.lines().any(|line| line.contains("interaction_outcome") && (line.contains("link-first") || line.contains("link-repeat"))), "successful calls must not emit unknown-outcome warnings: {log}");
+        assert!(log.lines().any(|line| line.contains("interaction_outcome") && line.contains("link-refused") && line.contains("refused")), "positive control: the real refusal must reach the same collector: {log}");
     }
 
     async fn seed(app: &axum::Router) {
@@ -1038,6 +1425,25 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn direct_history_delivery_obeys_recorded_submission_verdict() {
+        let (app, state, _dir) = app_with_state();
+        state.store.write_async(|conn| {
+            for (id, verdict) in [(1, Some("confirmed")), (2, Some("stuck")),
+                (3, Some("retried")), (4, Some("unverified")), (5, None),
+                (6, Some("future-state"))] {
+                conn.execute("INSERT INTO cmd_history(id,text,type,session,ts,delivery,submit_verdict) VALUES(?1,'fixture','user','direct-verdict-fixture',1000,'direct',?2)", rusqlite::params![id,verdict])?;
+            }
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+        for (id, expected) in [(1,"delivered"),(2,"not delivered"),(3,"delivered"),
+            (4,"unknown"),(5,"unknown"),(6,"unknown")] {
+            let (status, value) = send(&app,"GET",&format!("/api/history/{id}"),None).await;
+            assert_eq!(status,StatusCode::OK,"{value}");
+            assert_eq!(value["delivered"],expected,"actual history endpoint row {id}: {value}");
+        }
+    }
+
     /// The sweep instrument that misled in both directions must now be unable to.
     ///
     /// Both historical misreadings were of the SAME column and pointed opposite
@@ -1049,17 +1455,17 @@ mod tests {
     fn an_unstamped_column_is_never_read_as_a_delivery_verdict() {
         // The case that nearly produced a false finding: queued, cmd_history
         // silent, and the deliverer's own table says it landed in 2 seconds.
-        let (v, src) = delivery_truth("queued", Some(Some(1_787_779_179.0)));
+        let (v, src) = delivery_truth("queued", None, Some(Some(1_787_779_179.0)));
         assert_eq!(v, "delivered");
         assert!(src.contains("steering_history"), "must name the instrument that answered: {src}");
 
         // A row the deliverer HOLDS and has not stamped is real evidence of
         // non-delivery, and must not be flattened into the unknown case.
-        assert_eq!(delivery_truth("queued", Some(None)).0, "not delivered");
+        assert_eq!(delivery_truth("queued", None, Some(None)).0, "not delivered");
 
         // NO ROW IS NOT A NEGATIVE. This is the assertion that stops the whole
         // class: absence of a lookup result is a fact about the lookup.
-        let (v3, src3) = delivery_truth("queued", None);
+        let (v3, src3) = delivery_truth("queued", None, None);
         assert_eq!(v3, "unknown", "no steering row means we cannot tell, not that it failed");
         assert_ne!(v3, "not delivered");
         assert!(
@@ -1071,19 +1477,18 @@ mod tests {
         // The three inputs must not collapse into two outputs — if any pair
         // renders alike, the join has bought nothing over reading the column.
         let all = [
-            delivery_truth("queued", Some(Some(1.0))).0,
-            delivery_truth("queued", Some(None)).0,
-            delivery_truth("queued", None).0,
+            delivery_truth("queued", None, Some(Some(1.0))).0,
+            delivery_truth("queued", None, Some(None)).0,
+            delivery_truth("queued", None, None).0,
         ];
         let mut uniq = all.to_vec();
         uniq.sort_unstable();
         uniq.dedup();
         assert_eq!(uniq.len(), 3, "three input states must yield three verdicts: {all:?}");
 
-        // A direct send is honestly answerable from cmd_history alone (AMUX-3541
-        // kept `now_ms` there deliberately), so it must NOT be reported as
-        // unknown merely because no steering row was looked up.
-        let (v4, src4) = delivery_truth("direct", None);
+        // A confirmed direct submission is answerable from its durable verdict,
+        // without requiring an unrelated steering-history record.
+        let (v4, src4) = delivery_truth("direct", Some("confirmed"), None);
         assert_eq!(v4, "delivered");
         assert!(src4.contains("cmd_history"), "and it must say which instrument: {src4}");
     }

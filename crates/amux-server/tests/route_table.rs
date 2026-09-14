@@ -520,6 +520,66 @@ fn every_directly_routed_api_path_is_in_the_table() {
         handler.contains("not_found") || handler.contains("_404")
     }
 
+    // A sub-router can itself nest another module. The previous walk stopped
+    // after api/mod.rs -> browser.rs, silently missing browser/ios.rs entirely.
+    // Keep the defining module's directory as we descend; `ios::routes` is
+    // relative to browser, not src/api. Report unreadable children loudly.
+    fn nested_routes(
+        body: &str,
+        module_dir: &std::path::Path,
+        prefix: &str,
+        depth: usize,
+        mounted: &mut Vec<String>,
+    ) {
+        assert!(depth < 32, "router composition recursion at {prefix}");
+        let mut pos = 0;
+        while let Some(i) = body[pos..].find(".nest(") {
+            let open = pos + i + ".nest(".len() - 1;
+            pos = open + 1;
+            let close = matching_paren(body, open).expect("balanced nested router");
+            let arg = body[open + 1..close].trim_start();
+            let Some(arg) = arg.strip_prefix('"') else {
+                continue;
+            };
+            let end = arg.find('"').expect("literal nested prefix");
+            let nested_prefix = format!("{prefix}{}", &arg[..end]);
+            for callee in callees_of(&arg[end..]) {
+                let (module, func) = callee.rsplit_once("::").expect("module-qualified callee");
+                let mut directory = module_dir.to_path_buf();
+                for segment in module.split("::") {
+                    match segment {
+                        "self" => {}
+                        "super" => {
+                            assert!(directory.pop(), "unresolvable {callee}");
+                        }
+                        "crate" => {
+                            directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+                        }
+                        other => directory.push(other),
+                    }
+                }
+                let file = directory.with_extension("rs");
+                let source = std::fs::read_to_string(&file)
+                    .or_else(|_| std::fs::read_to_string(directory.join("mod.rs")))
+                    .unwrap_or_else(|e| {
+                        panic!("unreadable nested router {nested_prefix} -> {callee}: {e}")
+                    });
+                let child = fn_body(&source, func)
+                    .unwrap_or_else(|| panic!("no fn {func} in nested router {callee}"));
+                for (path, handler) in route_literals(child) {
+                    if !is_404_answerer(&handler) {
+                        mounted.push(if path == "/" {
+                            nested_prefix.clone()
+                        } else {
+                            format!("{nested_prefix}{path}")
+                        });
+                    }
+                }
+                nested_routes(child, &directory, &nested_prefix, depth + 1, mounted);
+            }
+        }
+    }
+
     // ---- the walk ---------------------------------------------------------
     //
     // Nest spans are recorded FIRST so the top-level merge pass can tell a
@@ -570,6 +630,8 @@ fn every_directly_routed_api_path_is_in_the_table() {
                 missing.push(format!("<no fn {func}() found for nest {prefix} -> {callee}>"));
                 continue;
             };
+            let module = callee.rsplit("::").nth(1).unwrap();
+            nested_routes(body, &api_dir.join(module), prefix, 0, &mut mounted);
             for (sub, handler) in route_literals(body) {
                 // A nested router's paths are RELATIVE. An absolute /api/
                 // literal here means the scan wandered outside the nested
@@ -633,6 +695,7 @@ fn every_directly_routed_api_path_is_in_the_table() {
         ("`.nest()` into a sub-router", "/api/workers/{id}/peek"),
         ("`.merge()` INSIDE a `.nest()`", "/api/workers/{id}/dead-letters"),
         ("top-level `.merge()` of a module outside src/api", "/api/debug/storage"),
+        ("`.nest()` inside a sub-router's function", "/api/browser/ios/action"),
     ] {
         assert!(
             mounted.iter().any(|m| m == canary),
@@ -643,6 +706,7 @@ fn every_directly_routed_api_path_is_in_the_table() {
         );
     }
 
+    missing.extend(mounted.iter().filter(|p| !tabled.contains(p.as_str())).cloned());
     missing.sort();
     missing.dedup();
 

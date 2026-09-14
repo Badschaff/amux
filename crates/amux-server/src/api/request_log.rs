@@ -1220,6 +1220,9 @@ const ANY: &[&str] = &["*"];
 /// public and protected alike. Ordering is by mount site for diffability;
 /// matching specificity is computed, not positional.
 pub const ROUTE_TABLE: &[RouteEntry] = &[
+    RouteEntry { path: "/api/brex/status", methods: &["GET"] },
+    RouteEntry { path: "/api/brex/card", methods: &["POST"] },
+    RouteEntry { path: "/api/brex/webhook", methods: &["POST"] },
     // -- public (outside require_bearer)
     RouteEntry { path: "/health", methods: &["GET"] },
     RouteEntry { path: "/api/health", methods: &["GET"] },
@@ -1418,6 +1421,19 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/scope", methods: ANY },
     // -- browser
     RouteEntry { path: "/api/browser/start", methods: &["POST"] },
+    // The simulator is nested inside browser::routes(), one composition level
+    // below api/mod.rs. Keep its real verbs visible to request-log verdicts
+    // and route.callers_have_routes, just like the desktop browser verbs.
+    RouteEntry { path: "/api/browser/ios/targets", methods: &["GET"] },
+    RouteEntry { path: "/api/browser/ios/start", methods: &["POST"] },
+    RouteEntry { path: "/api/browser/ios/status", methods: &["GET"] },
+    RouteEntry { path: "/api/browser/ios/stop", methods: &["POST"] },
+    RouteEntry { path: "/api/browser/ios/state", methods: &["GET"] },
+    RouteEntry { path: "/api/browser/ios/screenshot", methods: &["GET"] },
+    RouteEntry { path: "/api/browser/ios/screenshot/file", methods: &["GET"] },
+    RouteEntry { path: "/api/browser/ios/action", methods: &["POST"] },
+    RouteEntry { path: "/api/browser/ios/inspect", methods: &["GET"] },
+    RouteEntry { path: "/api/browser/ios/inspect/clear", methods: &["POST"] },
     RouteEntry { path: "/api/browser/status", methods: &["GET"] },
     RouteEntry { path: "/api/browser/stop", methods: &["POST"] },
     RouteEntry { path: "/api/browser/identify", methods: &["POST"] },
@@ -1625,6 +1641,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // route.callers_have_routes census read the TABLE and reported them unrouted.
     // Caught by tests/route_table.rs's completeness scan (both were named).
     RouteEntry { path: "/api/history/{id}", methods: &["GET"] },
+    RouteEntry { path: "/api/history/{id}/card", methods: &["PUT"] },
     RouteEntry { path: "/api/orchestrate/plan", methods: &["POST"] },
     // -- logs (this module)
     RouteEntry { path: "/api/logs", methods: &["GET"] },

@@ -5,6 +5,9 @@ for (const vp of [{name:'phone', w:375, h:812}, {name:'tablet', w:834, h:1112}])
   test(`peek customizer anchors under its button @${vp.name}`, async ({ browser }) => {
     const ctx = await browser.newContext({ ...devices['iPhone 11 Pro'],
       viewport: { width: vp.w, height: vp.h }, serviceWorkers: 'block' });
+    // Menu placement is an existing-install scenario; this independent context
+    // must initialize that prerequisite too, rather than clicking through onboarding.
+    await ctx.addInitScript(() => localStorage.setItem('amux_walkthrough_done', '1'));
     const page = await ctx.newPage();
     await page.goto('/');
     await page.waitForFunction(() => typeof (window as any).openPeek === 'function', { timeout: 20000 });
@@ -31,6 +34,7 @@ for (const vp of [{name:'phone', w:375, h:812}, {name:'tablet', w:834, h:1112}])
     const ideal = Math.min(r.btnLeft, r.vw - r.w - 8);
     const expected = Math.max(8, ideal);
     expect(r.mLeft, `menu left ${r.mLeft} != expected ${expected} (btn ${r.btnLeft}, w ${r.w}, vw ${r.vw})`).toBe(expected);
+    await page.screenshot({ path: test.info().outputPath(`tab-menu-${vp.name}.png`) });
     await ctx.close();
   });
 }

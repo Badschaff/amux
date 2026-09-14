@@ -255,16 +255,22 @@ pub async fn sweep(ignore_leases: bool) -> Vec<String> {
 /// nothing" and "the repair never ran" are otherwise the same silence — and
 /// this whole class of bug is one where silence was read as health.
 pub fn spawn() -> PeriodicTask {
-    tokio::spawn(async {
-        let fixed = sweep(true).await;
-        tracing::info!(
-            count = fixed.len(),
-            sessions = ?fixed,
-            "pane-size: one-shot repair complete (AMUX-2634)"
-        );
-    });
-    super::spawn_periodic("pane_size", TICK_SECS, || async {
-        let _ = sweep(false).await;
+    // The first periodic tick is immediate. Keep boot repair INSIDE the same
+    // guarded constructor: a separate startup task bypassed fleet isolation
+    // even while the registry correctly reported this job disabled (AF-789).
+    let mut first = true;
+    super::spawn_periodic("pane_size", TICK_SECS, move || {
+        let boot = std::mem::replace(&mut first, false);
+        async move {
+            let fixed = sweep(boot).await;
+            if boot {
+                tracing::info!(
+                    count = fixed.len(),
+                    sessions = ?fixed,
+                    "pane-size: one-shot repair complete (AMUX-2634)"
+                );
+            }
+        }
     })
 }
 

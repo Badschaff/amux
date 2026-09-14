@@ -71,9 +71,8 @@ pub enum WorkerLifecycle {
     /// messages, task assignment, and automatic driving.
     #[default]
     Active,
-    /// Fully configured and visible, session may remain intact, but must
-    /// not receive new automatic work or be automatically driven.
-    /// Manual inspection and explicit user actions still work.
+    /// Work is stopped; history and configuration remain available.
+    /// Resume before starting or assigning new work.
     Paused,
     /// Deliberately parked/retired. Excluded from fleet discovery,
     /// scheduling, orchestration, automatic driving, and default views.
@@ -110,7 +109,7 @@ impl WorkerLifecycle {
     }
 
     pub fn can_start(self) -> bool {
-        matches!(self, Self::Active | Self::Paused)
+        matches!(self, Self::Active)
     }
 
     pub fn is_visible_default(self) -> bool {
@@ -726,9 +725,9 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_can_start_active_and_paused() {
+    fn lifecycle_can_start_only_active() {
         assert!(WorkerLifecycle::Active.can_start());
-        assert!(WorkerLifecycle::Paused.can_start());
+        assert!(!WorkerLifecycle::Paused.can_start());
         assert!(!WorkerLifecycle::Archived.can_start());
         assert!(!WorkerLifecycle::Deleted.can_start());
     }

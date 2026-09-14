@@ -37,6 +37,16 @@ on:
   pull_request:
     paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', 'e2e/**', 'amux', 'scripts/**', 'cloud/**', 'eslint.config.mjs', '.github/workflows/rust.yml']
 
+# No group ran the full ~20min check+e2e once per push with nothing
+# superseding anything, so a burst of pushes to main paid full price for
+# every one of them (mixpeek-cicd, 2026-09-14: rust was 82% of this repo's
+# GitHub Actions minutes, $222/mo of that in e2e alone). Group by PR number
+# when this is a pull_request run, by ref otherwise (push to main) — a new
+# push cancels its own stale run rather than racing it to completion.
+concurrency:
+  group: rust-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -77,8 +87,11 @@ jobs:
       # quiet for a few days; leaving it advisory forever would make it
       # decoration.
       - name: cargo test (workspace) — tree-residue guarded
+        env:
+          AMUX_REQUIRE_TMUX: '1'
         run: |
           set -uo pipefail
+          command -v tmux >/dev/null || { sudo apt-get update && sudo apt-get install -y tmux; } || exit 1
           bash scripts/test-tree-clean.sh cargo test --workspace
           rc=$?
           if [ "$rc" = "3" ]; then
@@ -184,11 +197,15 @@ jobs:
       - name: runtime smoke -- hooks install from HEAD, not the worktree (AMUX-3682)
         run: bash scripts/test-hook-install-from-head.sh
 
-  e2e:
+  e2e-shards:
     # PR Full Gate tier (plan §CI tiers): the golden scenarios in a real
     # browser against the real server + real extracted dashboard.
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -225,14 +242,63 @@ jobs:
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
       - name: Golden scenarios (desktop + mobile + ios-safari)
-        run: npx playwright test --config e2e/playwright.config.ts
+        run: npx playwright test --config e2e/playwright.config.ts --workers=2 --shard=${{ matrix.shard }}/4 --global-timeout=1200000
         env:
+          AMUX_E2E_EVIDENCE_DIR: ci-results/shard-${{ matrix.shard }}
           AMUX_E2E_WORKING_TREE: '1'
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
-      - name: Upload traces on failure
-        if: failure()
+      # Runner deadline leaves time for partial evidence even when tests time out.
+      - name: Upload execution evidence
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: playwright-results
+          name: e2e-evidence-${{ matrix.shard }}
+          path: ci-results/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-results-${{ matrix.shard }}
           path: test-results/
+          retention-days: 7
+
+  # Preserve the e2e check name; a green subset cannot satisfy it.
+  e2e:
+    needs: e2e-shards
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - run: npm ci --ignore-scripts
+      - name: Collect the full unchanged population (no execution claim)
+        run: npx playwright test --config e2e/playwright.config.ts --list
+        env:
+          AMUX_E2E_EVIDENCE_DIR: ci-full
+      - uses: actions/download-artifact@v4
+        if: always()
+        with:
+          pattern: e2e-evidence-*
+          path: ci-results
+          merge-multiple: true
+      - name: Require all shards and account for every test
+        if: always()
+        run: |
+          set -o pipefail
+          node scripts/check-e2e-evidence.mjs ci-results ci-full/manifest.json 4 | tee e2e-verdict.json
+      - name: Require successful setup and test jobs too
+        if: always()
+        env:
+          SHARD_RESULT: ${{ needs.e2e-shards.result }}
+        run: test "$SHARD_RESULT" = success
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-verdict
+          path: e2e-verdict.json
+          if-no-files-found: error
           retention-days: 7

@@ -294,6 +294,11 @@ entry_with() { # $1 = card field, $2 = session field
 rc=$( { header; entry_with "ZZZ-1" "ghost-lane"; } | run_on_board stranded_fires sessions_ok )
 check_says "(s1) unknown prefix + absent author reports STRANDED" "STRANDED" stranded_fires
 check_says "(s1) names the author who cannot be asked" "ghost-lane" stranded_fires
+# AF-755: absence measures provenance, not a veto of AF-352's retirement policy.
+check_says "(s1) offers the owner-approved objective evidence path" "AF-352" stranded_fires
+check_says "(s1) preserves subjective author decisions" "Subjective" stranded_fires
+check_says "(s1) logs the measured retirement-review population" "retirement_review measured=true n_considered=1" stranded_fires
+check_lacks "(s1) does not prohibit all retirement for absent authors" "cannot leave the file" stranded_fires
 
 # (s2) MUST NOT FIRE: same unresolved id, but the author IS live here.
 rc=$( { header; entry_with "ZZZ-1" "live-lane"; } | run_on_board author_live sessions_ok )

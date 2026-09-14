@@ -1,10 +1,27 @@
 #!/usr/bin/env bash
 # Canonical status-hook installation and payload regression cells.
-set -euo pipefail
+set -Eeuo pipefail
+trap 'echo "FAIL status-hook fixture line=$LINENO command=$BASH_COMMAND" >&2' ERR
 cd "$(dirname "$0")/.."
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 SETTINGS="$TMP/settings.json"
+
+# Fixture writes participate in the same queue lock as the producer/drain.
+# Seeing HTTP capture does not mean the acknowledgement has reached disk.
+write_queue_fixture() {
+  /usr/bin/python3 - "$1" "$2" <<'PYWRITE'
+import fcntl,os,sys,tempfile
+path,payload=sys.argv[1:]
+with open(path+".lock","a+") as guard:
+    fcntl.flock(guard,fcntl.LOCK_EX)
+    fd,tmp=tempfile.mkstemp(prefix="fixture.",dir=os.path.dirname(path))
+    with os.fdopen(fd,"w") as stream:
+        stream.write(payload);stream.flush();os.fsync(stream.fileno())
+    os.replace(tmp,path)
+print("ok   fixture queue write serialized with durable acknowledgement")
+PYWRITE
+}
 
 printf '%s\n' '{
   "model": "keep-me",
@@ -282,7 +299,7 @@ echo "ok   ordinary state hook wakes and route-corrects a surviving legacy queue
 
 # Corruption is evidence, not an empty queue. Preserve the exact bad bytes,
 # announce the verdict, and let the new event proceed in a fresh atomic file.
-printf '%s' '{not-json' > "$QF"
+write_queue_fixture "$QF" '{not-json'
 HOME="$TMP/home" AMUX_URL="$URL" AMUX_SESSION=probe \
   bash scripts/hooks/hook-report.sh subagent-start corrupt-successor \
   <<<'{"session_id":"abc-123","agent_id":"after-corrupt"}'
@@ -290,7 +307,7 @@ wait_for 'any(r["body"].get("agent_id")=="after-corrupt" for r in rows)'
 CORRUPT=$(find "$TMP/home/.amux/hook-report-queue" -name 'probe.json.corrupt.*' -print -quit)
 test -n "$CORRUPT"
 test "$(cat "$CORRUPT")" = '{not-json'
-printf '%s' '{}' > "$QF"
+write_queue_fixture "$QF" '{}'
 HOME="$TMP/home" AMUX_URL="$URL" AMUX_SESSION=probe \
   bash scripts/hooks/hook-report.sh subagent-start corrupt-schema-successor \
   <<<'{"session_id":"abc-123","agent_id":"after-schema-corrupt"}'

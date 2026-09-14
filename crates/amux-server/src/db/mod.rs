@@ -16,6 +16,7 @@
 
 pub mod advance;
 pub mod artifact_store;
+pub mod attempts;
 pub mod board_store;
 pub mod task_graph_store;
 pub mod trace_store;

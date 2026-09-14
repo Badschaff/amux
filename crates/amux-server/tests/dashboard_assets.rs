@@ -1253,7 +1253,7 @@ fn the_worker_tab_customizer_is_the_grid_glyph() {
 /// into the dedup gate, and after two minutes became a BLOCKED op with a red
 /// banner over a message the worker already had (2026-09-11, two workers).
 #[test]
-fn a_slow_send_waits_for_the_server_instead_of_falling_into_the_outbox() {
+fn a_slow_send_has_a_bounded_outer_deadline() {
     let js = asset("app.js");
     let i = js.find("async function doSend(").expect("doSend exists");
     let j = js[i..].find("async function doKeys(").expect("doKeys follows doSend");
@@ -1263,8 +1263,10 @@ fn a_slow_send_waits_for_the_server_instead_of_falling_into_the_outbox() {
         "doSend aborts at 10s again; on this host /send routinely exceeds that"
     );
     assert!(body.contains("AbortSignal.timeout(90000)"), "doSend keeps a 90s ceiling for a hung server");
-    // Uncertain outcomes retain their durable intent. The executable
-    // e2e/outbox-acceptance-recovery.test.mjs checks safe receipt-only retries.
+    // Uncertain delivery must retain the original durable intent. The executable
+    // dashboard-outage-recovery.mjs contract tests the real response path and
+    // checkmark state, including a negative control restoring the old drop.
+    // Receipt-only automatic retries are covered by e2e/outbox-acceptance-recovery.test.mjs.
 
 }
 
@@ -1338,5 +1340,195 @@ fn reconnect_shows_the_sync_checklist() {
     assert!(
         js.contains("i.status === 'done'") && js.contains("&#x2714;"),
         "the checklist must mark each item done with a checkmark as it syncs"
+    );
+}
+
+/// The worker-LIST card composer has no "Attach file" button (Ethan,
+/// 2026-09-12: "remove the attach file button we don't need that from worker
+/// list page"). Attaching on a card still works by drag-and-drop and paste; the
+/// standalone 📎 button was the redundant surface. The peek composer keeps its
+/// own attach affordance — this guard is scoped to the card picker class.
+#[test]
+fn the_worker_list_card_has_no_attach_file_button() {
+    let js = asset("app.js");
+    assert!(
+        !js.contains("card-file-picker"),
+        "the card composer's standalone Attach-file button is back; Ethan removed it \
+         (drag-and-drop + paste still attach)"
+    );
+}
+
+/// The settings menu must ESCAPE the sticky .header-row (position:sticky;
+/// z-index:40) on mobile, or its absolutely-positioned dropdown paints behind
+/// #session-view and is invisible (Ethan, 2026-09-12: "when I press the
+/// settings button on mobile I don't see anything"). Only leaving that stacking
+/// context (position:fixed) works; raising z-index does not. Pin the mobile
+/// fixed override so a later refactor cannot silently re-trap it.
+#[test]
+fn the_mobile_settings_menu_escapes_the_sticky_header() {
+    let css = asset("app.css");
+    // Locate the actual selector and declarations. A character budget after
+    // a prose marker failed as soon as the rationale exceeded that budget.
+    let rule = regex::Regex::new(r"(?s)@media\s*\(max-width:\s*600px\)\s*\{\s*\.settings-menu\s*\{([^}]+)").unwrap();
+    let captures = rule.captures(&css).expect("the mobile settings-menu rule must be present");
+    let block = &captures[1];
+    assert!(
+        block.contains("position: fixed"),
+        "the mobile settings-menu override must use position:fixed to leave the header stacking context"
+    );
+}
+
+/// AMUX-4475: the interaction-feedback "Actions/Confirmed" hub (state/feedback.mjs
+/// appends it to .header-row) orphaned itself at the header's right edge and left
+/// the toolbar crammed in the corner. Ethan, 2026-09-12: "get rid of this and make
+/// the toolbar use the real estate we have." It is hidden in CSS (feedback still
+/// surfaces via toasts); pin that so a refactor cannot silently restore the clutter.
+#[test]
+fn the_interaction_feedback_hub_is_hidden_from_the_header() {
+    let css = asset("app.css");
+    let rule = regex::Regex::new(r"#interaction-feedback\s*\{[^}]*display:\s*none")
+        .unwrap();
+    assert!(
+        rule.is_match(&css),
+        "the interaction-feedback hub must be hidden (#interaction-feedback{{display:none}}) \
+         so it stops orphaning the header toolbar (AMUX-4475)"
+    );
+}
+
+/// AMUX-4475 "weird blue highlighting": .tab-bar is overflow-x:auto, which per the
+/// overflow spec forces overflow-y:auto, so a focused tab's focus ring gets its top
+/// and bottom clipped by the scroll box — leaving two stray blue vertical bars. The
+/// fix insets the ring (negative outline-offset) so it draws as a clean box and is
+/// never clipped. Pin the negative offset on the tab focus-visible rule.
+#[test]
+fn the_tab_focus_ring_is_inset_so_it_is_not_clipped_into_blue_bars() {
+    let css = asset("app.css");
+    let rule = regex::Regex::new(
+        r"(?s)\.tab-bar\s+button:focus-visible\s*\{([^}]*)\}",
+    )
+    .unwrap();
+    let block = rule
+        .captures(&css)
+        .expect("a .tab-bar button:focus-visible rule must exist (AMUX-4475)");
+    let decls = &block[1];
+    let off = regex::Regex::new(r"outline-offset:\s*(-?\d+)")
+        .unwrap()
+        .captures(decls)
+        .and_then(|c| c[1].parse::<i32>().ok())
+        .expect("the focus-visible rule must set outline-offset");
+    assert!(
+        off < 0,
+        "the tab focus ring must be INSET (negative outline-offset) so overflow-y:auto \
+         cannot clip it into stray blue vertical bars (AMUX-4475); got {off}"
+    );
+}
+
+/// AMUX-4476: clicking into a worker's Messages was slow because the surfaces
+/// fetched a 200-row first page, and /api/history is 12-120s under this host's
+/// read-pool contention (the wall-clock scales with row count). A small first
+/// page paints fast; "Load older" pages the rest. Pin the first-page ceiling so a
+/// later edit cannot quietly restore the 200-row wait.
+#[test]
+fn the_message_tabs_load_a_small_first_page() {
+    let js = asset("app.js");
+    for name in ["_PEEK_MSG_PAGE", "_MSGS_PAGE"] {
+        let re = regex::Regex::new(&format!(r"const\s+{name}\s*=\s*(\d+)")).unwrap();
+        let n = re
+            .captures(&js)
+            .and_then(|c| c[1].parse::<i32>().ok())
+            .unwrap_or_else(|| panic!("{name} constant must exist (AMUX-4476)"));
+        assert!(
+            n <= 100,
+            "{name} is {n}; the message first page must stay small (<=100) so click-to-display \
+             is fast under read-pool contention (AMUX-4476)"
+        );
+    }
+}
+
+/// AMUX-4475: the toolbar controls must read as one consistent bordered set
+/// (Ethan, 2026-09-12: "borders around buttons too", "make the components all
+/// consistent", flat emoji throughout). The AF-750 header refinement had made
+/// the icon/count buttons borderless (border-color:transparent). Pin the boxed
+/// styling back so a later refactor cannot silently flatten them again.
+#[test]
+fn the_toolbar_buttons_are_boxed_not_borderless() {
+    let css = asset("app.css");
+    // The header override must NOT strip the border to transparent.
+    assert!(
+        !css.contains("border-color:transparent; background:transparent"),
+        "the header buttons are borderless again (border-color:transparent) — Ethan asked \
+         for borders around the toolbar buttons (AMUX-4475)"
+    );
+    // notif bell must carry a real border in the header.
+    let notif = regex::Regex::new(r"\.header-row #notif-btn \{[^}]*\}")
+        .unwrap()
+        .find(&css)
+        .map(|m| m.as_str().to_string())
+        .expect(".header-row #notif-btn rule must exist");
+    assert!(
+        notif.contains("border:1px solid var(--border)"),
+        "the notification bell must be a bordered box in the toolbar (AMUX-4475); got: {notif}"
+    );
+    // active + settings must be bordered boxes too.
+    let box_rule = regex::Regex::new(
+        r"\.header-row \.btn-active, \.header-row \.settings-btn \{[^}]*\}",
+    )
+    .unwrap()
+    .find(&css)
+    .map(|m| m.as_str().to_string())
+    .expect(".header-row .btn-active, .settings-btn rule must exist");
+    assert!(
+        box_rule.contains("border:1px solid var(--border)"),
+        "the active/settings toolbar buttons must be bordered boxes (AMUX-4475); got: {box_rule}"
+    );
+}
+
+/// AMUX-4475: flat emoji throughout the toolbar (Ethan's choice). The settings
+/// gear was a monochrome text glyph (U+2699) while the bell was a colour emoji;
+/// the gear now carries VARIATION SELECTOR-16 (U+FE0F) so it renders as an emoji
+/// to match. Also: the bell button must not re-add an inline border:none that
+/// would beat the stylesheet box.
+#[test]
+fn the_toolbar_icons_render_as_consistent_emoji() {
+    let html = asset("index.html");
+    let gear = regex::Regex::new(r#"id="settings-btn"[^>]*>([^<]*)</button>"#)
+        .unwrap()
+        .captures(&html)
+        .map(|c| c[1].to_string())
+        .expect("settings-btn must exist");
+    assert!(
+        gear.contains("&#x2699;&#xFE0F;") || gear.contains('\u{2699}'),
+        "the settings gear must render as an emoji (U+2699 + VS16) to match the bell (AMUX-4475); got: {gear:?}"
+    );
+    let notif = regex::Regex::new(r#"id="notif-btn"[^>]*style="([^"]*)""#)
+        .unwrap()
+        .captures(&html)
+        .map(|c| c[1].to_string())
+        .expect("notif-btn must exist");
+    assert!(
+        !notif.contains("border:none"),
+        "the bell must not carry an inline border:none — it beats the toolbar box border (AMUX-4475); got: {notif}"
+    );
+}
+
+/// AMUX-4477: the MDAI viewer built a file's absolute path by joining the list
+/// path onto _AMUX_HOME ($HOME). But the list returns paths relative to the
+/// `.mdai` SCAN ROOT, which a `mdai_root` pref can move into a sub-vault (e.g.
+/// ~/.amux/local). There, joining onto $HOME produced /Users/x/Foo.mdai for a
+/// file at /Users/x/.amux/local/Foo.mdai, so EVERY open hit "no such path". The
+/// fix serves the real root as window._AMUX_MDAI_ROOT and _mdaiAbs prefers it.
+/// Pin both halves so a refactor cannot silently reintroduce the $HOME-only join.
+#[test]
+fn the_mdai_viewer_resolves_paths_against_the_scan_root() {
+    let js = asset("app.js");
+    let abs = regex::Regex::new(r"(?s)function _mdaiAbs\([^)]*\)\s*\{(.*?)\n\}")
+        .unwrap()
+        .captures(&js)
+        .map(|c| c[1].to_string())
+        .expect("_mdaiAbs must exist");
+    assert!(
+        abs.contains("_AMUX_MDAI_ROOT"),
+        "_mdaiAbs must join list paths onto _AMUX_MDAI_ROOT (the scan root), not just \
+         _AMUX_HOME, or every open under a mdai_root sub-vault hits 'no such path' (AMUX-4477)"
     );
 }

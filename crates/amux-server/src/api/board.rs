@@ -719,7 +719,8 @@ async fn ready_frontier(
         "ready": f.ready,
         "claimable_now": f.claimable_now,
         "wip": {"doing": f.holding.len(), "cap": f.wip_cap, "available": f.wip_available,
-                "holding": f.holding},
+                "holding": f.holding, "measured": f.wip_measured,
+                "why_unmeasured": if f.wip_measured { None } else { Some("WIP capacity query failed; claims are unavailable") }},
         "excluded": {
             "blocked_by_deps": f.blocked_by_deps,
             "blocked_by_parked_dep": f.blocked_by_parked_dep,
@@ -984,6 +985,7 @@ pub(crate) struct LaneFrontier {
     pub claimable_now: usize,
     pub wip_cap: usize,
     pub wip_available: usize,
+    pub wip_measured: bool,
     pub holding: Vec<String>,
     pub blocked_by_deps: usize,
     /// Of `blocked_by_deps`, the ones whose blocker CANNOT clear on its own:
@@ -1004,19 +1006,11 @@ pub(crate) fn lane_frontier(
     // same type exclusions, same archived/deleted filter. A frontier that
     // disagreed with the gate would offer cards the gate then refuses, which is
     // the view/mechanism split ethos rule 1 is about.
-    let holding: Vec<String> = conn
-        .prepare(
-            "SELECT id FROM issues WHERE session = ?1 AND status = 'doing' \
-               AND deleted IS NULL AND COALESCE(archived,0) = 0 \
-               AND COALESCE(type,'') NOT IN ('tripwire','watch','epic') ORDER BY id",
-        )
-        .and_then(|mut st| {
-            st.query_map(rusqlite::params![lane], |r| r.get::<_, String>(0))
-                .map(|rows| rows.filter_map(Result::ok).collect())
-        })
-        .unwrap_or_default();
+    let holding_result = crate::runtime_jobs::board_drive::wip_holding_ids(conn, lane, None);
+    let wip_measured = holding_result.is_ok();
+    let holding = holding_result.unwrap_or_default();
     let cap = crate::runtime_jobs::board_drive::wip_cap().max(0) as usize;
-    let available = cap.saturating_sub(holding.len());
+    let available = if wip_measured { cap.saturating_sub(holding.len()) } else { 0 };
 
     // Candidates: claimable cards this lane owns. `todo` only — `backlog` is
     // parked on a trigger and `review` is somebody else's turn.
@@ -1103,6 +1097,7 @@ pub(crate) fn lane_frontier(
         ready,
         wip_cap: cap,
         wip_available: available,
+        wip_measured,
         holding,
         blocked_by_deps,
         blocked_by_parked_dep,
@@ -2177,6 +2172,62 @@ fn actor_from_headers(headers: &HeaderMap) -> (Actor, String) {
 /// Rides through slim on purpose: it is NOT in `SLIM_OMITS`, because a
 /// liveness verdict that disappears from the list payload is worse than one
 /// that was never there — `row.get("live")` returning None reads as an answer.
+/// RR-0052 Invariant 2: the 409 a non-holder worker gets for moving a leased
+/// card. Every constraint needs a truthful path in every legitimate state
+/// (ethos rule 3), so the body names all three: ask the holder, let the lease
+/// lapse (the reaper frees a silent holder's card), or override on the record.
+pub(crate) fn lease_held_409(row: &IssueRow, caller_lane: &str, target: &str, now: i64) -> Value {
+    let holder = row.lease_owner.as_deref().unwrap_or("");
+    json!({
+        "error": "lease_held",
+        "ok": false,
+        "blocked": true,
+        "card": row.id,
+        "holder": holder,
+        "caller": caller_lane,
+        "from": row.status,
+        "to": target,
+        "lease": {
+            "acquired_at": row.lease_acquired_at,
+            "heartbeat_at": row.lease_heartbeat_at,
+            "heartbeat_age_s": row.lease_heartbeat_at.map(|h| now - h),
+            "expires_at": row.lease_expires_at,
+            "generation": row.lease_generation,
+        },
+        "why": format!(
+            "{} holds the lease on {}: only the holder moves a card it is working. \
+             A move by another lane would strand the holder's attempt mid-work.",
+            holder, row.id
+        ),
+        "exits": {
+            "ask_the_holder": format!("amux send {holder} --stdin   (ask them to move {} to {target})", row.id),
+            "wait_for_expiry": "a holder that stops reporting loses the lease at expires_at; the board driver returns the card to todo and you can claim it",
+            "override_on_the_record": format!("amux board {target} {} --force --reason \"<why the holder cannot do this>\"", row.id),
+        },
+    })
+}
+
+/// RR-0052: who holds this card and how fresh the holding is, as one object on
+/// every row that carries a lease (absent otherwise, so "no lease" and "lease
+/// with a null field" never read the same). Kept OUT of `snapshot_fields` on
+/// purpose: that is the replay/journal snapshot, and a heartbeat moving every
+/// minute is not a card change the journal should see.
+fn designate_lease(obj: &mut serde_json::Map<String, Value>, row: &IssueRow) {
+    let Some(holder) = row.lease_owner.as_deref().filter(|h| !h.is_empty()) else {
+        return;
+    };
+    obj.insert(
+        "lease".into(),
+        json!({
+            "holder": holder,
+            "acquired_at": row.lease_acquired_at,
+            "heartbeat_at": row.lease_heartbeat_at,
+            "expires_at": row.lease_expires_at,
+            "generation": row.lease_generation,
+        }),
+    );
+}
+
 fn designate_live_state(obj: &mut serde_json::Map<String, Value>, row: &IssueRow) {
     let (live, reason) = live_state(row);
     obj.insert("live".into(), json!(live));
@@ -2235,6 +2286,7 @@ fn detail_body(row: &IssueRow) -> Value {
         // liveness verdict too, or a consumer that fetches one card gets a
         // different contract from one that lists.
         designate_live_state(obj, row);
+        designate_lease(obj, row);
     }
     v
 }
@@ -2829,6 +2881,7 @@ pub fn list_body(row: &IssueRow, slim: bool, stale: bool) -> Value {
     // `detail_body` above, which is also the function the single-card GET calls.
     if slim {
         designate_owner_reach(obj, row);
+        designate_lease(obj, row);
     }
     // BOTH paths, unlike designate_owner_reach above: the full branch gets its
     // owner-reach fields inside detail_body, but liveness is inserted here so
@@ -3627,10 +3680,17 @@ pub async fn list_board(
         } else {
             Default::default()
         };
-        Ok((kept, term_total, term_kept, working))
+        // RR-0052: the running attempt number for leased rows, one query over
+        // the running set, only when a leased row is in the page at all.
+        let attempt_nums = if kept.iter().any(|r| r.lease_owner.is_some()) {
+            crate::db::attempts::running_attempt_numbers(&conn).unwrap_or_default()
+        } else {
+            Default::default()
+        };
+        Ok((kept, term_total, term_kept, working, attempt_nums))
     })
     .await;
-    let (kept, term_total, term_kept, working) = match joined {
+    let (kept, term_total, term_kept, working, attempt_nums) = match joined {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => return internal(e),
         Err(e) => return internal(e),
@@ -3726,7 +3786,13 @@ pub async fn list_board(
 
     let items: Vec<Value> = page
         .iter()
-        .map(|r| list_body(r, slim, is_stale(r, now, &working)))
+        .map(|r| {
+            let mut v = list_body(r, slim, is_stale(r, now, &working));
+            if let (Some(n), Some(lease)) = (attempt_nums.get(&r.id), v.get_mut("lease")) {
+                lease["attempt"] = json!(n);
+            }
+            v
+        })
         .collect();
 
     let mut headers = HeaderMap::new();
@@ -4451,16 +4517,10 @@ pub async fn create_item(
         .collect();
 
     let _intake_guard = super::board_intake::lock(&session, &owner_type).await;
-    let mut intake = super::board_intake::plan(&state.store, &session, &owner_type, &title,
-        &body_str(&map, "desc").unwrap_or_default()).await;
-    // Reconciliation must not silently drop graph edges, explicit gates,
-    // callbacks or scheduling metadata from a structured create request.
-    if ["depends_on", "gate", "callback", "due", "due_time", "reviewer", "shepherd",
-        "ask_actor", "ask_type", "ask_question", "ask_unblocks", "tags"].iter()
-        .any(|key| map.get(*key).is_some_and(|v| !v.is_null() && v != "" && v != &json!([])))
-        || matches!(item_type.as_str(), "epic" | "watch" | "tripwire") {
-        intake.preserve_structured_request();
-    }
+    let intake = super::board_intake::plan_create(&map, &item_type, || async {
+        super::board_intake::plan(&state.store, &session, &owner_type, &title,
+            &body_str(&map, "desc").unwrap_or_default()).await
+    }).await;
     let intake_response = intake.clone();
     // A repeated/refined request should not be refused merely because the
     // existing queue is full; reconciliation adds no WIP slot.
@@ -5035,11 +5095,12 @@ pub async fn get_item(
         }).collect::<Vec<_>>();
         let verified_gate = bs::effective_gate_trail(&conn, &row, TaskStatus::Verified, &groups);
         let verification = crate::db::verification_store::coverage(&conn, &row, &verified_gate.criteria)?;
-        Ok(Some((row, children, messages, artifacts, asset_links, gate_requirements, verification)))
+        let attempts = crate::db::attempts::list_for_card(&conn, &row.id)?;
+        Ok(Some((row, children, messages, artifacts, asset_links, gate_requirements, verification, attempts)))
     })
     .await;
     match joined {
-        Ok(Ok(Some((row, children, messages, artifacts, asset_links, gate_requirements, verification)))) => {
+        Ok(Ok(Some((row, children, messages, artifacts, asset_links, gate_requirements, verification, attempts)))) => {
             // Weak ETag for read-modify-write callers (AMUX-1711 parity).
             let mut headers = HeaderMap::new();
             if let Ok(v) = format!("W/\"{}-{}\"", row.id, row.rev).parse() {
@@ -5052,6 +5113,13 @@ pub async fn get_item(
             body["asset_links"] = json!(asset_links);
             body["gate_requirements"] = json!(gate_requirements);
             body["verification"] = verification;
+            // RR-0052 Invariant 1: every holding of this card, oldest first.
+            if let Some(n) = attempts.iter().rev().find(|a| a.ended_at.is_none()).map(|a| a.attempt) {
+                if let Some(lease) = body.get_mut("lease") {
+                    lease["attempt"] = json!(n);
+                }
+            }
+            body["attempts"] = json!(attempts);
             (StatusCode::OK, headers, Json(body)).into_response()
         }
         Ok(Ok(None)) => not_found(&id),
@@ -7321,7 +7389,7 @@ fn discarded_by_refusal(map: &serde_json::Map<String, Value>) -> Vec<String> {
                 // writes a log line from it) and a caller who is told nothing
                 // changed cannot tell a registered fold from an ignored field,
                 // which is the failure this whole thread is about.
-                || matches!(k.as_str(), "desc_append" | "callback" | "folded_into")
+                || matches!(k.as_str(), "desc_append" | "callback" | "folded_into" | "archive_outcome")
         })
         .cloned()
         .collect();
@@ -7569,7 +7637,20 @@ mod af413_discarded_tests {
     }
 }
 
-const PATCH_CONTROL: [&str; 12] = [
+// Archive validation and mutation must interpret the same flag. The API has
+// always accepted string spellings as well as JSON booleans/numbers; checking
+// only true/1 in the outcome guard rejected requests the mutation accepted.
+fn patch_archived_value(value: &Value) -> i64 {
+    let raw = match value {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    i64::from(matches!(raw.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+}
+
+const PATCH_CONTROL: [&str; 13] = [
+    // Persisted in the attributed archive log, not a standalone column.
+    "archive_outcome",
     // The lane ASSERTS that this card was folded into another. It is not read
     // from prose: the caller names the target and the SERVER writes the
     // canonical `capture folded into <ID>` line that `folded_into()` parses.
@@ -8346,6 +8427,22 @@ pub async fn patch_item(
                 })
                 .cloned()
                 .collect();
+            if !ignored.is_empty() {
+                tracing::warn!(target: "amux::board", verdict="patch_fields_ignored", item=%id_w,
+                    fields=?ignored, measured=true, n_considered=ignored.len(), "board PATCH contains ignored fields");
+            }
+            if let Some(outcome) = map.get("archive_outcome") {
+                let archiving = map.get("archived").is_some_and(|v| patch_archived_value(v) == 1);
+                let reason = outcome.as_str().filter(|s| !s.trim().is_empty());
+                if !archiving || reason.is_none() {
+                    return finish(&slot_w, PatchOut::Refused(StatusCode::BAD_REQUEST,
+                        json!({"error":"archive_outcome requires archived=true and a nonempty string", "item":row.id})), no_write());
+                }
+                if row.archived == 1 {
+                    return finish(&slot_w, PatchOut::Refused(StatusCode::CONFLICT,
+                        json!({"error":"card is already archived; unarchive before recording another archive_outcome", "item":row.id})), no_write());
+                }
+            }
             // Filled by the source_ref arm below when a trigger is rerouted to
             // the card body. Empty on every other write.
             let mut diverted: Vec<Value> = Vec::new();
@@ -9058,15 +9155,7 @@ pub async fn patch_item(
             // every view and autonomy loop, a termination in effect.
             // UN-archiving is never gated, or the un-do is unreachable.
             if let Some(v) = map.get("archived") {
-                let raw = match v {
-                    Value::String(s) => s.clone(),
-                    Value::Bool(b) => if *b { "true".into() } else { "false".into() },
-                    other => other.to_string(),
-                };
-                let arc_v: i64 = i64::from(matches!(
-                    raw.trim().to_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                ));
+                let arc_v = patch_archived_value(v);
                 if arc_v == 1 {
                     let owner = row.session.clone().unwrap_or_default().trim().to_string();
                     let authorized = map
@@ -9599,6 +9688,51 @@ pub async fn patch_item(
                     };
                     let force = map.get("force").and_then(Value::as_bool).unwrap_or(false);
                     let reason = body_str(&map, "reason").unwrap_or_default();
+                    // RR-0052 Invariant 2: ONLY THE HOLDER MOVES A LEASED CARD.
+                    //
+                    // The first cut handed core an Actor::Worker only for NAMED,
+                    // non-Force transitions, and core's holder_guard sits in six of
+                    // those arms. So with enforcement on, another lane could still
+                    // release (doing->todo), park (doing->backlog, a pair PATCH maps
+                    // to Force), discard or quarantine a card mid-attempt. The guard
+                    // is asked HERE for every status move, with core's own predicate
+                    // (not a second copy of it). An explicit `force` stays the
+                    // override: it already requires attribution and a reason, and
+                    // it is audited. Humans and anonymous callers are not workers.
+                    //
+                    // FIRST, before every other refusal on this path: a non-holder
+                    // told "gate not acknowledged" would ack the gate and only then
+                    // learn the card is not theirs to move.
+                    let caller_wid = (!caller_lane.is_empty())
+                        .then(|| crate::orchestrator::runtime::foreign_worker_id(&caller_lane));
+                    if let (Some(wid), false) = (&caller_wid, force) {
+                        let as_worker = Actor::Worker { id: wid.clone() };
+                        if amux_core::board::holder_guard(&task, &as_worker).is_err() {
+                            if bs::lease_enforcement_enabled() {
+                                tracing::warn!(
+                                    target: "amux::board", card = %next.id, caller = %caller_lane,
+                                    holder = next.lease_owner.as_deref().unwrap_or(""),
+                                    from = %next.status, to = %bs::status_to_db(target, &next.status),
+                                    measured = true, n_considered = 1, verdict = "lease_held_refused",
+                                    "board: refused a non-holder status move on a leased card (RR-0052 Invariant 2)"
+                                );
+                                return finish(
+                                    &slot_w,
+                                    PatchOut::Refused(
+                                        StatusCode::CONFLICT,
+                                        lease_held_409(&next, &caller_lane, &bs::status_to_db(target, &next.status), chrono::Utc::now().timestamp()),
+                                    ),
+                                    no_write(),
+                                );
+                            }
+                            tracing::info!(
+                                target: "amux::board", card = %next.id,
+                                caller = %caller_lane, measured = true, n_considered = 1,
+                                verdict = "lease_would_refuse",
+                                "ledger: lease would-refuse (AMUX_LEASE_ENFORCE off): cross-lane transition on a leased card (AMUX-4498/RR-0052)"
+                            );
+                        }
+                    }
                     // A CAPTURE IS AN ENVELOPE, NOT A PARKABLE UNIT OF WORK
                     // (MR-174, mvs-research, 2026-09-09).
                     //
@@ -9689,21 +9823,9 @@ pub async fn patch_item(
                         && !override_doing
                     {
                         if let Some(sess) = next.session.as_deref().filter(|s| !s.is_empty()) {
-                            let holding: Vec<String> = conn
-                                .prepare(
-                                    "SELECT id FROM issues WHERE session = ?1 \
-                                     AND status = 'doing' AND id != ?2 \
-                                     AND deleted IS NULL AND COALESCE(archived,0) = 0 \
-                                     AND COALESCE(type,'') NOT IN ('tripwire','watch','epic') \
-                                     ORDER BY id",
-                                )
-                                .and_then(|mut st| {
-                                    st.query_map(rusqlite::params![sess, next.id], |r| {
-                                        r.get::<_, String>(0)
-                                    })
-                                    .map(|rows| rows.filter_map(Result::ok).collect())
-                                })
-                                .unwrap_or_default();
+                            let holding = crate::runtime_jobs::board_drive::wip_holding_ids(
+                                conn, sess, Some(&next.id),
+                            )?;
                             if !holding.is_empty() {
                                 return finish(
                                     &slot_w,
@@ -10707,7 +10829,17 @@ pub async fn patch_item(
                             })
                     };
 
-                    match apply_transition(&task, tx, &actor, &[], now) {
+                    let transition_actor = match (&caller_wid, &tx) {
+                        (Some(wid), t)
+                            if bs::lease_enforcement_enabled()
+                                && !matches!(t, BoardTransition::Force { .. }) =>
+                        {
+                            Actor::Worker { id: wid.clone() }
+                        }
+                        _ => actor.clone(),
+                    };
+
+                    match apply_transition(&task, tx, &transition_actor, &[], now) {
                         Ok(updated) => {
                             let from_raw = next.status.clone();
                             let stamp = hhmm();
@@ -10744,6 +10876,19 @@ pub async fn patch_item(
                             // Gap 4: waiting_on side effects before status change.
                             crate::db::advance::apply_status_side_effects(&mut next, &target_raw);
                             next.status = target_raw.clone();
+                            // RR-0052: mirror apply_common's lease set/clear on the
+                            // PATCH write path so the driver and PATCH never disagree.
+                            let lease_holder: Option<String> = if caller_lane.is_empty() {
+                                next.session.clone()
+                            } else {
+                                Some(caller_lane.clone())
+                            };
+                            crate::db::advance::apply_lease_transition(
+                                &mut next,
+                                &target_raw,
+                                lease_holder.as_deref(),
+                                now.timestamp(),
+                            );
                             next.version = i64::try_from(updated.version).unwrap_or(next.version + 1);
 
                             // REVISIT DATE ON THE TWO STATUSES NOTHING DRAINS
@@ -11005,6 +11150,19 @@ pub async fn patch_item(
             }
             next.updated = now_secs();
             bs::save_patched(conn, &mut next)?;
+            // RR-0052 Invariant 1: the PATCH door is the other lease choke point.
+            // After the save, so a refusal above can never leave an attempt behind.
+            crate::db::attempts::record_lease_change(
+                conn,
+                &next.id,
+                row.lease_owner.as_deref(),
+                next.lease_owner.as_deref(),
+                next.lease_generation,
+                &next.status,
+                &actor_name,
+                body_str(&map, "reason").as_deref(),
+                now_secs(),
+            )?;
             if next.status == "verified" && (row.status != "verified" || map.get("reverify").and_then(Value::as_bool) == Some(true)) && !map.get("force").and_then(Value::as_bool).unwrap_or(false) {
                 let groups = next.session.as_deref().map(crate::api::session_verbs::lane_groups).unwrap_or_default();
                 let trail = bs::effective_gate_trail(conn, &next, TaskStatus::Verified, &groups);
@@ -11294,6 +11452,10 @@ pub async fn patch_item(
             // that does not compute this at all, and a caller cannot tell those
             // apart if it is omitted when empty (ethos rule 4).
             let dropped = discarded_on_refusal;
+            if dropped.iter().any(|key| key == "archive_outcome") {
+                tracing::warn!(target: "amux::board", verdict="archive_outcome_refused", item=%id,
+                    measured=true, n_considered=1, "archive outcome was not applied; the entire PATCH was refused");
+            }
             if !dropped.is_empty() {
                 body["discarded_note"] = json!(format!(
                     "the transition was refused, so the WHOLE body was discarded — \
@@ -12006,6 +12168,54 @@ mod af701_archive_guard_tests {
     }
 
     #[tokio::test]
+    async fn archive_outcome_validation_uses_the_archive_flags_existing_coercion() {
+        let (state, store) = fixture();
+        for flag in [json!(true), json!(1), json!("1"), json!("true"), json!("TRUE"), json!(" yes "), json!("ON")] {
+            let id = seed(&store, "mvs-research", "done");
+            let (status, body) = patch_as(&state, &id, owner_headers("mvs-research"),
+                json!({"archived":flag, "archive_outcome":"Exact compatibility reason"})).await;
+            assert_eq!(status, StatusCode::OK, "flag={flag}: {body}");
+            let row = current(&store, &id);
+            assert_eq!(row.archived, 1);
+            assert!(row.log.as_deref().unwrap_or_default().contains("archive_outcome: Exact compatibility reason"));
+        }
+        for flag in [json!(false), json!(0), json!("false"), json!("off"), json!(null), json!({}), json!([]), json!(2)] {
+            let id = seed(&store, "mvs-research", "done");
+            let (status, body) = patch_as(&state, &id, owner_headers("mvs-research"),
+                json!({"archived":flag, "archive_outcome":"Must not be applied"})).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "flag={flag}: {body}");
+            assert_eq!(current(&store, &id).archived, 0);
+            assert!(body["discarded"].as_array().unwrap().contains(&json!("archive_outcome")));
+        }
+    }
+
+    #[tokio::test]
+    async fn archive_outcome_without_an_archive_is_explicitly_refused() {
+        let (state, store) = fixture();
+        for input in [json!({"archive_outcome":"must not vanish"}), json!({"archived":true,"archive_outcome":17})] {
+            let id = seed(&store, "mvs-research", "done");
+            let (status, body) = patch_as(&state, &id, owner_headers("mvs-research"), input).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body["discarded"].as_array().unwrap().contains(&json!("archive_outcome")), "{body}");
+            assert_eq!(current(&store, &id).archived, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_new_outcome_on_an_already_archived_card_is_not_silently_lost() {
+        let (state, store) = fixture();
+        let id = seed(&store, "mvs-research", "done");
+        let input = json!({"archived":true,"archive_outcome":"original reason"});
+        let (status, body) = patch_as(&state, &id, owner_headers("mvs-research"), input.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = patch_as(&state, &id, owner_headers("mvs-research"), json!({"archived":true,"archive_outcome":"different reason"})).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        let row = current(&store, &id);
+        assert!(row.log.as_deref().unwrap().contains("archive_outcome: original reason"));
+        assert!(!row.log.as_deref().unwrap().contains("different reason"));
+    }
+
+    #[tokio::test]
     async fn a_combined_archive_and_status_change_in_one_request_is_still_refused_without_an_outcome() {
         // Tried making this combination the escape hatch first; it cannot work
         // (see the comment on the gate in patch_item), so this pins that a
@@ -12086,9 +12296,11 @@ mod af701_archive_guard_tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["ignored_fields"].as_array().is_none_or(|fields| !fields.contains(&json!("archive_outcome"))), "persisted outcome must not be reported ignored: {body}");
         let row = current(&store, &id);
         assert_eq!(row.archived, 1);
         assert_eq!(row.status, "doing", "the outcome does not itself change status");
+        assert!(row.log.as_deref().unwrap_or_default().contains("mvs-research: archive_outcome: superseded by a later card"), "exact attributed outcome must survive readback: {:?}", row.log);
     }
 }
 
@@ -13480,15 +13692,9 @@ async fn apply_status_update(
         {
             "continuation_missing".to_string()
         } else {
-            let holding: Vec<String> = conn.prepare(
-                "SELECT id FROM issues WHERE session=?1 AND status='doing' AND id!=?2 \
-                 AND deleted IS NULL AND COALESCE(archived,0)=0 \
-                 AND COALESCE(type,'') NOT IN ('tripwire','watch','epic') \
-                 AND NOT (creator='amux' AND substr(COALESCE(\"desc\",''),1,11)='**Prompt:**') \
-                 AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=issues.id \
-                                 AND lower(t.tag) LIKE 'needs:you%') ORDER BY id"
-            )?.query_map(rusqlite::params![&actor, &id], |r| r.get::<_, String>(0))?
-                .filter_map(Result::ok).collect();
+            let holding = crate::runtime_jobs::board_drive::wip_holding_ids(
+                conn, &actor, Some(&id),
+            )?;
             if !holding.is_empty() {
                 "wip_conflict".to_string()
             } else {

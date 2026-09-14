@@ -6,6 +6,15 @@ async function boot(page: Page): Promise<void> {
   await page.waitForFunction(() => typeof (window as any).__amuxState?.interactions?.recent === 'function');
 }
 
+async function openRecentActions(page: Page): Promise<void> {
+  const panel = page.locator('#notif-panel');
+  if (!await panel.isVisible()) await page.getByRole('button', {name:'Notifications', exact:true}).click();
+  await expect(panel).toBeVisible();
+  const hub = panel.locator('#interaction-feedback');
+  if (!await hub.evaluate((element: HTMLDetailsElement) => element.open)) await hub.locator(':scope > summary').click();
+  await expect(hub).toHaveAttribute('open', '');
+}
+
 async function seedReviewReceipts(page: Page, ids: string[], phase = 'applied'): Promise<void> {
   await page.addInitScript(({ids,phase}) => {
     if(sessionStorage.getItem('receipt-review-seeded'))return;
@@ -22,7 +31,9 @@ async function seedReviewReceipts(page: Page, ids: string[], phase = 'applied'):
 
 test('review: completed command recovers effects after a failed read and reload without replay', async ({page},testInfo) => {
   const id='int_review_effect_retry';let probes=0;let mutations=0;
-  page.on('request',request=>{if(request.method()==='POST' && new URL(request.url()).pathname==='/api/prefs')mutations++;});
+  // Default tab-layout bootstrap is an unrelated preference write. Count all
+  // other prefs mutations so recovering a receipt cannot replay its command.
+  page.on('request',request=>{if(request.method()==='POST' && new URL(request.url()).pathname==='/api/prefs' && request.postDataJSON()?.key !== 'peek_tab_layout')mutations++;});
   await page.route(`**/api/interactions/${id}/effects`,route=>{
     probes++;
     return probes===1 ? route.fulfill({status:503,json:{error:'Unavailable'}})
@@ -30,7 +41,7 @@ test('review: completed command recovers effects after a failed read and reload 
   });
   await seedReviewReceipts(page,[id]);await boot(page);
   await expect.poll(()=>page.evaluate(id=>(window as any).__amuxInteractions.get(id)?.effect_sync?.phase,id),{timeout:15000}).toBe('failed');
-  await page.locator('#interaction-feedback > summary').click();
+  await openRecentActions(page);
   await expect(page.locator(`article[data-interaction-id="${id}"] .interaction-effects-status`)).toHaveText('Changes unavailable; retrying');
   expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
   await page.screenshot({path:testInfo.outputPath('effect-retry.png')});
@@ -80,7 +91,7 @@ test('review: a real replay acknowledgement removes the obsolete reload warning'
   },id);
   const receipt=await page.evaluate(id=>(window as any).__amuxInteractions.get(id),id);
   expect(receipt.phase).toBe('applied');expect(receipt.measured).toBe(true);expect(receipt.why_unmeasured).toBeUndefined();
-  await page.locator('#interaction-feedback > summary').click();
+  await openRecentActions(page);
   await expect(page.locator(`article[data-interaction-id="${id}"]`)).not.toContainText('Page reloaded before completion');
 });
 
@@ -105,7 +116,7 @@ test('status polling reaches older receipts and server queues while newer comman
     {timeout:20000}).toBe('applied');
   await expect.poll(()=>page.evaluate(()=>(window as any).__amuxInteractions.get('int_poll_11')?.phase),
     {timeout:20000}).toBe('running');
-  await page.locator('#interaction-feedback > summary').click();
+  await openRecentActions(page);
   await expect(page.locator('article[data-interaction-id="int_poll_0"] .interaction-status')).toHaveText('Completed');
 });
 
@@ -178,7 +189,7 @@ test('a command control is immediately busy and its durable feedback survives re
   await expect(save).toHaveAttribute('aria-busy','true');
   await expect(save).toHaveAttribute('data-interaction-kind','environment.post');
   const id=await save.getAttribute('data-interaction-id');
-  await page.locator('#interaction-feedback > summary').click();
+  await openRecentActions(page);
   const row=page.locator(`[data-interaction-id="${id}"]`).filter({has:page.locator('.interaction-status')});
   await expect(row.locator('progress')).toBeVisible();
   await expect(row.locator('.interaction-status')).toHaveText('Sending');
@@ -189,7 +200,7 @@ test('a command control is immediately busy and its durable feedback survives re
   await expect(row.locator('.interaction-status')).toHaveText('Completed');
   await page.reload();
   await page.waitForFunction(id=>(window as any).__amuxInteractions?.get(id)?.phase==='applied',id);
-  await page.locator('#interaction-feedback > summary').click();
+  await openRecentActions(page);
   await expect(page.locator(`article[data-interaction-id="${id}"] .interaction-status`)).toHaveText('Completed');
 });
 
@@ -207,7 +218,7 @@ test('nonqueueable command reports server failure and sends a diagnostic', async
   });
   expect(receipt.phase).toBe('failed');
   await expect.poll(()=>failed).toBe(true);
-  await page.locator('#interaction-feedback > summary').click();
+  await openRecentActions(page);
   await expect(page.locator(`article[data-interaction-id="${receipt.id}"]`)).toContainText('Execution failed');
 });
 
@@ -220,7 +231,7 @@ test('409 and ignored fields retain the remedy instead of displaying success',as
   });
   expect(result.phase).toBe('refused');
   expect(result.acknowledgement.remedy).toBe('Provide the command and result');
-  await page.locator('#interaction-feedback > summary').click();
+  await openRecentActions(page);
   await expect(page.locator(`article[data-interaction-id="${result.id}"]`)).toContainText('Evidence required');
 });
 
@@ -347,4 +358,86 @@ test('replay mismatch retains a refused receipt instead of reporting success',as
   const receipt=await page.evaluate(id=>(window as any).__amuxInteractions.get(id),id);
   expect(receipt.feedback.message).toContain('exact card');
   expect(receipt.effects).toEqual([]);
+});
+
+
+test('Notifications exposes scrollable receipts without adding a header control or replaying commands', async ({page}, testInfo) => {
+  const ids = Array.from({length:28}, (_, i) => 'int_panel_' + i);
+  let writes = 0;
+  const beacons: any[] = [];
+  page.on('request', request => {
+    const path = new URL(request.url()).pathname;
+    if (request.method() === 'POST' && path === '/api/prefs' && request.postDataJSON()?.key !== 'peek_tab_layout') writes++;
+    if (path === '/api/client-debug' && request.method() === 'POST') beacons.push(request.postDataJSON());
+  });
+  await seedReviewReceipts(page, ids);
+  await boot(page);
+  await expect(page.locator('.header-row > #interaction-feedback')).toHaveCount(0);
+  await expect(page.locator('#interaction-feedback')).toBeHidden();
+  await openRecentActions(page);
+  const panel = page.locator('#notif-panel');
+  await expect(panel.locator('.interaction-list article')).toHaveCount(20);
+  const geometry = await panel.evaluate(element => {
+    const r = element.getBoundingClientRect();
+    return {left:r.left,right:r.right,top:r.top,bottom:r.bottom,width:innerWidth,height:innerHeight};
+  });
+  expect(geometry.left).toBeGreaterThanOrEqual(0);
+  expect(geometry.right).toBeLessThanOrEqual(geometry.width);
+  expect(geometry.top).toBeGreaterThanOrEqual(0);
+  expect(geometry.bottom).toBeLessThanOrEqual(geometry.height);
+  await expect.poll(() => beacons.some(b => b.verdict === 'interaction_inspector_visible' && b.measured && b.n_considered === 1)).toBe(true);
+  await page.screenshot({path:testInfo.outputPath('notifications-receipts-top.png')});
+  const last = panel.locator('.interaction-list article').last();
+  const detailsSummary = last.locator('details > summary');
+  await detailsSummary.focus();
+  await page.keyboard.press('Enter');
+  await expect(last.locator('details > p')).toBeVisible();
+  const scrollBeforeUpdate = await panel.evaluate(element => element.scrollTop);
+  expect(scrollBeforeUpdate).toBeGreaterThan(0);
+  const lastId = await last.getAttribute('data-interaction-id');
+  let effectsReads = 0;
+  await page.route('**/api/interactions/' + lastId + '/effects', route => {
+    effectsReads++;
+    return route.fulfill({json:{measured:true,n_considered:1,
+      effects:[{id:'view-refresh-effect-' + effectsReads,kind:'pref.updated'}],more:false}});
+  });
+  // Successful effects are cached for 60s. Make this synthetic receipt due
+  // before subsequent reads so the outside-focus controls actually rerender.
+  const readEffectsAgain = () => page.evaluate(id => {
+    const app = window as any;
+    app._interactionSet(id, {effect_sync:{...app.__amuxInteractions.get(id).effect_sync, next_attempt_at:0}});
+    return app._interactionReconcile(id);
+  }, lastId);
+  await page.evaluate(id => (window as any)._interactionReconcile(id), lastId);
+  await expect(last.locator('details'), 'a receipt update must preserve the disclosure being read').toHaveAttribute('open', '');
+  await expect(last.locator('details > p')).toContainText('1 recorded changes');
+  expect(Math.abs(await panel.evaluate(element => element.scrollTop) - scrollBeforeUpdate)).toBeLessThanOrEqual(2);
+  await expect(detailsSummary, 'receipt reconciliation preserves the keyboard control being used').toBeFocused();
+  await page.keyboard.press('Enter');
+  await expect(last.locator('details')).not.toHaveAttribute('open', '');
+  await page.keyboard.press('Enter');
+  await expect(last.locator('details')).toHaveAttribute('open', '');
+  await expect.poll(() => beacons.some(b => b.verdict === 'interaction_focus_restored' && b.measured && b.n_considered === 1)).toBe(true);
+  await page.screenshot({path:testInfo.outputPath('notifications-receipts-bottom.png')});
+  await page.locator('#settings-btn').focus();
+  const beforeOutsideRead = effectsReads;
+  await readEffectsAgain();
+  expect(effectsReads).toBeGreaterThan(beforeOutsideRead);
+  await expect(page.locator('#settings-btn'), 'updates must not steal focus from another control').toBeFocused();
+  await detailsSummary.focus();
+  await page.keyboard.press('Escape');
+  await expect(panel).toBeHidden();
+  await expect(page.locator('#notif-btn')).toBeFocused();
+  await expect(page.locator('#notif-btn')).toHaveAttribute('aria-expanded', 'false');
+  const beforeDismissedRead = effectsReads;
+  await readEffectsAgain();
+  expect(effectsReads).toBeGreaterThan(beforeDismissedRead);
+  await expect(panel).toBeHidden();
+  await expect(page.locator('#notif-btn'), 'a dismissed inspector must not reclaim focus').toBeFocused();
+  await openRecentActions(page);
+  await page.mouse.click(2, geometry.bottom + 4);
+  await expect(panel).toBeHidden();
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  expect(beacons.filter(b => b.verdict === 'interaction_inspector_clipped'), 'a dismissed panel is not a clipped inspector').toEqual([]);
+  expect(writes, 'opening, inspecting and dismissing receipts must not resend their commands').toBe(0);
 });

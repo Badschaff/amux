@@ -254,7 +254,8 @@ test('toolbar has one horizontal row, explicit filters and reachable named actio
 
   await page.locator('#peek-overlay').getByRole('button', { name: 'Worker actions', exact: true }).click();
   const tabs = page.getByRole('button', { name: 'Customize worker tabs' });
-  await expect(tabs).toContainText('Tabs');
+  await expect(tabs).toHaveText('⊞'); // grid icon introduced by 7e0b0ecb; accessible name stays explicit
+  await expect(tabs).toHaveAttribute('title', 'Show, hide or reorder worker tabs');
   const box = await tabs.boundingBox();
   expect(box!.width).toBeGreaterThanOrEqual(44);
   expect(box!.height).toBeGreaterThanOrEqual(44);
@@ -639,7 +640,8 @@ test('live worker composer is a preserved draft, never a delivered message', asy
 });
 
 test('Gemini peer messages remain searchable with the Workers terminal filter', async ({ page }) => {
-  await page.route(/\/api\/sessions(?:\?.*)?$/, route => route.fulfill({json:[{name:'nav-probe',provider:'gemini',running:true,status:'idle'}]}));
+  // This renderer specimen sets the provider below; beforeEach already loaded
+  // the fleet. A second post-navigation sessions route would never be consumed.
   const raw = '> [amux-origin: reviewer — server-verified from the sender\'s session identity]\n\n  REVIEW_APPROVED Task ID: LG1A-2. Actual independent tests passed.\n\n✦ I will produce the report.\n> [12:30 PM] Read the reviewed report and summarize its actual results.\n✦ Report ready.\n────────────────────\n> Type your message or @path/to/file\n────────────────────\nworkspace (/directory)    sandbox    /model\n';
   const classified = await page.evaluate(raw => {
     const w = window as any;

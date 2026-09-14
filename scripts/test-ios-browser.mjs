@@ -38,8 +38,15 @@ async function until(script,predicate,timeout=20000){
 }
 function pass(name){checks++;console.log('PASS '+name);}
 async function shot(name){const data=await api('screenshot');const png=await request(new URL(data.serve,base));assert.equal(png.status,200);await fs.writeFile(path.join(output,name+'.png'),png.bytes);}
+async function openRecentActions() {
+  if (!await evaluate('document.querySelector("#notif-panel").classList.contains("active")'))
+    await api('action',{action:'click',selector:'#notif-btn'});
+  if (!await evaluate('document.querySelector("#interaction-feedback").open'))
+    await api('action',{action:'click',selector:'#interaction-feedback > summary'});
+  await until('document.querySelector("#interaction-feedback").open',value=>value===true);
+}
 let mode='plain',effectReads=0,prefPosts=0,beacons=[],hangingAborts=0;
-const receipts=()=> (mode==='hang'?['ios_hang','ios_healthy']:[mode==='recovery'?'ios_recovery':'ios_replay']).map(id=>({
+const receipts=()=> (mode==='browse'?Array.from({length:28},(_,i)=>'ios_browse_'+i):mode==='hang'?['ios_hang','ios_healthy']:[mode==='recovery'?'ios_recovery':'ios_replay']).map(id=>({
  id,command:{id:'cmd_'+id,kind:'environment.post',target:{primitive:'environment',id:'prefs'}},request:{method:'POST',path:'/api/prefs'},
  phase:mode==='replay'?'sending':'applied',measured:true,n_considered:1,acknowledgement:{status:200,applied:true},effects:[],
  feedback:{required:true,message:mode==='replay'?'Sending':'Completed'},created_at:Date.now(),updated_at:Date.now()}));
@@ -124,12 +131,12 @@ try {
   assert.equal(await page.locator('#bw-img').isVisible(),false);await browser.close();browser=null;
   pass('Browser picker, Go, remote simulator frame, mobile layout and target switching');
 
-  for(const scenario of ['recovery','hang','replay']) {
+  for(const scenario of ['recovery','hang','replay','browse']) {
     mode=scenario;effectReads=0;prefPosts=0;beacons=[];
     await api('start',{udid,url:origin+'/?iosCase='+mode+'-'+runId});await until('window.__iosTestScenario+":"+!!window.__amuxState',v=>v===mode+':true');
     if(mode==='recovery'){
       await until('window.__amuxInteractions.get("ios_recovery")?.effect_sync?.phase',v=>v==='failed');
-      await api('action',{action:'click',selector:'#interaction-feedback > summary'});await shot('simulator-effects-retry');
+      await openRecentActions();await shot('simulator-effects-retry');
       assert((await evaluate('document.querySelector("article[data-interaction-id=ios_recovery]").innerText')).includes('Changes unavailable; retrying'));
       await api('start',{udid,url:origin+'/?iosCase='+mode+'-'+runId});
       await until('window.__amuxInteractions?.get("ios_recovery")?.effect_sync?.phase',v=>v==='synced');
@@ -139,23 +146,47 @@ try {
       await until('window.__amuxInteractions.get("ios_healthy")?.effects.length',v=>v===1);
       assert(beacons.some(b=>b.verdict==='interaction_reconcile_failed'&&b.interaction_id==='ios_hang'));assert(hangingAborts>0);
       pass('hung effects body abort, receipt-specific failure beacon and healthy peer progress');
-    }else{
+    }else if(mode==='replay'){
       await until('window.__amuxInteractions.get("ios_replay")?.measured',v=>v===false);
       await evaluate(`fetch('/api/prefs',{method:'POST',headers:{'Content-Type':'application/json','X-Amux-Interaction-Id':'ios_replay'},body:JSON.stringify({key:'ios-replay-measured',value:'1'})}).then(r=>{if(!r.ok)throw Error(r.status);return true})`);
       const receipt=await until('window.__amuxInteractions.get("ios_replay")',v=>v?.measured===true&&v.phase==='applied');
       assert.equal(receipt.why_unmeasured,undefined);
-      await api('action',{action:'click',selector:'#interaction-feedback > summary'});await shot('simulator-replay-recovered');
+      await openRecentActions();await shot('simulator-replay-recovered');
       assert(!(await evaluate('document.querySelector("article[data-interaction-id=ios_replay]").innerText')).includes('Page reloaded before completion'));
       pass('real replay acknowledgement removes obsolete uncertainty and warning');
+    }else{
+      await openRecentActions();
+      const bounds=await evaluate('(()=>{const p=document.querySelector("#notif-panel"),r=p.getBoundingClientRect();return {left:r.left,right:r.right,top:r.top,bottom:r.bottom,width:innerWidth,height:innerHeight,rows:p.querySelectorAll("article").length,scroll:p.scrollTop}})()');
+      assert(bounds.left>=0 && bounds.right<=bounds.width && bounds.top>=0 && bounds.bottom<=bounds.height);
+      assert.equal(bounds.rows,20);await shot('simulator-notifications-top');
+      const down=await api('action',{action:'scroll',x:200,y:420,dy:350});
+      if(native)assert.equal(down.data.result.input_method,'xcuitest');
+      const downTop=await until('document.querySelector("#notif-panel").scrollTop',value=>value>bounds.scroll);
+      await api('action',{action:'scroll',x:200,y:420,dy:-300});
+      await until('document.querySelector("#notif-panel").scrollTop',value=>value<downTop);
+      const id=await evaluate('document.querySelector("#notif-panel article:last-child").dataset.interactionId');
+      const details='article[data-interaction-id="'+id+'"] > details';
+      await api('action',{action:'click',selector:details+' > summary'});
+      await until('document.querySelector('+JSON.stringify(details)+').open',value=>value===true);
+      await evaluate('_interactionReconcile('+JSON.stringify(id)+')');
+      assert.equal(await evaluate('document.querySelector('+JSON.stringify(details)+').open'),true);
+      await api('action',{action:'scroll',x:200,y:420,dy:300});
+      await until('(()=>{const e=document.querySelector('+JSON.stringify(details+' > p')+'),r=e.getBoundingClientRect(),p=document.querySelector("#notif-panel").getBoundingClientRect();return {visible:r.width>0&&r.height>0&&r.top>=p.top&&r.bottom<=p.bottom,text:e.textContent}})()',value=>value.visible&&value.text.includes(id)&&value.text.includes('1 recorded changes'));
+      await shot('simulator-notifications-details');
+      await api('action',{action:'click',selector:'#notif-btn'});
+      assert.equal(await evaluate('document.querySelector("#notif-panel").classList.contains("active")'),false);
+      assert.equal(prefPosts,0);
+      assert(beacons.some(b=>b.verdict==='interaction_disclosures_preserved'&&b.measured&&b.restored>0));
+      pass('native Notifications bounds, down/up scroll, Details retained through read, dismissal and zero command POSTs');
     }
     assert(await evaluate('document.documentElement.scrollWidth<=innerWidth'));
   }
   await messages.run({setMode:value=>{mode=value;},navigate:suffix=>api('start',{udid,url:origin+suffix}),until,evaluate,api,shot,pass,runId});
-  if (process.env.AMUX_IOS_LIFECYCLE === '1') {
+  { // Board editing is a baseline native regression, including keyboard occlusion.
     mode='plain';
     const coverage=[];
     const visible=selector=>`(()=>{const e=document.querySelector(${JSON.stringify(selector)});return !!e&&!!e.getClientRects().length&&getComputedStyle(e).visibility!=='hidden'})()`;
-    for (const surface of ['sessions','board','groups','calendar','scheduler','files','mdai','proxies','email','connectors','logs','messages','skills','sql','map','metrics','cost','torrents','terminal','browser']) {
+    for (const surface of (process.env.AMUX_IOS_LIFECYCLE === '1' ? ['sessions','board','groups','calendar','scheduler','files','mdai','proxies','email','connectors','logs','messages','skills','sql','map','metrics','cost','torrents','terminal','browser'] : [])) {
       try {
         await api('start',{udid,url:origin+'/#view=sessions'});await until('!!window.__amuxState && !document.querySelector("#peek-overlay").classList.contains("active")',v=>v);
         const tab='#tab-'+surface;
@@ -181,9 +212,14 @@ try {
       const title='iOS lifecycle '+Date.now()+' — preserve this complete title across creation, reload and search';
       await api('action',{action:'input',selector:'#be-title',text:title});
       await api('action',{action:'input',selector:'#be-desc',text:'Acceptance: keep this exact simulator lifecycle note.'});
-      await shot('lifecycle-board-new');await api('action',{action:'click',selector:'.be-save'});
+      await shot('lifecycle-board-new');
+      const saved=await api('action',{action:'click',selector:'.be-save'});
+      if(native)assert.equal(saved.data.result.keyboard_dismissed,true,'The real keyboard must be dismissed before tapping below it');
       const rows=await until(`fetch('/api/board?done_limit=0').then(r=>r.json()).then(rows=>rows.filter(r=>r.title===${JSON.stringify(title)}))`,v=>v?.length===1);
-      const card=rows[0];await api('start',{udid,url:origin+'/#issue='+encodeURIComponent(card.id)});await until('document.querySelector("#bd-key")?.textContent',v=>v===card.id);
+      const card=rows[0];
+      const full=await evaluate(`fetch('/api/board/'+${JSON.stringify(card.id)}).then(r=>r.json())`);
+      assert.equal(full.desc,'Acceptance: keep this exact simulator lifecycle note.','A page tap must not append a native keyboard character');
+      await api('start',{udid,url:origin+'/#issue='+encodeURIComponent(card.id)});await until('document.querySelector("#bd-key")?.textContent',v=>v===card.id);
       assert((await evaluate('document.querySelector("#bd-preview").innerText')).includes('exact simulator lifecycle note'));
       await shot('lifecycle-board-persisted');await api('start',{udid,url:origin+'/#issue='+encodeURIComponent(card.id)});
       await until('document.querySelector("#bd-key")?.textContent',v=>v===card.id);

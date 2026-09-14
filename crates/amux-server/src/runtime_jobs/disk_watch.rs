@@ -469,8 +469,9 @@ fn report_disk_pressure() {
             state = "critical",
             "DISK CRITICALLY LOW — under 25 GB free. Builds and DB writes will start \
              failing. Check APFS local snapshots first (`tmutil listlocalsnapshots /`): \
-             they pin blocks from deleted files, so deleting things frees `du` and not \
-             `df` until they are thinned (DESKT-25)"
+             snapshots may retain shared blocks, but their count does not measure \
+             retained bytes. macOS can remove them automatically; check backup status \
+             and remeasure free space before deciding on further deletion (DESKT-25)"
         ),
         "warn" => tracing::warn!(
             job = JOB,

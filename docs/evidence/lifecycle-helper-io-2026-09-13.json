@@ -1,0 +1,35 @@
+{
+  "status": "PARTIAL",
+  "native_lifecycle": "INCOMPLETE: host admission denies new workers",
+  "source_base": "ec76baf74fd214fc1fc8186c2e10616de546be49",
+  "archive_key": "helper-io-20260913",
+  "before": {
+    "passed": 0,
+    "failed": 3
+  },
+  "final": {
+    "passed": 42,
+    "failed": 0,
+    "ignored": 0,
+    "filtered_out": 2355,
+    "scope": [
+      "api::mdai::",
+      "api::board_intake::",
+      "runtime_jobs::message_capture::"
+    ]
+  },
+  "negative_control": {
+    "landed": true,
+    "replacement": "deadline multiplied by 20",
+    "test": "helper_io_deadline_covers_a_prompt_the_child_never_reads",
+    "exit_code": 101,
+    "reverted": true
+  },
+  "output_retention_default_bytes": 8388608,
+  "native_model_calls": 0,
+  "gates": {
+    "workspace_check": 0,
+    "all_targets_clippy": 0,
+    "runner_tests_passed": 9
+  }
+}

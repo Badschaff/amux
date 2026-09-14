@@ -191,7 +191,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <h1 role="button" tabindex="0" aria-label="About amux" title="About amux" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openAbout()}" id="brand-header" style="margin:0;cursor:pointer;display:flex;align-items:center;gap:6px;" onclick="openAbout()"><span id="brand-icon-header"></span><span id="brand-name-header">amux</span></h1>
     <span role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();showConnHistory()}" id="conn-status" class="conn-status online" title="Connection status — click for disconnection history" onclick="showConnHistory()"></span>
     <div style="position:relative;">
-      <button id="notif-btn" onclick="toggleNotifPanel()" title="Notifications" style="background:none;border:none;cursor:pointer;padding:2px 4px;font-size:1rem;opacity:0.7;line-height:1;position:relative;" aria-label="Notifications">&#x1F514;<span id="notif-badge" class="notif-badge" style="display:none;">0</span></button>
+      <button id="notif-btn" onclick="toggleNotifPanel()" title="Notifications" style="cursor:pointer;padding:2px 4px;font-size:1rem;opacity:0.7;line-height:1;position:relative;" aria-label="Notifications" aria-controls="notif-panel" aria-expanded="false">&#x1F514;<span id="notif-badge" class="notif-badge" style="display:none;">0</span></button>
       <div id="notif-panel" class="notif-panel">
         <div class="notif-panel-header">
           <span>Notifications</span>
@@ -220,7 +220,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <div class="active-dropdown" id="active-dropdown"></div>
     </div>
     <div class="header-add-wrap">
-      <button class="header-add-btn" id="add-btn" onclick="event.stopPropagation();toggleAddMenu()">+</button>
+      <button class="header-add-btn" id="add-btn" onclick="event.stopPropagation();toggleAddMenu()" aria-label="Create or connect" title="Create or connect">+</button>
       <div class="header-add-menu" id="add-menu">
         <div class="card-menu-item" onclick="event.stopPropagation();closeAddMenu();openCreate()"><span class="mi">&#x2795;</span> New worker</div>
         <div class="card-menu-item" onclick="event.stopPropagation();closeAddMenu();openConnect()"><span class="mi">&#x1F517;</span> Connect tmux</div>
@@ -231,7 +231,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       </div>
     </div>
     <div class="settings-wrap">
-      <button class="settings-btn" id="settings-btn" onclick="event.stopPropagation();toggleSettings()">&#x2699;</button>
+      <button class="settings-btn" id="settings-btn" onclick="event.stopPropagation();toggleSettings()" aria-label="Settings" title="Settings">&#x2699;&#xFE0F;</button>
       <div class="settings-menu" id="settings-menu">
         <div class="settings-tabs" id="settings-tabs">
           <button class="settings-tab-btn active" data-stab="account" onclick="event.stopPropagation();_settingsTab('account')">Account</button>
@@ -511,6 +511,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         </div>
         <div class="settings-sep"></div>
         <div class="settings-section" style="text-align:center;display:flex;flex-direction:column;gap:8px;">
+          <button class="btn" id="style-guide-btn" onclick="openStyleGuide()">Style guide</button>
           <span style="font-size:0.7rem;color:var(--dim);cursor:pointer;" onclick="openAbout();closeSettings()">About amux &amp; token stats</span>
           <span style="font-size:0.7rem;color:var(--dim);cursor:pointer;" onclick="openDevtools();closeSettings()">&#x1F6E0; Developer tools</span>
           <span id="logout-btn" style="font-size:0.7rem;color:var(--dim);cursor:pointer;display:none;" onclick="window.location='/api/cloud-logout'">&#x2192; Sign out</span>
@@ -581,8 +582,8 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <div id="offline-ops" class="offline-queue-ops"></div>
 </div>
 <div id="pinned-notes-home" class="pinned-notes-home"></div>
-<div id="cards" class="cards"></div>
 <div id="paused-section"></div>
+<div id="cards" class="cards"></div>
 <div id="archived-section"></div>
 </div>
 <div id="groups-view" style="display:none;">
@@ -1642,7 +1643,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 <!-- Video player overlay -->
 <div id="video-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.92);z-index:9999;flex-direction:column;align-items:center;justify-content:center;" onclick="if(event.target===this)_closeVideo()">
   <div id="vp-container" style="position:relative;width:90vw;max-width:1200px;">
-    <div id="vp-title" style="color:#fff;font-size:0.85rem;margin-bottom:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></div>
+    <div class="vp-heading"><div id="vp-title"></div><button onclick="_closeVideo()" aria-label="Close video" title="Close video">&#x2715;</button></div>
     <div style="position:relative;background:#000;border-radius:8px;overflow:hidden;">
       <video id="video-player" playsinline webkit-playsinline x-webkit-airplay="allow" airplay="allow" preload="metadata" style="width:100%;max-height:75vh;display:block;"></video>
       <!-- Loading/error overlay -->
@@ -1667,7 +1668,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
             <input id="vp-volume" type="range" min="0" max="1" step="0.05" value="1" oninput="_vpSetVolume(this.value)" style="width:70px;accent-color:var(--accent);cursor:pointer;">
           </div>
           <button onclick="_vpFullscreen()" style="background:none;border:none;color:#fff;font-size:0.9rem;cursor:pointer;padding:0;" title="Fullscreen">&#x26F6;</button>
-          <button onclick="_closeVideo()" style="background:none;border:none;color:rgba(255,255,255,0.6);font-size:1rem;cursor:pointer;padding:0;" title="Close">&#x2716;</button>
+
         </div>
       </div>
     </div>
@@ -1951,8 +1952,11 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
      routes it to the right workers → review → send. -->
 <div id="orch-overlay" class="edit-overlay" onclick="if(event.target===this)_orchClose()">
   <div class="edit-box orch-box">
-    <h3 style="display:flex;align-items:center;gap:8px;">&#x1F399;&#xFE0F; Orchestrate the fleet
-      <span style="font-size:0.68rem;font-weight:400;color:var(--dim);">speak or paste, then approve before it sends</span></h3>
+    <div class="orch-heading">
+      <h3>Orchestrate the fleet</h3>
+      <button class="btn" onclick="_orchClose()" aria-label="Close orchestrator">&#x2715;</button>
+    </div>
+    <p class="orch-subtitle">Speak or paste, then review before sending.</p>
 
     <!-- Step 1: record -->
     <div id="orch-step-record" class="orch-step">
@@ -2280,7 +2284,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <div class="peek-attach-bar" id="peek-attach-bar"></div>
         <!-- Input row -->
         <div class="ac-wrap peek-composer-input">
-          <textarea class="send-input" id="peek-cmd-input" rows="1" placeholder="Type a message or drop a file..."
+          <textarea class="send-input" id="peek-cmd-input" rows="1" placeholder="Message…" aria-label="Message the worker"
             autocomplete="off" autocorrect="on" autocapitalize="sentences" spellcheck="true"
             enterkeyhint="enter" style="width:100%;"
             oninput="autoGrow(this);slashAcUpdate();cmdHistoryReset();_draftSaveDebounced(peekSession,this.value)" onkeydown="slashAcKeydown(event)"

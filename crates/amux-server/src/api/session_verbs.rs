@@ -1731,17 +1731,17 @@ pub(crate) fn detect_claude_status(raw_output: &str) -> String {
     // codex one. The border char on the cursor's own line is the chrome
     // anchor prose cannot fake (same trick as the `│ ❯ 1.` claude form).
     //
-    // Scanned over `clean` (the WHOLE frame), not `current`: `current_start`
-    // anchors to the LAST composer-placeholder line, so a picker whose text
-    // sits ahead of that anchor — e.g. a picker still open while a stale
-    // placeholder happens to remain visible below it — was invisible to this
-    // check entirely and read as idle (caught by
-    // `gemini_058_composer_and_boundary_follow_actual_terminal`'s synthetic
-    // picker-over-frame case). The chrome anchor is exactly why widening the
-    // scan is safe: prose cannot fake `│ ●` bordering the cursor, so scanning
-    // the whole frame does not turn quoted text into a false "waiting".
-    if clean.contains("\u{2502} \u{25cf} 1.") {
-        return "waiting".into();
+    // Gemini can retain its boxed composer placeholder beneath a live picker.
+    // A newer bare Claude/Codex prompt, however, closes a quoted historical
+    // picker. Reading that old box as current blocks automatic steering.
+    if let Some(picker) = lines.iter().rposition(|line| line.contains("\u{2502} \u{25cf} 1.")) {
+        let newer_prompt = lines[picker + 1..].iter()
+            .any(|line| matches!(line.trim(), "❯" | "›"));
+        if !newer_prompt {
+            return "waiting".into();
+        }
+        tracing::debug!(target: "amux::steering", verdict = "stale_picker_ignored",
+            "historical boxed picker precedes the current empty composer");
     }
     let raw_lines: Vec<&str> = raw_output.lines().filter(|l| !strip_ansi(l).trim().is_empty()).collect();
     let stripped: Vec<String> = raw_lines.iter().map(|l| strip_ansi(l)).collect();
@@ -2091,6 +2091,11 @@ pub const SESSION_SCOPED_FIELDS: &[(&str, RenameDisposition)] = &[
     ("issues.shepherd", RenameDisposition::Migrate),
     ("issues.requested_by", RenameDisposition::Migrate),
     ("issues.callback_session", RenameDisposition::Migrate),
+    // RR-0052: the lease holder is the lane's own live claim. Left on the old
+    // name, a renamed lane becomes a NON-holder of the card it is working, and
+    // with AMUX_LEASE_ENFORCE on it is refused on its own card until the
+    // reaper reclaims it.
+    ("issues.lease_owner", RenameDisposition::Migrate),
     ("schedules", RenameDisposition::Migrate),
     ("session_gates", RenameDisposition::Migrate),
     ("saved_messages", RenameDisposition::Migrate),
@@ -2164,7 +2169,7 @@ pub fn simple_rename_tables() -> Vec<&'static str> {
         .collect()
 }
 
-pub const RENAME_MIGRATIONS: [(&str, &str); 11] = [
+pub const RENAME_MIGRATIONS: [(&str, &str); 12] = [
     ("issues", "UPDATE issues SET session=?1 WHERE session=?2 AND deleted IS NULL"),
     // BEYOND PYTHON, and the reason AMUX-3749 exists: the cascade
     // migrated a card's OWNER and left the two columns that address
@@ -2188,6 +2193,10 @@ pub const RENAME_MIGRATIONS: [(&str, &str); 11] = [
     (
         "issues.callback_session",
         "UPDATE issues SET callback_session=?1 WHERE callback_session=?2 AND deleted IS NULL",
+    ),
+    (
+        "issues.lease_owner",
+        "UPDATE issues SET lease_owner=?1 WHERE lease_owner=?2 AND deleted IS NULL",
     ),
     ("schedules", "UPDATE schedules SET session=?1 WHERE session=?2"),
     ("session_gates", "UPDATE session_gates SET session=?1 WHERE session=?2"),
@@ -2491,17 +2500,47 @@ pub(crate) fn conversation_owner(
 ///
 /// Tail-bounded and TTL-cached: /api/sessions is polled hard and there are ~47
 /// lanes, so an uncached full read would be a file scan per lane per poll.
-pub(crate) fn transcript_evidence(name: &str) -> (Option<String>, Option<u64>) {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-    type Cache = HashMap<String, (f64, Option<String>, Option<u64>)>;
-    static EV: OnceLock<Mutex<Cache>> = OnceLock::new();
-    let ttl = std::env::var("AMUX_TRANSCRIPT_EVIDENCE_TTL_S")
+type TranscriptEvidenceCache = std::collections::HashMap<String, (f64, Option<String>, Option<u64>)>;
+
+fn transcript_evidence_cache() -> &'static std::sync::Mutex<TranscriptEvidenceCache> {
+    static EV: std::sync::OnceLock<std::sync::Mutex<TranscriptEvidenceCache>> = std::sync::OnceLock::new();
+    EV.get_or_init(Default::default)
+}
+
+fn transcript_evidence_ttl() -> f64 {
+    std::env::var("AMUX_TRANSCRIPT_EVIDENCE_TTL_S")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(15.0);
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(15.0)
+}
+
+fn prune_transcript_evidence(cache: &mut TranscriptEvidenceCache, now: f64, ttl: f64) -> usize {
+    let before = cache.len();
+    cache.retain(|_, (at, _, _)| now - *at <= ttl.max(300.0));
+    let removed = before - cache.len();
+    if removed > 0 {
+        cache.shrink_to_fit();
+    }
+    removed
+}
+
+/// Also called by hourly maintenance, so inactive/deleted lanes do not need
+/// another request to release their cached values and map allocation.
+pub(crate) fn sweep_transcript_evidence() -> usize {
+    transcript_evidence_cache().lock().map(|mut cache| {
+        let removed = prune_transcript_evidence(&mut cache, now_f64(), transcript_evidence_ttl());
+        if removed > 0 {
+            tracing::info!(removed, remaining = cache.len(), "transcript evidence cache expired");
+        }
+        removed
+    }).unwrap_or(0)
+}
+
+pub(crate) fn transcript_evidence(name: &str) -> (Option<String>, Option<u64>) {
+    let ttl = transcript_evidence_ttl();
     let now = now_f64();
-    let cache = EV.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache = transcript_evidence_cache();
     if let Ok(g) = cache.lock() {
         if let Some((at, m, t)) = g.get(name) {
             if now - at < ttl {
@@ -2554,6 +2593,7 @@ pub(crate) fn transcript_evidence(name: &str) -> (Option<String>, Option<u64>) {
         }
     }
     if let Ok(mut g) = cache.lock() {
+        prune_transcript_evidence(&mut g, now, ttl);
         g.insert(name.to_string(), (now, model.clone(), tokens));
     }
     (model, tokens)
@@ -4268,6 +4308,7 @@ fn mint_capture_card(
     session_name: &str,
     body: &str,
     now_ms: i64,
+    from_peer: bool,
 ) -> rusqlite::Result<Option<crate::db::board_store::IssueRow>> {
     // Redact secret shapes BEFORE anything derives a title/desc from the prompt —
     // both come from `body`, and the board is fleet-readable (AMUX-3384).
@@ -4309,6 +4350,38 @@ fn mint_capture_card(
         tracing::info!(
             session = %session_name,
             "ledger: informational prompt not carded (recorded in cmd_history only) — AMUX-3330"
+        );
+        return Ok(None);
+    }
+    // A status report, a detailed ack, or a broadcast announcement is peer
+    // coordination chatter, not a deliverable this worker owns. Carding it put
+    // acks/CI-status/announcements on every recipient's board (2,691 capture
+    // cards discarded fleet-wide; one broadcast on 55 boards — AMUX-4498). It
+    // stays in cmd_history; it just does not become a work card. Surface it
+    // (two-fixes rule): grep "ledger: status report not carded" to audit the
+    // detector, so a wrongly suppressed REAL task is findable in the logs.
+    if amux_core::board::is_status_report(body) {
+        tracing::info!(
+            session = %session_name,
+            "ledger: status report not carded (recorded in cmd_history only) — AMUX-4498"
+        );
+        return Ok(None);
+    }
+    // Provenance gate: a PEER message (from another worker) mints a work card
+    // only when it carries a genuine ask. Workers narrate status to each other
+    // constantly ("LANDED <sha>", "verified on origin", "read and recorded",
+    // "all three landed") and each was carding a `code` task on the recipient's
+    // board (Ethan, 2026-09-14: "workers are populating their board with bogus
+    // ... be better about amux task creation"; 82% of 200 recent peer capture
+    // cards carried no ask). Human/schedule prompts never reach here with
+    // from_peer=true, so Ethan's own instructions are unaffected, and a peer
+    // message naming a card the recipient already owns was already linked by the
+    // reuse path above this call. Surface it (two-fixes rule): grep
+    // "ledger: peer message without an ask not carded".
+    if from_peer && !amux_core::board::peer_message_wants_action(body) {
+        tracing::info!(
+            session = %session_name,
+            "ledger: peer message without an ask not carded (recorded in cmd_history only) — AMUX-4498"
         );
         return Ok(None);
     }
@@ -4519,6 +4592,7 @@ fn associate_capture_card(
     body: &str,
     now_ms: i64,
     intake: &super::board_intake::Plan,
+    from_peer: bool,
 ) -> rusqlite::Result<Option<CaptureAssociation>> {
     let mut live_owned = Vec::new();
     for id in prompt_card_refs(body) {
@@ -4547,7 +4621,7 @@ fn associate_capture_card(
     if let Some(row) = super::board_intake::apply(conn, intake, &title, body, now_ms / 1000)? {
         return Ok(Some(CaptureAssociation {row, created:false}));
     }
-    if let Some(mut row) = mint_capture_card(conn, session_name, body, now_ms)? {
+    if let Some(mut row) = mint_capture_card(conn, session_name, body, now_ms, from_peer)? {
         row.log = Some(crate::db::board_store::append_log(row.log.as_deref(), &chrono::Local::now().format("%H:%M").to_string(), &format!("{}; disposition=create", intake.log_line())));
         crate::db::board_store::save_patched(conn, &mut row)?;
         return Ok(Some(CaptureAssociation { row, created: true }));
@@ -4562,6 +4636,8 @@ fn associate_capture_card(
     let redacted = redact_prompt_secrets(body);
     if amux_core::board::title_from_prompt(&redacted).is_some()
         && !amux_core::board::is_informational_query(&redacted)
+        && !amux_core::board::is_status_report(&redacted)
+        && !(from_peer && !amux_core::board::peer_message_wants_action(&redacted))
     {
         let captured_desc = format_captured_desc(&redacted);
         if let Some(id) =
@@ -4722,6 +4798,9 @@ pub(crate) async fn cmd_hist_record_full(
         _ if !landed => None,
         _ => Some(now_ms),
     };
+    let capture_pending = task_bearing && landed
+        && amux_core::board::title_from_prompt(&text).is_some()
+        && !amux_core::board::is_informational_query(&text);
     let msg_row_id_w = msg_row_id.clone();
     let cap_session = session.clone();
     let truth_session = cap_session.clone();
@@ -4740,17 +4819,17 @@ pub(crate) async fn cmd_hist_record_full(
                 dup_prior_ts_w.store(pts, std::sync::atomic::Ordering::SeqCst);
             }
             conn.execute(
-                "INSERT INTO cmd_history (text, type, session, ts, origin, delivery, queued_at, delivered_at, submit_verdict) \
-                 VALUES (?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO cmd_history (text, type, session, ts, origin, delivery, queued_at, delivered_at, submit_verdict, capture_pending) \
+                 VALUES (?,?,?,?,?,?,?,?,?,?)",
                 rusqlite::params![
                     text, ctype, session, now_ms, origin,
-                    delivery, queued_at_ms, delivered_at_ms, submit_verdict
+                    delivery, queued_at_ms, delivered_at_ms, submit_verdict, capture_pending
                 ],
             )?;
             let row_id = conn.last_insert_rowid();
             msg_row_id_w.store(row_id, std::sync::atomic::Ordering::SeqCst);
             conn.execute(
-                "DELETE FROM cmd_history WHERE session=?1 AND id NOT IN \
+                "DELETE FROM cmd_history WHERE session=?1 AND capture_pending=0 AND id NOT IN \
                  (SELECT id FROM cmd_history WHERE session=?1 ORDER BY ts DESC LIMIT ?2)",
                 rusqlite::params![session, CMD_HIST_KEEP],
             )?;
@@ -4828,152 +4907,9 @@ pub(crate) async fn cmd_hist_record_full(
     // keeping; the card is a consequence that did not happen.
     let substantive = amux_core::board::title_from_prompt(&cap_text).is_some()
         && !amux_core::board::is_informational_query(&cap_text);
-    if task_bearing && landed && substantive {
+    if capture_pending {
         let row_id = msg_row_id.load(std::sync::atomic::Ordering::SeqCst);
-        if row_id > 0 {
-            let cap_isolated = session_is_isolated(&cap_session);
-            let cap_text_for_capture = cap_text.clone();
-            let associated: std::sync::Arc<std::sync::Mutex<Option<CaptureAssociation>>> =
-                std::sync::Arc::new(std::sync::Mutex::new(None));
-            let associated_w = associated.clone();
-            let sess_log = cap_session.clone();
-            let peer_requester = (cap_ctype == "session" && !cap_origin.trim().is_empty())
-                .then(|| cap_origin.clone());
-            let _intake_guard = super::board_intake::lock(&cap_session, "agent").await;
-            let intake = super::board_intake::plan(&state.store, &cap_session, "agent",
-                &amux_core::board::title_from_prompt(&cap_text_for_capture).unwrap_or_default(), &cap_text_for_capture).await;
-            let res = state
-                .store
-                .write_async(move |conn| match associate_capture_card(
-                    conn,
-                    &cap_session,
-                    &cap_text_for_capture,
-                    now_ms,
-                    &intake,
-                )? {
-                    Some(mut association) => {
-                        if let Some(requester) = peer_requester.as_deref() {
-                            arm_peer_callback(conn, &mut association.row, requester)?;
-                        }
-                        conn.execute(
-                            "UPDATE cmd_history SET card_id = ?1 WHERE id = ?2",
-                            rusqlite::params![association.row.id, row_id],
-                        )?;
-                        let ev = if association.created {
-                            crate::db::PendingEvent {
-                                entity_type: amux_core::revision::EntityType::Task,
-                                entity_id: association.row.id.clone(),
-                                mutation: amux_core::revision::MutationKind::Created,
-                                payload: Some(association.row.snapshot()),
-                            }
-                        } else {
-                            crate::db::PendingEvent {
-                                entity_type: amux_core::revision::EntityType::Message,
-                                entity_id: format!("MSG-{row_id}"),
-                                mutation: amux_core::revision::MutationKind::Updated,
-                                payload: None,
-                            }
-                        };
-                        let mut events = vec![ev];
-                        if !association.created {
-                            events.push(crate::db::PendingEvent {
-                                entity_type: amux_core::revision::EntityType::Task,
-                                entity_id: association.row.id.clone(),
-                                mutation: amux_core::revision::MutationKind::Updated,
-                                payload: Some(association.row.snapshot()),
-                            });
-                        }
-                        *associated_w.lock().unwrap() = Some(association);
-                        Ok(crate::db::WriteOutcome { applied: true, events })
-                    }
-                    None => Ok(crate::db::WriteOutcome { applied: false, events: vec![] }),
-                })
-                .await;
-            match res {
-                // Positive log signal (two-fixes rule): if auto-capture silently
-                // stops again, the absence of these lines while user prompts keep
-                // arriving — plus the cmd_history.card_id NULL rate — is the
-                // detector. grep "ledger: auto-captured".
-                Ok(_) => {
-                    let association = associated.lock().ok().and_then(|mut value| value.take());
-                    if let Some(association) = association {
-                        let created = association.created;
-                        let cid = association.row.id;
-                        let status = association.row.status;
-                        if created {
-                            tracing::info!(session = %sess_log, card_id = %cid,
-                                owner_isolated = cap_isolated,
-                                requested_no_board = skip_board,
-                                "ledger: auto-captured board card from delivered prompt");
-                        } else {
-                            tracing::info!(session = %sess_log, card_id = %cid, %status,
-                                owner_isolated = cap_isolated,
-                                requested_no_board = skip_board,
-                                measured = true, n_considered = 1,
-                                verdict = "substantive_prompt_linked_existing_card",
-                                "ledger: linked substantive delivered prompt to its unique live owned card");
-                        }
-                        let (event, reason, verdict, receipt) = match (created, status.as_str()) {
-                            (true, "doing") => (
-                                "task.claimed",
-                                "delivered-owner-prompt",
-                                "capture-claimed",
-                                format!("prompt-card:{row_id}"),
-                            ),
-                            (true, _) => (
-                                "task.captured",
-                                "delivered-owner-prompt-pending-active-claim",
-                                "capture-pending-active-claim",
-                                format!("prompt-card:{row_id}"),
-                            ),
-                            (false, "doing") => (
-                                "task.claimed",
-                                "delivered-owner-prompt-existing-card",
-                                "linked-doing-card",
-                                format!("prompt-card:{row_id}"),
-                            ),
-                            (false, _) => (
-                                "task.attribution_pending",
-                                "substantive-prompt-references-non-doing-card",
-                                "existing-card-must-be-claimed",
-                                format!("prompt-attribution:{row_id}"),
-                            ),
-                        };
-                        emit_event(
-                            state,
-                            &sess_log,
-                            event,
-                            Some(json!({
-                                "issue": cid,
-                                "status": status,
-                                "reason": reason,
-                                "measured": true,
-                                "n_considered": 1,
-                                "verdict": verdict,
-                            })),
-                            Some(receipt),
-                            "prompt-capture",
-                        )
-                        .await;
-                        if !created && status != "doing" {
-                            tracing::warn!(
-                                target: "amux::sessions",
-                                session = %sess_log,
-                                card_id = %cid,
-                                %status,
-                                measured = true,
-                                n_considered = 1,
-                                verdict = "existing_card_must_be_claimed",
-                                "substantive prompt linked to an existing non-Doing card; runtime WORKING withheld until it is claimed"
-                            );
-                        }
-                    }
-                }
-                Err(e) => tracing::warn!(session = %sess_log, error = %e,
-                    owner_isolated = cap_isolated,
-                    "ledger auto-capture FAILED; prompt recorded without a board card"),
-            }
-        }
+        if row_id > 0 { capture_recorded_message(state, row_id).await; }
     }
     if task_bearing && landed {
         let cardless_reason = if amux_core::board::is_informational_query(&cap_text) {
@@ -5010,6 +4946,234 @@ pub(crate) async fn cmd_hist_record_full(
             )
             .await;
         }
+    }
+}
+
+/// Resume only explicitly pending message consequences. This does not deliver a
+/// command, insert history, or infer work from arbitrary old cardless messages.
+pub(crate) async fn capture_recorded_message(state: &AppState, row_id: i64) {
+    use rusqlite::OptionalExtension;
+    let session = (|| -> anyhow::Result<Option<String>> {
+        let conn = state.store.read()?;
+        Ok(conn
+            .query_row(
+                "SELECT session FROM cmd_history WHERE id=?1 AND capture_pending!=0",
+                [row_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    })();
+    let cap_session = match session {
+        Ok(Some(session)) => session,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(message_id=row_id, %error, measured=false, n_considered=0,
+                verdict="capture_recovery_unmeasured", "ledger: pending message could not be read");
+            return;
+        }
+    };
+    let _intake_guard = super::board_intake::lock(&cap_session, "agent").await;
+    let loaded = (|| -> anyhow::Result<Option<(String, String, String, i64)>> {
+        let conn = state.store.read()?;
+        Ok(conn.query_row("SELECT text,type,origin,ts FROM cmd_history WHERE id=?1 AND capture_pending!=0 AND card_id IS NULL",
+            [row_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?)
+    })();
+    let (cap_text, cap_ctype, cap_origin, now_ms) = match loaded {
+        Ok(Some(row)) => row,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(message_id=row_id, %error, measured=false, n_considered=0,
+                verdict="capture_recovery_unmeasured", "ledger: pending capture snapshot unavailable");
+            return;
+        }
+    };
+    let cap_isolated = session_is_isolated(&cap_session);
+    let cap_text_for_capture = cap_text.clone();
+    let associated: std::sync::Arc<std::sync::Mutex<Option<CaptureAssociation>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let associated_w = associated.clone();
+    let sess_log = cap_session.clone();
+    // A message whose cmd_history type is `session` came from a peer worker (not
+    // a human or a schedule); the mint gate holds it to a higher bar (AMUX-4498).
+    let from_peer = cap_ctype == "session";
+    let peer_requester =
+        (cap_ctype == "session" && !cap_origin.trim().is_empty()).then(|| cap_origin.clone());
+    let intake = super::board_intake::plan(
+        &state.store,
+        &cap_session,
+        "agent",
+        &amux_core::board::title_from_prompt(&cap_text_for_capture).unwrap_or_default(),
+        &cap_text_for_capture,
+    )
+    .await;
+    let res = state
+        .store
+        .write_async(move |conn| {
+            let pending: bool = conn
+                .query_row(
+                    "SELECT capture_pending!=0 AND card_id IS NULL FROM cmd_history WHERE id=?1",
+                    [row_id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if !pending {
+                return Ok(crate::db::WriteOutcome {
+                    applied: false,
+                    events: vec![],
+                });
+            }
+            match associate_capture_card(
+                conn,
+                &cap_session,
+                &cap_text_for_capture,
+                now_ms,
+                &intake,
+                from_peer,
+            )? {
+                Some(mut association) => {
+                    if let Some(requester) = peer_requester.as_deref() {
+                        arm_peer_callback(conn, &mut association.row, requester)?;
+                    }
+                    conn.execute(
+                        "UPDATE cmd_history SET card_id = ?1, capture_pending=0 WHERE id = ?2",
+                        rusqlite::params![association.row.id, row_id],
+                    )?;
+                    let ev = if association.created {
+                        crate::db::PendingEvent {
+                            entity_type: amux_core::revision::EntityType::Task,
+                            entity_id: association.row.id.clone(),
+                            mutation: amux_core::revision::MutationKind::Created,
+                            payload: Some(association.row.snapshot()),
+                        }
+                    } else {
+                        crate::db::PendingEvent {
+                            entity_type: amux_core::revision::EntityType::Message,
+                            entity_id: format!("MSG-{row_id}"),
+                            mutation: amux_core::revision::MutationKind::Updated,
+                            payload: None,
+                        }
+                    };
+                    let mut events = vec![ev];
+                    if !association.created {
+                        events.push(crate::db::PendingEvent {
+                            entity_type: amux_core::revision::EntityType::Task,
+                            entity_id: association.row.id.clone(),
+                            mutation: amux_core::revision::MutationKind::Updated,
+                            payload: Some(association.row.snapshot()),
+                        });
+                    }
+                    *associated_w.lock().unwrap() = Some(association);
+                    Ok(crate::db::WriteOutcome {
+                        applied: true,
+                        events,
+                    })
+                }
+                None => {
+                    conn.execute(
+                        "UPDATE cmd_history SET capture_pending=0 WHERE id=?1",
+                        [row_id],
+                    )?;
+                    tracing::info!(
+                        message_id = row_id,
+                        measured = true,
+                        n_considered = 1,
+                        verdict = "capture_predicate_declined",
+                        "ledger: pending capture resolved without a task"
+                    );
+                    Ok(crate::db::WriteOutcome {
+                        applied: true,
+                        events: vec![],
+                    })
+                }
+            }
+        })
+        .await;
+    match res {
+        // Positive log signal (two-fixes rule): if auto-capture silently
+        // stops again, the absence of these lines while user prompts keep
+        // arriving — plus the cmd_history.card_id NULL rate — is the
+        // detector. grep "ledger: auto-captured".
+        Ok(_) => {
+            let association = associated.lock().ok().and_then(|mut value| value.take());
+            if let Some(association) = association {
+                let created = association.created;
+                let cid = association.row.id;
+                let status = association.row.status;
+                if created {
+                    tracing::info!(session = %sess_log, card_id = %cid,
+                                owner_isolated = cap_isolated,
+                                message_id = row_id,
+                                "ledger: auto-captured board card from delivered prompt");
+                } else {
+                    tracing::info!(session = %sess_log, card_id = %cid, %status,
+                                owner_isolated = cap_isolated,
+                                message_id = row_id,
+                                measured = true, n_considered = 1,
+                                verdict = "substantive_prompt_linked_existing_card",
+                                "ledger: linked substantive delivered prompt to its unique live owned card");
+                }
+                let (event, reason, verdict, receipt) = match (created, status.as_str()) {
+                    (true, "doing") => (
+                        "task.claimed",
+                        "delivered-owner-prompt",
+                        "capture-claimed",
+                        format!("prompt-card:{row_id}"),
+                    ),
+                    (true, _) => (
+                        "task.captured",
+                        "delivered-owner-prompt-pending-active-claim",
+                        "capture-pending-active-claim",
+                        format!("prompt-card:{row_id}"),
+                    ),
+                    (false, "doing") => (
+                        "task.claimed",
+                        "delivered-owner-prompt-existing-card",
+                        "linked-doing-card",
+                        format!("prompt-card:{row_id}"),
+                    ),
+                    (false, _) => (
+                        "task.attribution_pending",
+                        "substantive-prompt-references-non-doing-card",
+                        "existing-card-must-be-claimed",
+                        format!("prompt-attribution:{row_id}"),
+                    ),
+                };
+                emit_event(
+                    state,
+                    &sess_log,
+                    event,
+                    Some(json!({
+                        "issue": cid,
+                        "status": status,
+                        "reason": reason,
+                        "measured": true,
+                        "n_considered": 1,
+                        "verdict": verdict,
+                    })),
+                    Some(receipt),
+                    "prompt-capture",
+                )
+                .await;
+                if !created && status != "doing" {
+                    tracing::warn!(
+                        target: "amux::sessions",
+                        session = %sess_log,
+                        card_id = %cid,
+                        %status,
+                        measured = true,
+                        n_considered = 1,
+                        verdict = "existing_card_must_be_claimed",
+                        "substantive prompt linked to an existing non-Doing card; runtime WORKING withheld until it is claimed"
+                    );
+                }
+            }
+        }
+        Err(e) => tracing::warn!(session = %sess_log, error = %e,
+                    message_id = row_id, measured = true, n_considered = 1,
+                    verdict = "capture_retry_pending",
+                    owner_isolated = cap_isolated,
+                    "ledger auto-capture FAILED; durable prompt remains pending for retry"),
     }
 }
 
@@ -6249,23 +6413,21 @@ fn verb_resp(ok: bool, msg: String) -> Response {
     jresp(code, body)
 }
 
-/// Durable submission evidence (py:25373 `_jsonl_user_msg_since`): true if
-/// `text` already landed in the session's conversation JSONL as a user message
-/// stamped AFTER `since`.
-///
-/// The pane can lie mid-repaint (resize rewrap; the ~1s gap before the spinner
-/// paints after a submit); the JSONL append happens AT submission and cannot.
-/// The `since` gate uses the message's OWN timestamp, not file mtime, so an
-/// older identical text — a second "continue" minutes later — cannot count as
-/// this send.
-pub(crate) fn jsonl_user_msg_since(name: &str, text: &str, since: f64) -> bool {
-    let needle = text.trim();
-    if needle.is_empty() {
-        return false;
-    }
-    let Some(p) = session_jsonl_path(name) else { return false };
-    // 256KiB tail, same budget as python's f.seek(size - 262144).
-    jsonl_records_have(&iter_jsonl_tail(&p, 262_144), needle, since)
+/// Submission may be accepted into Claude's native queue before a user turn
+/// exists. Require the provider's exact enqueue content and timestamp, never
+/// infer acceptance from a busy badge or from old identical text.
+fn jsonl_submission_since(name: &str, text: &str, since: f64) -> bool {
+    let Some(path) = session_jsonl_path(name) else { return false };
+    submission_records_have(&iter_jsonl_tail(&path, 262_144), text, since)
+}
+
+fn submission_records_have(records: &[Value], text: &str, since: f64) -> bool {
+    jsonl_records_have(records, text, since) || (!text.trim().is_empty() && records.iter().any(|record| {
+        record["type"].as_str() == Some("queue-operation")
+            && record["operation"].as_str() == Some("enqueue")
+            && record["content"].as_str().is_some_and(|content| content.trim() == text.trim())
+            && record["timestamp"].as_str().and_then(parse_iso8601).is_some_and(|ts| ts >= since)
+    }))
 }
 
 /// The evidence scan itself, over already-parsed records — pure so it can be
@@ -6309,8 +6471,8 @@ pub(crate) enum FrameRead {
     NoUi,
     /// The composer is drawn and does not hold our text.
     Cleared,
-    /// Our text is still sitting in the composer, and the lane is generating —
-    /// that is queued input, which submits at the turn boundary.
+    /// Our text is still sitting in the composer while the lane is generating.
+    /// Generation does not prove that Enter accepted it into the native queue.
     StillThereGenerating,
     /// Our text is still sitting in the composer with the lane idle. Nothing is
     /// going to submit it.
@@ -6367,9 +6529,8 @@ pub(crate) fn final_frame_confirms(frame: FrameRead) -> bool {
     match frame {
         // The composer is drawn and no longer holds our text: it went in.
         FrameRead::Cleared => true,
-        // Still in the box while the lane generates. That is queued input and
-        // the turn boundary submits it, so Confirmed is right.
-        FrameRead::StillThereGenerating => true,
+        // A running turn cannot acknowledge text still in its input box.
+        FrameRead::StillThereGenerating => false,
         // We cannot read our own message back, so the frame proves nothing in
         // either direction. Defer to the durable record.
         FrameRead::NoUi => false,
@@ -6642,10 +6803,11 @@ async fn verify_submitted(
                 cleared_once = true;
                 continue;
             }
-            // Text still in the box while Claude is generating: it is queued
-            // input that submits at the turn end — don't touch it (Escape would
-            // interrupt).
-            FrameRead::StillThereGenerating => return (Submission::Confirmed, retried),
+            // The native queue clears the composer after accepting Enter.
+            // While our text remains, require transcript evidence or let the
+            // caller retry bare Enter. Never Escape into a running turn, even
+            // when generation began after the send's initial idle snapshot.
+            FrameRead::StillThereGenerating => {}
             FrameRead::StillThereIdle => {}
             // TREATED AS "still there", because it IS (AMUX-3880). The composer
             // is painted and holding something unsubmitted; the text is merely
@@ -6674,10 +6836,15 @@ async fn verify_submitted(
         // Durable evidence beats the pane: the conversation JSONL gets the user
         // message appended at submission. If it is there stamped after this send
         // began, it submitted and the pane read is a repaint lie.
-        if sent_at > 0.0 && jsonl_user_msg_since(name, text, sent_at) {
+        if sent_at > 0.0 && jsonl_submission_since(name, text, sent_at) {
             return (Submission::Confirmed, retried);
         }
-        if !retry_keys {
+        let active_now = detect_claude_status(&raw) == "active";
+        if !retry_keys || active_now {
+            if active_now {
+                tracing::warn!(session = %name, verdict = "generating_composer_unsubmitted",
+                    "send: repeated captures still hold this message in the running worker's composer without a submission receipt");
+            }
             return (Submission::Stuck, retried);
         }
         // Idle with our text genuinely stuck → press Escape (closes a picker
@@ -6717,7 +6884,7 @@ async fn verify_submitted(
     // A re-send now happens only when the message is genuinely absent from the
     // durable record, which is precisely when re-sending is the right move; the
     // old path traded that for a silent drop.
-    if sent_at > 0.0 && jsonl_user_msg_since(name, text, sent_at) {
+    if sent_at > 0.0 && jsonl_submission_since(name, text, sent_at) {
         (Submission::Confirmed, retried)
     } else {
         (Submission::Stuck, retried)
@@ -6791,10 +6958,7 @@ pub(crate) fn all_lane_names() -> Vec<String> {
         .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(String::from))
         .collect();
     names.sort();
-    names.retain(|n| {
-        let cfg = parse_env(n);
-        cfg.get("CC_ARCHIVED") != Some("1") && cfg.get("CC_PAUSED") != Some("1")
-    });
+    names.retain(|n| { let cfg = parse_env(n); cfg.get("CC_ARCHIVED") != Some("1") && cfg.get("CC_PAUSED") != Some("1") });
     names
 }
 
@@ -8289,7 +8453,7 @@ fn gemini_session_flag(meta: &mut Map<String, Value>, fresh: bool) -> String {
     format!("--session-id {}", sh_quote(&id))
 }
 
-async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_conv_id: bool) -> (bool, String) {
+pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_conv_id: bool) -> (bool, String) {
     if !valid_session_name(name) {
         return (false, "invalid session name".into());
     }
@@ -8307,6 +8471,9 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
         return (false, format!("session '{name}' not found"));
     }
     let cfg = parse_env(name);
+    if cfg.get("CC_PAUSED") == Some("1") {
+        return (false, "worker is paused; resume it first".into());
+    }
     // ISOLATED (AMUX-3232): computed once here from the worker's own env so the
     // spawn path can strip the harness (env injection below, --mcp-config in
     // build_claude_cmd). Read from cfg, the same map every other CC_* flag on
@@ -9500,50 +9667,114 @@ async fn archive_session_issues(state: &AppState, name: &str, flag: i64) {
         .await;
 }
 
-/// Legacy cascade for the new lifecycle archive endpoint: sets CC_ARCHIVED=1
-/// in the env file (if it exists) and archives the worker's board cards.
-/// Does NOT stop the session (the caller handles that).
-pub(crate) async fn archive_legacy_cascade(state: &AppState, name: &str) {
-    let f = env_path(name);
-    if f.exists() {
-        let mut cfg = parse_env(name);
-        cfg.set("CC_ARCHIVED", "1");
-        let _ = cfg.write(&f);
-    }
-    archive_session_issues(state, name, 1).await;
+/// Persist the cold-start gate and report file failures to the lifecycle API.
+pub(crate) fn set_legacy_paused(name: &str, paused: bool) -> anyhow::Result<()> {
+    if !lane_env_exists(name) { return Ok(()); }
+    let mut cfg = parse_env(name);
+    if paused { cfg.set("CC_PAUSED", "1"); } else { cfg.remove("CC_PAUSED"); }
+    cfg.write(&env_path(name))?;
+    crate::api::sessions_legacy::invalidate_sessions_cache();
+    Ok(())
 }
 
-/// Legacy cascade for pause: sets CC_PAUSED=1 in the env file so cold-start
-/// (which reads env files without the server) skips paused workers.
-pub(crate) fn pause_legacy_cascade(name: &str) {
-    let f = env_path(name);
-    if f.exists() {
-        let mut cfg = parse_env(name);
-        cfg.set("CC_PAUSED", "1");
-        let _ = cfg.write(&f);
+/// Pause stops the process tree, including shell tools and local subagents.
+/// No slash command is typed into a busy provider's composer. Conversation
+/// metadata and terminal history remain available to the ordinary resume path.
+pub(crate) async fn stop_for_pause(state: &AppState, name: &str) -> anyhow::Result<()> {
+    let lock = session_op_lock(name);
+    let _guard = lock.lock().await;
+    let cfg = parse_env(name);
+    if backend_of_cfg(&cfg) == "herdr" {
+        let (ok, detail) = stop_session_process(name).await;
+        anyhow::ensure!(ok, "{detail}");
+    } else {
+        let target = st(name);
+        let pane = tmux(&["list-panes", "-t", &target, "-F", "#{pane_pid}"]).await;
+        if let Some(out) = pane.filter(|o| o.status.success()) {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let root: i32 = line.trim().parse()?;
+                terminate_pane_children(root).await?;
+            }
+        } else {
+            anyhow::ensure!(!is_running(name).await, "could not locate worker process for pause");
+        }
+        anyhow::ensure!(!is_running(name).await, "worker is still running after pause");
     }
+    clear_stopped_report(state, name).await?;
+    tracing::info!(session = name, verdict = "pause_process_stopped", "worker pause verified process shutdown");
+    Ok(())
 }
 
-/// Legacy cascade for resume: removes CC_PAUSED from the env file.
-pub(crate) fn resume_legacy_cascade(name: &str) {
-    let f = env_path(name);
-    if f.exists() {
-        let mut cfg = parse_env(name);
-        cfg.remove("CC_PAUSED");
-        let _ = cfg.write(&f);
+fn descendant_pids(root: i32, rows: &[(i32, i32)]) -> Vec<i32> {
+    let mut parents = vec![root];
+    let mut result = Vec::new();
+    while let Some(parent) = parents.pop() {
+        for &(pid, ppid) in rows {
+            if ppid == parent && pid > 1 && pid != root && !result.contains(&pid) {
+                result.push(pid);
+                parents.push(pid);
+            }
+        }
     }
+    result
 }
 
-/// Legacy cascade for the new lifecycle restore endpoint: removes CC_ARCHIVED
-/// from the env file (if it exists) and un-archives the worker's board cards.
-pub(crate) async fn restore_legacy_cascade(state: &AppState, name: &str) {
-    let f = env_path(name);
-    if f.exists() {
-        let mut cfg = parse_env(name);
-        cfg.remove("CC_ARCHIVED");
-        let _ = cfg.write(&f);
+pub(crate) async fn terminate_pane_children(root: i32) -> anyhow::Result<()> {
+    terminate_owned_tree(root, false).await
+}
+
+pub(crate) async fn terminate_owned_tree(root: i32, include_root: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(root > 1, "invalid pane process id");
+    // Freeze parents before walking deeper so tools cannot fork past the
+    // snapshot while shutdown is underway. The pane shell itself stays alive.
+    struct Frozen(Vec<i32>);
+    impl Drop for Frozen {
+        fn drop(&mut self) {
+            for &pid in &self.0 { unsafe { libc::kill(pid, libc::SIGCONT); } }
+        }
     }
-    archive_session_issues(state, name, 0).await;
+    let mut owned = Frozen(Vec::new());
+    let result = async {
+        if include_root {
+            if unsafe { libc::kill(root, libc::SIGSTOP) } == 0 { owned.0.push(root); }
+            else {
+                let e = std::io::Error::last_os_error();
+                anyhow::ensure!(e.raw_os_error() == Some(libc::ESRCH), "cannot stop process {root}: {e}");
+                return Ok(());
+            }
+        }
+        loop {
+            let out = run_cmd("ps", &["-axo", "pid=,ppid="], OP_TIMEOUT).await
+                .ok_or_else(|| anyhow::anyhow!("process tree probe timed out"))?;
+            anyhow::ensure!(out.status.success(), "process tree probe failed");
+            let rows: Vec<(i32, i32)> = String::from_utf8_lossy(&out.stdout).lines()
+                .filter_map(|line| {
+                    let mut words = line.split_whitespace();
+                    Some((words.next()?.parse().ok()?, words.next()?.parse().ok()?))
+                }).collect();
+            let fresh: Vec<i32> = descendant_pids(root, &rows).into_iter()
+                .filter(|pid| !owned.0.contains(pid)).collect();
+            if fresh.is_empty() { break; }
+            for pid in fresh {
+                // SIGSTOP cannot be caught; ESRCH means it already exited.
+                if unsafe { libc::kill(pid, libc::SIGSTOP) } != 0 {
+                    let e = std::io::Error::last_os_error();
+                    anyhow::ensure!(e.raw_os_error() == Some(libc::ESRCH), "cannot stop process {pid}: {e}");
+                } else { owned.0.push(pid); }
+            }
+        }
+        // Kill leaves first; no parent can create replacements while frozen.
+        for &pid in owned.0.iter().rev() {
+            if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
+                let e = std::io::Error::last_os_error();
+                anyhow::ensure!(e.raw_os_error() == Some(libc::ESRCH), "cannot terminate process {pid}: {e}");
+            }
+        }
+        owned.0.clear(); // Killed processes no longer need the cancellation guard.
+        sleep_ms(100).await;
+        Ok(())
+    }.await;
+    result
 }
 
 /// Sync a lifecycle change from the legacy (env-file) side to the Rust worker
@@ -10406,7 +10637,7 @@ async fn peek_response(name: &str, lines: i64, live_only: bool, no_trim: bool) -
         let live = if output.is_empty() { String::new() } else { strip_launch_noise(output.trim()) };
         // The live=1 trim needs the transcript the CLIENT is displaying; the
         // rust origin re-renders it (bounded) instead of a process cache.
-        let live = if !live.is_empty() && !no_trim {
+        let live = if !live.is_empty() && !no_trim && provider == "claude" {
             let tr = render_session_transcript(name, 120_000);
             if tr.is_empty() { live } else { trim_live_overlap(&tr, &live) }
         } else {
@@ -10421,10 +10652,25 @@ async fn peek_response(name: &str, lines: i64, live_only: bool, no_trim: bool) -
     }
     let tmux_lines = if output.is_empty() { 0 } else { output.lines().count() };
     let is_alt = tmux_alt_screen(name).await;
-    if is_alt {
-        let (transcript, output) = if provider != "claude" {
-            // Non-Claude alt-screen TUIs repaint in place: the LIVE frame is
-            // the whole truthful state (py:75040).
+    let has_codex_history = matches!(provider.as_str(), "codex" | "ollama");
+    // Saved Claude history must survive normal-screen mode after resume.
+    if is_alt || has_codex_history || provider == "claude" {
+        let mut history_measurement = None;
+        let (transcript, output) = if has_codex_history {
+            let transcript = match transcript_history::snapshot(name, &provider, 120_000) {
+                Ok(page) => {
+                    history_measurement = Some(json!({"measured":true, "n_considered":page.records}));
+                    page.text
+                }
+                Err(why) => {
+                    history_measurement = Some(json!({"measured":false, "n_considered":0, "why_unmeasured":why}));
+                    String::new()
+                }
+            };
+            // Codex repaints both normal and alternate screens. Its rollout
+            // owns history; tmux contributes only the current viewport.
+            (transcript, strip_scroll_pill(&tmux_capture(name, 0).await))
+        } else if provider != "claude" {
             (String::new(), clean_gemini_frame(&tmux_capture(name, 0).await))
         } else {
             (render_session_transcript(name, 120_000), output)
@@ -10446,6 +10692,12 @@ async fn peek_response(name: &str, lines: i64, live_only: bool, no_trim: bool) -
         if out_compat.is_empty() && !output.is_empty() {
             out_compat = collapse_blank_runs(&strip_launch_noise(output.trim()));
         }
+        if provider == "claude" && !is_alt && !transcript.is_empty() {
+            static RECOVERED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+            if RECOVERED.get_or_init(Default::default).lock().unwrap().insert(name.to_owned()) {
+                tracing::info!(session = name, verdict = "normal_screen_history_restored", "saved Claude history retained independently of terminal mode");
+            }
+        }
         let history = if transcript.is_empty() { String::new() } else { collapse_blank_runs(&transcript) };
         let ol = out_compat.lines().filter(|l| !l.trim().is_empty()).count();
         let hl = history.lines().filter(|l| !l.trim().is_empty()).count();
@@ -10462,6 +10714,10 @@ async fn peek_response(name: &str, lines: i64, live_only: bool, no_trim: bool) -
             // the structural fact instead of guessing at the cause.
             "output_is_viewport_only": true,
         });
+        if let Some(measurement) = history_measurement {
+            resp["history_source"] = json!("codex-rollout");
+            resp["history_measurement"] = measurement;
+        }
         if hl > ol + 20 {
             resp["hint"] = json!(format!(
                 "`output` is only the current terminal frame ({ol} line(s)) — a full-screen \
@@ -12603,6 +12859,10 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                 std::sync::Arc::new(std::sync::Mutex::new(None));
             let associated_w = associated.clone();
             let peer_requester = sender.clone();
+            // A non-empty `sender` means a peer worker sent this (a human/schedule
+            // steer has none); the mint gate holds peer messages to a higher bar
+            // (AMUX-4498).
+            let from_peer = !sender.trim().is_empty();
             let _intake_guard = super::board_intake::lock(&sess3, "agent").await;
             let intake = super::board_intake::plan(&state.store, &sess3, "agent",
                 &amux_core::board::title_from_prompt(&text3).unwrap_or_default(), &text3).await;
@@ -12627,7 +12887,7 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                     if already > 0 {
                         return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
                     }
-                    match associate_capture_card(conn, &sess3, &text3, now_ms, &intake)? {
+                    match associate_capture_card(conn, &sess3, &text3, now_ms, &intake, from_peer)? {
                         Some(mut association) => {
                             if !peer_requester.trim().is_empty() {
                                 arm_peer_callback(conn, &mut association.row, &peer_requester)?;
@@ -12635,7 +12895,7 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                             // Link the most recent uncarded cmd_history row for this
                             // prompt, if the enqueue recorded one without carding it.
                             conn.execute(
-                                "UPDATE cmd_history SET card_id = ?1 WHERE id = \
+                                "UPDATE cmd_history SET card_id = ?1, capture_pending=0 WHERE id = \
                                  (SELECT id FROM cmd_history WHERE session = ?2 AND text = ?3 \
                                   AND card_id IS NULL ORDER BY id DESC LIMIT 1)",
                                 rusqlite::params![association.row.id, sess3, text3],
@@ -15292,6 +15552,9 @@ pub(crate) async fn steer_mutate(
         };
     }
     if *method == Method::POST {
+        if let Some(refusal) = isolated_peer_refusal(state, name, headers).await {
+            return refusal;
+        }
         let mut text = body_str(body, "text");
         if text.is_empty() {
             return jresp(StatusCode::BAD_REQUEST, json!({"error": "missing 'text'"}));
@@ -16074,7 +16337,31 @@ pub(crate) async fn send_verb(
     send_post(state, name, headers, body).await
 }
 
+/// Isolation is a reachability boundary for both direct and queued peer
+/// messages. Check before recording history/dedupe/queue state, independently
+/// of the configurable group policy. Authenticated dashboard members remain
+/// human owners; the scope guard has already checked their resource access.
+async fn isolated_peer_refusal(state: &AppState, name: &str, headers: &HeaderMap) -> Option<Response> {
+    let origin = hdr_worker(headers);
+    if super::org::local_member_actor(headers).is_some()
+        || origin.is_empty() || origin == name || !session_is_isolated(name)
+    {
+        return None;
+    }
+    let reason = format!("send refused: '{name}' is an isolated (raw-agent) worker; only its owner can send to it");
+    tracing::warn!(origin = %origin, target = %name, verdict = "isolated_target", "{reason}");
+    emit_event(state, name, "send.isolated_refused",
+        Some(json!({"origin": origin, "target": name})), None, "isolation").await;
+    Some(jresp(StatusCode::FORBIDDEN, json!({
+        "ok": false, "error": reason, "blocked": "isolated", "code": "isolated_target",
+        "what_to_do": "An isolated worker is reachable only by its owner from the dashboard; no approval can authorize peer delivery.",
+    })))
+}
+
 async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
+    if let Some(refusal) = isolated_peer_refusal(state, name, headers).await {
+        return refusal;
+    }
     // GROUP SCOPING, before anything is delivered or recorded. The origin is the
     // SERVER-VERIFIED stamp (AMUX-1768), never a body-supplied claim, so a lane
     // cannot talk its way across a group boundary.
@@ -16095,35 +16382,6 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
         .unwrap_or(true)
     {
         if let Err(reason) = cross_group_send_ok(&send_origin, name) {
-            // Isolation is a permanent reachability boundary, not a permission
-            // prompt. The generic refusal path below used to mint a one-shot
-            // cross-group grant even though approving it could never make an
-            // isolated raw-agent lane a valid peer target. Worse, a previously
-            // approved allowance was consumed before the refusal and bypassed
-            // the isolation check entirely. Return the exact refusal without a
-            // grant: only the owner/dashboard path (empty origin) is allowed.
-            if session_is_isolated(name) {
-                tracing::warn!(origin = %send_origin, target = %name, "{reason}");
-                emit_event(
-                    state,
-                    name,
-                    "send.isolated_refused",
-                    Some(json!({"origin": send_origin, "target": name})),
-                    None,
-                    "isolation",
-                )
-                .await;
-                return jresp(
-                    StatusCode::FORBIDDEN,
-                    json!({
-                        "ok": false,
-                        "error": reason,
-                        "blocked": "isolated",
-                        "code": "isolated_target",
-                        "what_to_do": "An isolated worker is reachable only by its owner from the dashboard; no approval can authorize peer delivery.",
-                    }),
-                );
-            }
             // AN OWNER-APPROVED, SINGLE-USE ALLOWANCE RELEASES EXACTLY ONE SEND
             // (AMUX-3997). Checked before the refusal so an approval the owner
             // already gave is honoured on the worker's own retry.
@@ -18525,6 +18783,23 @@ pub(crate) async fn report_post(state: &AppState, name: &str, headers: &HeaderMa
                 .unwrap_or_else(|| json!({}));
             let prev_state =
                 reports[&name_s]["state"].as_str().unwrap_or("").to_string();
+            // RR-0052 LEASE HEARTBEAT. Any self-report proves the process in this
+            // lane is alive, so it renews the lease on every card the lane holds.
+            // This runs BEFORE the resurrection guard below on purpose: that guard
+            // stops a late tool-hook from flipping a finished turn back to active,
+            // but the tool call still happened, and liveness is all a lease asks.
+            // A failed renewal must not cost the report itself, so it is logged
+            // and swallowed rather than rolled back with it.
+            if let Err(error) =
+                crate::db::board_store::refresh_lease_heartbeat(conn, &name_s, now_f64() as i64)
+            {
+                tracing::warn!(
+                    target: "amux::board", session = %name_s, %error,
+                    measured = false, n_considered = 0,
+                    verdict = "lease_heartbeat_write_failed",
+                    "report: lease heartbeat could not be written (RR-0052); held cards will age toward reclaim"
+                );
+            }
             // A HEARTBEAT MUST NOT RESURRECT A FINISHED TURN (AMUX-2538):
             // tool-hook only refreshes an already-active turn.
             if src2 == "tool-hook" && prev_state != "active" {
@@ -21431,6 +21706,43 @@ mod tests {
         assert!(body.get("grant_id").is_none(), "an impossible send must not ask for approval: {body}");
     }
 
+    #[tokio::test]
+    async fn isolated_peer_queue_refuses_before_history_or_dedupe_but_owner_retry_survives() {
+        let (st, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("raw.env"), "CC_TAGS=alpha\nCC_ISOLATED=1\n").unwrap();
+        for (caller, group) in [("same", "alpha"), ("outside", "beta")] {
+            std::fs::write(sessions.join(format!("{caller}.env")), format!("CC_TAGS={group}\nCC_SEND_ALLOW=*\n")).unwrap();
+            let mut headers = HeaderMap::new();
+            headers.insert("x-amux-worker", caller.parse().unwrap());
+            let response = steer_mutate(&st, "raw", &Method::POST, &headers,
+                &json!({"text":"owner task", "msg_id":"same-identity", "record_history":true})).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "peer queue bypass from {caller}");
+            let body: Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+            assert_eq!(body["code"], "isolated_target");
+            assert!(body.get("grant_id").is_none());
+        }
+        for table in ["steering_queue", "cmd_history"] {
+            let count: i64 = st.store.read().unwrap().query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE session='raw'"), [], |r| r.get(0)).unwrap();
+            assert_eq!(count, 0, "refused peers must leave no {table} rows");
+        }
+        // The refusal must not reserve the owner's operation ID. Queue twice
+        // with that same ID to prove both acceptance and retry deduplication.
+        for _ in 0..2 {
+            let response = steer_mutate(&st, "raw", &Method::POST, &HeaderMap::new(),
+                &json!({"text":"owner task", "msg_id":"same-identity", "record_history":true})).await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        for table in ["steering_queue", "cmd_history"] {
+            let count: i64 = st.store.read().unwrap().query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE session='raw'"), [], |r| r.get(0)).unwrap();
+            assert_eq!(count, 1, "owner retries must preserve exactly one {table} row");
+        }
+    }
+
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
@@ -22335,6 +22647,70 @@ mod tests {
             assert_eq!(status,StatusCode::CONFLICT,"{body}");
             assert_ne!(body["deduped"],true,"a refusal is not an acceptance receipt");
         }
+    }
+
+    /// AMUX-4486: cancellation after the durable message write must not erase
+    /// its board consequence while semantic intake is waiting for this lane.
+    #[tokio::test]
+    async fn cancelling_intake_after_recording_keeps_the_owner_prompt_linked() {
+        let (st, _dir) = state();
+        st.store.write(|conn| {
+            ensure_fleet_tables(conn)?;
+            Ok(crate::db::WriteOutcome { applied: false, events: vec![] })
+        }).unwrap();
+        let lane = "cancelled-intake-fixture";
+        let gate = super::super::board_intake::lock(lane, "agent").await;
+        let recording_state = st.clone();
+        let recording = tokio::spawn(async move {
+            cmd_hist_record_full(&recording_state, lane,
+                "implement the missing parser validation", "user", "", false,
+                DeliveryMeta::direct()).await;
+        });
+        let message_id = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let id = {
+                    let conn = st.store.read().unwrap();
+                    conn.query_row("SELECT id FROM cmd_history WHERE session=?1", [lane],
+                        |r| r.get::<_, i64>(0)).ok()
+                };
+                if let Some(id) = id { break id; }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("positive precondition: the message must really be committed");
+        assert!(!recording.is_finished(), "the lane intake lock must hold the consequence path");
+        recording.abort();
+        assert!(recording.await.unwrap_err().is_cancelled());
+        drop(gate);
+        assert_eq!(st.store.read().unwrap().query_row(
+            "SELECT capture_pending FROM cmd_history WHERE id=?1", [message_id],
+            |r| r.get::<_, i64>(0)).unwrap(), 1);
+        // Reopen the database: the recovery input must survive loss of all
+        // request state, not just a detached future in this runtime.
+        drop(st);
+        let restarted = AppState {
+            store: std::sync::Arc::new(crate::db::Store::open(&_dir.path().join("t.db")).unwrap()),
+            started: std::time::Instant::now(), build_hash: "restarted".into(), auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        crate::runtime_jobs::message_capture::tick(&restarted).await;
+        let conn = restarted.store.read().unwrap();
+        let (count, linked, pending): (i64, Option<String>, i64) = conn.query_row(
+            "SELECT COUNT(*), card_id, capture_pending FROM cmd_history WHERE id=?1", [message_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        assert_eq!(count, 1, "the original durable message must survive cancellation exactly once");
+        assert!(linked.is_some(),
+            "capture_consequence_lost_after_cancellation: durable MSG-{message_id} remains unlinked after its request was cancelled during intake");
+        assert_eq!(pending, 0);
+        let cards: i64 = conn.query_row("SELECT COUNT(*) FROM issues WHERE session=?1", [lane], |r| r.get(0)).unwrap();
+        assert_eq!(cards, 1);
+        drop(conn);
+        let ((), ()) = tokio::join!(
+            crate::runtime_jobs::message_capture::tick(&restarted),
+            capture_recorded_message(&restarted, message_id));
+        let conn = restarted.store.read().unwrap();
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM cmd_history WHERE session=?1", [lane], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM issues WHERE session=?1", [lane], |r| r.get::<_, i64>(0)).unwrap(), cards);
+        assert_eq!(conn.query_row("SELECT card_id FROM cmd_history WHERE id=?1", [message_id], |r| r.get::<_, Option<String>>(0)).unwrap(), linked);
     }
 
     // The column ALIGNMENT, which submit_verdict_of's unit tests cannot catch:
@@ -25123,6 +25499,63 @@ CLAUDE-POSTFIX-COMPLETE
     }
 
     #[tokio::test]
+    async fn pause_terminates_tools_and_grandchildren_without_touching_peer() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use std::process::Stdio;
+        let mut pane = tokio::process::Command::new("sh")
+            .args(["-c", "sh -c 'sleep 120 & wait' & echo $!; read done"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+        let mut lines = BufReader::new(pane.stdout.take().unwrap()).lines();
+        let child: i32 = lines.next_line().await.unwrap().unwrap().parse().unwrap();
+        let mut peer = tokio::process::Command::new("sleep").arg("120").kill_on_drop(true).spawn().unwrap();
+        sleep_ms(100).await;
+        let ps = run_cmd("ps", &["-axo", "pid=,ppid="], OP_TIMEOUT).await.unwrap();
+        let rows: Vec<(i32,i32)> = String::from_utf8_lossy(&ps.stdout).lines().filter_map(|l| {
+            let mut w = l.split_whitespace(); Some((w.next()?.parse().ok()?, w.next()?.parse().ok()?))
+        }).collect();
+        let descendants = descendant_pids(pane.id().unwrap() as i32, &rows);
+        assert!(descendants.contains(&child));
+        assert!(descendants.len() >= 2, "fixture must include a running tool grandchild");
+        terminate_pane_children(pane.id().unwrap() as i32).await.unwrap();
+        for pid in descendants {
+            let out = run_cmd("ps", &["-p", &pid.to_string(), "-o", "stat="], OP_TIMEOUT).await.unwrap();
+            let status = String::from_utf8_lossy(&out.stdout);
+            assert!(status.trim().is_empty() || status.trim().starts_with('Z'), "owned process {pid} still runs: {status}");
+        }
+        assert!(pane.try_wait().unwrap().is_none(), "pane shell must survive");
+        assert!(peer.try_wait().unwrap().is_none(), "unrelated worker must survive");
+        pane.kill().await.unwrap(); peer.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pause_normal_screen_keeps_the_claude_history_contract() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let name = format!("pause-history-{}", std::process::id());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        std::fs::write(home.path().join(format!("sessions/{name}.env")),
+            format!("CC_PROVIDER=claude\nCC_DIR={}\n", home.path().display())).unwrap();
+        // No provider process/alternate screen. A fresh or stopped worker is
+        // still the same conversation surface, with measured empty history.
+        let body = peek_response(&name, 300, false, false).await;
+        assert_eq!(body["name"], name);
+        assert_eq!(body["history"], "");
+        assert_eq!(body["history_lines"], 0);
+        assert!(body["live"].is_string());
+    }
+
+    #[tokio::test]
+    async fn pause_prevents_legacy_start_before_provider_launch() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        std::fs::write(home.path().join("sessions/probe.env"), "CC_PAUSED=1\nCC_DIR=/tmp\n").unwrap();
+        let (state, _dir) = state();
+        let (ok, detail) = start_session(&state, "probe", "", false).await;
+        assert!(!ok); assert!(detail.contains("paused"), "{detail}");
+    }
+
+    #[tokio::test]
     async fn file_backed_verbs_roundtrip_hermetically() {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join("sessions")).unwrap();
@@ -26035,7 +26468,7 @@ mod steer_boundary_tests {
                     now_ms / 1000,
                 )?;
                 // The open manual card must NOT block a new user task.
-                let first = super::mint_capture_card(conn, "s", "build the connectors tab", now_ms)?;
+                let first = super::mint_capture_card(conn, "s", "build the connectors tab", now_ms, false)?;
                 assert!(first.is_some(), "a new task must card even with an open manual card");
                 assert_eq!(first.as_ref().unwrap().status, "backlog", "a delivered prompt must preserve the active manual claim");
                 assert!(first.as_ref().unwrap().source_ref.is_some());
@@ -26052,12 +26485,12 @@ mod steer_boundary_tests {
                     ],
                 )?;
                 // An identical transport retry within the window IS deduped.
-                let retry = super::mint_capture_card(conn, "s", "build the connectors tab", now_ms + 1_000)?;
+                let retry = super::mint_capture_card(conn, "s", "build the connectors tab", now_ms + 1_000, false)?;
                 assert!(retry.is_none(), "an identical retry within the window must dedup");
                 // A different task two seconds later is not a retry. The old
                 // time-only shim silently swallowed it before any model could
                 // classify or decompose it.
-                let rapid = super::mint_capture_card(conn, "s", "also wire slack", now_ms + 2_000)?;
+                let rapid = super::mint_capture_card(conn, "s", "also wire slack", now_ms + 2_000, false)?;
                 assert!(rapid.is_some(), "a distinct rapid task must card immediately");
                 Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
             })
@@ -26081,7 +26514,7 @@ mod steer_boundary_tests {
         state
             .store
             .write_async(move |conn| {
-                let first = super::mint_capture_card(conn, "s", "recover and continue", now_ms)?;
+                let first = super::mint_capture_card(conn, "s", "recover and continue", now_ms, false)?;
                 let first_id = first.as_ref().expect("the first delivery must card").id.clone();
                 // The direct path links the minted id to the row it recorded. The
                 // steering duplicate never gets a row of its own, which is why the
@@ -26095,7 +26528,7 @@ mod steer_boundary_tests {
                 // THE BUG: the same prompt, steering-delivered 17 minutes later.
                 // Far outside any retry window, and the card is still open.
                 let late = now_ms + 17 * 60 * 1_000;
-                let dup = super::mint_capture_card(conn, "s", "recover and continue", late)?;
+                let dup = super::mint_capture_card(conn, "s", "recover and continue", late, false)?;
                 assert!(
                     dup.is_none(),
                     "a prompt whose capture card is still open must not card twice, \
@@ -26107,7 +26540,7 @@ mod steer_boundary_tests {
                 // green above means "deduped" rather than "blocked everything".
                 conn.execute("UPDATE issues SET status='done' WHERE id=?1", rusqlite::params![first_id])?;
                 let after_close =
-                    super::mint_capture_card(conn, "s", "recover and continue", late + 1_000)?;
+                    super::mint_capture_card(conn, "s", "recover and continue", late + 1_000, false)?;
                 assert!(
                     after_close.is_some(),
                     "once the card is closed an identical prompt is new work and must card"
@@ -26116,7 +26549,7 @@ mod steer_boundary_tests {
                 // A DIFFERENT lane holding an identical open capture must not block
                 // this one: the duplicate is per-session, and the incident was one
                 // prompt broadcast to 56 lanes that each legitimately needed a card.
-                let peer = super::mint_capture_card(conn, "other", "recover and continue", late)?;
+                let peer = super::mint_capture_card(conn, "other", "recover and continue", late, false)?;
                 assert!(peer.is_some(), "a peer lane's open capture must not suppress this lane's");
                 Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
             })
@@ -26329,6 +26762,36 @@ mod steer_boundary_tests {
         let (h2, since2) = status_decision_history(&conn, "never-changed", 20);
         assert!(h2.is_empty());
         assert_eq!(since2, Some(1000.0), "the record exists, this lane simply never moved");
+    }
+
+    /// RR-0052: the shipped report handler is the lease heartbeat. Driven through
+    /// `report_post` (not the store helper) because the bug this closes was a
+    /// reaper whose liveness signal nothing on the real path ever produced.
+    #[tokio::test]
+    async fn a_self_report_renews_the_reporting_lanes_lease_and_only_its_own() {
+        let (state, _d) = tstate();
+        let old = now_f64() as i64 - 1000;
+        state.store.write(move |conn| {
+            for (id, owner) in [("L-MINE", "probe"), ("L-THEIRS", "other")] {
+                conn.execute(
+                    "INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type, \
+                     lease_owner,lease_acquired_at,lease_heartbeat_at,lease_expires_at,lease_generation) \
+                     VALUES (?1,?1,'',?2,?3,?4,?4,'agent','code',?3,?4,?4,?5,1)",
+                    rusqlite::params![id, "doing", owner, old, old + 1800],
+                )?;
+            }
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let hb = |state: &AppState, id: &str| -> i64 {
+            state.store.read().unwrap()
+                .query_row("SELECT lease_heartbeat_at FROM issues WHERE id=?1", [id], |r| r.get(0))
+                .unwrap()
+        };
+        // A tool-hook with no active turn is IGNORED as a state report (AMUX-2538)
+        // and must still count as liveness: the tool call happened.
+        report_post(&state, "probe", &HeaderMap::new(), &json!({"state": "active", "source": "tool-hook"})).await;
+        assert!(hb(&state, "L-MINE") > old, "the reporting lane's lease must be renewed");
+        assert_eq!(hb(&state, "L-THEIRS"), old, "another lane's lease is not this report's to renew");
     }
 
     /// AMUX-3048: subagent start/stop events accumulate a live count in the same
@@ -27147,8 +27610,8 @@ mod submission_gate_tests {
              \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} \u{2190} 2 agents\n"
         )
     }
-    /// Same text still in the box, but the lane is generating: this IS queued
-    /// input and must be left alone.
+    /// Same unsubmitted input while the worker is generating. A native queue
+    /// receipt, not the spinner, is required to establish acceptance.
     fn frame_stuck_active(text: &str) -> String {
         format!(
             "\u{2731} Galloping\u{2026} (12s \u{b7} \u{2193} 84 tokens)\n\
@@ -27215,6 +27678,50 @@ mod submission_gate_tests {
         // no deliverer stamps a verdict (AMUX-3541).
         assert_eq!(submit_verdict_of("queued (steering) — will deliver at the next boundary"), None);
         assert_eq!(submit_verdict_of(""), None);
+    }
+
+    #[test]
+    fn native_queue_acceptance_requires_exact_new_provider_receipt() {
+        let receipt = json!({"type":"queue-operation","operation":"enqueue",
+            "timestamp":"1970-01-01T00:02:00Z","content":GHOST});
+        assert!(submission_records_have(std::slice::from_ref(&receipt), GHOST, 119.0));
+        assert!(!submission_records_have(std::slice::from_ref(&receipt), GHOST, 121.0), "an earlier identical send is not this send");
+        assert!(!submission_records_have(std::slice::from_ref(&receipt), "9 queued commands", 119.0), "a substring is not an enqueue identity");
+        let mut dequeue = receipt.clone(); dequeue["operation"] = json!("dequeue");
+        assert!(!submission_records_have(&[dequeue], GHOST, 119.0));
+        let mut quoted = receipt; quoted["type"] = json!("assistant");
+        assert!(!submission_records_have(&[quoted], GHOST, 119.0));
+    }
+
+    #[tokio::test]
+    #[ignore = "real tmux capture replay; no model or production worker; run explicitly"]
+    async fn real_tmux_submission_replay_keeps_generating_input_unconfirmed() {
+        struct Pane(String);
+        impl Drop for Pane {
+            fn drop(&mut self) {
+                let stq = session_target(&self.0);
+                let _ = std::process::Command::new("tmux").args(["kill-session", "-t", &stq]).output();
+            }
+        }
+        for (frame, expected) in [(frame_stuck_active(GHOST), Submission::Stuck), (frame_cleared(), Submission::Confirmed)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("frame.txt");
+            std::fs::write(&path, frame).unwrap();
+            let lane = format!("submission-replay-{}-{}", std::process::id(), (now_f64() * 1_000_000.0) as u64);
+            let pane = Pane(tmux_name(&lane));
+            let output = std::process::Command::new("tmux").args([
+                "new-session", "-d", "-s", &pane.0, "-x", "200", "-y", "24",
+                "python3", "-c", "import pathlib,sys,time;print(pathlib.Path(sys.argv[1]).read_text(),flush=True);time.sleep(20)",
+                path.to_str().unwrap(),
+            ]).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            // Walk the actual asynchronous capture/verification loop, with no
+            // key retries or transcript claims. The busy fixture must fail
+            // verification; the drawn empty composer is the positive control.
+            let (observed, retried) = verify_submitted(&lane, GHOST, None, 0.0, false).await;
+            assert_eq!(observed, expected);
+            assert!(!retried);
+        }
     }
 
     #[test]
@@ -27327,9 +27834,9 @@ mod submission_gate_tests {
             final_frame_confirms(read_frame(&frame_cleared(), &t)),
             "a drawn, empty composer IS a submitted send and must stay confirmed"
         );
-        assert!(
+        assert!(!
             final_frame_confirms(read_frame(&frame_stuck_active(GHOST), &t)),
-            "text queued while the lane generates submits at the turn boundary"
+            "generation cannot acknowledge text that remains in the input box"
         );
 
         // EXHAUSTIVE over the enum. The original defect was a negative match
@@ -27337,7 +27844,7 @@ mod submission_gate_tests {
         // variant is a decision somebody made, not that today's four are right.
         for (frame, confirms) in [
             (FrameRead::Cleared, true),
-            (FrameRead::StillThereGenerating, true),
+            (FrameRead::StillThereGenerating, false),
             (FrameRead::NoUi, false),
             (FrameRead::StillThereIdle, false),
         ] {
@@ -29995,4 +30502,27 @@ mod commit_shape_tests {
         assert!(gi < wi, "layers compose least-specific first: {after}");
     }
 
+}
+
+#[cfg(test)]
+mod transcript_cache_retention_tests {
+    use super::*;
+
+    #[test]
+    fn inactive_worker_entries_expire_without_evicting_valid_long_ttl_entries() {
+        let mut cache = TranscriptEvidenceCache::new();
+        for i in 0..2048 {
+            cache.insert(format!("deleted-{i}"), (1.0, Some("model".into()), Some(42)));
+        }
+        cache.insert("active".into(), (999.0, Some("sonnet".into()), Some(123)));
+        cache.insert("long-ttl".into(), (600.0, None, None));
+        let capacity = cache.capacity();
+        assert_eq!(prune_transcript_evidence(&mut cache, 1000.0, 500.0), 2048);
+        assert_eq!(cache.len(), 2);
+        assert!(cache.capacity() < capacity);
+        assert_eq!(prune_transcript_evidence(&mut cache, 1000.0, 15.0), 1);
+        assert_eq!(cache["active"].2, Some(123));
+        assert_eq!(prune_transcript_evidence(&mut cache, 1400.0, 15.0), 1);
+        assert!(cache.is_empty());
+    }
 }

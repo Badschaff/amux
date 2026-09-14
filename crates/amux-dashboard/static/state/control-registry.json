@@ -1,6 +1,6 @@
 {
   "measured": true,
-  "n_considered": 1922,
+  "n_considered": 1936,
   "command_handlers": {
     "_applyEmbedView": {
       "kind": "command._applyEmbedView",
@@ -94,6 +94,12 @@
     },
     "_bdOpenMessage": {
       "kind": "command._bdOpenMessage",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_bdReadSnapshot": {
+      "kind": "command._bdReadSnapshot",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1874,6 +1880,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_peekStopFollowing": {
+      "kind": "command._peekStopFollowing",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_peekToggleSchedule": {
       "kind": "command._peekToggleSchedule",
       "feedback_required": true,
@@ -2084,6 +2096,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_renderIcalBody": {
+      "kind": "command._renderIcalBody",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_renderOrgSwitcher": {
       "kind": "command._renderOrgSwitcher",
       "feedback_required": true,
@@ -2216,6 +2234,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_scopeEditClose": {
+      "kind": "command._scopeEditClose",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_scopeEditSave": {
       "kind": "command._scopeEditSave",
       "feedback_required": true,
@@ -2342,6 +2366,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_syncOneUpload": {
+      "kind": "command._syncOneUpload",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_sysJobToggle": {
       "kind": "command._sysJobToggle",
       "feedback_required": true,
@@ -2458,6 +2488,12 @@
     },
     "_tunnelStartUI": {
       "kind": "command._tunnelStartUI",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_tunnelStatus": {
+      "kind": "command._tunnelStatus",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -3062,6 +3098,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "loadTunnelSettings": {
+      "kind": "command.loadTunnelSettings",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "moveBoardItem": {
       "kind": "command.moveBoardItem",
       "feedback_required": true,
@@ -3214,6 +3256,12 @@
     },
     "peekSearchPrev": {
       "kind": "command.peekSearchPrev",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "pickCardFiles": {
+      "kind": "command.pickCardFiles",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -3532,6 +3580,12 @@
     },
     "shareSession": {
       "kind": "command.shareSession",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "showIcalInfo": {
+      "kind": "command.showIcalInfo",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"

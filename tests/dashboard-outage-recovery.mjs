@@ -18,7 +18,7 @@ function fixture(names = [], shared = {}) {
   const timers = new Map(); const timerDelays = new Map(); let tid = 0;
   const elements = new Map();
   const element = id => {
-    if (!elements.has(id)) elements.set(id, {value: '', textContent: '', innerHTML: '', style: {}, scrollHeight: 0, classList: {add() {}, remove() {}, contains() {return false;}}});
+    if (!elements.has(id)) elements.set(id, {value: '', textContent: '', innerHTML: '', style: {}, scrollHeight: 0, setAttribute() {}, classList: {add() {}, remove() {}, contains() {return false;}}});
     return elements.get(id);
   };
   const sandbox = { Response, AbortController, AbortSignal, DOMException, crypto: globalThis.crypto,
@@ -29,7 +29,7 @@ function fixture(names = [], shared = {}) {
       removeItem(k) { stored.delete(k); }, key(i) { return [...stored.keys()][i] ?? null; }, get length() { return stored.size; }},
     setTimeout(fn, delay) { timers.set(++tid, fn); timerDelays.set(tid, delay); return tid; }, clearTimeout(id) { timers.delete(id); timerDelays.delete(id); },
     API: '', offlineQueue: [], drafts: [], online: true, _syncFlight: null, _syncRetryTimer: null, _syncBackoffMs: 0, _SYNC_MIN_MS: 2000, _SYNC_MAX_MS: 60000, _OUTBOX_STALLED_MS:600000,
-    _localWriteError: '', window:{isSecureContext:true}, APP_VER:'test', _writeError: '', _outboxActive: new Set(), _bdSaveRequests: new Set(), consecutiveFailures: 0,
+    _interactionReplay:q => ({id:q.id}), _interactionAcknowledge:async () => {}, _interactionSet() {}, _upqList:async () => [], _uploadSyncPending:false, _syncChecklist:[], _localWriteError: '', window:{isSecureContext:true}, APP_VER:'test', _writeError: '', _outboxActive: new Set(), _bdSaveRequests: new Set(), consecutiveFailures: 0,
     _OUTBOX_SKIP: /\/api\/client-debug/, _OUTBOX_METHODS: {POST:1,PATCH:1,PUT:1,DELETE:1},
     _authHeaders: h => h, esc: s => s, escJs: s => s, describeOp: q => q.url,
     showToast() {}, amuxTrack() {}, updateConnectionStatus() {}, fetchSessions() {}, fetchBoard() {},
@@ -39,7 +39,7 @@ function fixture(names = [], shared = {}) {
     _apiErrText: async r => `${r.status}: ${await r.text()}`,
   };
   const ctx = vm.createContext(sandbox);
-  for (const name of ['_localStorageBytes', '_writeUserStorage', '_outboxDiagnostic', '_outboxAgeMs', '_outboxIsStalled', '_outboxAgeLabel', '_outboxNeedsAttention', '_localWriteNotice', '_localMessageRequest', '_validateMessageAcknowledgement', '_validateBoardAcknowledgement', '_readQueue', '_outboxLock', '_mutateQueue', '_outboxQueueable', '_queueOp', '_boundedMutationFetch', '_syncOneDraft', '_syncBackoffReset', '_scheduleSyncRetry', '_runSyncBanner', 'runSyncBanner', ...names]) vm.runInContext(code(name), ctx);
+  for (const name of ['_localStorageBytes', '_writeUserStorage', '_outboxDiagnostic', '_outboxAgeMs', '_outboxIsStalled', '_outboxAgeLabel', '_outboxNeedsAttention', '_localWriteNotice', '_localMessageRequest', '_validateMessageAcknowledgement', '_validateBoardAcknowledgement', '_readQueue', '_outboxLock', '_mutateQueue', '_outboxQueueable', '_outboxMessageId', '_outboxUncertainMessage', '_outboxConfirmMessage', '_queueOp', '_boundedMutationFetch', '_syncOneDraft', '_syncBackoffReset', '_scheduleSyncRetry', '_clearSyncTransientToast', '_runSyncBanner', 'runSyncBanner', ...names]) vm.runInContext(code(name), ctx);
   return {ctx, stored, timers, timerDelays, element};
 }
 const patch = {method:'PATCH', body:'{"title":"saved","expect_rev":1}'};
@@ -294,7 +294,7 @@ test('a board poll during hydration cannot make stale controls look like user ed
   Object.assign(ctx, {boardDetailId:'TASK-1', _boardDetailOpenGeneration:2, _bdHydrated:false,
     _bdActiveDirty:false, _boardDrafts:{}, _tagState:{bd:[]},
     boardItems:[{id:'TASK-1', title:'Old snapshot', status:'todo'}],
-    apiCall:() => new Promise(resolve => {finish = resolve;}),
+    _bdReadSnapshot:() => new Promise(resolve => {finish = resolve;}),
     _bdDraftHasActiveEdits:() => false, _renderDetailStatusBtns() {}, _bdRenderHistory() {},
     _bdRenderStatusBanner() {}, _bdRenderMeta() {}, _populateSessionSelect() {}, _bdConfigureGo() {},
     _beTagRenderChips() {}, _beTagInputUpdate() {}});
@@ -302,7 +302,7 @@ test('a board poll during hydration cannot make stale controls look like user ed
   const hydration = ctx._bdHydrate('TASK-1');
   const fresh = {id:'TASK-1', title:'Committed update', status:'todo', rev:2};
   ctx.boardItems = [fresh];
-  finish(new Response(JSON.stringify(fresh)));
+  finish(fresh);
   assert.equal(await hydration, true);
   assert.equal(element('bd-title').value, 'Committed update');
   assert.equal(ctx._bdLoadedIdentity.rev, 2);
@@ -335,18 +335,20 @@ test('message receipt loss replays the same msg_id after reload; dedup receipt d
   assert.equal(JSON.parse(first.stored.get('amux_offline_queue')).length, 0);
 });
 
-test('ambiguous 200 blocks a message and preserves ordering behind it across retries', async () => {
+test('ambiguous 200 checks acceptance and preserves ordering behind it across retries', async () => {
   const {ctx, stored} = fixture();
   for (const text of ['first','second']) await ctx._queueOp('/api/sessions/owned/send', {method:'POST',body:JSON.stringify({text,msg_id:text})});
-  let calls = 0;
-  ctx._origFetch = async () => { calls++; return new Response(JSON.stringify({ok:true,submitted:false})); };
+  const calls = [];
+  ctx._origFetch = async (url,opts) => { calls.push({url,method:opts.method}); return new Response(JSON.stringify({ok:true,submitted:false})); };
   await ctx.runSyncBanner();
   const saved = JSON.parse(stored.get('amux_offline_queue'));
-  assert.equal(calls, 1);
+  assert.equal(calls.length, 1);
   assert.equal(saved.length, 2);
-  assert.equal(saved[0].state, 'blocked');
+  assert.equal(saved[0].state, 'pending');assert.equal(saved[0].delivery_uncertain,true);
   await ctx.runSyncBanner();
-  assert.equal(calls, 1, 'later messages cannot overtake a blocked predecessor');
+  assert.deepEqual(calls.map(r=>r.method),['POST','GET'],'only a receipt read may follow uncertain acceptance');
+  assert.equal(calls[1].url,'/api/sessions/owned/send?msg_id=first');
+  assert.equal(JSON.parse(stored.get('amux_offline_queue')).length,2,'later message remains durable and unsubmitted');
 });
 
 test('server deferred and steering receipts acknowledge storage without claiming terminal submission', async () => {
@@ -382,10 +384,10 @@ test('a newly queued send stays quiet while a stuck send shows its waiting state
   ctx.offlineQueue = [{url:'/api/sessions/worker/send',timestamp:Date.now()}];
   ctx.updateConnectionStatus();
   assert.equal(classes.has('active'), false);
-  ctx.offlineQueue[0].timestamp -= 21000;
+  ctx.offlineQueue[0].timestamp -= 600001;
   ctx.updateConnectionStatus();
   assert.equal(classes.has('active'), true);
-  assert.match(element('offline-banner-title').innerHTML, /1 sending/);
+  assert.match(element('offline-banner-title').innerHTML, /1 stalled/);
   ctx.online = false;
   ctx.updateConnectionStatus();
   assert.match(element('offline-banner-title').innerHTML, /will send on reconnect/);
@@ -565,4 +567,184 @@ test('a stale failed-row dismiss cannot remove work another tab has resumed', as
   assert.equal(events[0][0],'outbox_dismiss_ignored');
   await ctx._clearBlockedOps();
   assert.deepEqual(JSON.parse(stored.get('amux_offline_queue')).map(q=>q.id),['resumed']);
+});
+
+
+test('uncertain message receipt never becomes a synced checkmark or deletes intent', async()=>{
+  const {ctx,stored,element}=fixture();
+  await ctx._queueOp('/api/sessions/worker/send',{method:'POST',body:JSON.stringify({text:'with @/tmp/evidence.txt',msg_id:'uncertain'})});
+  ctx._origFetch=async()=>new Response(JSON.stringify({ok:false,submission:'uncertain'}),{status:409});
+  await ctx.runSyncBanner();
+  const rows=JSON.parse(stored.get('amux_offline_queue'));
+  assert.equal(rows.length,1);assert.equal(rows[0].state,'pending');assert.equal(rows[0].delivery_uncertain,true);
+  assert.equal(JSON.parse(rows[0].options.body).msg_id,'uncertain');
+  assert.equal(element('sync-title-text').textContent,'0 synced, 1 awaiting confirmation');
+  assert.doesNotMatch(element('sync-items').innerHTML,/sync-item done/);
+});
+
+test('steering rows survive reload and time passage without merging identical requests',async()=>{
+  const {ctx,stored}=fixture(['_steerQueueFor']);
+  for(const id of ['one','two'])await ctx._queueOp('/api/sessions/worker/steer',{method:'POST',body:JSON.stringify({text:'same text',msg_id:id})});
+  await ctx._mutateQueue(q=>{for(const r of q)r.timestamp-=600000});
+  const reloaded=fixture(['_steerQueueFor'],{stored});
+  reloaded.ctx.offlineQueue=reloaded.ctx._readQueue();
+  const rows=reloaded.ctx._steerQueueFor({name:'worker',steering:[]});
+  assert.equal(rows.length,2);assert.ok(rows.every(r=>r.pending));assert.notEqual(rows[0].id,rows[1].id);
+  await reloaded.ctx._mutateQueue(q=>q.splice(0,q.length));
+  assert.equal(reloaded.ctx._steerQueueFor({name:'worker',steering:[]}).length,0,'delivered steering leaves no optimistic ghost');
+});
+
+
+test('quiet batches show individual receipts while one ordinary send stays quiet', async()=>{
+  for(const count of [1,2]) {
+    const {ctx,element}=fixture();let shown=false;
+    element('sync-banner').classList.add=()=>{shown=true};
+    for(let i=0;i<count;i++)await ctx._queueOp('/api/board/TASK-'+i,patch);
+    ctx._origFetch=async url=>new Response(JSON.stringify({id:url.split('/').pop()}),{status:200});
+    await ctx.runSyncBanner(true);
+    assert.equal(shown,count>=2);
+    assert.equal(ctx.offlineQueue.length,0);
+  }
+});
+
+test('offline board editing requires a complete versioned snapshot and never masks an HTTP refusal', async () => {
+  const {ctx} = fixture(['_bdCompleteSnapshot', '_bdReadSnapshot']);
+  const full = {id:'TASK-1', title:'Cached task', desc:'Keep this prose', status:'todo', rev:7,
+    session:null, due:null, due_time:null, tags:[], gate:['Preserve evidence']};
+  let cached = full, writes = 0, reads = 0;
+  Object.assign(ctx, {online:false, _bdAudit() {}, _idb:{
+    getIssue:async () => {reads++; return cached;}, putIssue:async () => {writes++;},
+  }});
+  assert.equal((await ctx._bdReadSnapshot('TASK-1')).rev, 7);
+  for (const invalid of [{...full, id:'TASK-2'}, {...full, rev:null}, {...full, deleted:1},
+    {...full, desc:undefined}, {...full, gate:null}, {...full, session:undefined}]) {
+    cached = invalid;
+    assert.equal(await ctx._bdReadSnapshot('TASK-1'), null);
+  }
+  cached = full; ctx.online = true;
+  for (const status of [403,404,409,503]) {
+    const before = reads;
+    ctx.fetch = async () => new Response('{}', {status});
+    assert.equal(await ctx._bdReadSnapshot('TASK-1'), null);
+    assert.equal(reads, before, 'a server refusal must not fall back to a stale row');
+  }
+  ctx.fetch = async () => {throw new TypeError('Network unavailable');};
+  assert.equal((await ctx._bdReadSnapshot('TASK-1')).desc, full.desc);
+  ctx.fetch = async () => new Response(JSON.stringify({...full, rev:8}));
+  assert.equal((await ctx._bdReadSnapshot('TASK-1')).rev, 8);
+  assert.equal(writes, 1);
+});
+
+test('offline snapshot hydration cannot authorize a different card after navigation', async () => {
+  const {ctx} = fixture(['_bdHydrate']);
+  let resolve;
+  Object.assign(ctx, {boardDetailId:'TASK-1', _boardDetailOpenGeneration:1,
+    boardItems:[], _bdHydrated:false, _bdLoadedIdentity:null,
+    _bdReadSnapshot:() => new Promise(done => {resolve=done;})});
+  const pending = ctx._bdHydrate('TASK-1');
+  ctx.boardDetailId='TASK-2'; ctx._boardDetailOpenGeneration=2;
+  resolve({id:'TASK-1', rev:7});
+  assert.equal(await pending, false);
+  assert.equal(ctx._bdHydrated, false);
+  assert.equal(ctx._bdLoadedIdentity, null);
+});
+
+test('file reconnect checks only a confirmed durable receipt and retains failed bytes for retry', async () => {
+  const {ctx, element, timers} = fixture(['_syncOneUpload']);
+  let rows = [{id:'file-1', name:'evidence.bin', surface:'directory', totalChunks:2}];
+  let confirm; const refreshed=[];
+  Object.assign(ctx, {_filesPath:'/folder', _explorePath:'/folder', loadFiles:path => refreshed.push('files:' + path), loadExplore:path => refreshed.push('explore:' + path),
+    _upqList:async () => rows, _storedUploadFile:() => ({}), _uploadStorageError() {}, _upqRenderBadge() {},
+    _upqRemove:async id => {rows = rows.filter(row => row.id !== id);},
+    _runUpload:async f => {await new Promise(resolve => {confirm = resolve;}); f.error='Connection dropped';},
+  });
+  const replay = ctx.runSyncBanner(); await new Promise(setImmediate);
+  assert.equal(rows.length, 1);
+  assert.match(element('sync-items').innerHTML, /running/);
+  assert.doesNotMatch(element('sync-items').innerHTML, /sync-item done/);
+  confirm(); await replay;
+  assert.equal(rows.length, 1);
+  assert.equal(element('sync-title-text').textContent, '0 synced, 1 failed');
+  assert.ok(timers.size, 'an upload-only failure schedules an automatic retry');
+  ctx._runUpload=async f => {f.path='/tmp/evidence.bin'; f.url='/api/upload/evidence.bin';};
+  await ctx.runSyncBanner();
+  assert.equal(rows.length, 0);
+  assert.equal(element('sync-title-text').textContent, '1 synced');
+  assert.equal(ctx._uploadSyncPending, false);
+  assert.ok(refreshed.includes('files:/folder'));
+  assert.ok(refreshed.includes('explore:/folder'));
+});
+
+test('browser offline does not retry writes or cover the editor with a failed sync banner', async () => {
+  const {ctx, element} = fixture(); await enqueue(ctx);
+  ctx.navigator.onLine=false;
+  ctx._origFetch=async () => {assert.fail('no network attempts while the browser is explicitly offline');};
+  await ctx.runSyncBanner();
+  assert.equal(ctx.offlineQueue.length, 1);
+  assert.equal(element('sync-items').innerHTML, '');
+  ctx.navigator.onLine=true;
+  ctx._origFetch=async () => new Response('{"id":"TASK-1"}');
+  await ctx.runSyncBanner();
+  assert.equal(ctx.offlineQueue.length, 0);
+  assert.equal(element('sync-title-text').textContent, '1 synced');
+});
+
+test('reconnect retries retain completed file checkmarks without uploading those files twice', async () => {
+  const {ctx, element} = fixture(); await enqueue(ctx);
+  let uploads=[{id:'evidence',name:'evidence.txt'}], uploadsSent=0;
+  let visible=false;
+  element('sync-banner').classList={contains:() => visible, add() {visible=true;}, remove() {visible=false;}};
+  Object.assign(ctx, {_upqList:async () => uploads, _upqRenderBadge() {},
+    _syncOneUpload:async () => {uploadsSent++; uploads=[];},
+    _origFetch:async () => new Response('unavailable',{status:503})});
+  await ctx.runSyncBanner();
+  assert.equal(element('sync-title-text').textContent,'1 synced, 1 failed');
+  ctx._origFetch=async () => new Response('{"id":"TASK-1"}');
+  await ctx.runSyncBanner();
+  assert.equal(element('sync-title-text').textContent,'2 synced');
+  assert.equal(uploadsSent,1);
+  assert.equal((element('sync-items').innerHTML.match(/sync-item done/g)||[]).length,2);
+});
+
+test('a queue entry removed in another tab cannot earn an acknowledgement checkmark', async () => {
+  const {ctx, stored, element} = fixture(); await enqueue(ctx);
+  ctx._outboxLock=async (name, work) => {if(name.startsWith('amux-outbox-delivery:')) stored.set('amux_offline_queue','[]'); return work();};
+  await ctx.runSyncBanner();
+  assert.equal(element('sync-title-text').textContent,'0 synced, 1 skipped');
+  assert.doesNotMatch(element('sync-items').innerHTML,/sync-item done/);
+});
+
+test('background history import never enters the user outbox or claims a failed migration completed', async () => {
+  const {ctx} = fixture(['_loadCmdHistoryFromServer']);
+  let status=503;
+  Object.assign(ctx,{_cmdHistory:['retained local history'],_cmdHistoryServerLoaded:false,
+    fetch:async (url,options) => {
+      if(url.includes('/import')) {assert.equal(options._skipOutbox,true); return new Response('{}',{status});}
+      return new Response('[]');
+    }});
+  await ctx._loadCmdHistoryFromServer(); assert.equal(ctx._cmdHistoryServerLoaded,false);
+  status=200; await ctx._loadCmdHistoryFromServer(); assert.equal(ctx._cmdHistoryServerLoaded,true);
+});
+
+test('history migration never promotes a pending message to sent history before replay', async () => {
+  const {ctx} = fixture(['_loadCmdHistoryFromServer']);
+  await ctx._queueOp('/api/sessions/owned/steer',{method:'POST',body:JSON.stringify({text:'not delivered',msg_id:'pending'})});
+  Object.assign(ctx,{_cmdHistory:[{text:'not delivered',session:'owned'}],_cmdHistoryServerLoaded:false,
+    _msgNorm:x => x, _mergeUnechoed:() => ctx._cmdHistory, _peekReclassifyPrompts() {},
+    fetch:async url => {assert.equal(url,'/api/history?limit=500'); return new Response('[]');}});
+  await ctx._loadCmdHistoryFromServer();
+  assert.equal(ctx._cmdHistory[0].text,'not delivered');
+});
+
+test('successful sync clears stale offline feedback without hiding unrelated failures', async () => {
+  const {ctx, element} = fixture(); await enqueue(ctx);
+  let visible=true, cancelled=false;
+  Object.assign(ctx,{toastTimer:0});
+  const toast=element('toast'); toast.textContent='Server unreachable — offline mode';
+  toast.classList.remove=() => {visible=false;};
+  toast.getAnimations=() => [{cancel() {cancelled=true;}}];
+  await ctx.runSyncBanner();
+  assert.equal(visible,false); assert.equal(cancelled,true);
+  visible=true; toast.textContent='Upload failed: storage unavailable';
+  ctx._clearSyncTransientToast(); assert.equal(visible,true);
 });

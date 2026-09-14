@@ -299,6 +299,8 @@ struct WorkerShared {
     /// The live child, present while a turn is running. Held for `cancel`;
     /// the reader task takes it back at EOF to reap the exit status.
     child: Mutex<Option<Child>>,
+    paused: std::sync::atomic::AtomicBool,
+    reading: std::sync::atomic::AtomicBool,
     /// The provider conversation the NEXT run resumes (continuity, module
     /// docs). Seeded from config, updated from each run's init line.
     conversation: Mutex<Option<String>>,
@@ -313,7 +315,7 @@ impl WorkerShared {
     }
 
     fn set_state(&self, s: AgentState) {
-        *self.state.lock().unwrap() = s;
+        *self.state.lock().unwrap() = if self.paused.load(std::sync::atomic::Ordering::SeqCst) { AgentState::Paused } else { s };
     }
 }
 
@@ -354,6 +356,8 @@ impl StructuredCliProtocol {
                 state: Mutex::new(AgentState::Idle),
                 seen_keys: Mutex::new(HashSet::new()),
                 child: Mutex::new(None),
+                paused: std::sync::atomic::AtomicBool::new(false),
+                reading: std::sync::atomic::AtomicBool::new(false),
                 conversation: Mutex::new(conversation),
                 sink: self.sink.clone(),
             }),
@@ -386,6 +390,9 @@ impl StructuredCliProtocol {
         // this block awaits.
         let (stdout, stderr, turn, resumed_from) = {
             let mut keys = shared.seen_keys.lock().unwrap();
+            if shared.paused.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(ProtocolError::Rejected(format!("worker {worker} is paused")));
+            }
             if keys.contains(&key) {
                 return Ok(()); // Invariant 9: redelivery must not double-run.
             }
@@ -459,6 +466,7 @@ impl StructuredCliProtocol {
             })?;
             let stderr = child.stderr.take();
             *shared.child.lock().unwrap() = Some(child);
+            shared.reading.store(true, std::sync::atomic::Ordering::SeqCst);
 
             let turn = TurnId::from_ulid(ulid::Ulid::new());
             shared.set_state(AgentState::Working {
@@ -507,6 +515,11 @@ async fn read_stream(
     turn: TurnId,
     resumed_from: Option<String>,
 ) {
+    struct Reading(Arc<WorkerShared>);
+    impl Drop for Reading {
+        fn drop(&mut self) { self.0.reading.store(false, std::sync::atomic::Ordering::SeqCst); }
+    }
+    let _reading = Reading(shared.clone());
     let stderr_task = tokio::spawn(stderr_tail(stderr));
 
     let mut lines = BufReader::new(stdout).lines();
@@ -599,6 +612,14 @@ async fn read_stream(
             kind: TurnTraceKind::CommandOutput,
             content: tail.clone(),
         }));
+    }
+
+    if shared.paused.load(std::sync::atomic::Ordering::SeqCst) {
+        // Intentional interruption is not evidence that the resume target died.
+        // Keep its reference, and do not spend the task's failure budget.
+        shared.set_state(AgentState::Paused);
+        tracing::info!(worker = %shared.worker, verdict = "protocol_turn_paused", "structured turn stopped by worker pause");
+        return;
     }
 
     match status {
@@ -721,21 +742,41 @@ impl AgentProtocol for StructuredCliProtocol {
         Ok(())
     }
 
-    /// Not supported, honestly (ethos rule 3): a headless one-shot run has
-    /// no suspend state to enter. The caller gets a truthful refusal, not a
-    /// fake acknowledgement.
+    /// Pause terminates current work and retains the conversation reference.
     async fn pause(&self, worker: &WorkerId) -> Result<()> {
-        self.shared(worker)?;
-        Err(ProtocolError::Rejected(
-            "pause is not supported by headless structured-CLI sessions".to_string(),
-        ))
+        let shared = self.shared(worker)?;
+        let pid = {
+            let _keys = shared.seen_keys.lock().unwrap();
+            shared.paused.store(true, std::sync::atomic::Ordering::SeqCst);
+            shared.child.lock().unwrap().as_ref().and_then(|c| c.id())
+        };
+        shared.set_state(AgentState::Paused);
+        if let Some(pid) = pid {
+            crate::api::session_verbs::terminate_owned_tree(pid as i32, true).await
+                .map_err(|e| ProtocolError::Transport(e.to_string()))?;
+            // The stream reader owns reaping. Do not acknowledge until the
+            // previous turn's process is gone, even if EOF raced the kill.
+            for _ in 0..100 {
+                if !shared.reading.load(std::sync::atomic::Ordering::SeqCst) && unsafe { libc::kill(pid as i32, 0) } != 0 {
+                    tracing::info!(worker = %worker, verdict = "protocol_pause_stopped", "paused structured worker process stopped");
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            return Err(ProtocolError::Transport("could not confirm paused protocol process stopped".into()));
+        }
+        Ok(())
     }
 
     async fn resume(&self, worker: &WorkerId) -> Result<()> {
-        self.shared(worker)?;
-        Err(ProtocolError::Rejected(
-            "resume is not supported by headless structured-CLI sessions".to_string(),
-        ))
+        let shared = self.shared(worker)?;
+        let _keys = shared.seen_keys.lock().unwrap();
+        if shared.reading.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ProtocolError::Rejected("previous turn is still stopping".into()));
+        }
+        shared.paused.store(false, std::sync::atomic::Ordering::SeqCst);
+        shared.set_state(AgentState::Idle);
+        Ok(())
     }
 
     async fn state(&self, worker: &WorkerId) -> Result<AgentState> {
@@ -1227,34 +1268,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pause_and_resume_are_honestly_rejected() {
-        let dir = tempfile::tempdir().unwrap();
+    async fn pause_and_resume_stop_headless_work_and_preserve_conversation() {
+        use std::os::unix::fs::PermissionsExt;
+        for (i, provider) in [CliProvider::ClaudeCode, CliProvider::CodexCli, CliProvider::GeminiCli].into_iter().enumerate() {
+            let dir = tempfile::tempdir().unwrap();
+            let script = dir.path().join("provider");
+            std::fs::write(&script, "#!/bin/sh\nsleep 120 &\necho $! > tool.pid\nwait\n").unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let proto = StructuredCliProtocol::new();
+            let w = worker_id(&format!("{:05}", i + 60));
+            proto.register(w.clone(), WorkerConfig { provider, cwd:dir.path().into(), binary:Some(script), model:None, conversation:Some("saved-conversation".into()) });
+            proto.send_prompt(&w, prompt("before-pause")).await.unwrap();
+            for _ in 0..100 {
+                if dir.path().join("tool.pid").exists() { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let tool = std::fs::read_to_string(dir.path().join("tool.pid")).unwrap();
+            proto.pause(&w).await.unwrap();
+            assert_eq!(proto.state(&w).await.unwrap(), AgentState::Paused);
+            assert!(matches!(proto.send_prompt(&w, prompt("while-paused")).await, Err(ProtocolError::Rejected(_))));
+            let status = Command::new("ps").args(["-p", tool.trim(), "-o", "stat="]).output().await.unwrap();
+            let stat = String::from_utf8_lossy(&status.stdout);
+            assert!(stat.trim().is_empty() || stat.trim().starts_with('Z'), "tool survived pause: {stat}");
+            assert_eq!(proto.shared(&w).unwrap().conversation.lock().unwrap().as_deref(), Some("saved-conversation"));
+            proto.resume(&w).await.unwrap();
+            assert_eq!(proto.state(&w).await.unwrap(), AgentState::Idle);
+            // A rejected prompt did not consume the key; it can be sent after Resume.
+            proto.send_prompt(&w, prompt("while-paused")).await.unwrap();
+            proto.pause(&w).await.unwrap();
+        }
         let proto = StructuredCliProtocol::new();
-        let w = worker_id("00006");
-        proto.register(
-            w.clone(),
-            WorkerConfig {
-                provider: CliProvider::ClaudeCode,
-                cwd: dir.path().to_path_buf(),
-                binary: None,
-                model: None,
-                conversation: None,
-            },
-        );
-        assert!(matches!(
-            proto.pause(&w).await,
-            Err(ProtocolError::Rejected(_))
-        ));
-        assert!(matches!(
-            proto.resume(&w).await,
-            Err(ProtocolError::Rejected(_))
-        ));
-        // Unregistered workers still get NoSession, not Rejected.
-        let ghost = worker_id("00007");
-        assert!(matches!(
-            proto.pause(&ghost).await,
-            Err(ProtocolError::NoSession(_))
-        ));
+        assert!(matches!(proto.pause(&worker_id("00007")).await, Err(ProtocolError::NoSession(_))));
     }
 
     #[tokio::test]

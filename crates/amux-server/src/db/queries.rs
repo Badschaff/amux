@@ -12,7 +12,7 @@
 //! exists because these queries are also usable from contexts that do not
 //! enjoy the writer's serialization.
 //!
-//! LIFECYCLE (migration 0067): the `lifecycle` column on `_amux_workers`
+//! LIFECYCLE (migration 0069): the `lifecycle` column on `_amux_workers`
 //! carries the canonical lifecycle state (active/paused/archived/deleted).
 //! This replaces the soft-delete sidecar that stored `deleted_at` inside the
 //! state JSON column, which was a named deviation resolved by 0067.

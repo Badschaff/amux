@@ -117,6 +117,7 @@ pub mod ids {
     pub const TELEGRAM_POLL: &str = "telegram-poll";
     pub const TELEGRAM_RELAY: &str = "telegram-relay";
     pub const QUEUE_DISPOSITION: &str = "queue-disposition";
+    pub const MESSAGE_CAPTURE: &str = "message-capture";
     pub const MAC_HEALTH: &str = "mac-health";
     pub const ACCOUNTABILITY_NUDGE: &str = "accountability-nudge";
     pub const CONTEXT_HEALTH: &str = "context-health";
@@ -159,6 +160,7 @@ pub const ALL_IDS: &[&str] = &[
     ids::TELEGRAM_POLL,
     ids::TELEGRAM_RELAY,
     ids::QUEUE_DISPOSITION,
+    ids::MESSAGE_CAPTURE,
     ids::MAC_HEALTH,
     ids::ACCOUNTABILITY_NUDGE,
     ids::CONTEXT_HEALTH,
@@ -316,6 +318,18 @@ pub const CATALOG: &[Doc] = &[
         detail: Some("/api/debug/downtime"),
     },
     Doc {
+        id: ids::MESSAGE_CAPTURE,
+        name: "Message capture recovery",
+        purpose: "Resumes durable pending message-to-card capture after interruption, using the original history row and semantic intake without resending commands. Historical unlinked messages require explicit reviewed attribution.",
+        env: &[EnvControl {
+            var: "AMUX_MESSAGE_CAPTURE_SECS",
+            effect: "0 disables recovery; otherwise the loop runs every 90 seconds (positive values do not change its interval)",
+            off: Some("0"),
+        }],
+        pref: None,
+        detail: Some("/api/history"),
+    },
+    Doc {
         id: ids::QUEUE_DISPOSITION,
         name: "Queue disposition",
         purpose: "Tells a lane which of its todo cards auto-pickup has already stopped offering, and asks for one of three dispositions. Files ONE card per lane and updates it; it never retires or retypes a card itself.",
@@ -330,7 +344,7 @@ pub const CATALOG: &[Doc] = &[
     Doc {
         id: ids::STORAGE,
         name: "Storage retention",
-        purpose: "Prunes seven append-only tables and three cache directories on a timer, and rotates the server log.",
+        purpose: "Bounds append-only history, caches, diagnostic run logs and build artifacts; preserves referenced uploads and expires transcript cache entries.",
         env: &[EnvControl {
             var: "AMUX_STORAGE_SWEEP_SECS",
             effect: "sweep seconds; 0 stops the sweep",
@@ -439,17 +453,17 @@ pub const CATALOG: &[Doc] = &[
             EnvControl {
                 var: "AMUX_BROWSER_ACTIVITY_REAP_S",
                 effect: "seconds since last verb (navigate/screenshot/action) before release (default 300 = 5 min); 0 disables this arm",
-                off: Some("0"),
+                off: None, // disables one expiry arm, not the running job
             },
             EnvControl {
                 var: "AMUX_BROWSER_IDLE_REAP_S",
                 effect: "seconds a profile must be continuously empty (no real pages) before release (default 3600); 0 disables this arm",
-                off: Some("0"),
+                off: None, // disables one expiry arm, not the running job
             },
             EnvControl {
                 var: "AMUX_BROWSER_TTL_S",
                 effect: "hard age ceiling — any browser older than this is released even with open pages (default 14400 = 4 h); 0 disables",
-                off: Some("0"),
+                off: None, // disables one expiry arm, not the running job
             },
             EnvControl {
                 var: "AMUX_BROWSER_REAP_TICK_S",
@@ -1163,19 +1177,25 @@ pub fn outcome_for(id: &str) -> Option<String> {
         }),
         ids::STORAGE => super::storage::last_report().map(|r| {
             format!(
-                "{} table(s) swept, {} file(s) removed, {} freed",
+                "{} table(s) swept, {} file(s) and {} directory(s) removed, {} freed, {} cache entries expired{}",
                 r.tables.len(),
-                r.files_removed,
-                human_bytes(r.bytes_freed + r.rotated_bytes)
+                r.files_removed + r.rotated_logs_removed,
+                r.dirs_removed + r.run_logs.removed,
+                human_bytes(r.bytes_freed + r.rotated_logs_freed + r.dir_bytes_freed + r.run_logs.bytes_freed),
+                r.memory_entries_removed,
+                if r.upload_refs_error.is_some() || !r.run_logs.measured || r.diagnostic_dirs.iter().any(|(_, d)| !d.measured) { "; some cleanup deferred (see storage diagnostics)" } else { "" }
             )
         }),
         ids::SCAN => crate::orchestrator::scan::last_scan_state().map(|s| {
             format!(
-                "{} scanned, {} demoted (structured), {} demoted (native), {} capture failure(s)",
+                "{} scanned, {} demoted (structured), {} demoted (native), {} capture failure(s), {} process exit(s), {} exit probe/apply failure(s), {} stale exit observation(s)",
                 s.report.scanned.len(),
                 s.report.demoted_structured.len(),
                 s.report.demoted_native.len(),
                 s.report.capture_failures.len(),
+                s.report.process_exits.len(),
+                s.report.process_exit_failures.len(),
+                s.report.stale_process_exits.len(),
             )
         }),
         _ => None,

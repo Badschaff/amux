@@ -50,13 +50,14 @@ const dashboardAssets = [
   ['AMUX_E2E_DASHBOARD_SOURCE', '**/app.js', 'text/javascript'],
   ['AMUX_E2E_DASHBOARD_CSS', '**/app.css', 'text/css'],
   ['AMUX_E2E_DASHBOARD_HTML', '**/', 'text/html'],
+  ['AMUX_E2E_STATE_KERNEL', '**/state/kernel.js', 'text/javascript'],
 ].flatMap(([env, route, contentType]) => {
   const source = process.env[env];
   if (!source) return [];
   const bytes = readFileSync(source);
   console.log('[e2e] candidate dashboard asset: ' + source + ' sha256='
     + createHash('sha256').update(bytes).digest('hex') + '; API binary is unchanged');
-  return [{route, bytes, contentType}];
+  return [{route: route === '**/' ? /^https?:\/\/[^/]+\/(?:\?.*)?$/ : route, bytes, contentType}];
 });
 
 export { expect };

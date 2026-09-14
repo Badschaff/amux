@@ -480,7 +480,7 @@ fn inject_bootstrap(html: &str, state: &AppState, legacy: Option<u16>, owner_acc
          window._AMUX_POSTHOG_KEY={};window._AMUX_POSTHOG_HOST={};window._AMUX_USER_EMAIL={};\
          window._AMUX_USER_ID={};window._AMUX_UI_TOKEN={};window._AMUX_DEFAULT_MODEL={};\
          window._AMUX_LEGACY_PORT={};window._AMUX_CANONICAL_PORT={};\
-         window._AMUX_AUTH_WITHHELD={};</script>\n",
+         window._AMUX_AUTH_WITHHELD={};window._AMUX_MDAI_ROOT={};</script>\n",
         jstr(&ical_subscribe_url()),
         jstr(&auth),
         jstr(&home),
@@ -502,6 +502,10 @@ fn inject_bootstrap(html: &str, state: &AppState, legacy: Option<u16>, owner_acc
         legacy.unwrap_or(0),
         crate::legacy_port::canonical_port(),
         auth_withheld,
+        // The `.mdai` scan root, so the client joins list paths onto the right
+        // root instead of $HOME when a `mdai_root` pref points elsewhere
+        // (AMUX-4477).
+        jstr(&crate::api::mdai::mdai_root_str()),
     );
     let with_bootstrap = format!("{}{}{}", &html[..b], block, &html[e..]);
     // Client update adoption is the SSE ping's job, exactly like Python

@@ -8,6 +8,16 @@ The rule for when and how to log is in
 log friction the NEXT session will also hit, link a card, and record the cost in what
 it actually cost.
 
+**Current retirement instruction (Ethan, 2026-09-13; AF-780):** every entry must
+link a concrete issue on the amux-frustrations board and retain its originating
+`SESSION`. Only mark the issue Verified after that originating session validates
+the exact entry and explicitly agrees it is complete, with all resolved board
+gates satisfied. Then remove the entry from this file using the archive tool,
+preserving its text and actual agreement. An unavailable or ambiguous originator
+is unresolved; another verifier or a publishing committer cannot stand in for them.
+This instruction supersedes the older AF-352 independent-retirement exception for
+this drain. `ORIGINAL_CARD` preserves a historical pointer when `CARD` is repaired.
+
 ## Format — fixed fields so this greps
 
 Append at the bottom. One entry per distinct friction. Never rewrite an existing
@@ -44,58 +54,15 @@ needs rebuilding. No single entry makes that argument, and free-form prose canno
 counted.
 
 ---
-## The rust request log recorded a ~15-second restart choreography as a 76ms request
-AREA: instruments
-SEVERITY: slows
-STATUS: open
-DATE: 2026-08-09
-SESSION: amux-rust (lifecycle-fix subagent)
-CARD: AR-111
-SYMPTOM: Forensics on the amux start incident: `_amux_request_log` shows
-  `PATCH /api/sessions/amux/config` at ts 19:10:35 with latency 76.26ms — but the SAME
-  request wrote its "Captured before model swap" log marker at 19:10:20 and the env
-  header at 19:10:35.42, i.e. the handler ran a synchronous ~15s stop/relaunch
-  choreography that the request log renders as a sub-100ms call. Whatever the
-  middleware stamps (completion-time ts + an inner-layer latency, or a batched flush
-  clock), a long-running request is indistinguishable from a fast one.
-COST: ~30 minutes of incident reconstruction chasing a phantom second actor, because
-  the timeline read as "capture at :20 cannot belong to a 76ms request at :35" — the
-  instrument manufactured a contradiction that had to be disproved with three other
-  artifacts (env header, session log markers, session_events).
-FIX: request-log middleware should stamp arrival ts and wall-clock latency around the
-  WHOLE handler future; a restart choreography should be a visibly long row.
-
-## e2e auth tests flip green->red mid-session: the server under test is rebuilt from a shared checkout that moves between runs
-AREA: instruments
-SEVERITY: slows
-STATUS: open
-DATE: 2026-08-09
-SESSION: no-silent-actions agent (subagent; no $AMUX_SESSION in env)
-CARD: ARE-5
-SYMPTOM: three consecutive runs of `npx playwright test --config e2e/playwright.config.ts`
-on the same working tree: run 1 = 83 passed / 0 failed; run 2 = 12 failed; run 3 =
-5 failed, all in phase0 auth ("protected API rejects a bad bearer token" expected
-401, got 200) + settings_missing_endpoint_probe. Nothing in the diff between runs
-was mine — the config's webServer runs `cargo run -p amux-server`, so every run
-rebuilds whatever the concurrent lane has landed in crates/ since the last one.
-The 401->200 flip itself looks like a REAL auth regression landing upstream while
-I was testing the SPA layer.
-COST: ~15 minutes ruling out my own SPA-only changes as the cause of server-side
-auth failures; and a possible live auth regression (bad bearer accepted with 200)
-observed but not attributable to a commit from here (NEVER-run-git constraint).
-FIX: same instrument the CLAUDE.md /health-build bracket prescribes, applied to e2e:
-have playwright.config.ts record the server build hash (GET /health .build) into the
-run report so a mid-session flip names "the binary moved" instead of reading as
-flaky tests; separately, someone with git access should bisect the 401->200 auth
-behavior on current crates/amux-server HEAD.
-
 ## Ghost-rescue can only rescue the messages that happen to carry a timestamp prefix
 AREA: instruments
 SEVERITY: slows
 STATUS: open
 DATE: 2026-08-09
 SESSION: (agent, AMUX-2629)
-CARD: AMUX-2629
+AUTHOR_PROVENANCE: Original label preserved; exact originating-session identity remains unconfirmed. First published in 131d932484db7a4e8eb3a0d9708f9e00dcb7f7c3. Committer identity is not author validation.
+CARD: AF-782
+ORIGINAL_CARD: AMUX-2629
 SYMPTOM: the ported `[ghost-rescue]` sweep decides a stuck message is amux's — and so
 safe to submit — only when the composer text starts with the dashboard's `[H:MM AM]`
 stamp (py:9160, the only sound discriminator: anything else risks submitting a
@@ -122,7 +89,9 @@ SEVERITY: blocks
 STATUS: open
 DATE: 2026-08-09
 SESSION: board-drive (AMUX-2637)
-CARD: AMUX-2637
+AUTHOR_PROVENANCE: Original label preserved; exact originating-session identity remains unconfirmed. First published in e48983ff8e44675a85692c09fdbab6f310e65a31. Committer identity is not author validation.
+CARD: AF-783
+ORIGINAL_CARD: AMUX-2637
 SYMPTOM: I created `crates/amux-server/src/runtime_jobs/board_drive.rs` and wired it
   into `lib.rs` at ~22:0x, having run NO tests yet. At 22:07 another session rebuilt
   and installed `~/.local/bin/amux-server-rs` from this shared checkout; `strings` on
@@ -153,7 +122,8 @@ SEVERITY: blocks
 STATUS: open
 DATE: 2026-08-09
 SESSION: amux (cloud rust image, AMUX-2619)
-CARD: AMUX-2644
+CARD: AF-784
+ORIGINAL_CARD: AMUX-2644
 SYMPTOM: Started a worker in the new cloud container. `GET /api/workers/<id>` returned
   `{"status":"idle","running":true,"state":{"state":"idle"}}` — a healthy-looking lane.
   `peek` showed what had actually happened: `--dangerously-skip-permissions cannot be
@@ -182,7 +152,9 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-08-09
 SESSION: rust-rebuild (RR-0109/0110 lane)
-CARD: ARE-10
+AUTHOR_PROVENANCE: Original label preserved; exact originating-session identity remains unconfirmed. First published in 572047d0369f3390f8e6f75004165a5b7a0fd9d8. Committer identity is not author validation.
+CARD: AF-786
+ORIGINAL_CARD: ARE-10
 SYMPTOM: I created `crates/amux-server/migrations/0013_search.sql` at 22:16:42 EDT and
   never installed or restarted anything. At 22:18:23 EDT the migration was applied to
   `~/.amux/amux.db` — the live 269MB database — creating 2 tables, 24 triggers and
@@ -210,7 +182,9 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-08-09
 SESSION: (Claude Code in iTerm — not a fleet lane, hence no session stamp)
-CARD: AMUX-2663
+AUTHOR_PROVENANCE: Original label preserved; exact originating-session identity remains unconfirmed. First published in 963e40f4d3632f41d6867163c10dc505455d9bdf. Committer identity is not author validation.
+CARD: AF-787
+ORIGINAL_CARD: AMUX-2663
 SYMPTOM: TWICE in ~40 minutes, by different peers. `e679bdb` ("fix(hygiene): five carded
   defects") took an in-progress `/report` attribution change in `api/session_verbs.rs` and
   a brand-new test file that had not yet passed — it was still 404ing on a missing rig
@@ -236,7 +210,9 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-08-10
 SESSION: amux-rust (AMUX-2647 lane)
-CARD: AMUX-2647
+AUTHOR_PROVENANCE: Original label preserved; exact originating-session identity remains unconfirmed. First published in 7ec5e3102961eaf966427e74a8542bd3770c829f. Committer identity is not author validation.
+CARD: AF-788
+ORIGINAL_CARD: AMUX-2647
 SYMPTOM: I wrote `migrations/0015_schedule_run_delivery.sql` and registered it in
   `migrate.rs`, uncommitted, under an explicit instruction never to commit. Commit
   4d76ff3 ("feat: universal FTS5 search …") picked up my `migrate.rs` edit; the .sql
@@ -265,7 +241,9 @@ SEVERITY: blocks
 STATUS: open
 DATE: 2026-08-10
 SESSION: autofix (subagent)
-CARD: AF-69 (investigation, signed off) + AMUX-3221 (the FIX, open)
+AUTHOR_PROVENANCE: Original label preserved; exact originating-session identity remains unconfirmed. First published in 9a9194525bcb31e0d80454e107a851b07839f69a. Committer identity is not author validation.
+CARD: AF-789
+ORIGINAL_CARD: AF-69 (investigation, signed off) + AMUX-3221 (the FIX, open)
 SYMPTOM: Started an isolated server (`AMUX_HOME=/tmp/amux-af-home`, port 8899, own DB) to
   verify a change without touching the fleet. Within 4 seconds its log showed:
     pane-size: restoring detached window ... session=amux-amux from=220x50 to=220x50
@@ -306,7 +284,9 @@ SEVERITY: blocks
 STATUS: open
 DATE: 2026-08-10
 SESSION: storage-audit
-CARD: AMUX-2701
+AUTHOR_PROVENANCE: Original label preserved; exact originating-session identity remains unconfirmed. First published in e188b0eb86a3d5406d2b29e53f0e6889d0c8e100. Committer identity is not author validation.
+CARD: AF-790
+ORIGINAL_CARD: AMUX-2701
 SYMPTOM: With the volume at 741MB free, ~450GB of stale cargo target dirs was deleted and
   `df` moved to 9.0GB free — about 8GB recovered from 450GB deleted. Deleting a further
   26.8GB moved free space DOWN (8.1Gi -> 6.6Gi). The cause was 24 hourly APFS local Time
@@ -333,7 +313,9 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-08-10
 SESSION: claude (AMUX-2619/2780 lane)
-CARD: AMUX-2799
+AUTHOR_PROVENANCE: Original label preserved; exact originating-session identity remains unconfirmed. First published in e84525e61cf0afaf8f0a9aa9a25e6104c9b4e600. Committer identity is not author validation.
+CARD: AF-791
+ORIGINAL_CARD: AMUX-2799
 SYMPTOM: With the now-mandated `CARGO_TARGET_DIR=~/.amux/rust-build-target` (e188b0e, "ONE
   shared cargo target"), `cargo test -p amux-server` reported, in sequence, three DIFFERENT
   compile errors in files I had never touched: `unresolved import
@@ -367,7 +349,8 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-08-11
 SESSION: amux
-CARD: AMUX-2841
+CARD: AF-792
+ORIGINAL_CARD: AMUX-2841
 SYMPTOM: Retracting a peer's report of a tree-wide mtime restamp, I grepped
   .git/hooks/pre-commit on amux and mixpeek for `git stash`, found none, and wrote
   "the mechanism does not exist" onto MI-4650. Three independent reasons it could not
@@ -393,7 +376,8 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-08-14
 SESSION: amux
-CARD: AMUX-3119
+CARD: AF-793
+ORIGINAL_CARD: AMUX-3119
 SYMPTOM: AMUX-3116 and AMUX-3117 (amux CLI fixes) were verified end-to-end by gtm-engine
   with negative controls, field-level CC_* diffs and a server-API cross-check, which is
   stronger than a typical same-group review. But the code verified-gate criterion is
@@ -410,7 +394,8 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-08-16
 SESSION: amux (file-manager subagent)
-CARD: AMUX-3249
+CARD: AF-794
+ORIGINAL_CARD: AMUX-3249
 SYMPTOM: The pre-commit staged-guard bases its verdict on per-session EDIT RECORDS in a
   time window, not on the staged diff. Running as a subagent, my Edits to app.css /
   index.html / sw.js produced no edit record under my session, so the guard reported
@@ -433,7 +418,8 @@ SEVERITY: blocks
 STATUS: open
 DATE: 2026-08-17
 SESSION: desktop
-CARD: DESKT-10
+CARD: AF-795
+ORIGINAL_CARD: DESKT-10
 SYMPTOM: My fix 5b923db moved the direction-unknown branches to the ancestry test but DELIBERATELY kept `git cat-file -e $(git hash-object <path>)` in the STALE section, with a comment arguing it was correct there because the classifier had already proven the path was behind. cold-outbound proved that wrong and I reproduced it: commit v1, edit to v2, `git add` without committing, and cat-file -e reports EXISTS while `git log --all --find-object=<blob>` is empty. `git add` writes the blob into .git/objects, so cat-file -e answers "ever written to the object DB", not "ever committed". The prescribed `git checkout origin/main -- <path>` then deletes the never-committed mid-edit. cold-outbound hit a live 4-minute near-miss on server-fast-checks.yml, mid-keystroke.
 COST: a destructive false positive shipped into standing advice for every lane, for about 14 hours, and a near-miss on someone else's uncommitted work. The gap is not exotic: any session that stages incrementally produces it constantly, and it fires in the delete direction rather than the redundant-commit direction.
 FIX: `git log --all --find-object=<blob>`; empty means never committed anywhere. `--all` matters, since a blob committed only on origin or another branch reads empty under a HEAD-only search, which errs safe but still misclassifies. amux has a fix agent in flight across commit_nudge.rs, the shell guards and session-freshness.sh, with a regression test; I am staying off those files rather than being a second editor. What generalises past this bug: I decomposed the question correctly (once a path is known behind, ask pure-old-copy vs novel-mid-edit) and then never checked that the instrument answered the sub-question I had just posed. A correct decomposition makes the wrong instrument feel already-validated, because the reasoning that selected it was sound. Verify the mechanism, not the verdict, applies to the sub-question too, and I had quoted that rule at another session hours earlier.
@@ -446,7 +432,8 @@ SEVERITY: blocks
 STATUS: open — owner's decision
 DATE: 2026-08-17
 SESSION: amux-errors-and-bugs
-CARD: AEAB-11
+CARD: AF-654
+ORIGINAL_CARD: AEAB-11
 SYMPTOM: Two launchd jobs both run the Rust server against `~/.amux/amux.db` —
   `com.amux.server-rs` (pid 22521, port 8824, last exit -9) and `com.amux.serve`
   (pid 22053, port 8823, exit 0) — same binary, same build, both logging "schedule loop
@@ -477,7 +464,8 @@ SEVERITY: annoys
 STATUS: open
 DATE: 2026-08-18
 SESSION: amux-errors-and-bugs
-CARD: AEAB-28
+CARD: AF-656
+ORIGINAL_CARD: AEAB-28
 SYMPTOM: The machine was up and on the network at 15:18; amux did not start until the
   console login at 18:28 — 3h10m later. All four amux units are user LaunchAgents in
   `~/Library/LaunchAgents` with no `LimitLoadToSessionType`, so they are `Aqua`: they
@@ -502,7 +490,8 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-08-19
 SESSION: amux-errors-and-bugs
-CARD: AEAB-36
+CARD: AF-657
+ORIGINAL_CARD: AEAB-36
 SYMPTOM: Closing AEAB-34, the entire output was:
     warning: outcome NOT recorded — server sent no JSON
   Verified against the API immediately afterwards: status still `review`, desc_len
@@ -531,7 +520,8 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-08-20
 SESSION: amux-errors-and-bugs
-CARD: AEAB-40
+CARD: AF-658
+ORIGINAL_CARD: AEAB-40
 SYMPTOM: `.claude/rules/frustrations.md` mandates an entry for any amux friction and says
   "Append at the bottom", so every branch doing real work ends by appending to the same last
   line of the same file. Two branches in flight is a guaranteed textual conflict. Hit three
@@ -556,7 +546,8 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-08-22
 SESSION: amux
-CARD: AMUX-1315
+CARD: AF-796
+ORIGINAL_CARD: AMUX-1315
 SYMPTOM: my commit of a one-file autofix.rs fix was refused because the pre-commit gate
   (cargo check/clippy) compiles the WHOLE workspace, which at that moment contained a
   peer's mid-edit mdai.rs (their AF-141 work, uncommitted). The suite also wedged and two
@@ -580,7 +571,8 @@ SEVERITY: blocks
 STATUS: half-fixed — detection reaches a session now; the reinstall is the owner's call
 DATE: 2026-08-23
 SESSION: amux-errors-and-bugs
-CARD: AEAB-47
+CARD: AF-659
+ORIGINAL_CARD: AEAB-47
 SYMPTOM: `.git/hooks/pre-commit` is dated Aug 5 22:39 in ~/amux, ~/Developer/amux AND
   ~/Projects/amux-gtm, while `scripts/git-hooks/` is current. `grep -c guard_version` returns
   0 in the installed hooks and 3 in the repo's. `.git/hooks/pre-push` never calls
@@ -625,7 +617,8 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-08-23
 SESSION: desktop
-CARD: DESKT-21
+CARD: AF-797
+ORIGINAL_CARD: DESKT-21
 SYMPTOM: `amux board desc DESKT-21 --stdin` -> `amux board: unknown subcommand: desc`. The
   full verb list (`amux help board`) is `done|doing|todo`, `add <title>`, `list`. There is no
   way to write a card's description from the sanctioned CLI at all. `amux board done` accepts
@@ -646,7 +639,8 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-08-23
 SESSION: desktop
-CARD: DESKT-22
+CARD: AF-798
+ORIGINAL_CARD: DESKT-22
 SYMPTOM: `amux board add --stdin <<'EOF' ... EOF` created a card whose TITLE IS THE
   LITERAL STRING `--stdin`, and threw the real title away. Exit 0, a full JSON card body
   echoed back, nothing wrong-looking. The identical command an hour earlier had worked
@@ -684,7 +678,8 @@ SEVERITY: blocks
 STATUS: open
 DATE: 2026-08-23
 SESSION: desktop
-CARD: DESKT-22
+CARD: AF-799
+ORIGINAL_CARD: DESKT-22
 SYMPTOM: I staged four files for DESKT-22 (`git add` of a migration, heartbeat.rs,
   health.rs, migrate.rs), then ran `git commit -m ...`. It died with
   `fatal: cannot lock ref 'HEAD': is at c8272bf17 but expected 78b77653b`. My commit
@@ -795,7 +790,8 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-08-24
 SESSION: amux
-CARD: AF-182
+CARD: AF-800
+ORIGINAL_CARD: AF-182
 SYMPTOM: `cargo test -p amux-server --lib` returned "1284 passed; 1 failed" twice tonight,
   hours apart, and BOTH times the failure vanished on an immediate rerun with no change to my
   tree (1282/0, then 1285/0). The suite prints the count in the tail but the failing test name
@@ -826,7 +822,8 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-08-22
 SESSION: amux-errors-and-bugs
-CARD: AEAB-43
+CARD: AF-664
+ORIGINAL_CARD: AEAB-43
 SYMPTOM: `reap_orphaned_scans` runs `UPDATE reclaim_scans SET status='interrupted',
   error='server restarted mid-scan; the scan thread did not survive' WHERE
   status='running'` — no owner on the row. 8824 boots 10s after 8823 and reaps 8823's
@@ -850,7 +847,8 @@ SEVERITY: annoys
 STATUS: open
 DATE: 2026-08-24
 SESSION: amux (hit it, twice), amux-frustrations (verified the mechanism)
-CARD: AF-214 (nudge skip, done) / AMUX-3668 (the `changes-requested` status, open)
+CARD: AF-801
+ORIGINAL_CARD: AF-214 (nudge skip, done) / AMUX-3668 (the `changes-requested` status, open)
 SYMPTOM: amux reviewed AF-203, rejected it with four specifics, and was re-nudged twice with
   "[amux] AF-203 sits in 'review' and names YOU as reviewer". The nudge predicate
   (board_drive.rs:2461) is `status == review AND reviewer == you`, and its own instruction —
@@ -905,7 +903,9 @@ SEVERITY: blocks
 STATUS: open
 DATE: 2026-08-29
 SESSION: 6527367a-8ff6-431a-ace9-e421554fb30d
-CARD: none
+AUTHOR_PROVENANCE: Original label preserved; exact originating-session identity remains unconfirmed. First published in 67d7478c9e2c419df362d32c476f8bb98a38f0f2. Committer identity is not author validation.
+CARD: AF-802
+ORIGINAL_CARD: none
 SYMPTOM: After `systemctl --user restart amux.service` (from a deployment), the amux
   worker session stays down: `GET /api/sessions/amux` returns `running: false`. Inbound
   Telegram messages have nowhere to route into until someone manually calls `POST
@@ -927,7 +927,8 @@ SEVERITY: blocks
 STATUS: open
 DATE: 2026-08-31
 SESSION: amux
-CARD: AMUX-48
+CARD: AF-668
+ORIGINAL_CARD: AMUX-48
 SYMPTOM: Shortly after fixing AMUX-49 (every registered lane, not just `amux`,
   now comes back up after a reboot — 6 more Claude sessions went from stopped to
   running as a direct result), a plain `cargo check -p amux-server` — the ONE
@@ -969,7 +970,8 @@ SEVERITY: blocks
 STATUS: open
 DATE: 2026-08-31
 SESSION: amux
-CARD: AMUX-48
+CARD: AF-669
+ORIGINAL_CARD: AMUX-48
 SYMPTOM: Supersedes/extends "A fix that brings the fleet back up can itself
   make local cargo unsafe again" (same date, above) — that entry covered a
   manual `cargo check` getting OOM-killed once. Verifying AMUX-48's `done`
@@ -1013,7 +1015,8 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-08-26
 SESSION: amux
-CARD: AMUX-3772
+CARD: AF-803
+ORIGINAL_CARD: AMUX-3772
 SYMPTOM: A host-wide stall that RAMPS files a single-family outlier card on the scan where fewer than AMUX_OUTLIER_ROLLUP_AT (3) families have crossed the threshold. That card's verdict then says "This is not a percentile shift — it is individual requests going wrong, so look at the request, not the family", which is the exact opposite of the truth, and it names an endpoint that answered in 0.09s minutes later. The rollup that describes it correctly already exists and fires on every subsequent scan; nothing revisits the card filed at the leading edge.
 COST: One lane-turn to diagnose, and the diagnosis only landed because `host_load_at_worst` was in the payload and I followed it. A reader who trusts the verdict audits innocent code. ethos.md rates a loud wrong probe worse than a silent one, and this is one: it answers, names a specific target, and is wrong.
 FIX: none yet, deliberately. The obvious fix — suppress a single-family card when an open ROLLUP exists — is WRONG while a rollup card can sit parked in backlog indefinitely, because it would mute every genuine single-endpoint regression. That prerequisite is AMUX-3774 and is now fixed; this card is parked with that as its trigger. Recorded because building the wrong fix first is exactly what I did, and the order matters.
@@ -1024,7 +1027,8 @@ SEVERITY: annoys
 STATUS: open
 DATE: 2026-08-28
 SESSION: amux
-CARD: AMUX-3849
+CARD: AF-804
+ORIGINAL_CARD: AMUX-3849
 SYMPTOM: A live outage (`/api/browser/start` 502) produced FOUR cards in three hours. I hand-filed AMUX-3842 with the diagnosis, then discarded the two autofix cards as duplicates of it, twice, and a fourth arrived anyway. `open_card_for_fault` suppresses on `source_ref LIKE 'autofix:<ident>|%'` for any card not done/verified/discarded — so a HAND-FILED card carries no signature and can never suppress, and discarding the autofix ones removes the only cards that could. The two look identical on the board: same title shape, same status vocabulary, no visible difference between a card the detector will honour and one it cannot see. `discarded` not suppressing is DELIBERATE and correct (it is what lets a genuinely new occurrence file after a judged one), so every individual piece behaved as designed while the composite guaranteed a re-file loop.
 COST: Three discards, four cards, and the wrong conclusion available at every step — the obvious reading is "the dedupe is broken", which is what I would have reported if I had not gone and read `fault_identity`. The detector was right and I had deleted its memory. Also self-inflicted noise on a shared board while the underlying outage sat correctly parked in `needsyou`.
 FIX: none yet. Immediate workaround, applied: copy the autofix signature onto the hand-filed card's `source_ref`, which makes it suppress (verified against the LIKE). Two candidate real fixes, cheapest first: (a) `amux board discard` warns when the card carries an autofix signature AND is the last non-terminal card holding that ident — a discard that turns the detector back on should say so; (b) `board add` for a fault already carded by autofix is the wrong move entirely and the honest path is folding the diagnosis INTO the autofix card, which nothing currently suggests. The transferable shape: a card's suppressing power lives in a field nobody looks at, so two cards that read identically to a human behave oppositely to the detector.
@@ -1035,7 +1039,8 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-08-30
 SESSION: amux
-CARD: AF-342
+CARD: AF-805
+ORIGINAL_CARD: AF-342
 SYMPTOM: Mid-task on AMUX-3886 I had ~87 uncommitted lines in
  crates/amux-server/src/api/browser.rs (a `with_cause` helper plus 28 call sites).
  ts-gke committed 78009d90, "browser-reaper: add hard TTL to kill old browsers
@@ -1149,7 +1154,8 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-08-31
 SESSION: amux-frustrations
-CARD: AMUX-3954
+CARD: AF-806
+ORIGINAL_CARD: AMUX-3954
 SYMPTOM: The staged-guard named me as a co-editor of
  crates/amux-server/src/runtime_jobs/autofix.rs. Three timestamps break the claim:
    my observed record for that path   20:41:38
@@ -1235,7 +1241,8 @@ SEVERITY: blocks
 STATUS: fixed
 DATE: 2026-09-02
 SESSION: amux
-CARD: AMUX-99
+CARD: AF-670
+ORIGINAL_CARD: AMUX-99
 SYMPTOM: GET /api/health/invariants showed hooks.report_hook_matches_committed
   and hooks.shared_guard_matches_committed both failing — runtime hook sha
   differs from the sha baked into the running binary. ~/.amux/hooks/
@@ -1268,7 +1275,8 @@ SEVERITY: slows
 STATUS: open (provider-side notification defect; amux lifecycle handling is fixed)
 DATE: 2026-09-02
 SESSION: amux-testing-e2e
-CARD: ATE-10
+CARD: AF-807
+ORIGINAL_CARD: ATE-10
 SYMPTOM: Claude produced an initial subagent completion notification while that agent
   still reported waiting and its requested file did not exist; a second notification
   arrived only after the file was actually written.
@@ -1425,7 +1433,8 @@ SEVERITY: blocks
 STATUS: open
 DATE: 2026-09-03
 SESSION: amux
-CARD: AMUX-4083
+CARD: AF-808
+ORIGINAL_CARD: AMUX-4083
 SYMPTOM: Two independent blocks in one hour, both false, both naming a session
   that had only READ the file.
   (1) mixpeek-oss went to commit two browser.rs paths and staged-guard refused,
@@ -1566,7 +1575,8 @@ SEVERITY: wrong-conclusion
 STATUS: open
 DATE: 2026-09-04
 SESSION: amux
-CARD: AMUX-4142
+CARD: AF-809
+ORIGINAL_CARD: AMUX-4142
 SYMPTOM: A post-commit `scripts/safe-cargo.sh build -p amux-server` in the
  Basecoat integration worktree exited 0 and `/health` reported that worktree's
  `11c1b789` commit, but the same process served `APP_VER=0.9.804` and no
@@ -1586,7 +1596,8 @@ SEVERITY: blocks
 STATUS: fixed
 DATE: 2026-09-04
 SESSION: amux-codex
-CARD: AC-416
+CARD: AF-810
+ORIGINAL_CARD: AC-416
 SYMPTOM: In three simultaneous saved browser profiles, switching workspaces
  returned synthetic HTTP 202 `queued/offline`, reloaded as though it succeeded,
  and either stayed in the old workspace or changed context later when the
@@ -1611,7 +1622,8 @@ SEVERITY: blocks
 STATUS: open
 DATE: 2026-09-04
 SESSION: amux-codex
-CARD: AC-416
+CARD: AF-811
+ORIGINAL_CARD: AC-416
 SYMPTOM: The Gmail workspace stayed on "Starting your workspace" for several
  minutes while board/session reads in the other two profiles took 50-135s.
  The local 8824 control plane simultaneously repeated its known failure mode:
@@ -1631,7 +1643,8 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-09-05
 SESSION: amux (Codex agent; no $AMUX_SESSION in env)
-CARD: AMUX-3249
+CARD: AF-812
+ORIGINAL_CARD: AMUX-3249
 SYMPTOM: After implementing and browser-testing local multiplayer invites, the commit
   guard attributed the staged files to `amux-cloud` and `amux-frustrations` and refused
   the commit even though every staged hunk was produced by this task. The shell had an
@@ -1650,7 +1663,8 @@ SEVERITY: blocks
 STATUS: fixed
 DATE: 2026-09-07
 SESSION: mixpeek-ops-server
-CARD: MOS-33
+CARD: AF-813
+ORIGINAL_CARD: MOS-33
 SYMPTOM: A concurrent reader was named owner of three ops research files after their mtimes changed during its Bash command. The production classifier reproduces a foreign block with provenance observed while its explanation asserts a transcript write. A later observation can also replace an existing recorded writer.
 COST: The reader had to disown files it never edited; publication required an ownership check and this repair.
 FIX: Keep mtime observations in a separate, counted advisory. They cannot name an owner or replace recorded edits; preserve recorded-writer and blind-cotenant protection. Regression: concurrent_reader_observations_cannot_claim_the_ops_research_files.
@@ -1663,7 +1677,8 @@ SEVERITY: blocks
 STATUS: open
 DATE: 2026-09-07
 SESSION: amux
-CARD: AMUX-4203
+CARD: AF-814
+ORIGINAL_CARD: AMUX-4203
 SYMPTOM: At 17:27:23 EDT fleet captures began timing out; at 17:29:49 the socket refused connections. A new tmux server created at 17:30:07 replaced the default socket while its original owner remained alive with 62 sessions. /api/debug/tmux measured only the replacement (7 sessions at first inspection), and invariants classified the original workers as stopped. Kernel socket owners and server identity were absent from both instruments.
 COST: 30 minutes with most of the fleet inaccessible before diagnosis; original sessions had to be recovered via a separately preserved socket and 57 non-archived workers reconciled with the replacement fleet. The initiating stall cannot be proven from retained logs.
 FIX: AMUX-4203 adds independent socket-owner evidence, persistent stall process/stack samples, an invariant WARN, and guarded tmux creation. The initial stall remains unproven; do not read recovery as proof of its cause.
@@ -1675,7 +1690,8 @@ SEVERITY: blocks
 STATUS: fixed
 DATE: 2026-09-07
 SESSION: amux
-CARD: AMUX-4203
+CARD: AF-815
+ORIGINAL_CARD: AMUX-4203
 SYMPTOM: During fleet recovery, handoff-consumer-0907 displayed `unset ANTHROPIC_API_KEYclaude --dangerously-skip-permissions ...`; bash rejected the agent flags as unset identifiers. Two other workers remained at shell prompts after accepted starts. `type_line` used separate tmux clients for literal input and Enter, discarded errors, and proceeded to the next command under capture load.
 COST: Three individual launch retries, plus manual verification that all 57 non-archived workers had live agents rather than merely an accepted start response.
 FIX: Submit each literal line and Enter together in one tmux command queue. WARN with shell_line_submission_failed when tmux does not confirm it, without recording shell command contents. A private-socket regression test verifies two complete shell commands reach the shell.
@@ -1687,7 +1703,8 @@ SEVERITY: blocks
 STATUS: fixed
 DATE: 2026-09-07
 SESSION: amux
-CARD: AMUX-4203
+CARD: AF-816
+ORIGINAL_CARD: AMUX-4203
 SYMPTOM: Both synchronous fleet-probe runners polled child exit before draining stdout/stderr. A child writing 262,144 bytes filled the pipe and was killed on its three-second deadline; both regression tests failed against the shipped functions. The capture runner justified this with “30 lines”, which is not a byte bound. Its timeout WARN and diagnostic note blamed an unresponsive tmux without recording bytes read or whether the child had already exited.
 COST: The original fleet incident produced 511 capture timeout warnings during 17:27–17:29, but the instrument could not distinguish an upstream stall from its own unread pipe. The investigation had to reproduce the runner separately before its timeout verdict could be trusted. Current captures were below pipe capacity, so this entry does not claim the pipe defect initiated that incident.
 FIX: Drain both pipes nonblockingly while polling the child, with the deadline covering continuously producing children and descendants holding a pipe after the child exits. Preserve byte counts, PID, elapsed time and child-exit versus pipe-EOF phase in WARN logs and /api/debug/tmux, including when the diagnostic's own fleet query fails. Trigger bounded independent tmux/host evidence collection on the first timeout, at most once per minute; retain host load and processes ranked by CPU/RSS without process arguments. Regression fixtures test large stdout and stderr, real hangs, continuous output, inherited pipes and successful output preservation.
@@ -1699,7 +1716,8 @@ SEVERITY: slows
 STATUS: fixed
 DATE: 2026-09-08
 SESSION: amux
-CARD: AMUX-4225
+CARD: AF-817
+ORIGINAL_CARD: AMUX-4225
 SYMPTOM: A full gate on clean 21909b7e reported a missing cache prefix and a
   card-syncing assertion absent from that tree. The executable in the shared
   target directory embedded a different PR review checkout as its manifest
@@ -1721,7 +1739,8 @@ SEVERITY: blocks
 STATUS: fixed
 DATE: 2026-09-09
 SESSION: mvs-research
-CARD: MR-174
+CARD: AF-818
+ORIGINAL_CARD: MR-174
 SYMPTOM: MSG-50976 correctly linked to MR-174, status-update correctly claimed the
   card as doing, and the worker registered its board-drain report asset. At 08:12
   the unchanged captured-prompt envelope nevertheless accepted `doing -> backlog`,
@@ -1745,7 +1764,8 @@ SEVERITY: blocks
 STATUS: fixed
 DATE: 2026-09-09
 SESSION: amux-testing-e2e
-CARD: ATE-128
+CARD: AF-819
+ORIGINAL_CARD: ATE-128
 SYMPTOM: The authored-entry audit's isolated timestamp_units_declared target
   failed on org_teams.created_at. The earlier full CI run stopped at another
   integration target before reaching this guard, so a green library result
@@ -1765,7 +1785,8 @@ SEVERITY: blocks
 STATUS: open
 DATE: 2026-09-09
 SESSION: amux-testing-e2e
-CARD: ATE-130
+CARD: AF-820
+ORIGINAL_CARD: ATE-130
 SYMPTOM: An isolated 54-case browser audit had five cold #issue navigation
   timeouts. A focused unchanged-source rerun passed 8/9; the remaining desktop
   card-details case reached its asset assertions, then the onboarding backdrop
@@ -1784,7 +1805,8 @@ SEVERITY: blocks
 STATUS: open
 DATE: 2026-09-09
 SESSION: amux-testing-e2e
-CARD: AF-640
+CARD: AF-821
+ORIGINAL_CARD: AF-640
 SYMPTOM: Ethan's phone terminal squeezed split diff/tool output into unreadable
   columns, wrapped code away from its line numbers and overlaid controls on output.
   The live/history split still reparsed all history on each changed snapshot and
@@ -1855,7 +1877,9 @@ SEVERITY: blocks
 STATUS: fixed
 DATE: 2026-09-10
 SESSION: codex-amux-lifecycle
-CARD: AMUX-4362
+AUTHOR_PROVENANCE: Original label preserved; exact originating-session identity remains unconfirmed. Committer identity is not author validation.
+CARD: AF-822
+ORIGINAL_CARD: AMUX-4362
 SYMPTOM: GitHub's e2e job failed the shipped-function Node test because it still expected a failed outbox write to make the connection badge read Sync error. The current product deliberately reports connection/read health separately and shows pending operation failures in the outbox.
 COST: The stale assertion stopped the browser CI job before its browser cases could run.
 FIX: Align the assertion with the documented connection behavior, retain the checks for pending counts and read/auth errors, and explicitly assert the failed operation still displays its error. The existing named Node assertion is the local/CI diagnostic; no runtime behavior is changed.
@@ -1865,7 +1889,9 @@ SEVERITY: blocks
 STATUS: fixed
 DATE: 2026-09-11
 SESSION: codex-server-sync
-CARD: AMUX-4416
+AUTHOR_PROVENANCE: Original label preserved; exact originating-session identity remains unconfirmed. First published in 091bc3a9d0c12f859dcf7d35bbf2189c8f28df61. Committer identity is not author validation.
+CARD: AF-823
+ORIGINAL_CARD: AMUX-4416
 SYMPTOM: During host ENOSPC, heartbeat repeatedly reported "writer thread is gone" and request-log rows were dropped, while /health returned store:"ok" from a read-only probe. The browser retained 26 queued operations. Failure injection also showed journal and COMMIT errors poisoning the next transaction.
 COST: Hours of failed writes could look healthy to the watchdog and an empty request-log analysis; cache deletion did not free snapshot-retained blocks. Recovery required explicit snapshot-reclamation approval and an API restart. Separate reader-pool exhaustion during recovery is not attributed to a specific borrower by these tests.
 FIX: Guard every write transaction through commit, catch mutation unwinding without killing the writer, emit failure verdicts, and include a bounded no-op writer transaction in health. Four baseline regressions failed before the change; panic, journal, commit, unwritable-writer and stalled-writer cases now cover recovery. Keep the detailed read failure in the Sync error modal and update it on recovery. See docs/incidents/2026-09-11-offline-sync.md for the causal limits.
@@ -1876,7 +1902,8 @@ SEVERITY: blocks
 STATUS: fixed
 DATE: 2026-09-11
 SESSION: codex-server-sync
-CARD: AMUX-4416
+CARD: AF-824
+ORIGINAL_CARD: AMUX-4416
 SYMPTOM: Send/Queue bypassed local persistence and waited on the API, then fell back into Queued/Syncing. An optimistic follow-up cleared draft text and uploads before durable acceptance.
 COST: A slow mobile connection became a composer delay; failed local storage could lose the working draft. Automatic retries opened delivery progress during ordinary sends.
 FIX: Restore both modes through the existing durable local outbox, clear only the accepted draft/files, retain newer edits, and run automatic replay quietly. Tests exercise held responses, refusal, quota failure, reload and retry on desktop/mobile/WebKit. Two contract controls reproduce the old behavior on 091bc3a9. Historical causes are recorded in docs/incidents/2026-09-11-offline-sync.md.
@@ -1887,7 +1914,8 @@ SEVERITY: blocks
 STATUS: open
 DATE: 2026-09-11
 SESSION: codex-server-sync
-CARD: AMUX-4417
+CARD: AF-825
+ORIGINAL_CARD: AMUX-4417
 SYMPTOM: Fresh Gemini CLI 0.58 authenticated and displayed an empty composer, but /api/debug/steering held its first task at not-at-turn-boundary. Workers displayed idle. The captured-frame regression returns empty status rather than idle; the thin-rule input box is also unknown to the delivery verifier.
 COST: The new worker's lifecycle acceptance could not begin for more than ten minutes; no deliverables were produced.
 FIX: Recognize Gemini's provider-owned footer and current input box, preserve active/picker/pending-input controls, and emit idle_display_without_delivery_boundary when the display and delivery disagree. Rerun the live provider suite before closing.
@@ -1898,7 +1926,8 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-09-11
 SESSION: codex-server-sync
-CARD: AMUX-4417
+CARD: AF-826
+ORIGINAL_CARD: AMUX-4417
 SYMPTOM: Gemini's same-group run completed implementation, review and handoff but kept creating review/capture tasks after completion receipts. The server appended its default "Notify the requesting worker" instruction to the callback already addressed to that requester.
 COST: Repeated reviews, acknowledgement messages and capture cleanup consumed turns while the complete-board acceptance remained red.
 FIX: The automatic callback is the notification. Do not add another notify instruction; suppress the old generated instruction on existing rows, preserve explicit custom callbacks, and identify receipts that need no acknowledgement. callback_echo_instruction_suppressed logs legacy rows. The regression inspects the real durable callback queue. Live loop reduction is not yet claimed.
@@ -1909,7 +1938,8 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-09-11
 SESSION: codex-server-sync
-CARD: AMUX-4417
+CARD: AF-827
+ORIGINAL_CARD: AMUX-4417
 SYMPTOM: The consolidated mobile regression failed on desktop and mobile Chromium: a removed attachment returned after immediate reload. The chip vanished before its asynchronous IndexedDB deletion committed.
 COST: Cancelled files could be unintentionally reattached. Two of 33 mobile/offline checks failed; the 256 MiB interrupted upload and checksum checks passed.
 FIX: Save a per-attachment cancellation intent before removing the chip; suppress restoration and recover deletion after reload. Keep the attachment when saving cancellation fails. upload-storage reports cancellation-intent and recovery failures. The regression holds deletion forever before reloading and checks actual stored bytes are then removed.
@@ -1920,7 +1950,8 @@ SEVERITY: blocks
 STATUS: open
 DATE: 2026-09-11
 SESSION: codex-server-sync
-CARD: AMUX-4417
+CARD: AF-828
+ORIGINAL_CARD: AMUX-4417
 SYMPTOM: The real Gemini pair finished the review/revision cycle and its tasks, but terminal search for REVIEW_APPROVED with the Workers filter returned zero. Messages history contained the confirmed receipt. The renderer only recognized Claude/Codex prompt glyphs, while Gemini echoes input with >.
 COST: The live pair case failed after 9.9 minutes; three dependent upload/cross-group/queue cases could not run.
 FIX: Recognize Gemini input glyphs only for Gemini workers, preserve multiline provenance and exclude the actual input placeholder. The regression uses the real terminal filter/search buttons and verifies non-Gemini > lines remain unclassified. Navigation diagnostics now include provider beside considered prompts and match results.
@@ -1931,7 +1962,8 @@ SEVERITY: blocks
 STATUS: open
 DATE: 2026-09-11
 SESSION: codex-server-sync
-CARD: AMUX-4417
+CARD: AF-829
+ORIGINAL_CARD: AMUX-4417
 SYMPTOM: Seven studio-plg composer failures on Safari 0.9.900 reported only unconfirmed. The live Safari WebApp localStorage held 5,193,082 bytes, chiefly command history and reproducible board/schedule/HTML caches; its outbox was empty. The client attempted the failed local write twice and replaced the specific quota error with a terminal-confirmation message.
 COST: Messages could fail before reaching the server despite a healthy connection. A real WebKit quota reproduction against pre-fix source returned failed instead of queued.
 FIX: User-intent writes reclaim only reproducible HTML/board/schedule caches and retry the same atomic write, preserving other drafts, operations, attachment journals and the offline worker list. Local refusal returns once with its storage reason; outbox-storage logs measured byte counts, browser capabilities and the failure category without content. Quiet background replay no longer announces queued-operation completion. The original seven failures lacked a reason field, so their exact exception cannot be recovered retrospectively; quota is reproduced against the observed storage condition.
@@ -1942,7 +1974,8 @@ SEVERITY: blocks
 STATUS: open
 DATE: 2026-09-11
 SESSION: codex-server-sync
-CARD: AMUX-4417
+CARD: AF-830
+ORIGINAL_CARD: AMUX-4417
 SYMPTOM: Production watchdog logs explicitly issued kickstart -k at 13:16:19 and 13:29:32 on September 11 after three health responses with measured:false / probe_deadline_exceeded. launchd recorded SIGTERM, not an application crash. The 250 ms health deadline detached its ongoing writer/read probe but discarded its later success, so each slow sample could imply a hung store despite intervening progress.
 COST: The monitor itself disconnected clients and restarted the server; both restarts were followed by more slow probes rather than durable recovery.
 FIX: Retain monotonic completion and in-flight ages for real probes after HTTP timeout. Readiness remains unmeasured/503; the watchdog defers a restart only with recent successful progress or bounded initial work. Real writer failures, pool exhaustion, absent listeners and stale progress retain recovery. slow_probe_completed and watchdog restart-deferred logs expose the decision. Rust exercises a blocked writer twice and requires the detached first probe's receipt during the second timeout; Python tests cover actual HTTP 503 classification and both restart/no-restart loop controls.
@@ -1953,7 +1986,8 @@ SEVERITY: blocks
 STATUS: open
 DATE: 2026-09-11
 SESSION: codex-server-sync
-CARD: AMUX-4417
+CARD: AF-831
+ORIGINAL_CARD: AMUX-4417
 SYMPTOM: The real Gemini upload acceptance run clicked New conversation and received a successful config response, but the native terminal exited with Invalid session identifier. The handler cleared only the Claude conversation key, and Gemini/Codex launch paths ignored skip_conv_id, so the supposedly fresh launch still used --resume.
 COST: Upload acceptance could not start; the worker remained at a shell while the UI reported a reset.
 FIX: Fresh resets clear all provider resume keys and both hookless launch paths respect the fresh flag. New Gemini identities are UUIDs with random leading bytes, matching the CLI's documented --session-id contract and avoiding time-derived filename prefixes. conversation_recycled now logs provider identity. Tests exercise the config handler and a stale Gemini identity followed by fresh launch and exact subsequent resume.
@@ -1964,7 +1998,8 @@ SEVERITY: blocks
 STATUS: open
 DATE: 2026-09-11
 SESSION: codex-server-sync
-CARD: AMUX-4417
+CARD: AF-832
+ORIGINAL_CARD: AMUX-4417
 SYMPTOM: The real UI upload launched a fresh Gemini session, then its @uploaded-file prompt opened a native read approval outside the checkout. Amux's send verifier returned stuck. Gemini was launched with the log directory included but not the uploads directory.
 COST: The user-uploaded file could not reach a completed receipt task and the composer reported a send failure.
 FIX: Include the Amux uploads directory in the Gemini workspace, using its supported repeated --include-directories option. The real upload case must read the attached bytes, produce a matching JSON receipt, finish its board card and expose the delivered message and terminal on desktop and mobile.
@@ -1975,7 +2010,8 @@ SEVERITY: blocks
 STATUS: open
 DATE: 2026-09-11
 SESSION: codex-server-sync
-CARD: AMUX-4417
+CARD: AF-833
+ORIGINAL_CARD: AMUX-4417
 SYMPTOM: The real Gemini upload run received reset acceptance at 18:18:24Z, delivered its prompt at 18:18:26Z, and only launched the replacement process at 18:18:46Z. The test saw the previous terminal's banner while reset was still stopping that process.
 COST: A following send could appear accepted and then lose its native conversation when the asynchronous reset killed the old process.
 FIX: Acquire the existing per-lane send boundary before accepting a running reset and retain it through stop/start. Ordinary sends during that interval persist immediately into steering, with an acceptance receipt; interactive commands refuse without an effect. Holding the HTTP request itself through restart was disproven by a mobile timeout and pending duplicate receipt. Other lanes remain independent. conversation_restart_send_boundary and existing lane-send-serialised logs expose the ordering. The live upload scenario deliberately sends through the UI immediately after reset, then requires real attachment data and completed board evidence.
@@ -1986,7 +2022,8 @@ SEVERITY: blocks
 STATUS: open
 DATE: 2026-09-11
 SESSION: codex-server-sync
-CARD: AMUX-4417
+CARD: AF-834
+ORIGINAL_CARD: AMUX-4417
 SYMPTOM: Gemini recovered an auto-captured upload task through amux board show. The card preview ended at `row`, before `row_count` and the attachment path. The API already returned the full linked source message, but the Bash CLI dropped messages entirely. The worker searched logs and produced `rows` rather than the required `row_count`.
 COST: A completed receipt had the wrong schema despite the original request remaining in durable history; recovery spent tokens searching terminal logs for context the API already provided.
 FIX: Board show exposes linked message IDs and a supported --messages option for full assignments. Structured recovery explicitly reads that option for captured prompt previews, while ordinary board reads remain compact. A fake-transport regression uses the real CLI with a requirement beyond the 300-character preview and requires it only on the explicit full-message read.
@@ -1998,7 +2035,8 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-09-11
 SESSION: codex-server-sync
-CARD: AMUX-4417
+CARD: AF-835
+ORIGINAL_CARD: AMUX-4417
 SYMPTOM: The real Gemini upload reached steering history with outcome sent, produced its correct file and completed LG1A-7, but the acceptance helper timed out waiting for cmd_history.delivered_at, which the steering drain does not stamp.
 COST: A delivered message was reported as undelivered, stopping the remaining acceptance cases.
 FIX: Expose the existing steering outcome and submission verdict, and the exact queue ID for restart acceptance. The observer checks this delivery instrument and excludes dead-letter rows despite their timestamps. The real handler regression covers confirmed, retried and discarded histories; existing steering-delivered logs remain the operational signal.
@@ -2010,7 +2048,8 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-09-11
 SESSION: codex-server-sync
-CARD: AMUX-4417
+CARD: AF-836
+ORIGINAL_CARD: AMUX-4417
 SYMPTOM: The real Gemini mobile upload screenshot showed direct? on MSG-80 although its API receipt recorded queued. Both the shared history cache mapping and _msgNorm discarded delivery metadata before the shared renderer read it.
 COST: New messages looked like legacy records, and failed submission indicators could disappear from all three message surfaces.
 FIX: Preserve recorded delivery, queue timestamps, wait duration and submission verdict through the shared normalizer, and use it for initial history loading too. A browser regression fetches controlled direct, queued and stuck API rows through the actual scoped loader, renders all three message surfaces and requires their real labels. The existing server delivery logs and exposed steering outcome remain the diagnostic signal.
@@ -2022,7 +2061,8 @@ SEVERITY: blocks
 STATUS: open
 DATE: 2026-09-11
 SESSION: codex-server-sync
-CARD: AMUX-4417
+CARD: AF-837
+ORIGINAL_CARD: AMUX-4417
 SYMPTOM: The user's 11:55:17 screenshot showed a homepage request in Claude's native queue while Messages said not yet delivered. Its exact MSG-55405 server record had direct/confirmed delivery at 11:55:12. Local pending state was tied to the entire POST response, including downstream board processing, instead of the durable acceptance already recorded.
 COST: The client contradicted the terminal and offered cancellation as if an already-attempted message could still be prevented from sending.
 FIX: Expose a read-only, non-cacheable receipt lookup scoped by session and msg_id. During an in-flight send, a bounded lookup can acknowledge the exact durable receipt without repeating delivery or cancelling the original handler's board work. Persist attempted state before transport, label uncertainty as Awaiting confirmation, and refuse local cancellation once attempted; legacy entries without attempt provenance are conservative. acceptance_receipt_read and outbox_acceptance_receipt expose reconciliation. Tests hold the original POST open, reject wrong-ID/unaccepted receipts, and check the real handler never reserves or sends on a lookup.
@@ -2034,7 +2074,8 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-09-11
 SESSION: codex-server-sync
-CARD: AMUX-4417
+CARD: AF-838
+ORIGINAL_CARD: AMUX-4417
 SYMPTOM: After confirming the stale queued banner was gone, the user reported a slight delay before input appeared in the terminal. A message appended during an in-flight replay missed its snapshot and inherited retry backoff. The deterministic counterexample selected an 8000 ms timer. The post-input UI also launched two full-history refreshes; five read-only production samples were approximately 128 KB each versus 5 KB for a live frame.
 COST: Rapid messages waited unnecessarily and mobile terminal updates transferred scrollback to display newly arrived input.
 FIX: Newly added, unattempted operations resume on the next tick after the active replay, retaining FIFO delivery and receipt checks. Replace overlapping full refreshes with one bounded live-frame loop: first tick at 40 ms, then 100 ms intervals for 1.5 seconds, with normal cadence afterward. Remember pending turn-end history refreshes. The executable latency regression and its attached dispatch/render measurements detect recurrence; disabling immediate continuation makes the counterexample fail.
@@ -2046,7 +2087,8 @@ SEVERITY: blocks
 STATUS: open
 DATE: 2026-09-11
 SESSION: codex-server-sync
-CARD: AMUX-4417
+CARD: AF-839
+ORIGINAL_CARD: AMUX-4417
 SYMPTOM: The rapid-send lifecycle case failed on desktop, mobile and iPhone WebKit: the first local send cleared, but the second distinct message remained in the composer after Send. _btnFire suppressed every activation within 350 ms instead of only the synthesized echo of one gesture.
 COST: A legitimate new message required another tap and made the local-first composer appear stuck.
 FIX: Reset per-button echo suppression on a new pointerdown/touchstart and allow distinct keyboard activation. Keep the same gesture's pointerup/touchend/click echoes deduplicated. The rapid-send UI case exercises two different messages and verifies two unique IDs, immediate continuation and terminal rendering; the event contract verifies duplicate echoes still fire once. Existing send-fire diagnostics retain the pre/post composer length and event sequence.
@@ -2058,7 +2100,8 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-09-11
 SESSION: codex-server-sync
-CARD: AMUX-4417
+CARD: AF-840
+ORIGINAL_CARD: AMUX-4417
 SYMPTOM: LC-SEMANTIC-INTAKE posted candidate tasks directly to /api/board. The canonical case also promised captured worker messages, but no executable scenario sent those messages through a composer and checked their surviving task links.
 COST: A direct-board semantic pass could be mistaken for proof that ordinary new messages avoid near-duplicate board tasks.
 FIX: Add LC-SEMANTIC-MESSAGES to live discovery: six composer messages must produce three tasks, four linked source messages on one survivor, measured append/update decisions and preserved requirements. Follow source links in desktop/mobile details. Record live prerequisites separately: the first attempt failed worker admission under host memory pressure before sending, so it is not a semantic pass. Preserve the dedicated run's health and trace evidence.
@@ -2069,7 +2112,8 @@ SEVERITY: annoys
 STATUS: fixed
 DATE: 2026-09-11
 SESSION: codex-server-sync
-CARD: AMUX-4417
+CARD: AF-841
+ORIGINAL_CARD: AMUX-4417
 SYMPTOM: The phone composer put the textarea, top-aligned more button and bottom-aligned Queue button on one row. Removing the corrected full-width rule reproduces a 204px input in a 363px row. The expanded test also found the attachment menu 16px above the viewport in landscape.
 COST: Another user screenshot and a failed landscape acceptance run before the clipping was corrected.
 FIX: This commit gives phones a full-width input and a separate aligned 44px toolbar, bounds the long draft and attachment menu, and adds inputW/actionDelta to the existing layout diagnostic. Source-built LC-COMPOSER-LAYOUT, LC-LATENCY and LC-RECEIPT: 9 passed across desktop, mobile and iPhone WebKit; 32 outbox contracts passed. The CSS negative control fails on input width (204.34375px versus at least 362px).
@@ -2080,7 +2124,9 @@ SEVERITY: slows
 STATUS: fixed
 DATE: 2026-09-11
 SESSION: codex
-CARD: AMUX-4420
+AUTHOR_PROVENANCE: Original label preserved; exact originating-session identity remains unconfirmed. First published in 217a57929afb3b57b70edf726504da8a6a19d6c4. Committer identity is not author validation.
+CARD: AF-842
+ORIGINAL_CARD: AMUX-4420
 SYMPTOM: Ethan's mixpeek-frustrations screenshot showed NEEDS INPUT over Claude's usage limit with automatic resumption at 6:10pm. Preview cancellation text overwrote the provider state; the sweep discarded this banner's reset clock. The wider audit found ready-composer events overwriting quota/error states and missing Starting/Error badges.
 COST: User had to inspect the terminal and report a question that did not exist; independent state projections disagreed.
 FIX: Current provider-footer classification, clock-preserving observation, typed state projection, idle-prompt event semantics, and explicit dashboard badges. Controlled provider/model and browser chaos regressions; diagnostic verdicts preview_quota_over_input, provider_auto_resume_quota, and ready_composer_idle.
@@ -2091,7 +2137,8 @@ SEVERITY: slows
 STATUS: fixed
 DATE: 2026-09-11
 SESSION: codex
-CARD: AMUX-4421
+CARD: AF-843
+ORIGINAL_CARD: AMUX-4421
 SYMPTOM: Ethan opened mixpeek-general and landed midway through old terminal output instead of at the latest output.
 COST: Each open required finding and scrolling to the worker's current output.
 FIX: Preserve bottom-follow intent through asynchronous history/live rendering and resizing, cancel it on deliberate reading/navigation, and flush buffered output on resume. Desktop/phone race tests and bottom-anchor-restored diagnostics.
@@ -2102,7 +2149,8 @@ SEVERITY: slows
 STATUS: fixed
 DATE: 2026-09-11
 SESSION: codex
-CARD: AMUX-4424
+CARD: AF-844
+ORIGINAL_CARD: AMUX-4424
 SYMPTOM: Ethan sent a message to amux from worker details, but an earlier partially typed copy remained in the worker card. The 250ms draft mirror lagged; exact-match acceptance left the partial copy alive, and lifecycle DOM harvesting could save it again. Fullscreen edits and separate browser contexts also missed draft synchronization.
 COST: User could mistake already-submitted text for unsent work and submit it twice.
 FIX: Immediate per-worker draft updates across card/details/fullscreen and same-origin tabs/grid; revision-bound acceptance preserves newer edits, lifecycle events never overwrite storage from stale DOM, and failed storage retains text with a visible warning. Server client-debug verdicts composer_locally_accepted and composer_draft_storage_failed. Regression reproduced on pre-fix source; desktop, phone and WebKit coverage alongside durable outbox tests.
@@ -2113,7 +2161,8 @@ SEVERITY: annoys
 STATUS: fixed
 DATE: 2026-09-11
 SESSION: codex-server-sync
-CARD: AMUX-4417
+CARD: AF-845
+ORIGINAL_CARD: AMUX-4417
 SYMPTOM: A blocked 409 board edit displayed as queued and promised to send on reconnect while offline. The regression reproduced that exact text before the fix.
 COST: The user could wait for an automatic retry that will never occur.
 FIX: This commit separates failed and pending counts in offline mode, preserves review/dismiss actions for failed-only queues, and adds LC-BLOCKED-OUTBOX across desktop/mobile/WebKit. The final focused run passed 9 cases including gate revisions and linked records; screenshots were opened.
@@ -2124,7 +2173,8 @@ SEVERITY: blocks
 STATUS: fixed
 DATE: 2026-09-11
 SESSION: codex-server-sync
-CARD: AMUX-4417
+CARD: AF-846
+ORIGINAL_CARD: AMUX-4417
 SYMPTOM: A stale failed-row action removed its operation by ID even after durable storage changed its state to pending. The regression lost the resumed entry before the fix.
 COST: Potential loss of a pending edit when two tabs act on the same outbox.
 FIX: This commit checks blocked state inside the shared storage lock, refreshes the UI and emits outbox_dismiss_ignored when the action is stale. The contract verifies pending work survives both individual and bulk failed-only dismissal. All 34 outbox contracts passed.
@@ -2136,10 +2186,255 @@ SEVERITY: annoys
 STATUS: fixed
 DATE: 2026-09-11
 SESSION: codex-server-sync
-CARD: AMUX-4417
+CARD: AF-847
+ORIGINAL_CARD: AMUX-4417
 SYMPTOM: After integrating the latest toolbar change, LC-COMPOSER-LAYOUT failed on all three projects: the 320px phone input shrank to 155px instead of its available 308px.
 COST: Long drafts become difficult to read beside More and Queue.
 FIX: Remove the conflicting ac-wrap flex override, retain compact chrome and aligned action controls, and preserve the full-width mobile writing row. Existing composer-layout diagnostics record inputW and actionDelta; the browser case checks short/long drafts, Send/Queue, narrow/landscape viewports and attachment-menu reachability.
+
+## Uncertain native submission was deleted and counted as synced
+AREA: browser
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: codex-server-sync
+CARD: AF-848
+ORIGINAL_CARD: AMUX-4417
+SYMPTOM: An uncertain 409 send response removed the durable message and marked its progress row done.
+COST: The only recoverable intent disappeared while the UI reported a success.
+FIX: Keep the original message ID, text and attachment references in a blocked outbox row; outbox_retry_failed reports the rejection. The new uncertain-submission contract rejects false checkmarks.
+
+## Steering preview depended on expiring in-memory text matches
+AREA: browser
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: codex-server-sync
+CARD: AF-849
+ORIGINAL_CARD: AMUX-4417
+SYMPTOM: Pending steering used a temporary map cleared by matching text or a two-minute expiry, while actual intent lived in durable storage.
+COST: A reload or delay could erase the preview; identical messages could be conflated.
+FIX: Render pending steering directly from durable outbox entries with stable IDs. Distinct identical requests survive reload and age. steering_accept_failed identifies acceptance failures.
+
+## Worker-card file picker was missing on touch screens
+AREA: browser
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: codex-server-sync
+CARD: AF-850
+ORIGINAL_CARD: AMUX-4417
+SYMPTOM: Details offered Attach file while the worker card relied on drag/drop.
+COST: Phone users could not select files from the worker-list composer.
+FIX: Add a 44px card file picker using the same durable upload pipeline. card_files_selected logs file counts; lifecycle covers real upload/download bytes and Send/Queue from both surfaces.
+
+## Mobile attachment menu overflowed after compact composer layout
+AREA: browser
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: codex-server-sync
+CARD: AF-851
+ORIGINAL_CARD: AMUX-4417
+SYMPTOM: At 320px and iPhone WebKit the attachment menu extended 10–16px beyond the screen edge.
+COST: All three layout runs failed their reachability check.
+FIX: Right-align the menu with its More control. Desktop, phone and WebKit layout checks now pass at narrow, landscape and keyboard heights; existing composer geometry diagnostics expose bounds.
+
+## Disabling browser idle expiry disabled hard and activity lifetimes
+AREA: browser
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: codex-server-sync
+CARD: AF-852
+ORIGINAL_CARD: AMUX-4417
+SYMPTOM: The reaper returned immediately when idle expiry was zero, skipping independently configured hard and activity TTLs.
+COST: Browsers could retain processes indefinitely despite configured age limits.
+FIX: Evaluate activity and hard expiry before the idle-only switch. Existing reaper warnings report the actual expiry arm. The real-stop contract exercises both lifetimes with idle expiry disabled; notices now name AMUX_BROWSER_IDLE_REAP_S correctly.
+
+## Automatic browser capture could raise a user window
+AREA: browser
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: codex-server-sync
+CARD: AF-853
+ORIGINAL_CARD: AMUX-4417
+SYMPTOM: Screenshot retry restored the browser and invoked bringToFront; omitted API headless settings also launched a visible window.
+COST: Background automation could interrupt the foreground application.
+FIX: Default API automation to headless and remove all screenshot focus recovery. capture_failed_without_focus logs a failed capture; explicit headed sign-in remains available. Real browser lifetime and foreground checks are tracked in LC-BROWSER-BACKGROUND.
+
+## Reconnect hid individual progress and failed-step evidence
+AREA: browser
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: codex-server-sync
+CARD: AF-854
+ORIGINAL_CARD: AMUX-4417
+SYMPTOM: Reconnect requested a quiet sync and failures immediately hid the step list.
+COST: Users could not follow which saved operations had succeeded.
+FIX: Reconnect shows per-operation progress, only acknowledged changes receive checkmarks, and failed steps remain reviewable. LC-SYNC-PROGRESS holds three real edits at successive boundaries, injects one conflict and verifies explicit recovery.
+
+## Composer cleared before durable local acceptance
+AREA: browser
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: codex-server-sync
+CARD: AF-855
+ORIGINAL_CARD: AMUX-4417
+SYMPTOM: The recent fire-and-forget path cleared the editor before local persistence and restored text later on refusal.
+COST: A failed local write or intervening edit could create misleading success feedback.
+FIX: Clear only after the fetch interceptor durably accepts the intent; delivery remains asynchronous. Existing composer_locally_accepted and composer_unconfirmed diagnostics identify the boundary. Newer text and files survive refusal.
+
+## Quoted Gemini picker blocked an idle worker's steering boundary
+AREA: steering
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: codex-server-sync
+CARD: AF-856
+ORIGINAL_CARD: AMUX-4417
+SYMPTOM: The existing current_questions_survive_but_quoted_questions_do_not replay failed: a quoted boxed Gemini selector above a newer empty Claude prompt classified the worker as waiting.
+COST: Automatic steering could refuse an idle boundary based on historical output.
+FIX: Keep Gemini's live picker-over-placeholder behavior but disregard a boxed selector preceding a newer bare prompt. stale_picker_ignored emits a debug verdict. The existing cross-provider replay is the pre-fix failure; native completion remains separately blocked by host admission.
+
+## Browser reaper reported disabled while its hard lifetime was running
+AREA: browser
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: codex-server-sync
+CARD: AF-857
+ORIGINAL_CARD: AMUX-4417
+SYMPTOM: The real browser-lifetime probe expired Chrome successfully, but its follow-up system-jobs assertion found no enabled reaper: setting one expiry arm to zero marked the entire job disabled.
+COST: Operators could not distinguish a disabled lifetime arm from a stopped cleanup loop.
+FIX: The catalog no longer treats arm-specific zero values as job-level disable switches. Actual per-job and global isolation still report disabled. LC-BROWSER-BACKGROUND requires an enabled reaper and disabled unrelated loops before launching, then observes real expiry; system-jobs exposes the corrected status and tick count.
+
+## Reconnect toasts covered the sync checkmarks on a phone
+AREA: browser
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: codex-server-sync
+CARD: AF-858
+ORIGINAL_CARD: AMUX-4417
+SYMPTOM: Visual review of the passing iPhone sync-progress screenshot showed the reconnect toast covering the failed operation's explanation in the bottom checklist.
+COST: The requested per-operation evidence was temporarily obscured exactly when it changed.
+FIX: Use the visible checklist as reconnect feedback when saved work exists, cancel the lingering queue toast animation and clear its visible state when it opens, and remove its redundant completion toast. Reconnect without queued work still has its usual toast. Existing sync-step status and outbox diagnostics identify acknowledgements and failures.
+
+## CLI launch negative control stopped reproducing its claimed fault
+AREA: testing
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: codex-server-sync
+CARD: AF-859
+ORIGINAL_CARD: AMUX-4417
+SYMPTOM: GitHub check 103564599963 passed workspace tests and clippy, then failed the CLI launch smoke: deleting the local AMUX_API declaration still launched successfully because the CLI now also initializes it globally.
+COST: The negative control no longer established an unset variable and kept the overall check red.
+FIX: In the isolated mutant only, replace that declaration with an explicit unset so both local and inherited initialization are absent at the real inject. The unmodified CLI must still launch; the mutant must fail with the real unbound-variable error. The smoke output names the forced-unset precondition and its pass/failure verdict.
+
+### 2026-09-12 — Busy composer falsely acknowledged; board recovery vetoed by current claims
+
+User: workers still fail to drain backlog/todo/done and queued steering is not picked up. Live debug measured an empty server steering queue, but this is not provider completion evidence. The submission loop explicitly returned Confirmed for StillThereGenerating, bypassing its own bare-Enter retry. Require composer release or fresh provider transcript/native enqueue evidence instead; log generating_composer_unsubmitted.
+
+Live board-drive showed mixpeek-cicd holding two Doing cards untouched 11–14 hours with 18 eligible todos. The current-generation exact-claim guard returned before the canonical stale-reclaim selector could execute. Permit that guarded recovery and the existing capture-shell WIP exemption; revalidate the reclaim on the serialized writer. Log stalled_claim_yields_to_canonical_pickup.
+
+Board reminders also discarded enqueue errors and stamped cooldowns anyway. All reminder paths now check queue acceptance before recording budgets; failures log board_nudge_enqueue_failed and retry next tick. Verification was globally throttled for 24 hours after each eight-card batch; finishing a batch now re-arms the next one, without repeating an unchanged batch. Log verify_batch_queued. Dedicated driver tests and a real tmux capture replay cover these boundaries; fresh model-worker admission remains a separate live prerequisite.
+
+### 2026-09-12 — Incoming mobile CSS guard inspected its comment instead of its rule
+
+Integrating 5eaf25e0 made dashboard_assets fail despite the fixed positioning declaration being present. The test read only 500 characters after a long rationale; the declaration was outside that window. Inspect the mobile selector's declaration block instead. This changes the test only; the visual fix and version remain intact.
+
+### 2026-09-12 — Cargo resource growth and cleanup could feed repeated rebuilds
+
+The two-invocation throttle did not bound compiler/test parallelism, RSS, elapsed runtime, or target growth. Full debug data and incremental artifacts repeatedly crossed the release builder's 10 GiB cleanup threshold; unchanged failing build inputs also retried every minute. The wrapper now defaults to two compiler/test threads, disables routine dev/test DWARF and incremental output, and supervises owned Cargo groups with measured RSS/time/disk ceilings. JSON cargo_budget_* records explain refusals, stops and unmeasured probes. Idle debug cleanup moves to 32 GiB; unchanged failures back off 15 minutes and changed build inputs retry immediately (cargo_build_backoff).
+
+The hourly stale-target sweep bypassed the shared Cargo guard with remove_dir_all, including for arbitrary old target names. Route every discovered target through that guard, preserving active leases and native lock files; cargo_reclaim_deferred identifies refusals. The consolidated lifecycle now exercises resource budgets, failed-build retries, active-target preservation and normal completion. Worker-created evidence folders and persistent profiles remain explicitly documented outside these cache quotas rather than being silently deleted.
+
+The final entry-point audit also found unbuilt-commits.sh --build invoking bare Cargo for each historical revision. It now resolves the current safe wrapper before entering an old worktree, so historical replay receives the same budgets and diagnostics.
+
+Make targets and the installer also invoked bare Cargo. They now use the same wrapper, with the installer's explicit target/jobs preserved. make run delegates to the committed signed atomic builder instead of overwriting the running binary from a checkout-local target. make dev bounds compilation and then runs the requested development server normally.
+
+
+## Hourly cleanup omitted diagnostic folders and could mistake a failed reference query for no references
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: codex-server-sync
+CARD: AF-860
+ORIGINAL_CARD: none — continuation of the user's isolated housekeeping request
+SYMPTOM: Worker-created log folders had no retention (one measured 3.6 GiB); expired transcript cache entries accumulated by worker name. Storage diagnostics counted 29 deleted rotated logs while the system-job summary said zero files and zero bytes.
+COST: Unbounded diagnostic output and misleading cleanup outcomes; an unavailable reference query also permitted deletion of aged uploads.
+FIX: Hourly guarded diagnostic retention, descendant recency/open-file/reference checks, bounded probes, fail-closed upload references covering messages and artifacts, and transcript cache expiry. storage diagnostics expose measured/deferred outcomes and actual deletion totals; diagnostic directory retention deferred, upload retention deferred and transcript evidence cache expired announce the affected paths. Consolidated lifecycle fixtures test deletion and preservation, including a real storage tick with an unavailable reference table.
+
+The old upload reference regex also truncated valid filenames containing spaces or Unicode. Match decoded references against actual filenames; the regression fixture keeps two such linked files and deletes an unrelated aged upload.
+
+The live-data probe also found ordinary text mentioning “logs” would consume the reference snapshot budget (over 18 MiB in board text before filtering). Filter on normalized path separators in SQL, so plain prose cannot prevent cleanup. A large-prose control accompanies the missing/oversized-reference tests.
+
+
+## Diagnostic-folder cleanup deferred because launchd could not locate lsof
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: codex-server-sync
+CARD: AF-861
+ORIGINAL_CARD: none — live deployment verification for the user's housekeeping request
+SYMPTOM: The first deployed sweep reported unmeasured run/evidence/audit directory cleanup with ENOENT. The service PATH omitted /usr/sbin, although lsof was available from an interactive shell.
+COST: Directory cleanup deferred; 14 old log files were removed and five linked uploads were protected, but no diagnostic folders were examined.
+FIX: Resolve macOS's /usr/sbin/lsof explicitly and include the executable in spawn-failure diagnostics. A native test restricts PATH to /usr/bin:/bin and checks that the probe observes a real held file; reverting to bare lsof must fail that test.
+
+## Isolated worker peer boundary could be bypassed through Queue
+AREA: workers
+SEVERITY: breaks
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: codex-server-sync
+CARD: AF-862
+ORIGINAL_CARD: none — user requested isolated-worker consolidated lifecycle coverage
+SYMPTOM: The expanded LC-ISOLATED-BOUNDARY browser case received HTTP 200 from a same-group peer's POST /steer, although the identical peer's POST /send correctly returned 403 for the isolated target.
+COST: Peer messages could enter a raw worker through the steering queue, violating the same isolation boundary enforced on Send.
+FIX: Share an early isolated-peer refusal across direct and queued sends before dedupe/history/queue mutation. Preserve owner and authenticated member access; an explicit peer allowance cannot bypass isolation. Each refusal emits send.isolated_refused and a WARN with verdict=isolated_target. Rust controls verify no rejected message/history rows and exactly one owner queue/history row across retries; lifecycle browsers cover same/outside groups, UI toggles, reloads and cached discovery.
+
+## Cached board cards could not be edited offline, and retries covered Save
+AREA: board
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: codex-server-sync
+CARD: AF-863
+ORIGINAL_CARD: none — run-owned offline lifecycle fixture cards are deleted after verification
+SYMPTOM: A real network-off browser run retained only two message operations out of five expected writes: the three cached card edits failed the hydration guard. After enabling complete offline snapshots, automatic retry failures painted the sync banner over the third card's Save button while the browser was still explicitly offline.
+COST: The earlier 90-case outage/upload/checklist suite passed while the cold offline UI journey failed; task edits were not enqueued and a visible failure panel blocked further editing.
+FIX: Persist complete authoritative task snapshots in the existing IDB mirror and hydrate offline with identity/revision guards. Refuse incomplete snapshots and explicit HTTP refusals. Avoid replay while navigator.onLine is false, then resume through the real online event. File uploads now share the per-operation acknowledgement checklist and retry scheduling. Cache failures emit card-cache-write-failed; offline hydration names its verdict, and unconfirmed file replay emits upload-storage sync-unconfirmed.
+
+## Retrying sync erased file checkmarks that had already been acknowledged
+AREA: notices
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: codex-server-sync
+CARD: AF-864
+ORIGINAL_CARD: none — consolidated offline lifecycle acceptance
+SYMPTOM: The cold offline run restored seven operations. Two files finished while earlier network failures retried; the next checklist showed only five synced, despite all seven operations reaching their destination. A startup history migration could add a separate import operation to that list.
+COST: The final checklist did not account for every queued action. Terminal/history diagnostics also reported duplicate-history text when optimistic local message history was imported ahead of queued messages.
+FIX: Retain acknowledged rows across visible retries using stable operation keys. Removed operations are skipped without an acknowledgement checkmark. Background history imports bypass the user outbox, require an actual successful response, and defer while messages remain pending. LC-OFFLINE-ROUNDTRIP verifies every stable key and server result; negative controls fail if completed-row retention or acknowledgement guards are removed.
+
+## Completed mobile sync still showed a stale offline toast over its checkmarks
+AREA: notices
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: codex-server-sync
+CARD: AF-865
+ORIGINAL_CARD: none — visual review of the consolidated offline lifecycle
+SYMPTOM: All 138 browser assertions passed, but the captured desktop/mobile/WebKit screenshots showed “Server unreachable — offline mode” covering rows below “7 synced” while the header showed Live.
+COST: Successful server acknowledgements appeared contradictory and the phone's last two checkmarks were obscured.
+FIX: Clear only obsolete connectivity/queue toasts and their active animations when the checklist opens and completes successfully; preserve unrelated failure notices. The real offline lifecycle now asserts the toast is hidden before capturing every acknowledged row, and a shipped-function test preserves a separate upload failure notice.
 
 ## A delivered mobile message stays failed, and its local copy appears beside its server copy
 AREA: browser
@@ -2152,13 +2447,590 @@ SYMPTOM: Owner screenshots show messages received in this conversation remaining
 COST: Repeated manual Retry, duplicate-looking rows, and a false failed-operation banner on the phone.
 FIX: In progress: retain unknown acceptance and retry bounded receipt reads, use the correct steering namespace, and join display rows by transport identity. AF-736 tracks the duplicate representation; simulator verification remains outstanding.
 
-## Safari Simulator acknowledges pointer input without applying the requested click
+## Loaded mobile header hid controls and its compact label escaped its button
+AREA: browser
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-731
+SYMPTOM: The owner could not reach Settings beside the fleet's connection and limit labels. A first compact draft passed outer-button bounds but native Safari placed the red limited count beneath the next button.
+COST: Unreachable mobile controls and an extra native verification/correction cycle after desktop geometry passed.
+FIX: This candidate uses compact labels with full 44-point targets, a real count element, and measured mobile-header-clipped beacons for both control bounds and label containment. Phone-width tests and a visually inspected real iOS 26.5 screenshot cover a loaded 52-worker fleet with 18 limited; all eight targets are unobstructed. Deployment remains separate.
+
+## Archive reason persisted but CLI reported it ignored
+AREA: board
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-729
+SYMPTOM: An isolated archive command exited 6 and warned archive_outcome was ignored, while readback showed archived=1 and the exact reason in the attributed log. The protocol consumed the key but omitted it from PATCH_CONTROL, contradicting its own successful write.
+COST: The owner repeated a reason that was already saved because the acknowledgement claimed it was lost.
+FIX: Register archive_outcome as a protocol key carrying log content. Refused transitions report it among discarded fields; invalid or non-applying outcome requests are explicitly refused instead of silently accepted. Structured patch_fields_ignored and archive_outcome_refused warnings name the affected card and measured population without logging supplied content. The acknowledgement regression failed first; isolated CLI reproduction and focused archive tests record the before/after evidence.
+
+## Unreadable board acknowledgements falsely said writes were not recorded
+AREA: cli
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-657
+SYMPTOM: A loopback HTTP fixture returned non-JSON after accepting evidence/outcome writes. The CLI printed NOT recorded, continued to the status PATCH, and printed raw HTML for its unreadable response. Exit 1 prevented a success claim but did not tell the caller which writes were unknown; a mixed success could still invite repeating an already-applied append.
+COST: The caller must rediscover whether prose and status landed independently before safely retrying.
+FIX: Shared acknowledgement validation rejects malformed or non-object JSON, stops before a dependent status transition, and explicitly says the write outcome is unknown. It retains a measured board_ack_unknown event in the existing durable CLI diagnostic spool, delivered on the next invocation. Five real-CLI tests deliberately apply writes before corrupting replies, cover each stage plus success/refusal controls, and verify spool delivery; four failed before the fix and all five pass after. Existing transport checks also pass (11/11).
+
+## Codex Terminal showed only Working while its saved conversation still existed
+AREA: browser
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-740
+SYMPTOM: Mobile screenshot MSG-58672 showed the Codex Working/input footer and empty space. The structured transcript endpoint resolved 92 events, but Terminal discarded history for non-Claude alternate screens and depended on raw tmux paint otherwise. Load earlier output also bypassed the structured Codex reader. An isolated pre-fix API probe returned history absent/0 characters for a pinned, existing rollout.
+COST: User reported missing logs and could not inspect earlier work from Terminal; diagnosis required tracing two provider-specific paths despite the saved conversation already being readable elsewhere.
+FIX: AF-740 routes Codex/Ollama full peek and paginated earlier history through the existing provider projection, preserves independent tool results across byte cursors, keeps live polls separate, and emits measured peek_history_loaded/peek_history_unavailable signals. Native audit also found array-shaped input_text tool results were silently ignored by the shared Codex projection; those now decode alongside strings/objects, exclude image payloads, and are counted as tool_output_arrays in page logs. The terminal contract tests now initiate real wheel/touch intent before positioning earlier text: direct scrollTop assignments had left follow-bottom enabled and produced six false user-scroll failures across three engines, while native touch scrolling passed. Candidate is tested in scratch/frustrations-integration; production deployment remains pending.
+
+## Archive reason validation rejected a flag the archive operation accepted
+AREA: board
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-729
+SYMPTOM: Broad integration validation after AF-740 caught patch_archived_round_trip_with_cross_lane_guard failing at board_api.rs:703: archived="true" plus archive_outcome returned 400. AF-729's new reason validator recognized only JSON true/1, while the existing archive mutation also accepted normalized strings 1/true/yes/on.
+COST: One real compatibility regression escaped the earlier focused archive tests and prevented a clean integration gate; the existing cross-lane archive regression caught it.
+FIX: Share one patch_archived_value coercion between validation and mutation, preserve authorization and exact attributed reasons, and cover accepted/rejected flag forms. The existing archive_outcome_refused WARN continues to identify rejected fields without a silent write. Corrected code is on the isolated integration branch; production adoption is still pending.
+
+## Safari consumes the first tap on a board column card
+AREA: browser
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-741
+SYMPTOM: Native iOS 26.5 Safari emitted touchstart/touchend/mouseover/mousemove on a column card but no click; the first tap revealed the previously transparent Pin button. Only the second tap opened the card. List rows opened on the first tap, so viewport-only checks missed the failure.
+COST: Mobile board audit required three native reproductions to separate an incorrectly located test swipe from the real two-tap card defect. Users must tap a card twice to view it.
+FIX: Limit card hover reveals to hover-capable pointers and keep touch Pin controls visible. A passive stationary-touch observer emits measured board_tap_unopened when a card tap never becomes a click, excluding scrolling and child controls. scripts/test-ios-board.mjs uses real isolated board records and native Simulator inputs; all six journeys pass after the fix. Candidate only; deployment pending.
+
+## The bottom-follow threshold traps small upward log gestures
 AREA: browser
 SEVERITY: blocks
 STATUS: open
 DATE: 2026-09-12
 SESSION: amux-frustrations
-CARD: AF-732
-SYMPTOM: Safari WebDriver on local iOS 26.5 returns success for element clicks and pointer actions while a form remains unfocused; send-keys similarly succeeds without changing the field. Native screenshots include insets absent from DOM coordinates.
-COST: Simulator end-to-end interaction tests fail despite successful API replies; repeated compile/test cycles delayed usable browser integration.
-FIX: In progress: test native XCTest input through Appium, require observed effects in the harness, and preserve input-method and failure diagnostics instead of claiming successful native input from transport status.
+CARD: AF-742
+SYMPTOM: User reported being unable to scroll up after reaching log bottom. Native iOS 26.5 Safari reproduced it: -25pt gesture left gap=0/following=true, whereas -350pt escaped. The scroll event and live-frame renderer independently treated being within 40px of the bottom as permission to resume following, undoing the first small upward movement.
+COST: Earlier logs became unreachable with small gestures, and a correction to only the scroll handler still snapped the reader back when a live frame arrived; the new three-engine regression caught that second path.
+FIX: Track scroll direction, resume only on downward movement to the actual end, and make live refresh honor the explicit follow state. Emit measured bottom-follow-paused / reader_scrolling with input kind and bottom gap. New five-pixel regression fails before and passes after, including live-frame position retention and deliberate return to bottom. Native small/large gestures both pass with changed live frames, and the full terminal browser matrix passes 72 tests. Candidate only; production deployment pending.
+
+## Empty mobile composer clips its own working-state placeholder
+AREA: browser
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-743
+SYMPTOM: MSG-58894 circles a mobile textarea whose working-state placeholder wraps to three lines and clips below its border. The user explicitly requires input/More/Send on one row; repeating the Working status and drop-file hint consumes the remaining writing width. Reproduced in the native Simulator log audit and a 375px active/idle browser regression.
+COST: The empty field looks broken and obscures where to type; the user reported another screenshot despite the one-row layout already being implemented.
+FIX: Use Message… with an accessible recipient label, preserving the one-row layout, drafts and send behavior. Existing keyboard-down/up geometry beacons now measure placeholder width against the actual text area and emit composer_placeholder_clipped or composer_readable. New test fails in all three engines before and passes after; native keyboard-open controls, More/mode taps and exact draft retention pass. Owner has authorized deployment; live verification follows clean integration gates.
+
+## Helper quota errors were accepted as classifier answers
+AREA: board
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: codex-server-sync
+CARD: AF-866
+ORIGINAL_CARD: AMUX-4417
+SYMPTOM: The subprocess regression returned Ok("session limit reached") after the helper exited 7. The same path accepted JSON-shaped stdout from a failed process, so failed model work could be parsed as a measured intake decision.
+COST: Semantic intake failure/recovery could not be certified; quota diagnostics were misreported as invalid classifier JSON and unavailable comparison preserved extra records.
+FIX: Honor process exit status before accepting stdout, retain at most 400 diagnostic characters, log distinct helper_exit_failed/helper_timeout/helper_empty_output verdicts, and reap killed children. The real-child regression matrix and before/final results are recorded in docs/lifecycle-helper-validation-2026-09-12.md. This does not claim that provider quota or native admission has recovered.
+
+## Cargo rebuilds unchanged detached worktrees
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: codex-server-sync
+CARD: AF-867
+ORIGINAL_CARD: AMUX-4417
+SYMPTOM: Consecutive helper/intake checks rebuilt amux-server for about 75 seconds each despite identical crate bytes. The tiny real Cargo regression confirmed that an unchanged detached-worktree build reported fresh=false because build.rs watched nonexistent .git/HEAD and .git/refs/heads/main paths.
+COST: Repeated full server compilation during verification, with avoidable CPU and memory pressure on a host already denying new workers.
+FIX: Resolve Git metadata using git rev-parse --git-path; watch the current HEAD and branch, including packed-ref transitions. The lifecycle resource case now runs a tiny real Cargo fixture proving cached repeats and correct identities after commit/branch changes. Restoring the broken HEAD watch makes the fixture fail.
+
+## A browser schema test reached the live browser with an upload fixture
+AREA: gates
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-868
+ORIGINAL_CARD: AF-745
+SYMPTOM: The clean deployment suite's valid-files control called the action API and assumed any 400 was a schema failure. With Chrome running it reached the real page and returned no element matches #f; a matching input could have received the fixture.
+COST: Deployment held while reproducing and separating schema validation from browser I/O.
+FIX: The handler and positive control share a browser-independent validator; malformed API controls still prove validation ordering. Rejections emit browser_files_schema_rejected with measured/count fields. Negative evidence: scratch/ios-simulator-review/deploy-browser-schema-probe.log.
+
+## A late request success cleared the phone's offline state
+AREA: browser
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-869
+ORIGINAL_CARD: AF-745
+SYMPTOM: The browser lifecycle regression intermittently displayed 1 sending while the browser network was explicitly offline. setOnline(true) from a previously started read could overwrite the newer offline event.
+COST: Two additional browser matrix failures delayed deployment and exposed misleading queue feedback.
+FIX: setOnline refuses a positive transition while navigator.onLine is false and emits connectivity_stale_success / offline_preserved. The lifecycle test deliberately injects the late success and checks offline feedback plus subsequent reconnection.
+
+## New Brex scaffolding failed the full-suite dead-public-API gate
+AREA: gates
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-870
+ORIGINAL_CARD: AF-745
+SYMPTOM: Upstream f834583e introduced is_freeze and unfreeze_card without any caller. Workspace Clippy passed; no_new_unreferenced_pub_fn_in_amux_server named both as failures on the clean deployment snapshot.
+COST: Deployment held for a full-suite failure invisible to the language lint gate.
+FIX: Removed the two unconnected methods; the existing dead_pub_api gate remains the log signal for recurrence. No wired Brex behavior changes.
+
+## The mounted Brex API was absent from the route boundary registry
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-871
+ORIGINAL_CARD: AF-745
+SYMPTOM: Upstream f834583e mounted /api/brex but omitted NATIVE_FAMILIES and its three ROUTE_TABLE paths; the clean proxy_composition test named the unclaimed route family.
+COST: Another full-suite failure after the standalone Clippy gate passed.
+FIX: Register the mounted native family and all three paths so the diagnostic endpoints, composition guard and route census describe the actual router. The failing test is the standing regression signal.
+
+## CI kept failing because the debris test opted out of the harness guard
+AREA: gates
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-872
+ORIGINAL_CARD: AMUX-4460
+SYMPTOM: checks failed repeatedly through upstream f834583e: test-reap-amux-debris.sh lacked set -e. Its comment claimed exclusion from the guard, but the actual classifier still included it. A helper existence check did not make setup/helper execution failures abort.
+COST: Multiple main-branch CI failures and another deployment gate correction.
+FIX: Enable errexit for setup/helper failures while check() continues to accumulate assertion failures. Compare all eight fixture checks before and after; test-harness-guard is the standing log signal. Prior CI evidence: run 34721443418.
+
+## New native and portable regression harnesses had no CI disposition
+AREA: gates
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-873
+ORIGINAL_CARD: AMUX-4460
+SYMPTOM: After fixing the earlier checks failure, pushed 638b7203 reached the next guard and reported five newly unwired harnesses: board acknowledgement, Cargo provenance, two native Simulator scripts, and Tailscale owner bootstrap.
+COST: One additional failed main CI run (34723123687) despite the individual regression probes passing locally.
+FIX: Invoke portable acknowledgement and Cargo provenance tests in checks.yml; record explicit local device/daemon prerequisites and commands for the three native acceptance harnesses. The existing harness-wired guard continues to report the full population and any new omission.
+
+## Native keyboard dismissal stalled on the deployed worker's large history
+AREA: browser
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-874
+ORIGINAL_CARD: AF-745
+SYMPTOM: Native Safari keyboard/menu acceptance passed on small fixtures, but the real working-worker log hit a 70-second dismissal/restoration failure. The last context error masked the original dismissal failure. The toolbar lookup used XPath, whose driver path serializes the complete accessibility tree.
+COST: Live deployment verification stopped; roughly 15 minutes reproducing against real data and distinguishing a retained-keyboard test setup error from the driver failure.
+FIX: Use a native class-chain query scoped to Safari's toolbar Done control, keep ambiguity/visibility checks, preserve the original failure when context restoration also fails, and emit webdriver_transport_failed with operation, deadline, timeout and measured/count fields. Native live board taps now complete through the replacement query. The real Safari keyboard/menu rerun against production page data passed (1 passed, 0 failed), preserved the unsent draft, and its screenshots were inspected. The four-case refusal/dismissal/context-restoration regression passed; final deployment evidence is tracked on AF-745.
+
+## Memory pressure ranking hides the largest compressed consumers
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: codex-server-sync
+CARD: AF-875
+ORIGINAL_CARD: AMUX-4417
+SYMPTOM: mac-health ranks only RSS. Procwarden's Python process reports about 70 MiB resident while macOS counts 24 GiB including compressed memory; Activity Monitor holds 12 GiB and fseventsd 54 GiB. Native lifecycle admission remains denied.
+COST: Repeated lifecycle preflights cannot start, while the cleanup log names the wrong largest consumers.
+FIX: Use bounded macOS MEM/CMPRS measurements with process IDs, explicit metric and failed-probe visibility; keep foreign application recovery under user control.
+
+## Header notification badge intrudes into the adjacent status control
+AREA: browser
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-750
+SYMPTOM: Owner desktop/mobile screenshots showed an overflowing notification badge beside an oversized red status panel and mixed emoji controls. The header diagnostic ignored desktop widths entirely.
+COST: The owner requested repeated desktop/mobile visual corrections; fitting the overall header width had not ensured clean individual control boundaries.
+FIX: AF-750 / AF-751, dashboard 0.9.930: contain the badge, use consistent line icons and lighter status controls, align desktop actions, preserve 44px mobile targets and fit the four primary mobile navigation labels. The existing mobile-header-clipped beacon now measures both desktop and mobile, includes the actual visible control count and detects escaping badges. A deliberate desktop badge overflow requires the real diagnostic request in the regression test.
+
+## An own mtime observation can become "your edit record" in the commit nudge
+AREA: attribution
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-876
+ORIGINAL_CARD: AF-746
+SYMPTOM: mixpeek-frustrations reported six studio paths labeled as carrying its edit record despite zero worktree edits. The current local observation store contains none of those historical studio records, so that incident's exact provenance is unconfirmed. Source inspection independently found apply_observed promoting requester-only mtimes into GuardInputs.mine when peers are visible and have no recorded claim. The nudge interprets omission from foreign/unclaimed as authorship. Its decoder also reads the boolean undecided field as an array and cannot detect paths omitted by the guard's cap.
+COST: The reporter declined every remedy to avoid sweeping another lane's work. This investigation required separate guard-to-nudge boundary reproductions because the existing peer-observation regressions did not cover self-attribution. No foreign worktree changes or reported sweep occurred.
+FIX: Keep observation-only paths unclaimed and committable under the existing visible-cotenant policy; preserve real writer/blind protection. Require a complete, decided guard population before the nudge derives ownership. Retain measured diagnostics and tests at the real consumer boundary. Historical six-path provenance remains unconfirmed until its original verdict is available.
+
+## A refused pathspec commit leaves the recommended ownership check looking empty
+AREA: gates
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-877
+ORIGINAL_CARD: AF-746
+SYMPTOM: ts-gke reported overriding the ownership guard after an empty git diff --cached on a path that was not staged in the ordinary index. A real disposable Git reproduction confirms that git commit <path> gives the hook a temporary index and discards it on refusal. The emitted cached-diff hint then produces the same empty output for a legitimate append and a peer-style full rewrite. The report's eventual 66-line append was correct, but this check could not distinguish it.
+COST: One reported override used an unmeasured comparison; no incorrect commit was reported. Reproducing both append and rewrite through the actual hook required a separate fixture because ordinary staged-hook tests retained the index and missed the timing gap.
+FIX: Explain temporary-index lifetime in both the server refusal and installed hook. For pathspec retries compare the working tree against HEAD, the actual commit baseline; for staged commits first stage intended changes and inspect the cached diff. Require expected path/hunks and successful comparison; empty output, missing HEAD and errors are not ownership verification. Log measured review-required populations without claiming the user performed a review.
+
+
+## Working iOS routes are absent from the diagnostic catalog
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-878
+ORIGINAL_CARD: AMUX-4469
+SYMPTOM: During AF-748 board verification, /api/browser/ios/targets returned measured:true n_considered:10 while /api/debug/routes listed zero simulator routes. The fresh route.callers_have_routes results failed for the iOS prefix and targets. The coverage test followed api/mod.rs into browser.rs but never its nested browser/ios.rs; the extended test failed on all ten omitted paths before the catalog fix.
+COST: Two recurring automatic reports (AMUX-4468/4469) required another investigation; the diagnostic catalog could misclassify simulator request failures as missing routes.
+FIX: Add all ten real paths with their actual verbs and descend into nested router modules in the completeness test. Require a positive nested-route canary; verify the live catalog and invariant after deployment. Existing invariant incident warnings and normalized request-log verdicts carry the operational signal. Independent review remains pending.
+
+## A latency fixture changes the scan limit for sibling tests
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-879
+ORIGINAL_CARD: AF-397
+SYMPTOM: The scan-cap test sets process-wide AMUX_LATENCY_SCAN_CAP=200 while other tests use the same environment. A clean0c79fc53 rollup test given that value reproduces the reported empty findings: expected1, got0. Only20 baseline rows survive, below the detector's per-family minimum. An earlier separate window override was removed, but this fixture still changed global state.
+COST: Historical CI failures were charged to unrelated pushes; this audit needed a clean controlled reproduction and a scoped134-test run before the old flaky-test card could be assessed honestly.
+FIX: Pass the fixture's scan cap directly to the shared detector implementation, snapshot the production limit once, and include scan_cap with the considered/excluded population in the INFO log. Awaiting commit, clean gates and independent review.
+
+## Manual board claims still count a capture that automatic pickup exempts
+AREA: board
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-880
+ORIGINAL_CARD: AMUX-3757
+SYMPTOM: Current-source audit of the reopened manual-claim report found PATCH and the ready frontier still count an unanswered capture in Doing, while automatic pickup and status-update claims exempt it. Two isolated API regressions on bc0003b8 failed: PATCH refused with WC-1 as its sole holder, and the frontier advertised zero capacity for the ready real task. This is the manual-path recurrence, distinct from the old automatic-pickup entry retained in the archive.
+COST: The reopened card remained actionable despite its earlier fix and archive; the audit required two failing API specimens and inspection of five independently maintained holder queries before the mismatch was bounded.
+FIX: Share the canonical WIP-holder predicate across all five consumers, retain reshaped work as WIP, and emit measured capture-exemption and failed-query signals. Draft regressions pass; publication, independent review and live adoption remain to be recorded on the card.
+
+
+## Cancelling semantic intake leaves an already recorded owner message without a card
+AREA: board
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-881
+ORIGINAL_CARD: AMUX-4486
+SYMPTOM: A test holding the real intake lane lock observes the committed cmd_history row, cancels cmd_hist_record_full, and finds that original row still unlinked. Pre-fix result: 0 passed, 1 failed. The six historical messages named by AMUX-4486 also remain unlinked, but this reproduction does not prove their historical cause.
+COST: The board audit cannot honestly close six original delivered-message outcomes; it required a cancellation reproduction and durable-recovery implementation instead of trusting the current-uptime invariant PASS.
+FIX: Save the pending board consequence in the message transaction and resume existing semantic intake after cancellation/restart without resending commands; preserve pending rows through retention, retry failed links, and emit counted recovery/failure logs. Original six need individual reconciliation before this entry can be retired.
+
+## Retained unlinked messages have no audited repair operation
+AREA: board
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-882
+ORIGINAL_CARD: AMUX-4486
+SYMPTOM: Six exact original delivered messages survive with no card_id, but existing history append/import creates new rows and automatic semantic recapture can claim historical work as newly active. The reviewer can identify existing work but cannot record that judgment against the original source with the supported history API.
+COST: The original-operand reconciliation remains blocked after the bounded cancellation fix; a missing-route negative control fails with404, and a draft retry action had to be replaced because it could create false current task claims.
+FIX: Add an explicit audited PUT history/{id}/card that preserves owner/status/delivery, rejects conflicting linkage, and atomically records original source plus rationale. Transaction failure produces a measured WARN and rolls back the link. Publication and live six-message reconciliation remain pending.
+
+## Recovery health budget is shorter than its permitted attempt
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-883
+ORIGINAL_CARD: AMUX-4487
+SYMPTOM: Live c6242e22/build36e3f03eb7487ab1 registers message-capture with interval30s and stale_after90s but allows120s per attempt. A read shows in_flight true, last_tick_age90.96s, last_tick_ms120003.61 and status hung; its missing catalog row also reports documented false and purpose null.
+COST: The first deployment verification found a falsely unhealthy job during its own permitted runtime and an undocumented background loop, requiring a follow-up before the feature can be described as operationally coherent.
+FIX: Use a90s cadence whose existing health budget240s covers both a90s idle interval and the120s attempt bound, share the job ID with its catalog and publish the real disable control. Regression checks the actual registry budget against the source constants; startup INFO records both budgets with measured/count. Pending work success and original six-link reconciliation remain separate.
+
+## Sticky session fixture retries its first discovery race but fails its second
+AREA: gates
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-766
+SYMPTOM: Final ecd36b56 Rust CI failed2376passed1failed8ignored: the idle follow-up GET returned the explicit concurrent discovery epoch500 at workers.rs2537. Only the first GET had bounded retries. A one-shot idle middleware refusal reproduced0passed1failed locally.
+COST: Published corrections cannot satisfy their CI verification gate; required a fresh deterministic reproduction and another clean publication.
+FIX: Use one bounded fixture reader for both phases, retain unrelated500 and exhausted-churn failures, and emit stage/attempt test-log diagnostics. Keep AF-757 quota fixture contamination separate. Validation and independent review pending.
+
+## Browser CI reaches its job deadline without a final test population verdict
+AREA: gates
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-768
+SYMPTOM: ecd36b56 job 103697706086 cancelled after 30 minutes; 1,011 tests started with two workers but no final summary or failure-only artifact upload survived. Deadline is consistent with the observed timing, not independently proven as the only cancellation cause.
+COST: One 30-minute CI attempt produced no complete browser verdict and blocked honest verification of AF-762, AF-766 and AMUX-4487.
+FIX: Four unchanged-population shards, a shorter runner deadline and incremental completion evidence with full-union validation; local 13/0 controls and 1,011-test disjoint union pass. Fresh complete GitHub execution and independent review remain outstanding.
+
+## Native backlog nudge counts blocked cards that its own list excludes
+AREA: notices
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-770
+SYMPTOM: Native MSG-59704 says five drainable cards but lists only TG-3705. The runtime count omits blocked_on while the list excludes it; deterministic blocked-only fixture counted 1 with an empty list. ts-gke also reported separate orchestrator messages listing parked cards; those remain AF-771, not proof of this native mechanism.
+COST: Inflated workload and escalation input; investigating the peer report required separating two generators before identifying the count/list disagreement. The repeated external re-measurement cost belongs to the still-open orchestrator investigation.
+FIX: One shared dispatch-eligible population for native count/list/cadence, explicit display truncation and measured selection/error logs. Red control 0 passed / 1 failed; corrected gates, review and deployment pending.
+
+## Terminal browser fixtures kept testing retired request and input contracts
+AREA: gates
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-772
+SYMPTOM: Full CI run34749407249 finished every test but terminal fixtures stubbed limit=200 while the client requested60, expected Tabs after a grid icon shipped, called unsupported mouse.wheel in mobile WebKit, and clicked an existing-install menu beneath a fresh walkthrough. A local all-project correction run also caught delayed history arriving before Safari dispatched the fixture's scroll event.
+COST: 39 terminal-product,3 tab-label,1 wheel and1 onboarding failures in the complete CI matrix; local evidence retained1 failing history reproduction,44/1 Safari and134/1 all-project runs before the final ordering correction. No elapsed-time estimate or product regression count inferred.
+FIX: AF-772 repairs scoped request/context/input prerequisites while retaining route-hit guards, attribution/buffering/visibility assertions and all3projects; measured input-method diagnostics distinguish positioned browser specimens from separately checked native Simulator swipes. Remaining browser failure families stay open under AF-748.
+
+## Lifecycle teardown refused its own delete and hid the original failure
+AREA: gates
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-773
+SYMPTOM: All6 worker-lifecycle failures in completed CI run34749407249 reported only left-worker-behind. The test asserted bareDELETE403, repeated that forbidden call in finally, then threw over the original error. Exact historical-body fault control lost ORIGINAL_MID_FLOW_FAILURE and kept its fixture worker. Corrected teardown exposed a hidden receipt-target span selected ahead of the visible worker card.
+COST: Six original CI failure causes were hidden, and refused cleanup could leave test-owned provider panes on the shared host. A fresh real desktop run spent30s on the hidden locator; its cleanup is independently confirmed absent with an exact tmux control. No claim about how many historical orphans remain.
+FIX: AF-773 gives exact-fixture teardown a separate budget and guarded POST, retains primary and cleanup errors, emits measured client-debug/CI evidence, and scopes the worker visibility assertion to its real fleet card. Five installed-runner controls pass; all-project product lifecycle results remain separately required.
+
+
+## Lifecycle deletion screenshot passed while the worker card remained visible
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-773
+SYMPTOM: Exact d5293449 lifecycle matrix reported6 passed, but Safari Haiku worker-deleted.png still showed the deleted worker as WORKING. The test waited for a function definition and absence of an unrelated modal after reload, without requiring fresh session data or the actual card to disappear.
+COST: One misleading deletion screenshot in a green six-case matrix; independent visual inspection and two focused browser probes were needed before closure.
+FIX: Await the current list refresh and assert exact UI/API absence, with measured deletion-view evidence in client-debug and screenshots. Frozen stale-list negative control fails expected0/received1 while API membership is false; clean matrix and independent review pending.
+
+## Helper pipe I/O escapes the model deadline
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-13
+SESSION: codex-server-sync
+CARD: AF-884
+ORIGINAL_CARD: AMUX-4417
+SYMPTOM: Real child regressions show a large unread prompt blocks before the timeout starts, full stdout/stderr pipes deadlock before exit, and inherited pipes block after the parent exits. All three tests failed before the transport fix.
+COST: Capture/classification calls can occupy helper slots beyond their promised deadline; all three failures were reproduced without launching a native worker.
+FIX: Nonblocking concurrent stdin/stdout/stderr under one deadline, isolated helper-group cleanup, explicit bounded output retention and partial-input failure; LC-HELPER-FAILURE now includes these cases.
+
+## Offline recovery passes transport checks while its error UI still dominates Workers
+AREA: ui
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: codex-server-sync
+CARD: AF-885
+ORIGINAL_CARD: AMUX-4417
+SYMPTOM: Fresh desktop/mobile/WebKit transport tests pass, but opened screenshots show the expanded worker-list error panel that Ethan requested inside the sync modal, raw HTTP operation labels, and a five-operation count above a seven-operation checklist including files.
+COST: Nine green automated cases did not establish the requested visual behavior; eight screenshots were inspected and the missing acceptance requirements recorded as LW-12. No data loss was observed in this selected run.
+FIX: Pending: modal-only detailed errors with reachable retry/discard, readable operation labels, and consistently scoped pending totals; retain individual acknowledgement checks.
+
+
+## Header declutter hid the only durable action inspector
+AREA: browser
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-774
+SYMPTOM: AMUX-4475 removed header clutter with display:none!important on the sole interaction-feedback hub. Receipt retry/recovery continued, but users could not inspect pending/completed/refused actions or remedies; the full CI population retained18 hidden-summary failures.
+COST: Eighteen failed receipt cases in the completed1011-case CI run and a separate exact Safari reproduction to distinguish hidden feedback from failed effects recovery.
+FIX: Move the existing receipt inspector into Notifications with visible access, viewport bounds, scrolling and dismissal, preserving the compact header. Measure visibility in client-debug, retain receipt semantics/no-resend tests and validate native iOS; draft implementation under AF-774.
+
+
+## An incoming receipt update collapses the Details section being read
+AREA: browser
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-774
+SYMPTOM: After opening the last retained receipt Details in Safari and reading one effects response through the actual reconciler, the disclosure lost its open attribute. feedback.mjs replaces every article on each receipt update and did not preserve disclosure state.
+COST: One failed targeted Safari regression after the inspector became reachable; a person reading the remedy would have to reopen it after updates.
+FIX: Preserve expanded receipt identities across rendering, log measured retained/restored counts, and verify open Details plus reading position through a real effects read. Full matrix/native/review still pending on AF-774.
+
+
+## Receipt updates discard keyboard focus while retaining open Details
+AREA: browser
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-774
+SYMPTOM: Receipt rendering replaces the focused Details summary, moving focus to body while its disclosure remains open; Enter then no longer operates the receipt.
+COST: Independent review rejected the candidate; two browser probes exposed a keyboard continuity gap missed by the 69-case matrix.
+FIX: Restore only the retained focused receipt summary within the active panel with preventScroll; record measured focus restoration/loss and exercise real effects reads plus outside-focus/dismissal controls.
+
+
+## Golden offline replay test stops at obsolete generic operation wording
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-775
+SYMPTOM: All three golden offline CI cases expected 3 ops while the current banner says 3 queued, will send on reconnect, so the retained real replay/uniqueness assertions were never reached.
+COST: Three persistent CI failures and loss of downstream offline replay coverage in the full matrix until this fixture was corrected.
+FIX: Assert the current explicit queued state/count, retain original real UI replay and uniqueness checks, and publish measured banner/queue/operation evidence in CI and amux client-debug. Working-tree six-case golden suite passes; clean gates/review/publication pending.
+
+## Keyboard sizing overrides the offline warning's reserved space and covers Save
+AREA: browser
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-777
+SYMPTOM: Published ec76baf7 CI has two Chromium sw-fail-bar positive failures: the actual hit target at Save is the warning. The shared keyboard max-height rule overrides the board editor's earlier subtraction of its measured warning height. A source geometry probe additionally shows a negative modal top and partially covered button edges even where the centre remains tappable.
+COST: Two failing CI cases and another browser/native audit to reconcile the keyboard and offline-warning fixes; a user can see Save while its tap area is covered.
+FIX: Preserve the measured warning subtraction in keyboard-sized board boxes, and report actual partial footer coverage through the existing measured modal-layout diagnostic. Owned draft has 33 browser passes plus two native iOS 26.5 checks covering real Save/readback, fully visible warning/buttons, broken-height diagnostic and dismissal; screenshots personally inspected. Independent review, clean integration gates and publication remain pending.
+
+## Board archive silently ignores unsupported flags and hides the card without its reason
+AREA: cli
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-729
+SYMPTOM: Four authorized historical-review archives used --outcome-stdin, a flag supported by status verbs but not archive. The archive parser broke on the unknown flag, sent archived=true anyway and returned exit0. Readback found no supplied reason in any of the four logs. A regression against the actual CLI reproduced invalid-argv PATCHes; this is separate from the already-landed API archive_outcome fix.
+COST: Four missing audit reasons, four readbacks, and eight corrective unarchive/rearchive operations before all exact reasons were present; the first success reports hid incomplete writes.
+FIX: Refuse unknown/trailing or missing-value archive arguments before any board PATCH, retain supported flag behavior, and emit a bounded privacy-safe cli-argument-refused diagnostic. Candidate and tests are in research/archive-cli-argument-refusal-2026-09-13.md; keep open until reviewed client installation and readback.
+
+## Mobile header wraps while its clipping diagnostic reports no problem
+AREA: browser
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-779
+SYMPTOM: Owner screenshot requested a fitting top bar. At 320px parent 9550ba05 renders a 106px two-row header; the prior geometry probe returns no clipping. Compact rules end at 480px although mobile layout extends to 600px.
+COST: Repeated owner report and a header consuming an extra 44px row on narrow phones; prior green clipping coverage missed it.
+FIX: AF-779 one-row 44px targets with fitting edge spacing through 600px, removed redundant top padding, and measured header-row-wrapped diagnostic. Browser 9/0 and real iOS Safari 6/0; research/mobile-header-fit-2026-09-13.md.
+
+## Structured board creation waits for a model answer that cannot affect its outcome
+AREA: board
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-785
+SYMPTOM: Creating explicit ledger fix records waited tens of seconds per request. create_item called semantic plan while holding the lane lock, then always discarded its decision when graph/gate/scheduling metadata required a separate structured record. The branch-order regression measured one comparison invocation where zero was required.
+COST: The ledger mapping paused after three creates instead of repeating this cost across the remaining100 records; an attempted atomic decomposition correctly refused the manually created epic and was not bypassed.
+FIX: Decide the existing structured-create policy before invoking its comparison closure; keep ordinary semantic reconciliation and WIP/ownership guards. Emit measured structured_create with model_called=false and candidate_population_measured=false; do not claim a semantic comparison ran. Red control0/1, corrected intake3/0; release and live adoption still pending under AF-785.
+
+## Upload storage paths masquerade as repeated instructions across repos
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-888
+SYMPTOM: friction_themes.py reported eight cross-lane repeated instructions, including three cross-repo groups, over 115 messages. Seven groups matched only common amux upload-path tokens in unrelated screenshot requests. Even after filtering those paths, the signal kept its literal both-repos scope for one genuine amux-only toolbar request.
+COST: The daily sweep would prescribe a global rule for a class manufactured from transport metadata. Extra manual message inspection was needed to reject the signal.
+FIX: Strip only amux @-upload references before phrase extraction, derive scope from all surviving evidence, and report excluded-reference counts in the signal and friction-sweep.log. Actual SQL-signal tests must retain genuine repeated instructions and ordinary filesystem prose while rejecting screenshot-only matches. Originating-session validation and resolved verification gates remain required before retirement.
+
+## Direct message records override their own failed submission verdict in diagnostics
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-889
+SYMPTOM: The frustration scan labeled MSG-59389 and MSG-59393 delivered even though each stored submit_verdict=stuck. The same shortcut in GET /api/history/{id} returned delivered beside a stuck verdict. Both readers treated direct transport selection as proof of successful submission.
+COST: The message sweep was told the two repeated RTSP requests had landed, concealing the delivery failure behind a success-shaped annotation. Extra source and exact-ID checks were required before judging the repeat.
+FIX: In both readers derive direct delivery from the existing durable submission verdict: confirmed/retried delivered, stuck not delivered, unverified/missing/unknown values unknown. Exercise the actual scanner query/output and actual history endpoint, with confirmed positive controls and explicit failure diagnostics. Queued steering-history inference is separate; no production send or retry is needed for this read-path correction. Originating-session validation and resolved verification gates remain required before retirement.
+
+## A sliced installer fixture reaches an uninitialized Rust stage before the Bash guard
+AREA: testing
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-891
+SYMPTOM: After private Rust artifact staging shipped, tests/cli_install.py executed only installer stage3 without the INSTALL_ARTIFACT_DIR created in stage2. It tried mkdir /publish and failed before reaching the real Bash syntax-refusal guard, reddening CI despite the new Rust publication checks passing.
+COST: The checks gate failed on eefc294f and could not test the Bash publisher boundary it claimed to exercise. The isolated fixture had drifted from the caller's required inputs.
+FIX: Supply a private Rust stage and stub only Rust artifact validation in this Bash-boundary fixture; retain the actual guarded Bash publisher and old-installed sentinel checks. The full Rust artifact path remains covered by its separate actual-installer matrix. Existing test and CI refusal output makes a recurrence visible. Origin validation and resolved gates remain required before retirement.
+
+## Peer collaboration is counted as board nudges and terminal closures as all progress
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-890
+SYMPTOM: The nudge-no-movement theme signal counted 8 board-drive pickup messages plus 8 substantive peer messages as 16 nudges for mixpeek-security. It called zero terminal closures no queue movement even though cards moved to explicit external-wait states.
+COST: A collaboration-heavy lane was presented as a stuck nudge loop, inviting an unsupported fleet mechanism diagnosis and needless inspection of peer work.
+FIX: Count only the actual board-drive pickup producer toward the nudge threshold, retain peer traffic separately, and state that nonterminal movement is unmeasured. Actual SQL tests retain a ten-nudge positive control and a terminal-completion control; friction_nudge_population records both populations. Origin validation and resolved verification gates remain required before retirement.
+
+## A corruption fixture races the status hook's durable acknowledgement
+AREA: testing
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-13
+SESSION: amux-frustrations
+CARD: AF-892
+SYMPTOM: The status-hook durability fixture writes corrupt bytes directly into a live queue after observing the HTTP request, before the asynchronous acknowledgement is necessarily persisted. A controlled lock schedule shows the old raw write overwritten with an empty queue; the corruption assertion can then fail despite no production regression. CI5f036682 exited1 inside this section without naming its failed assertion; exact historical failing line remains unknown.
+COST: The checks gate is red and the log only says exit1 after the preceding successful cell, requiring source inspection and an independent concurrency control to discriminate fixture timing from hook behavior.
+FIX: Serialize corruption injection through the actual queue lock and atomically replace fixture bytes, retaining byte/schema preservation assertions. Add an ERR diagnostic naming the fixture line and command. The controlled old write loses the bytes; the corrected writer preserves them. This establishes a real fixture race, not the exact schedule of the historical CI failure. Origin validation and all resolved gates remain required before retirement.
+
+## Pause reports completion while the worker's tools continue running
+AREA: browser
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-14
+SESSION: codex
+CARD: none — POST /api/board timed out after 30 seconds; the subsequent backlog read found no matching card
+SYMPTOM: TubeScience Pause returned success and lifecycle=paused while running=true and the terminal badge still said WORKING. Resume re-rendered the old card without a verified runtime transition.
+COST: User could not stop running work; required process-tree, queue, provider-protocol and browser regression tests.
+FIX: Lifecycle integration stops owned provider/tool descendants, gates queued delivery and bootstrap, preserves the conversation reference, and acknowledges only verified transitions. Pending/failed transitions are visible and retryable. Signals: worker_lifecycle_applied, worker_lifecycle_failed, pause_process_stopped, protocol_turn_paused. Process fixtures cover Claude/Codex/Gemini and an unrelated process; browser checks cover desktop, phone and Safari.
+
+## Opening and resizing a Claude terminal makes its history disappear
+AREA: browser
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-14
+SESSION: codex
+CARD: none — filing the related lifecycle incident timed out; no matching backlog card was returned
+SYMPTOM: Ethan's recording shows mixpeek-finances briefly displaying history, then replacing it with a few native screen lines. TubeScience reproduces the same mostly blank terminal. Claude was on the normal screen (alternate_on=0), and the peek handler only hydrated its saved JSONL history in alternate-screen mode.
+COST: User lost usable conversation navigation; required matching the recording to live tmux state and repeated refresh/resize browser tests.
+FIX: Load Claude conversation history in either terminal screen mode. Signal normal_screen_history_restored identifies the recovered path. A server regression test pins normal-screen history and a browser test covers reopen, refresh and resize from desktop to phone.
+
+## The shared-target fingerprint check cannot run from a clean checkout
+AREA: gates
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-14
+SESSION: codex
+CARD: AF-791
+SYMPTOM: The unpublished fingerprint regression script required an ignored scratch/af791-evidence/cargo-specimen and passed an extra test filter through a wrapper that already invokes cargo test. A clean checkout lacked the specimen, and a zero-test result could satisfy its loose success check.
+COST: Blocked verification while reconciling the user's request to publish every pending amux change.
+FIX: Create an owned temporary, dependency-free fixture; preserve source mtime to nanosecond precision; require exactly one passing fixture test. The normal run passes both cases. Disabling the fingerprint refresh makes the preserved-mtime case fail; the mutation helper restores the exact bytes afterward.

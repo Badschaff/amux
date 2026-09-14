@@ -755,5 +755,11 @@ else
 fi
 
 echo
+if python3 scripts/test-friction-attachments.py "$SCAN"; then
+  ok "L: actual cross-lane signal excludes upload metadata and preserves real instructions"
+else
+  bad "L: attachment metadata still contaminates cross-lane instruction evidence"
+fi
+
 echo "  $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

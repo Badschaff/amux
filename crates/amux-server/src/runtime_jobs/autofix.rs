@@ -1310,6 +1310,7 @@ struct P95Hit {
     /// (AMUX-3910)? Carried onto the card so `baseline_samples` cannot claim a
     /// 72h norm that was computed over 68h.
     scan_capped: bool,
+    scan_cap: usize,
     oldest_seen_h: f64,
 }
 
@@ -1375,7 +1376,7 @@ fn p95_finding(h: &P95Hit, mult: f64, min_n: i64, now: f64) -> Finding {
                      {:.1}h rather than the {:.0}h named above. The WINDOW is complete: the \
                      scan is ordered newest-first, so a cap can only shorten the baseline. \
                      Treat the multiple as directional.",
-                        latency_scan_cap(),
+                        h.scan_cap,
                         h.oldest_seen_h,
                         baseline_h()
                     )
@@ -1405,6 +1406,17 @@ pub(crate) fn detect_latency_at(
     conn: &Connection,
     now: f64,
     boot: Option<f64>,
+) -> (Vec<Finding>, Vec<Suppressed>) {
+    detect_latency_with_scan_cap(conn, now, boot, latency_scan_cap())
+}
+
+// AF-397: snapshot the configured limit once per scan. Tests pass their fixture limit
+// here instead of changing the process environment while sibling tests run.
+fn detect_latency_with_scan_cap(
+    conn: &Connection,
+    now: f64,
+    boot: Option<f64>,
+    scan_cap: usize,
 ) -> (Vec<Finding>, Vec<Suppressed>) {
     let w_start = now - window_h() * 3600.0;
     let b_start = now - baseline_h() * 3600.0;
@@ -1459,7 +1471,7 @@ pub(crate) fn detect_latency_at(
          ORDER BY ts DESC LIMIT ?2",
     ) {
         if let Ok(rows) =
-            stmt.query_map(rusqlite::params![b_start, latency_scan_cap() as i64], |r| {
+            stmt.query_map(rusqlite::params![b_start, scan_cap as i64], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, f64>(1)?,
@@ -1538,13 +1550,14 @@ pub(crate) fn detect_latency_at(
             tracing::info!(
                 considered,
                 excluded = spanned_restart,
+                scan_cap,
                 boot_at = boot.unwrap_or(0.0),
                 "latency: scanned request rows; excluded those whose clock spans this \
                  process's start — wall time across a restart is not service time (AF-175)"
             );
             considered_rows = considered;
             excluded_rows = spanned_restart;
-            if considered >= latency_scan_cap() {
+            if considered >= scan_cap {
                 // The cap is binding. It is now DIRECTED (newest first), so the
                 // window is whole and only the far end of the baseline is lost —
                 // but that still shortens the trailing norm every comparison is
@@ -1559,7 +1572,7 @@ pub(crate) fn detect_latency_at(
                 scan_capped = true;
                 tracing::warn!(
                     considered,
-                    cap = latency_scan_cap(),
+                    cap = scan_cap,
                     oldest_seen_h = (now - oldest_seen) / 3600.0,
                     "latency: row cap reached — baseline is truncated to the most recent rows; \
                      the WINDOW is complete (ORDER BY ts DESC, AMUX-3910) but the trailing norm \
@@ -1650,6 +1663,7 @@ pub(crate) fn detect_latency_at(
             win_n: win.len(),
             base_n: base.len(),
             scan_capped,
+            scan_cap,
             oldest_seen_h: (now - oldest_seen) / 3600.0,
         });
     }
@@ -4793,74 +4807,54 @@ fn disk_candidates(home: &std::path::Path) -> Vec<std::path::PathBuf> {
     v
 }
 
-/// Count APFS local snapshots. **This is the instrument that was missing.**
-/// On 2026-08-10 roughly 450GB was deleted and free space moved by 8GB, because
-/// 24 hourly Time Machine snapshots were pinning every deleted block. Without
-/// this number in the evidence, the only available conclusion is "we deleted
-/// the wrong things" and the next action is deleting more of the right ones,
-/// which also does nothing. Snapshots are purgeable by macOS under pressure and
-/// thinnable with `tmutil`, so this line turns an unexplainable non-recovery
-/// into a one-command fix.
-/// Run a short subprocess with a wall-clock ceiling, killing AND reaping it on
-/// overrun.
-///
-/// Exists because `du_one` was the only bounded subprocess in this file and the
-/// bound was written into its body, so the next subprocess added here inherited
-/// nothing (AF-97). `tmutil` was that next one. Reaping matters for the same
-/// reason it does in `du_one`: an unreaped child is a zombie holding the very
-/// FDs the neighbouring `detect_fd` detector counts, so an unbounded probe here
-/// makes the detector beside it report pressure that the probe itself caused.
-fn bounded_output(program: &str, args: &[&str], budget: std::time::Duration) -> Option<Vec<u8>> {
-    let deadline = std::time::Instant::now() + budget;
-    let mut child = std::process::Command::new(program)
-        .args(args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    loop {
-        match child.try_wait() {
-            Ok(Some(st)) => {
-                let out = child.wait_with_output().ok()?;
-                return st.success().then_some(out.stdout);
-            }
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    // WARN, not debug: unlike du's per-path skips this is one
-                    // line per tick at most, and a `tmutil` that stops answering
-                    // is a real machine fault worth seeing in a log sweep.
-                    tracing::warn!(
-                        program,
-                        budget_s = budget.as_secs_f64(),
-                        "autofix: subprocess exceeded its budget and was killed — \
-                         the value it would have produced is reported as absent, not as zero"
-                    );
-                    return None;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(_) => return None,
-        }
-    }
+// Keep the original deadline/parser regressions on the shared implementation
+// used by both the detector and reclaim; count alone does not prove causality.
+#[cfg(test)]
+use super::storage::bounded_output;
+
+#[cfg(test)]
+fn parse_local_snapshot_count(stdout: &[u8]) -> Option<usize> {
+    super::storage::parse_local_snapshots(stdout).map(|v| v.len())
 }
 
 fn local_snapshot_count() -> Option<usize> {
-    // 5s: `tmutil listlocalsnapshots /` answers in well under a second on a
-    // healthy machine. It talks to backupd, so a wedged Time Machine can hang it
-    // indefinitely — and before AF-97 that hang had no ceiling at all, on a
-    // thread that was also holding the SQLite store lock.
-    let stdout = bounded_output(
-        "/usr/bin/tmutil",
-        &["listlocalsnapshots", "/"],
-        std::time::Duration::from_secs(5),
-    )?;
-    Some(
-        String::from_utf8_lossy(&stdout)
-            .matches("com.apple.TimeMachine")
-            .count(),
-    )
+    super::storage::local_snapshots().map(|v| v.len())
+}
+
+fn disk_snapshot_evidence(snaps: Option<usize>) -> Vec<(String, String)> {
+    let retention = match snaps {
+        Some(0) => "absent",
+        Some(_) => "possible",
+        None => "unknown",
+    };
+    let why = "snapshot probe did not produce a successful recognized listing \
+               (unsupported platform/output, command failure, or timeout)";
+    tracing::info!(
+        measured = snaps.is_some(),
+        n_considered = snaps.unwrap_or(0),
+        retention,
+        why_unmeasured = if snaps.is_none() { why } else { "" },
+        "disk_snapshot_context"
+    );
+    let mut evidence = vec![
+        ("apfs_local_snapshots_measured".into(), snaps.is_some().to_string()),
+        (
+            "apfs_local_snapshots_n_considered".into(),
+            snaps.unwrap_or(0).to_string(),
+        ),
+        ("apfs_retention".into(), retention.into()),
+        (
+            "apfs_local_snapshots".into(),
+            snaps.map(super::storage::apfs_snapshot_note).unwrap_or_else(|| {
+                "Local snapshot retention is unmeasured. Do not infer that snapshots \
+                 are absent or that deleting them is necessary.".into()
+            }),
+        ),
+    ];
+    if snaps.is_none() {
+        evidence.push(("apfs_local_snapshots_why_unmeasured".into(), why.into()));
+    }
+    evidence
 }
 
 pub fn detect_disk(now: f64, home: &std::path::Path) -> (Vec<Finding>, Vec<Suppressed>) {
@@ -4965,25 +4959,14 @@ pub fn detect_disk(now: f64, home: &std::path::Path) -> (Vec<Finding>, Vec<Suppr
         ),
         ("top_consumers".into(), format!("\n{listing}")),
     ];
-    if let Some(n) = snaps {
-        evidence.push((
-            "apfs_local_snapshots".into(),
-            format!(
-                "{n} — READ THIS BEFORE DELETING ANYTHING. Each hourly Time Machine snapshot \
-                 pins the blocks of every file deleted since it was taken, so with snapshots \
-                 present, deleting files frees NOTHING until they age out (24h) or are thinned. \
-                 On 2026-08-10, 450GB was deleted and free space moved 8GB for exactly this \
-                 reason. Thin them first: sudo tmutil thinlocalsnapshots / 500000000000 4"
-            ),
-        ));
-    }
+    evidence.extend(disk_snapshot_evidence(snaps));
 
     out.push(Finding {
         kind: DetectorKind::DiskPressure,
         signature,
         title,
         evidence,
-        recheck: "df -h /System/Volumes/Data; tmutil listlocalsnapshots / | wc -l; \
+        recheck: "df -h /System/Volumes/Data; tmutil listlocalsnapshots /; \
                   curl -sk $AMUX_URL/api/debug/storage"
             .into(),
         owner: None,
@@ -7809,6 +7792,56 @@ fn parse_ts(s: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn snapshot_listing_requires_a_measured_listing_before_counting_zero() {
+        let header = "Snapshots for volume group containing disk /:\n";
+        assert_eq!(parse_local_snapshot_count(header.as_bytes()), Some(0));
+        assert_eq!(parse_local_snapshot_count(format!("{header}com.apple.TimeMachine.2026-09-13-010000.local\ncom.apple.TimeMachine.2026-09-13-020000.local\n").as_bytes()), Some(2));
+        for output in ["", "\n", "backupd unavailable", "error com.apple.TimeMachine.failure", "Snapshots for /"] {
+            assert_eq!(parse_local_snapshot_count(output.as_bytes()), None, "{output:?}");
+        }
+        assert_eq!(parse_local_snapshot_count(format!("{header}permission denied\n").as_bytes()), None);
+        assert_eq!(parse_local_snapshot_count(b"\xff"), None);
+    }
+
+    #[test]
+    fn snapshot_context_distinguishes_zero_positive_and_unmeasured_without_deletion_advice() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        for (count, verdict) in [(Some(0), "absent"), (Some(24), "possible"), (None, "unknown")] {
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            let writer = Writer(bytes.clone());
+            let subscriber = tracing_subscriber::fmt().with_ansi(false).without_time()
+                .with_writer(move || writer.clone()).finish();
+            let evidence: std::collections::BTreeMap<_, _> =
+                tracing::subscriber::with_default(subscriber, || disk_snapshot_evidence(count))
+                    .into_iter().collect();
+            let note = evidence.get("apfs_local_snapshots").expect("missing measurement is explicit");
+            assert!(!note.contains("Thin them first"), "a snapshot count cannot justify backup deletion: {note}");
+            assert!(!note.contains("deleting files frees NOTHING"), "count is not retained bytes: {note}");
+            assert_eq!(evidence["apfs_local_snapshots_measured"], count.is_some().to_string());
+            assert_eq!(evidence["apfs_local_snapshots_n_considered"], count.unwrap_or(0).to_string());
+            assert_eq!(evidence["apfs_retention"], verdict);
+            if count.is_none() {
+                assert!(!evidence["apfs_local_snapshots_why_unmeasured"].is_empty());
+            } else {
+                assert!(!evidence.contains_key("apfs_local_snapshots_why_unmeasured"));
+            }
+            let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+            assert!(logs.contains("disk_snapshot_context"), "{logs}");
+            assert!(logs.contains(&format!("measured={}", count.is_some())), "{logs}");
+            assert!(logs.contains(&format!("n_considered={}", count.unwrap_or(0))), "{logs}");
+            assert!(logs.contains(&format!("retention=\"{verdict}\"")), "{logs}");
+        }
+    }
 
     fn schedule_health_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -8616,7 +8649,7 @@ mod tests {
     fn every_blocking_subprocess_here_goes_through_a_bounded_helper() {
         let src = include_str!("autofix.rs");
         let prod = src.split("\nmod tests").next().unwrap_or(src);
-        const ALLOWED: [&str; 2] = ["du_one", "bounded_output"];
+        const ALLOWED: [&str; 1] = ["du_one"];
 
         let mut current = "<file scope>";
         let mut offenders: Vec<(usize, &str)> = Vec::new();
@@ -8652,7 +8685,9 @@ mod tests {
         let src = include_str!("autofix.rs");
         let prod = src.split("\nmod tests").next().unwrap_or(src);
         let n = prod.matches("std::process::Command::new").count();
-        assert!(n >= 2, "scan found {n} blocking subprocess call sites, expected at least the two bounded helpers — the pattern has drifted from the code");
+        // The native snapshot probe moved to storage.rs; its shared helper
+        // is exercised by the deadline/output tests below and storage's tests.
+        assert!(n >= 1, "scan found {n} blocking subprocess call sites, expected at least du_one — the pattern has drifted from the code");
     }
 
     /// AF-97. `bounded_output` must return on ITS deadline, not the command's.
@@ -11844,10 +11879,8 @@ mod tests {
         for i in 0..60 {
             insert(&st, now - 300.0 - i as f64, 900.0);
         }
-        std::env::set_var("AMUX_LATENCY_SCAN_CAP", "200");
         let conn = st.store.read().unwrap();
-        let (f, _) = detect_latency_at(&conn, now, None);
-        std::env::remove_var("AMUX_LATENCY_SCAN_CAP");
+        let (f, _) = detect_latency_with_scan_cap(&conn, now, None, 200);
 
         let hit = f
             .iter()
@@ -11867,6 +11900,10 @@ mod tests {
         assert!(
             ev["scan_coverage"].starts_with("PARTIAL"),
             "a capped scan must say so on the artifact, not only in the log: {ev:?}"
+        );
+        assert!(
+            ev["scan_coverage"].contains("200-row"),
+            "the evidence must name this scan's actual limit: {ev:?}"
         );
         assert!(
             ev["scan_coverage"].contains("WINDOW is complete"),

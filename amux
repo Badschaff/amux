@@ -1536,7 +1536,7 @@ cmd_pause() {
   name=$(resolve_session "${1:-}")
   local AMUX_API="${AMUX_API:-https://localhost:8824}"
   local resp
-  resp=$(_curl -sk -m 15 -X POST -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+  resp=$(_curl -sk -m 90 -X POST -H "X-Amux-Session: ${AMUX_SESSION:-}" \
     "$AMUX_API/api/workers/$name/pause" 2>/dev/null) || resp=""
   if [[ -z "$resp" ]]; then
     die "could not reach server to pause $name"
@@ -1558,7 +1558,7 @@ cmd_resume() {
   name=$(resolve_session "${1:-}")
   local AMUX_API="${AMUX_API:-https://localhost:8824}"
   local resp
-  resp=$(_curl -sk -m 15 -X POST -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+  resp=$(_curl -sk -m 90 -X POST -H "X-Amux-Session: ${AMUX_SESSION:-}" \
     "$AMUX_API/api/workers/$name/resume" 2>/dev/null) || resp=""
   if [[ -z "$resp" ]]; then
     die "could not reach server to resume $name"
@@ -1799,7 +1799,7 @@ for s in data:
   while IFS= read -r name; do
     [[ -z "$name" ]] && continue
     local resp
-    resp=$(_curl -sk -m 15 -X POST -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+    resp=$(_curl -sk -m 90 -X POST -H "X-Amux-Session: ${AMUX_SESSION:-}" \
       "$AMUX_API/api/workers/$name/pause" 2>/dev/null) || resp=""
     local lc
     lc=$(echo "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('lifecycle',''))" 2>/dev/null) || lc=""
@@ -1833,7 +1833,7 @@ for s in data:
   while IFS= read -r name; do
     [[ -z "$name" ]] && continue
     local resp
-    resp=$(_curl -sk -m 15 -X POST -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+    resp=$(_curl -sk -m 90 -X POST -H "X-Amux-Session: ${AMUX_SESSION:-}" \
       "$AMUX_API/api/workers/$name/resume" 2>/dev/null) || resp=""
     local lc
     lc=$(echo "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('lifecycle',''))" 2>/dev/null) || lc=""
@@ -2004,6 +2004,33 @@ of the five, it is not a block on a person:
   amux board needsyou $id --actor Ethan --ask decision --question \"...?\" --unblocks \"...\""
 }
 
+# A response can be unreadable AFTER a write landed. Stop before any dependent
+# status transition, and retain the uncertainty in the existing diagnostic spool.
+_board_require_ack() {
+  AMUX_ACK_LOG="$CC_HOME/cli-transport.jsonl" python3 -c '
+import json, os, sys, time
+try:
+    value = json.load(sys.stdin)
+    if not isinstance(value, dict): raise ValueError("non-object acknowledgement")
+except Exception:
+    item, field, pending_status = sys.argv[1:4]
+    event = {"ts": int(time.time()), "cli": "bash", "curl_exit": 0,
+             "verdict": "board_ack_unknown", "measured": True, "n_considered": 1,
+             "item": item, "field": field, "applied": None,
+             "session": os.environ.get("AMUX_SESSION", "")}
+    try:
+        with open(os.environ["AMUX_ACK_LOG"], "a") as out:
+            out.write(json.dumps(event) + "\n")
+    except OSError:
+        sys.stderr.write("warning: acknowledgement diagnostic could not be persisted\n")
+    sys.stderr.write("error: %s %s acknowledgement is unreadable; write outcome is unknown.\n" % (item, field))
+    if pending_status:
+        sys.stderr.write("The %s status transition was not attempted.\n" % pending_status)
+    sys.stderr.write("Read amux board show %s before retrying; earlier writes may have landed. [board_ack_unknown]\n" % item)
+    sys.exit(1)
+' "$1" "$2" "${3:-}"
+}
+
 _board_transition() {
   local id="$1" status="$2"; shift 2
   local ack="" newtype="" override="" rev="" outcome="" trigger="" force_reason=""
@@ -2140,6 +2167,7 @@ The card is unchanged."
     fi
     # Do NOT discard this response: a dropped reviewer that looks saved is the
     # whole defect (AC-323's shape, now on a fourth field).
+    printf '%s' "$_rvresp" | _board_require_ack "$id" "reviewer" "$status" || return $?
     printf '%s' "$_rvresp" | python3 -c '
 import sys, json
 try: d = json.load(sys.stdin)
@@ -2170,6 +2198,7 @@ if ign:
 NOTHING was applied — not the evidence, and not the '$status' transition.
 The card is unchanged."
     fi
+    printf '%s' "$_evresp" | _board_require_ack "$id" "evidence" "$status" || return $?
     printf '%s' "$_evresp" | python3 -c '
 import sys, json
 try: d = json.load(sys.stdin)
@@ -2239,6 +2268,7 @@ NOTHING was applied — not the outcome, and not the '$status' transition.
 The card is unchanged. Re-run when the server is back; if it just restarted to
 adopt a build, that is expected and a retry normally succeeds."
     fi
+    printf '%s' "$_oresp" | _board_require_ack "$id" "outcome" "$status" || return $?
     printf '%s' "$_oresp" | python3 -c '
 import sys, json
 try: d = json.load(sys.stdin)
@@ -2458,11 +2488,14 @@ EOF
 # 5 rev mismatch · 1 other refusal or malformed response. Refusals print the
 # server body to STDERR so pipelines keep clean stdout.
 _board_outcome() {
+  local _board_response
+  _board_response="$(cat)"
+  printf '%s' "$_board_response" | _board_require_ack "${1:-?}" "board write" || return $?
   # Optional args: the id and status the CALLER attempted. Not decoration —
   # the WIP-limit 409 body carries no `attempted_status`, so a hint derived
   # only from the response could never fire on the refusal that needs it most
   # (caught by running it, not by reading it). The caller always knows.
-  python3 -c '
+  printf '%s' "$_board_response" | python3 -c '
 import sys, json
 _argv = sys.argv[1:]
 raw = sys.stdin.read()
@@ -2616,6 +2649,20 @@ if "holding" in e or "doing" in e or "wip" in e:
 if "rev mismatch" in e:
     sys.exit(5)
 sys.exit(1)' "${1:-}" "${2:-}" "${3:-}"
+}
+
+_board_archive_arg_error() {
+  local operation="$1" item="$2" reason="$3" hint="$4" payload
+  echo "error: amux board $operation: $hint. No board change was sent." >&2
+  # Argument values can contain private outcome text. Emit only the validated
+  # item identity and a fixed reason, through the existing diagnostic surface.
+  payload=$(OP="$operation" ITEM="$item" WHY="$reason" python3 -c 'import json,os
+print(json.dumps({"kind":"cli-argument-refused","operation":os.environ["OP"],
+ "item":os.environ["ITEM"],"reason":os.environ["WHY"],"measured":True,"n_considered":1}))')
+  command curl -sk --connect-timeout 1 --max-time 2 -X POST \
+    -H 'Content-Type: application/json' -d "$payload" \
+    "$AMUX_API/api/client-debug" >/dev/null 2>&1 || true
+  exit 2
 }
 
 cmd_board() {
@@ -2837,6 +2884,64 @@ if "ask_type" in ign or "ask_actor" in ign:
       echo "$result" | _board_outcome "$id" "$status"
       return $?
       ;;
+    needs|report-blocker)
+      # report_blocker (RR-0052, Invariant 4): the worker hit a prerequisite it
+      # cannot satisfy itself. Instead of stalling on "I'm blocked because X does
+      # not exist", it files X as a NEW task on its own board and makes THIS card
+      # depend on it. The board driver then parks this card and auto-promotes it
+      # the moment the blocker reaches its completion boundary (promote_ready_
+      # backlog) — the swarm resolves the blocker without a human. Composes the
+      # existing create + depends_on primitives; adds no new endpoint.
+      local id="${1:-}"; shift 2>/dev/null || true
+      _board_id_guard "needs" "$id"
+      local title="${1:-}"
+      [[ -n "$id" && -n "$title" ]] || die "Usage: amux board needs <ISSUE-ID> \"<what this card needs first>\"
+Files the need as a NEW todo task on your board and makes <ISSUE-ID> depend on it,
+so the driver parks this card and resumes it when the blocker completes."
+      local worker="${AMUX_WORKER:-${AMUX_SESSION:-}}"
+      local api="${AMUX_API:-https://localhost:8824}"
+      local created bid
+      created=$(_curl -sk -X POST -H 'Content-Type: application/json' -H "X-Amux-Worker: $worker" \
+        -d "$(T="$title" S="$worker" python3 -c 'import json,os;print(json.dumps({"title":os.environ["T"],"session":os.environ["S"],"status":"todo"}))')" \
+        "$api/api/board") || die "cannot reach the board to create the blocker task"
+      bid=$(printf '%s' "$created" | python3 -c 'import sys,json
+try: print((json.load(sys.stdin).get("id") or ""))
+except Exception: print("")')
+      [[ -n "$bid" ]] || die "the blocker task was not created: $created"
+      # Append the new blocker to this card's existing depends_on (preserve them).
+      local newdeps linkresp
+      newdeps=$(_curl -sk "$api/api/board/$id" | B="$bid" python3 -c 'import sys,json,os
+d=json.load(sys.stdin); deps=list(d.get("depends_on") or []); b=os.environ["B"]
+deps.append(b) if b not in deps else None; print(json.dumps(deps))') || die "created blocker $bid but could not read $id to link it"
+      linkresp=$(_curl -sk -X PATCH -H 'Content-Type: application/json' -H "X-Amux-Worker: $worker" \
+        -d "$(D="$newdeps" python3 -c 'import json,os;print(json.dumps({"depends_on":json.loads(os.environ["D"])}))')" \
+        "$api/api/board/$id") || die "created blocker $bid but could not link it to $id"
+      echo "reported blocker: $id now depends on new task $bid (\"$title\"); it resumes when $bid completes."
+      return 0
+      ;;
+    fail|report-failure)
+      # report_failure (Invariant 4): the work could not be done. Route to the
+      # `quarantined` terminal (amux-core's anti-livelock terminal) with the
+      # reason, so the card leaves the active loop for the owner rather than
+      # sitting half-done. `fail` is the discoverable name for the FAILED outcome.
+      local id="${1:-}"; shift 2>/dev/null || true
+      _board_id_guard "fail" "$id"
+      local reason=""
+      while [[ $# -gt 0 ]]; do case "$1" in
+        --reason)       reason="${2:-}"; shift 2 ;;
+        --reason-stdin) reason="$(cat)"; shift ;;
+        *) shift ;;
+      esac; done
+      [[ -n "$id" ]] || die "Usage: amux board fail <ISSUE-ID> [--reason \"why\"]   (routes to the quarantined terminal)"
+      local result
+      if [[ -n "$reason" ]]; then
+        result=$(_board_transition "$id" "quarantined" --force "$reason")
+      else
+        result=$(_board_transition "$id" "quarantined")
+      fi
+      echo "$result" | _board_outcome "$id" "quarantined"
+      return $?
+      ;;
     status)
       local id="${1:-}"; local new_status="${2:-}";
       _board_id_guard "status" "$id"
@@ -3041,21 +3146,32 @@ print(json.dumps(b))')
       local _av=1; [[ "$subcmd" == "unarchive" ]] && _av=0
       local id="${1:-}"
       _board_id_guard "archive" "$id"
-      [[ -n "$id" ]] || die "Usage: amux board $sub <ISSUE-ID> [--authorized-by <who>] [--archive-outcome <why>]
+      [[ -n "$id" ]] || die "Usage: amux board $subcmd <ISSUE-ID> [--authorized-by <who>] [--archive-outcome <why>]
 archive   hides a card from every board view AND every autonomy loop (advance, pickup, rot)
 unarchive brings it back — this is the un-do that did not exist before AMUX-2492
 --authorized-by   required to archive a card owned by a DIFFERENT lane (AMUX-2492)
 --archive-outcome required to archive a card whose status is still needsyou (AF-701) —
                   someone is owed an answer, so archiving it needs to say what the answer was"
       shift
-      local _auth="" _outcome=""
+      local _auth="" _outcome="" _value=""
       # AF-701: order-independent, since a needsyou card owned by another lane
       # can need BOTH flags at once (cross-lane AND the outcome gate).
       while [[ $# -gt 0 ]]; do
         case "$1" in
-          --authorized-by) _auth="${2:-}"; shift 2 ;;
-          --archive-outcome) _outcome="${2:-}"; shift 2 ;;
-          *) break ;;
+          --authorized-by|--archive-outcome)
+            _value="${2:-}"
+            [[ $# -ge 2 && "$_value" != --* && "${_value//[[:space:]]/}" != "" ]] || \
+              _board_archive_arg_error "$subcmd" "$id" missing_value "$1 requires a nonempty value"
+            if [[ "$1" == --authorized-by ]]; then
+              _auth="$2"
+            else
+              [[ "$_av" == 1 ]] || _board_archive_arg_error "$subcmd" "$id" outcome_on_unarchive \
+                '--archive-outcome is only valid for archive'
+              _outcome="$2"
+            fi
+            shift 2 ;;
+          *) _board_archive_arg_error "$subcmd" "$id" unexpected_argument \
+               'unexpected argument; supported flags are --authorized-by and --archive-outcome' ;;
         esac
       done
       local result
@@ -4017,6 +4133,11 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
                                     REFUSED, not folded into the title — AEAB-17.)
   amux board claim <ID>            Atomically claim a todo/backlog card for this worker
   amux board assign <ID> <worker>  Reassign a card to a worker (the claim 409's sanctioned exit)
+  amux board needs <ID> "<title>"  Report a blocker: file <title> as a NEW task and make
+                                   <ID> depend on it. The driver parks <ID> and resumes it
+                                   when the blocker completes (the swarm clears it, no human).
+  amux board fail <ID> [--reason]  Report failure: route <ID> to the quarantined terminal
+                                   (the anti-livelock end state) with the reason.
   amux board needsyou <ID> --actor <name> --ask <type> --question "...?" --unblocks "..."
                                    Park a card on the human. The ask is TYPED:
                                    decision | access | credential | external | judgment

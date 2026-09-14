@@ -24,7 +24,7 @@ use crate::db::SharedStore;
 use crate::opencode::AgentProtocol;
 use amux_core::ids::{TurnId, WorkerId};
 use amux_core::provider::ProviderId;
-use amux_core::protocol::{WaitReason, WorkerEvent};
+use amux_core::protocol::{ExitStatus, WaitReason, WorkerEvent};
 use amux_core::worker::WorkerState;
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::Digest;
@@ -56,8 +56,20 @@ pub struct ScanReport {
     /// Backends whose native-status read failed this pass; their lanes fell
     /// back to the scrape, and the failure is named rather than silent.
     pub native_status_failures: Vec<String>,
+    /// Backend-confirmed exits, distinct from text inferred by the adapter.
+    pub process_exits: BTreeMap<String, ExitStatus>,
+    pub process_exit_failures: Vec<String>,
+    /// Exit observations rejected atomically because their session ended or changed.
+    pub stale_process_exits: BTreeMap<String, StaleProcessExit>,
     pub events_applied: usize,
     pub capture_failures: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StaleProcessExit {
+    pub observed_session: String,
+    pub current_session: Option<String>,
+    pub backend_ref: String,
 }
 
 /// The last completed scan pass, published for `GET /api/debug/scan` (AF-80):
@@ -119,18 +131,19 @@ impl ScanLoop {
     /// One pass over live terminal sessions.
     pub async fn scan_once(&self) -> anyhow::Result<ScanReport> {
         let mut report = ScanReport::default();
-        // Live terminal-backed sessions: (worker_id, backend name, ref, provider).
-        let targets: Vec<(String, String, String, String)> = {
+        // Capture session identity BEFORE asynchronous backend reads. Backend refs
+        // survive restarts and cannot identify the generation an exit belongs to.
+        let targets: Vec<(String, String, String, String, String)> = {
             let conn = self.store.read()?;
             let mut stmt = conn.prepare(
                 "SELECT s.worker_id, s.backend, s.backend_ref,
-                        COALESCE(w.provider, 'claude')
+                        COALESCE(w.provider, 'claude'), s.id
                  FROM _amux_sessions s
                  LEFT JOIN _amux_workers w ON w.id = s.worker_id
                  WHERE s.ended_at IS NULL AND s.backend IN ('tmux', 'herdr')",
             )?;
             let rows = stmt.query_map([], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             })?;
             rows.collect::<Result<_, _>>()?
         };
@@ -141,7 +154,16 @@ impl ScanLoop {
         // the report and that backend's lanes keep the scrape this tick —
         // "cannot answer" must not read as "stopped".
         let mut native: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+        let mut exits = BTreeMap::new();
         for backend in &self.backends {
+            match backend.process_exits().await {
+                Ok(found) => {
+                    exits.insert(backend.name().to_string(), found);
+                }
+                Err(e) => report
+                    .process_exit_failures
+                    .push(format!("{}: {e}", backend.name())),
+            }
             match backend.agent_states().await {
                 Ok(states) if !states.is_empty() => {
                     native.insert(backend.name().to_string(), states);
@@ -153,7 +175,7 @@ impl ScanLoop {
             }
         }
 
-        for (wid_str, backend_name, backend_ref, provider) in targets {
+        for (wid_str, backend_name, backend_ref, provider, session_id) in targets {
             let Ok(worker) = WorkerId::parse(&wid_str) else { continue };
 
             // DEMOTION: a live structured session means the worker speaks
@@ -216,6 +238,63 @@ impl ScanLoop {
                 backend_ref: backend_ref.clone(),
                 pid: None,
             };
+            if let Some(status) = exits.get(&backend_name).and_then(|m| m.get(&backend_ref)) {
+                let event = WorkerEvent::Exited(status.clone());
+                let w = worker.clone();
+                let observed = session_id.clone();
+                let expected_backend = backend_name.clone();
+                let expected_ref = backend_ref.clone();
+                let stale = Arc::new(Mutex::new(None));
+                let stale_write = stale.clone();
+                let applied = self
+                    .store
+                    .write_async(move |conn| {
+                        // Store executes this closure inside its authoritative writer
+                        // transaction. A pre-write read would leave the same race open.
+                        let current = crate::db::queries::live_session_for(conn, w.as_str())?;
+                        if !current.as_ref().is_some_and(|s| s.id == observed
+                            && s.backend == expected_backend && s.backend_ref == expected_ref)
+                        {
+                            let rejected = StaleProcessExit {
+                                observed_session: observed,
+                                current_session: current.map(|s| s.id),
+                                backend_ref: expected_ref,
+                            };
+                            tracing::warn!(worker = %w,
+                                observed_session = %rejected.observed_session,
+                                current_session = ?rejected.current_session,
+                                backend_ref = %rejected.backend_ref,
+                                measured = true, n_considered = 1, applied = false,
+                                "terminal_process_exit_stale: exit observation belongs to an ended or replaced session");
+                            *stale_write.lock().expect("exit result mutex") = Some(rejected);
+                            return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+                        }
+                        crate::orchestrator::events::apply_event(
+                            conn, &w, &event, chrono::Utc::now(),
+                        )
+                    })
+                    .await;
+                match applied {
+                    Ok(reply) if reply.applied => {
+                        report.events_applied += 1;
+                        report.process_exits.insert(wid_str.clone(), status.clone());
+                        tracing::warn!(worker = %worker, backend_ref = %backend_ref,
+                            session = %session_id,
+                            exit_code = ?status.code, signal = ?status.signal,
+                            measured = true, n_considered = 1,
+                            "terminal_process_exit: retained session no longer hosts a live process");
+                    }
+                    Ok(_) => {
+                        if let Some(rejected) = stale.lock().expect("exit result mutex").take() {
+                            report.stale_process_exits.insert(wid_str.clone(), rejected);
+                        }
+                    }
+                    Err(e) => report
+                        .process_exit_failures
+                        .push(format!("{wid_str}: apply exit: {e}")),
+                }
+                continue;
+            }
             let captured = match backend.capture(&proc, 60).await {
                 Ok(c) => c,
                 Err(e) => {
@@ -343,6 +422,9 @@ impl ScanLoop {
                 Ok(r) if !r.scanned.is_empty()
                         || !r.capture_failures.is_empty()
                         || !r.demoted_native.is_empty()
+                        || !r.process_exits.is_empty()
+                        || !r.process_exit_failures.is_empty()
+                        || !r.stale_process_exits.is_empty()
                         || !r.native_status_failures.is_empty() =>
                 {
                     tracing::debug!(
@@ -350,6 +432,9 @@ impl ScanLoop {
                         demoted = r.demoted_structured.len(),
                         demoted_native = r.demoted_native.len(),
                         native_failures = r.native_status_failures.len(),
+                        process_exits = r.process_exits.len(),
+                        process_exit_failures = r.process_exit_failures.len(),
+                        stale_process_exits = r.stale_process_exits.len(),
                         events = r.events_applied,
                         failures = r.capture_failures.len(),
                         "terminal scan pass"
@@ -437,12 +522,15 @@ mod tests {
     use rusqlite::params;
 
     /// Backend whose capture returns a scripted frame.
+    #[derive(Default)]
     struct ScriptedBackend {
         name: &'static str,
         frame: String,
         /// Native agent states the backend reports (backend_ref -> status).
         /// Empty = the tmux default (no native voice).
         native: BTreeMap<String, String>,
+        exits: BTreeMap<String, ExitStatus>,
+        exit_probe_fails: bool,
     }
 
     #[async_trait]
@@ -470,6 +558,11 @@ mod tests {
         }
         async fn agent_states(&self) -> crate::backend::Result<BTreeMap<String, String>> {
             Ok(self.native.clone())
+        }
+        async fn process_exits(&self) -> crate::backend::Result<BTreeMap<String, ExitStatus>> {
+            if self.exit_probe_fails {
+                Err(BackendError::CommandFailed("controlled unreadable exit census".into()))
+            } else { Ok(self.exits.clone()) }
         }
     }
 
@@ -546,6 +639,35 @@ mod tests {
     const LIMIT_FRAME: &str = "\n\u{23fa} did things\nYou've reached your weekly limit \u{00b7} resets 3pm\n\u{276f} \n";
 
     #[tokio::test]
+    async fn exit_probe_absence_failure_or_another_worker_cannot_stop_a_live_worker() {
+        for (n, fails, foreign) in [(1, false, false), (2, true, false), (3, false, true)] {
+            let store = store();
+            let w = wid(100 + n);
+            seed_terminal_worker(&store, &w);
+            let id = w.to_string();
+            store.write(move |conn| {
+                let now = chrono::Utc::now();
+                crate::db::queries::update_worker_state(conn, &id,
+                    &WorkerState::Idle { since: now }, &now.to_rfc3339())?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            }).unwrap();
+            let scan = ScanLoop::new(store.clone(), vec![Arc::new(ScriptedBackend {
+                name: "tmux", frame: String::new(), exit_probe_fails: fails,
+                exits: if foreign { BTreeMap::from([("amux-other".into(),
+                    ExitStatus { code: Some(1), signal: None })]) } else { BTreeMap::new() },
+                ..Default::default()
+            })], None);
+            let report = scan.scan_once().await.unwrap();
+            assert!(matches!(worker_state(&store, &w), WorkerState::Idle { .. }));
+            assert_eq!(report.events_applied, 0);
+            assert!(report.process_exits.is_empty());
+            assert_eq!(report.process_exit_failures.len(), usize::from(fails));
+            let conn = store.read().unwrap();
+            assert!(crate::db::queries::live_session_for(&conn, w.as_str()).unwrap().is_some());
+        }
+    }
+
+    #[tokio::test]
     async fn structured_session_is_demoted_not_scanned() {
         let store = store();
         let w = wid(1);
@@ -558,6 +680,8 @@ mod tests {
                 name: "tmux",
                 frame: LIMIT_FRAME.into(),
                 native: BTreeMap::new(),
+                exits: BTreeMap::from([("amux-x".into(), ExitStatus { code: Some(1), signal: None })]),
+                ..Default::default()
             })],
             Some(protocol),
         );
@@ -578,6 +702,7 @@ mod tests {
                 name: "tmux",
                 frame: LIMIT_FRAME.into(),
                 native: BTreeMap::new(),
+                ..Default::default()
             })],
             Some(Arc::new(MockProtocol::new())),
         );
@@ -636,6 +761,7 @@ mod tests {
                 name: "herdr",
                 frame: LIMIT_FRAME.into(),
                 native: native("amux-herdr-1", "working"),
+                ..Default::default()
             })],
             Some(Arc::new(MockProtocol::new())),
         );
@@ -657,6 +783,7 @@ mod tests {
                 name: "herdr",
                 frame: LIMIT_FRAME.into(),
                 native: native("amux-herdr-1", "blocked"),
+                ..Default::default()
             })],
             Some(Arc::new(MockProtocol::new())),
         );
@@ -679,6 +806,7 @@ mod tests {
                 name: "herdr",
                 frame: LIMIT_FRAME.into(),
                 native: native("amux-herdr-1", "working"),
+                ..Default::default()
             })],
             Some(Arc::new(MockProtocol::new())),
         );
@@ -695,6 +823,7 @@ mod tests {
                 name: "herdr",
                 frame: LIMIT_FRAME.into(),
                 native: native("amux-herdr-1", "idle"),
+                ..Default::default()
             })],
             Some(Arc::new(MockProtocol::new())),
         );
@@ -719,6 +848,7 @@ mod tests {
                 name: "herdr",
                 frame: LIMIT_FRAME.into(),
                 native: native("amux-herdr-1", "unknown"),
+                ..Default::default()
             })],
             Some(Arc::new(MockProtocol::new())),
         );
@@ -776,6 +906,7 @@ mod tests {
                 name: "herdr",
                 frame: LIMIT_FRAME.into(),
                 native: native("amux-herdr-1", "working"),
+                ..Default::default()
             })],
             Some(protocol),
         );
@@ -855,6 +986,7 @@ mod tests {
                 name: "tmux",
                 frame: CODEX_WORKING.into(),
                 native: BTreeMap::new(),
+                ..Default::default()
             })],
             Some(Arc::new(MockProtocol::new())),
         );
@@ -883,6 +1015,7 @@ mod tests {
                 name: "tmux",
                 frame: CODEX_IDLE.into(),
                 native: BTreeMap::new(),
+                ..Default::default()
             })],
             Some(Arc::new(MockProtocol::new())),
         );
@@ -915,6 +1048,7 @@ mod tests {
                 name: "tmux",
                 frame: LIMIT_FRAME.into(),
                 native: BTreeMap::new(),
+                ..Default::default()
             })],
             Some(protocol),
         );

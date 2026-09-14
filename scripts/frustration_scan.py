@@ -239,8 +239,11 @@ def annotate_delivery(conn, msgs):
     ).fetchone() is not None
     for m in msgs:
         if (m.get("delivery") or "") == "direct":
-            m["delivered"] = "delivered"
-            m["delivered_why"] = "cmd_history - a direct send is delivered when it is recorded"
+            verdict = m.get("submit_verdict")
+            m["delivered"] = ("delivered" if verdict in ("confirmed", "retried") else
+                              "not delivered" if verdict == "stuck" else "unknown")
+            m["delivered_why"] = ("cmd_history.submit_verdict=" + str(verdict) +
+                                  "; direct records alone do not prove submission")
             continue
         if not have_steer:
             # ABSENCE OF THE TABLE IS NOT ABSENCE OF DELIVERY. Saying "unknown"
@@ -276,15 +279,17 @@ def main():
         return 2
     cutoff_ms = int((time.time() - DAYS * 86400) * 1000)
     conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(cmd_history)")}
+    verdict_column = "submit_verdict" if "submit_verdict" in columns else "NULL"
     rows = conn.execute(
-        "SELECT id, ts, COALESCE(session,''), text, COALESCE(delivery,'') FROM cmd_history "
+        "SELECT id, ts, COALESCE(session,''), text, COALESCE(delivery,''), " + verdict_column + " FROM cmd_history "
         "WHERE type='user' AND COALESCE(origin,'')='' AND ts >= ? "
         "AND COALESCE(text,'') <> '' ORDER BY ts ASC",
         (cutoff_ms,),
     ).fetchall()
 
     msgs = []
-    for mid, ts, sess, text, _delivery in rows:
+    for mid, ts, sess, text, _delivery, _verdict in rows:
         norm = normalize(text)
         # SHORT = NOT A REQUEST, which is a statement about the REPEAT branch and
         # was being applied to both (AF-224). Its own comment says "cannot be a
@@ -308,7 +313,7 @@ def main():
         # repeat branch (what the gate wanted) and kept for the re-prompt branch,
         # where the timing carries the meaning.
         if len(norm) < 8:
-            msgs.append({"id": mid, "ts": ts, "session": sess, "text": text, "delivery": _delivery,
+            msgs.append({"id": mid, "ts": ts, "session": sess, "text": text, "delivery": _delivery, "submit_verdict": _verdict,
                          "norm": norm, "own": own_words(text), "control": True})
             continue
         # CONTROL WORDS ARE NOT REQUESTS. "continue" appeared six times in the
@@ -318,13 +323,26 @@ def main():
         # forever. They are still eligible for the re-prompt signal, where the
         # timing is what carries the meaning.
         if CONTROL.fullmatch(norm):
-            msgs.append({"id": mid, "ts": ts, "session": sess, "text": text, "delivery": _delivery,
+            msgs.append({"id": mid, "ts": ts, "session": sess, "text": text, "delivery": _delivery, "submit_verdict": _verdict,
                          "norm": norm, "own": own_words(text), "control": True})
             continue
-        msgs.append({"id": mid, "ts": ts, "session": sess, "text": text, "delivery": _delivery,
+        msgs.append({"id": mid, "ts": ts, "session": sess, "text": text, "delivery": _delivery, "submit_verdict": _verdict,
                      "norm": norm, "own": own_words(text), "control": False})
 
     annotate_delivery(conn, msgs)
+    unconfirmed_direct = sum(m.get("delivery") == "direct" and m["delivered"] != "delivered" for m in msgs)
+    delivery_measurement = {"measured": True, "n_considered": len(msgs),
+                            "unconfirmed_direct": unconfirmed_direct,
+                            "submit_verdict_column_present": "submit_verdict" in columns}
+    if unconfirmed_direct:
+        event = {"event": "friction_direct_submission_unconfirmed", "ts": int(time.time()), **delivery_measurement}
+        try:
+            folder = os.path.join(os.environ.get("AMUX_HOME", os.path.expanduser("~/.amux")), "logs")
+            os.makedirs(folder, exist_ok=True)
+            with open(os.path.join(folder, "friction-sweep.log"), "a") as stream:
+                stream.write(json.dumps(event, sort_keys=True) + "\n")
+        except OSError as error:
+            print(json.dumps({**event, "event": "friction_audit_unavailable", "reason": type(error).__name__}), file=sys.stderr)
 
     findings = defaultdict(lambda: {"score": 0, "why": [], "msgs": []})
 
@@ -513,6 +531,7 @@ def main():
                         "when": time.strftime("%m-%d %H:%M", time.localtime(m["ts"] / 1000)),
                         "session": m["session"],
                         "text": m["text"][:400],
+                        "submit_verdict": m.get("submit_verdict"),
                         "delivered": m.get("delivered", "unknown"),
                         "delivered_why": m.get("delivered_why", ""),
                     }
@@ -526,6 +545,7 @@ def main():
             {
                 "window_days": DAYS,
                 "ethan_messages_scanned": len(msgs),
+                "delivery_measurement": delivery_measurement,
                 "candidates": len(out),
                 "shown": min(len(out), MAX_OUT),
                 "findings": out[:MAX_OUT],

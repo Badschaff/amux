@@ -1,0 +1,22 @@
+-- AMUX board-as-state-machine: hard task leases (RR-0052 lands here).
+--
+-- A card in `doing` is held by a LEASE: the owning lane NAME, when it was
+-- acquired, the last heartbeat (the holder's turn activity), an expiry, and a
+-- generation bumped on every reclaim so a write from a dead claimant is
+-- recognizable. Ownership was a bare `session` NAME plus a `task.claimed`
+-- event; the lease makes it enforceable: only the holder may transition the
+-- card, and an expired lease returns the card to the pool without a human.
+--
+-- `lease_owner` is a NEW column, deliberately NOT reusing `session`: deriving a
+-- holder from `session` would instantly gate every existing owned Doing card,
+-- a fleet-wide regression. lease_owner is NULL on all legacy rows, so a card is
+-- gated only once it is claimed under the new path AND AMUX_LEASE_ENFORCE is on.
+-- All columns nullable, no backfill, inert until then.
+--
+-- ADDCOL: issues lease_owner TEXT
+-- ADDCOL: issues lease_acquired_at INTEGER
+-- ADDCOL: issues lease_heartbeat_at INTEGER
+-- ADDCOL: issues lease_expires_at INTEGER
+-- ADDCOL: issues lease_generation INTEGER NOT NULL DEFAULT 0
+CREATE INDEX IF NOT EXISTS idx_issues_lease_expiry
+    ON issues(status, lease_expires_at) WHERE lease_expires_at IS NOT NULL;

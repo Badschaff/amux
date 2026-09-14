@@ -1,9 +1,9 @@
--- 0067_worker_lifecycle.sql — First-class worker lifecycle (active/paused/archived/deleted).
+-- 0069_worker_lifecycle.sql — First-class worker lifecycle (active/paused/archived/deleted).
 --
 -- Replaces the soft-delete sidecar hack (deleted_at inside the state JSON) and
 -- the env-file CC_ARCHIVED flag with one canonical lifecycle column on the
 -- workers table. Orthogonal to WorkerState (execution state): a worker can be
--- active+stopped, paused+idle, or archived+stopped.
+-- active+stopped, paused+stopped, or archived+stopped.
 --
 -- Migration 0003's soft-delete deviation (queries.rs module docs) is resolved
 -- here: deleted_at is promoted from a JSON sidecar to a real column value.

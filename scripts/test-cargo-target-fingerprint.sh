@@ -4,18 +4,28 @@ set -o pipefail
 
 # AF-791: verifies shared-target stale-output detection in test-contended.
 # If a source edit does not advance mtime, Cargo may reuse a stale artifact.
-# This test requires the fixture in scratch/af791-evidence/cargo-specimen.
+# Build a private, dependency-free fixture so a clean checkout can run this.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SPEC="$ROOT/scratch/af791-evidence/cargo-specimen"
-if [ ! -d "$SPEC" ]; then
-  echo "missing fixture: $SPEC" >&2
-  exit 1
-fi
-
-TMP_TARGET="$ROOT/scratch/af791-evidence/fingerprint-target"
-rm -rf "$TMP_TARGET"
-mkdir -p "$TMP_TARGET"
+FIXTURE_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/amux-fingerprint-test.XXXXXX")
+trap 'rm -rf "$FIXTURE_ROOT"' EXIT
+SPEC="$FIXTURE_ROOT/specimen"
+TMP_TARGET="$FIXTURE_ROOT/target"
+mkdir -p "$SPEC/src" "$TMP_TARGET"
+cat > "$SPEC/Cargo.toml" <<'TOML'
+[package]
+name = "amux-af791-mtime-probe"
+version = "0.1.0"
+edition = "2021"
+[workspace]
+TOML
+cat > "$SPEC/src/lib.rs" <<'RS'
+pub fn answer() -> u64 { 7 }
+#[test]
+fn matches_expected_value() {
+    assert_eq!(answer(), std::env::var("AF791_EXPECT").unwrap().parse::<u64>().unwrap());
+}
+RS
 export CARGO_TARGET_DIR="$TMP_TARGET"
 WRAP="$ROOT/scripts/test-contended.sh"
 
@@ -32,7 +42,7 @@ run_once() {
     cd "$SPEC"
     AF791_EXPECT="$expect" \
     CARGO_TARGET_DIR="$TMP_TARGET" \
-    "$WRAP" --quiet -p amux-af791-mtime-probe "$@" >"$log" 2>&1
+    "$WRAP" --offline --quiet -p amux-af791-mtime-probe "$@" >"$log" 2>&1
   )
 }
 
@@ -57,16 +67,16 @@ if [ -z "$BASEVAL" ]; then
   exit 1
 fi
 
-if ! run_once "$BASELOG" "$BASEVAL" test; then
+if ! run_once "$BASELOG" "$BASEVAL"; then
   bad "baseline test accepts AF791_EXPECT=$BASEVAL"
-elif ! grep -q "test result: ok." "$BASELOG"; then
+elif ! grep -q "test result: ok. 1 passed; 0 failed;" "$BASELOG"; then
   bad "baseline test for AF791_EXPECT=$BASEVAL produced no passing test output"
 else
   ok "baseline test accepts AF791_EXPECT=$BASEVAL"
 fi
 
 # Create a content-only edit and preserve mtime.
-STAMP=$(stat -f %m "$SPEC/src/lib.rs")
+STAMP=$(python3 -c 'import os,sys;print(os.stat(sys.argv[1]).st_mtime_ns)' "$SPEC/src/lib.rs")
 NEXTVAL=$((BASEVAL + 1))
 python3 - "$SPEC/src/lib.rs" "$NEXTVAL" <<'PY'
 import re
@@ -84,15 +94,16 @@ if text == updated:
     raise SystemExit(1)
 open(path, "w").write(updated)
 PY
-touch -t "$(date -r "$STAMP" +%Y%m%d%H%M.%S)" "$SPEC/src/lib.rs"
-if [ "$(stat -f %m "$SPEC/src/lib.rs")" -ne "$STAMP" ]; then
-  bad "preserved-mtime edit setup failed"
-fi
+python3 - "$SPEC/src/lib.rs" "$STAMP" <<'PYTIME'
+import os,sys
+p,stamp=sys.argv[1],int(sys.argv[2]);os.utime(p,ns=(os.stat(p).st_atime_ns,stamp))
+assert os.stat(p).st_mtime_ns==stamp
+PYTIME
 
 STALENESS="$TMP_TARGET/staleness.log"
-if ! run_once "$STALENESS" "$NEXTVAL" test; then
+if ! run_once "$STALENESS" "$NEXTVAL"; then
   bad "rerun with preserved mtime does not accept AF791_EXPECT=$NEXTVAL"
-elif grep -q 'staleness: shared target cache for package amux-af791-mtime-probe differs from source digest;' "$STALENESS"; then
+elif grep -q 'test result: ok. 1 passed; 0 failed;' "$STALENESS" && grep -q 'staleness: shared target cache for package amux-af791-mtime-probe differs from source digest;' "$STALENESS"; then
   ok "preserved-mtime edit forced cache refresh; test now passes AF791_EXPECT=$NEXTVAL"
 else
   bad "preserved-mtime edit did not print a staleness notice"

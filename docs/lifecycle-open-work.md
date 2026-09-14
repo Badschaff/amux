@@ -1,12 +1,13 @@
 # Lifecycle status and closure checklist
 
-As of September 11, 2026, 23:13 America/New_York. Tracking work: **AMUX-4417**.
+Updated September 13, 2026. See the [steering and sync validation](lifecycle-validation-2026-09-12.md) for the latest candidate, runtime fixes and explicit native-run limits. Tracking work: **AMUX-4417**.
+The expanded [cold offline reconnect validation](lifecycle-offline-validation-2026-09-12.md) covers cached UI edits, messages, large files and per-operation checkmarks.
 Overall status: **INCOMPLETE**. This register covers all known unresolved items
 from the mobile messaging, board, Sonnet and Gemini lifecycle work. It is not a
 claim that every undiscovered product defect is enumerated.
 
-The deployed implementation is `241b92acb02c719cb72b9ef8d70109c1f75fa3e4`, dashboard
-0.9.911, build `a6d4111bd0eaff6c`. The latest read-only health probe returned
+The September 11 deployment receipt was `241b92acb02c719cb72b9ef8d70109c1f75fa3e4`, dashboard
+0.9.911, build `a6d4111bd0eaff6c`. That read-only health probe returned
 `status=ok`, `store=ok`, `pressure=warn`, `swap_used_mb=22176.1875`,
 `admission=deny`. Healthy serving and permission to launch another worker are
 separate facts. Admission denial is an observed host condition; the cause of
@@ -14,7 +15,7 @@ all retained memory/swap has not been established.
 
 Use the [acceptance guide](consolidated-lifecycle.md) for the full procedure and
 [case catalog](../e2e/lifecycle/cases.json) for individual acceptance conditions.
-The [portable evidence summary](evidence/lifecycle-2026-09-11.json) preserves run
+The [latest portable evidence summary](evidence/lifecycle-2026-09-12.json) preserves run
 identities, hashes, selections, failed stages and the deployment receipt. The
 [detailed incident report](lifecycle-validation-2026-09-11.md) preserves the
 investigation and earlier fixes. Raw traces remain in the local evidence archive;
@@ -28,7 +29,7 @@ no authentication headers or full user conversations.
 | Local acceptance and draft retention | Durable intent takes priority over disposable caches; exact message IDs survive retries; a newer draft is not cleared. Real WebKit quota reproduction and subsequent browser regressions are recorded in the incident report. |
 | Sent versus pending | Read-only acceptance receipts reconcile a pending browser request with native acceptance without sending again. Receipt tests use controlled transport; they do not prove model execution. |
 | Rapid input | Distinct pointer/touch gestures are accepted within 350 ms; newly queued work avoids outage backoff; a bounded lightweight poll burst displays terminal updates. Earlier measured dispatch/display timings are fixture timings, not native-model latency. |
-| Mobile composer | Full-width phone writing field, aligned 44px More/Send/Queue controls, reachable attachment menu and bounded long-draft height. The final 18-case run includes narrow phone and keyboard-height viewport checks, with screenshots opened. |
+| Mobile composer | The September 12 candidate preserves the newer compact writing row with aligned 44px More/Send/Queue controls, a reachable attachment menu and bounded long-draft height. The final 18-case run includes narrow phone and keyboard-height viewport checks, with screenshots opened. |
 | Failed offline operations | Failed and retryable counts remain distinct while offline; stale dismissal cannot remove an edit resumed by another tab. A real 409, offline period and reconnect verify the surviving edit. |
 | Verified and changed gates | Older evidence remains visible; changing the gate requires a fresh check and stale acknowledgements are refused. Browser cases pass on desktop Chromium, phone Chromium and iPhone WebKit. |
 | Linked task detail | Epic, child, source message, file, URL and commit navigation plus evidence and actual uploaded bytes passed the selected browser checks. This does not prove autonomous decomposition. |
@@ -47,8 +48,8 @@ and is also retained as FAIL; the repaired run is the later pass.
 
 | ID / status | Evidence and impact | Required closure |
 | --- | --- | --- |
-| LW-01 — BLOCKED: live worker admission | Current health denies new workers with memory pressure and about 22 GB of swap. `semantic-messages-live` failed preflight before creating a worker or sending a message. | Identify current memory consumers and release only authorized resources, or use an authorized independent lab. Recheck admission, then run both provider journeys. Do not disable admission to turn this red prerequisite green. |
-| LW-02 — OPEN: misleading helper error | The retained helper probe exited 1 with `You've hit your session limit` on stdout. `complete_cli` returns nonempty stdout even after failure, so intake reports invalid classifier JSON. This is a confirmed code-path defect. | Classifier calls must honor unsuccessful exit status, preserve a bounded useful diagnostic, and log exit/timeout separately from invalid successful output. Cover stdout-only quota, stderr-only failure, empty failure, failed JSON-shaped output, timeout and successful JSON. LC-HELPER-FAILURE is now in the guided catalog; it has not been implemented as an automated regression. |
+| LW-01 — BLOCKED: live worker admission | September 12 health denies new workers with memory pressure and about 30 GB of swap. Both new native-steering provider runs failed this preflight before worker creation. `semantic-messages-live` failed preflight before creating a worker or sending a message. | The [memory investigation](lifecycle-memory-validation-2026-09-12.md) found 54 GiB fseventsd, 24 GiB Procwarden, and 12 GiB Activity Monitor accounting; three owned stale lab sessions were stopped, but admission still denies. Recover host capacity with authorized application/system actions, or use an authorized independent lab. Recheck admission, then run both provider journeys. Do not disable admission to turn this red prerequisite green. |
+| LW-02 — FIXED: misleading helper error | The retained helper probe exited 1 with `You've hit your session limit` on stdout. `complete_cli` returns nonempty stdout even after failure, so intake reports invalid classifier JSON. Real subprocess regressions reproduced this before the fix. | The helper now honors exit status, bounds diagnostics to 400 characters, logs exit/timeout separately, and reaps timed-out children. LC-HELPER-FAILURE includes automated stdout-only quota, stderr-only failure, empty failure, failed JSON-shaped output, timeout, and successful JSON controls. The [September 13 I/O repair](lifecycle-helper-io-validation-2026-09-13.md) also bounds prompt writes, simultaneous output, inherited pipes and retained bytes, with owned-group cleanup. Real provider recovery and semantic merging remain in LW-03. |
 | LW-03 — INCOMPLETE: message-driven semantic deduplication | Live model-backed append/update assertions remain unexecuted in the new six-message scenario. When comparison fails, `board_intake::plan` preserves the request as a separate record with `measured=false`; this can accumulate near-duplicates. A Gemini worker still uses the server's configured helper, which may be Claude. | First fix LW-02 and establish helper availability independently of worker provider. Pass LC-SEMANTIC-MESSAGES: six actual composer messages, exactly three task IDs, four full source links on the survivor, measured append/update decisions, increasing revision and preserved/refined requirements. Separately test failure/recovery policy; do not silently merge on guessed title similarity or claim the current fallback deduplicates. |
 | LW-04 — FAILED: older Gemini peer terminal history | The cross-group run exchanged CROSS_REQUEST, CROSS_ACK and CROSS_DONE and completed core work, but the older peer message was not found under the terminal Workers filter. Readable history falls back to terminal paint logs rather than Gemini's structured conversation journal. | Add or repair provider history ingestion with durable origin/ID mapping. After enough output to leave the live frame, load older history, find the exact peer message under Workers, and navigate its task at desktop and phone widths. Repeat human-origin and live-frame positive controls. LC-27 and LC-SONNET-CROSSGROUP now explicitly require this. |
 | LW-05 — INCOMPLETE: backlog starvation and repeated coordination work | Reviewer LG1R-8/9 finished with correct artifacts; author LG1A-10/11 stayed Backlog/Todo while acknowledgement captures generated further work. The observer was stopped after 6.5 minutes. This is a partial result, not proof of a particular driver bug. | Trace which source messages create each extra card and which dispatch decision defers the originals. Repair capture/reply/dispatch at the responsible boundary. Repeat LC-SONNET-QUEUE without chat nudges or observer status writes: both workers finish their original Backlog and Todo IDs with dependencies and evidence. After handoff, observe three complete driver cycles with no receipt-only tasks or turns. |
@@ -56,7 +57,9 @@ and is also retained as FAIL; the repaired run is the later pass.
 | LW-07 — PARTIAL: upload/provider matrix | A real Gemini worker read an earlier small UI upload, reported row_count=2 and total_count=6, and completed LG1A-7. Initial folder trust required operator help. Large-file transport passed separately. | Repeat the upload scenario with a fresh Sonnet worker and a fresh Gemini worker; record trust setup honestly. Test representative large text/binary files, native access to the exact uploaded path, interruption/reload/retry/cancel, linked artifact preview/download, and independently checked output. Treat provider context/file-size limits as visible outcomes, not infinite-file support. |
 | LW-08 — NOT CERTIFIED: every UI action and physical mobile behavior | Selected desktop/phone/WebKit screenshots and interactions passed. Browser viewport resizing does not reproduce every physical iPhone keyboard, Safari/PWA lifecycle, background suspension or VPN condition. The complete guided ledger is unfinished. | Walk every discovered control using LC-01–LC-63 and supplemental cases: visible effect, persisted result/reload, cancel, invalid/empty input, keyboard focus and touch. Complete light/dark, long content, real keyboard, browser/PWA, background/reopen and back-navigation checks. External sends require a configured test sink. Leave unavailable controls/capabilities explicitly INCOMPLETE. |
 | LW-09 — UNMEASURED: token efficiency | Fewer terminal HTTP bytes and faster polling are not token savings. Repeated coordination work is observed; no matched native-worker plus helper token baseline proves a reduction. Intake considers at most 80 recent scoped candidates with 2,500 description characters each; incoming content and helper output also affect cost. | Measure identical verified outcomes before/after: model/settings, worker and helper calls, input/output/cache tokens when exposed, elapsed time and task/message growth. Remove receipt-only loops first; evaluate candidate/context changes without losing target selection or evidence. LC-TOKEN-EFFICIENCY records missing counters as UNMEASURED. Report tokens per verified outcome and quality together. |
-| LW-10 — PARTIAL: sustained disconnect recovery | Specific false restarts and browser state bugs were reproduced and fixed. Current serving is healthy but host pressure persists. No final long-duration phone/VPN/background soak proves all disconnects resolved. | Run LC-40–LC-43/LC-51 with controlled outage, response loss after acceptance, server adoption and background/reopen. Record build identities, health/probe ages, connection events and exact accepted message IDs. Require one delivery per ID, no lost intent/new draft, correct failed/uncertain state, and no watchdog restart merely because a progressing probe exceeds its short deadline. |
+| LW-10 — PARTIAL: sustained disconnect recovery | Specific false restarts and browser state bugs were reproduced and fixed. A post-deploy health probe returned 503 at its 250ms writer deadline, then succeeded at 702ms without a PID change. Worker-list requests took 5.9s and 3.2s; host pressure persists. No final long-duration phone/VPN/background soak proves all disconnects resolved. | Run LC-40–LC-43/LC-51 with controlled outage, response loss after acceptance, server adoption and background/reopen. Record build identities, health/probe ages, connection events and exact accepted message IDs. Require one delivery per ID, no lost intent/new draft, correct failed/uncertain state, and no watchdog restart merely because a progressing probe exceeds its short deadline. |
+
+| LW-11 — BROKEN: autofix alert refresh/expiry | Live logs repeatedly report `no such column: updated_at`; these queries use `updated_at/created_at`, while the issues schema uses `updated/created`. The dormant expiry update also discards by age with an unconditional ID-only write, so correcting the column names alone would enable unsafe cleanup. | Exercise LC-AUTOFIX-CLEANUP on a migrated scratch DB. Correct schema access, require resolved/obsolete evidence before terminal cleanup, and recheck status/claim/revision atomically so work claimed after selection survives. Keep ongoing faults, human work and claimed work intact. |
 
 ## Concrete repair entry points
 
@@ -129,8 +132,9 @@ Do not repeatedly start replacement workers or change billing to get a green run
 After the targeted repairs, run `python3 scripts/lifecycle/run.py full` with each
 provider configuration and finish the guided visual ledger. Newly expanded
 acceptance text is a requirement, not evidence that an existing spec implements
-all of it. In particular, helper-failure handling, post-completion quiet-cycle
-observation and token benchmarking still need automated regression coverage.
+all of it. Helper-failure handling and token benchmarking still need automated
+regression coverage. Three post-completion quiet driver cycles are now required
+by the paired queue observer, but their live execution remains admission-blocked.
 
 Close each LW item only with a named run, exact commit/build/provider/model,
 original task/message IDs, independently checked artifacts/criteria, inspected
@@ -139,7 +143,7 @@ AMUX-4417 remains open until all requested deliverables and acceptance cases hav
 an honest terminal verdict.
 
 
-## Validation of this documentation update
+## Historical September 11 discovery
 
 `python3 -m unittest discover -s scripts/lifecycle -p 'test_*.py'` passed all nine
 runner contracts. `python3 scripts/lifecycle/run.py plan` discovered 900 browser
@@ -148,3 +152,28 @@ guided rows remained NOT_RUN with empty evidence. Live `--list` discovery found
 10 tests in six files for each of the Claude and Gemini configurations. Catalog
 IDs are unique, source/document links resolve, and `git diff --check` passed.
 These are catalog/discovery checks, not new live-provider or runtime test passes.
+
+## Isolated-worker follow-up
+
+[Isolated lifecycle validation](lifecycle-isolated-validation-2026-09-12.md) adds
+owner queue/retry and UI-toggle coverage plus a native queued-file scenario. It
+records the peer Queue bypass fix and the still-open disagreement between board
+lane selection and isolated wake/steering refusals. Native isolated task drain,
+restart and offline continuations remain unverified.
+
+## Additional observation from the offline reconnect run
+
+The upstream interaction-receipt middleware reports `interaction_outcome` with
+`phase=unknown` for successful `/api/upload/start` and `/finish` subrequests.
+The upload workflow and reconnect checklist independently validate the finish
+path/URL and downloaded bytes; those subrequest receipts are not proof of native
+worker consumption or a fully reconciled server effect graph. Their classification
+remains open. The September 12 offline artifact logs preserve the observations.
+
+September 12 continuation: the live server at `fb7d746c` remained healthy but admission still denied new workers (memory pressure warn, approximately 42 GB of swap). No fresh native worker was launched or counted as a pass. See [helper failure validation](lifecycle-helper-validation-2026-09-12.md).
+
+## September 13 transport rerun and visual gap
+
+The [fresh pinned-release run](lifecycle-offline-validation-2026-09-13.md) passed nine selected browser cases and 46 outbox contracts. It does not certify the full lifecycle.
+
+**LW-12 — FAILED: offline error presentation.** Opened screenshots show an expanded worker-list error panel in addition to the reconnect checklist. Raw PATCH/POST paths appear as operation labels; the upper panel counts five JSON operations while the checklist includes seven operations with two files. Move detailed errors/retry/discard actions into the connection/sync modal, use task/message labels, and clearly scope or unify counts. Assert the worker list stays usable offline, modal actions still work, and file/message/edit checkmarks remain truthful. LC-SYNC-PROGRESS now names these visual requirements; no presentation repair is claimed here.

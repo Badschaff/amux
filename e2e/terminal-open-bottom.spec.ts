@@ -1,5 +1,6 @@
 import { test, expect, Page } from './fixtures';
 import type { Route } from '@playwright/test';
+import { readEarlier } from './reader-scroll';
 
 const history = 'Earlier context\n'.repeat(160) + '› Locate this earlier request\n' + 'Earlier answer\n'.repeat(160);
 const live = 'Latest tool result\n'.repeat(30) + 'LATEST_OUTPUT_END';
@@ -50,11 +51,10 @@ for (const provider of ['claude','codex','gemini']) for (const first of ['live',
   });
 }
 
-test('deliberate scroll-up during history load holds until Jump to bottom', async ({page}) => {
+test('deliberate scroll-up during history load holds until Jump to bottom', async ({page}, info) => {
   const routes = await prepare(page);
   await paint(routes.live,false); await bottom(page);
-  await page.locator('#peek-body').hover();
-  await page.mouse.wheel(0,-400);
+  await readEarlier(page, !!info.project.use.hasTouch);
   await expect.poll(() => page.locator('#peek-body').evaluate(el => el.scrollHeight-el.scrollTop-el.clientHeight)).toBeGreaterThan(100);
   const before = await page.locator('#peek-body').evaluate(el => el.scrollTop);
   await paint(routes.full,true);

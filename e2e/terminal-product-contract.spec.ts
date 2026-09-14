@@ -1,5 +1,6 @@
 import { type Route } from '@playwright/test';
 import { test, expect, type Page, allowUnusedRoute } from './fixtures';
+import { readEarlier } from './reader-scroll';
 
 const worker = 'terminal-contract';
 
@@ -37,8 +38,15 @@ async function boot(page: Page, options?: {
       ? { key, value: persistedLayout }
       : { key, value: null } });
   });
-  await page.route(`**/api/history?limit=200&offset=0&session=${worker}`,
-    route => route.fulfill({ json: historyRows }));
+  // This fixture supplies the worker's first page; page size is not its contract.
+  // Match the actual scoped request (currently 60 rows), never waive the hit guard.
+  await page.route(url => url.pathname === '/api/history'
+    && url.searchParams.get('session') === worker
+    && url.searchParams.get('offset') === '0' && url.searchParams.has('limit'), route => {
+    const size = Number(new URL(route.request().url()).searchParams.get('limit'));
+    expect(Number.isInteger(size) && size > 0 && size <= 200, 'bounded first history page').toBe(true);
+    return route.fulfill({ json: historyRows.slice(0, size) });
+  });
   const sendRoute = `**/api/sessions/${worker}/send`;
   await page.route(sendRoute, async (route: Route) => {
     const body = route.request().postDataJSON() as { text?: string };
@@ -147,6 +155,7 @@ test('terminal controls stay compact and the bottom affordance distinguishes nav
   expect(layout.controlsWidth).toBeLessThan(260);
   expect(Math.abs(layout.controlsRight - layout.bodyRight)).toBeLessThan(12);
 
+  await readEarlier(page, !!testInfo.project.use.hasTouch);
   await page.evaluate(() => {
     const body = document.getElementById('peek-body')!;
     body.scrollTop = 0;
@@ -208,9 +217,10 @@ test('worker tab choices restore from the server after browser storage is lost a
   await expect(page.locator('#peek-tab-steering')).toBeVisible();
 });
 
-test('terminal scroll geometry remains stable through repeated live frames', async ({ page }) => {
+test('terminal scroll geometry remains stable through repeated live frames', async ({ page }, testInfo) => {
   const transcript = Array.from({ length: 900 }, (_, i) => `stable terminal row ${i}`).join('\n');
   const state = await boot(page, { transcript, live: 'live frame zero\n' });
+  await readEarlier(page, !!testInfo.project.use.hasTouch);
   const before = await page.evaluate(() => {
     const body = document.getElementById('peek-body')!;
     body.scrollTop = Math.floor((body.scrollHeight - body.clientHeight) * 0.45);
@@ -296,4 +306,71 @@ test('the HTTP frame retains the worker column cap after renderer reconciliation
   expect(size.history).toBeCloseTo(size.max, 0);
   expect(size.history).toBeLessThan(size.body);
   expect(size.overflow).toBeLessThanOrEqual(1);
+});
+
+test('a small upward scroll at the log bottom relinquishes following through live updates', async ({ page }) => {
+  const fixture = await boot(page, { transcript: Array.from({length: 160}, (_, i) => `Saved line ${i}`).join('\n') });
+  const body = page.locator('#peek-body');
+  await expect.poll(() => body.evaluate(el => el.scrollHeight - el.clientHeight - el.scrollTop)).toBeLessThan(2);
+  // Model the first five pixels of a slow reader gesture. The native Simulator
+  // probe separately dispatches actual touch swipes; this isolates the 40px seam.
+  await body.dispatchEvent('wheel', { deltaY: -5 });
+  await body.evaluate(el => { el.scrollTop -= 5; });
+  await expect.poll(() => page.evaluate(() => eval('_peekFollowBottom'))).toBe(false);
+  const top = await body.evaluate(el => el.scrollTop);
+  fixture.setLive('New live output while reading the preceding line\n');
+  await page.evaluate(() => (window as any).refreshPeek(true));
+  await expect.poll(() => body.evaluate(el => el.scrollTop)).toBeCloseTo(top, 0);
+  await expect.poll(() => page.evaluate(() => eval('_peekScrollLocked'))).toBe(true);
+  // Reaching the actual bottom again must still resume live following.
+  await body.dispatchEvent('wheel', { deltaY: 100 });
+  await body.evaluate(el => { el.scrollTop = el.scrollHeight; });
+  await expect.poll(() => page.evaluate(() => eval('_peekFollowBottom'))).toBe(true);
+  fixture.setLive('Following resumed after the reader returned to the end\n');
+  await page.evaluate(() => (window as any).refreshPeek(true));
+  await expect.poll(() => body.evaluate(el => el.scrollHeight - el.clientHeight - el.scrollTop)).toBeLessThan(2);
+});
+
+test('the compact phone composer keeps its empty prompt readable beside the actions', async ({ page }, testInfo) => {
+  await page.setViewportSize({width:375,height:812});
+  await boot(page);
+  for (const status of ['active', 'idle']) {
+    await page.evaluate(status => { eval(`sessions.find(s=>s.name==='terminal-contract').status=${JSON.stringify(status)};updatePeekStatus()`); }, status);
+    const g = await page.locator('#peek-cmd-input').evaluate((el: HTMLTextAreaElement) => {
+      const style=getComputedStyle(el), canvas=document.createElement('canvas'),ctx=canvas.getContext('2d')!;
+      ctx.font=`${style.fontSize} ${style.fontFamily}`;
+      const input=el.getBoundingClientRect(), more=document.querySelector('#peek-composer-more-btn')!.getBoundingClientRect(),send=document.querySelector('#peek-cmd-row > .send-split')!.getBoundingClientRect();
+      return {promptWidth:ctx.measureText(el.placeholder).width,available:el.clientWidth-parseFloat(style.paddingLeft)-parseFloat(style.paddingRight),height:input.height,sameRow:Math.abs(input.bottom-more.bottom)<2&&Math.abs(input.bottom-send.bottom)<2,overflow:document.documentElement.scrollWidth>innerWidth};
+    });
+    expect(g.promptWidth,JSON.stringify(g)).toBeLessThanOrEqual(g.available);
+    expect(g.sameRow).toBe(true);expect(g.overflow).toBe(false);
+  }
+  await page.locator('#peek-cmd-input').fill('Preserve this mobile draft.');
+  await page.locator('#peek-composer-more-btn')[testInfo.project.use.hasTouch ? 'tap' : 'click']();
+  await expect(page.locator('#peek-more-menu')).toBeVisible();
+  await page.locator('#peek-composer-more-btn')[testInfo.project.use.hasTouch ? 'tap' : 'click']();
+  await expect(page.locator('#peek-cmd-input')).toHaveValue('Preserve this mobile draft.');
+  const failure = page.waitForRequest(request => request.url().endsWith('/api/client-debug') && request.postDataJSON()?.verdict === 'composer_placeholder_clipped');
+  await page.evaluate(() => {
+    const input=document.querySelector('#peek-cmd-input') as HTMLTextAreaElement;
+    input.value=''; input.placeholder='This deliberately long placeholder cannot fit the phone composer';
+    eval('_geoBeaconSent=false;_peekGeoBeacon()');
+  });
+  expect((await failure).postDataJSON()).toMatchObject({measured:true,n_considered:1,placeholder_fits:false});
+});
+
+
+test('saved conversation survives reopen, resize and repeated normal-screen frames', async ({page}, info) => {
+  const transcript = Array.from({length:60}, (_,i) => `❯ Saved request ${i}\n\n⏺ Saved answer ${i}\n`).join('\n');
+  await boot(page, {transcript, live:'❯ Ready for input\n', waitForBothFrames:true});
+  for (const viewport of [{width:1314,height:790},{width:820,height:690},{width:375,height:667}]) {
+    await page.setViewportSize(viewport);
+    await page.evaluate(async () => { await (window as any).refreshPeek(); });
+    await expect(page.locator('#pk-hist')).toContainText('Saved answer 59');
+    await expect(page.locator('#peek-cmd-input')).toBeVisible();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  }
+  await page.evaluate(name => { (window as any).closePeek(); (window as any).openPeek(name); }, worker);
+  await expect(page.locator('#pk-hist')).toContainText('Saved answer 59');
+  await page.screenshot({path:info.outputPath('saved-history-after-resize.png')});
 });

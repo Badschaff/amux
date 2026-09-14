@@ -119,17 +119,27 @@ async fn webdriver(
         .timeout(Duration::from_secs(deadline))
         .build()
         .map_err(failure)?;
+    let verb = method.to_string();
+    let transport_error = |error: reqwest::Error| {
+        let timed_out = error.is_timeout();
+        tracing::warn!(target:"amux::browser_ios",verdict="webdriver_transport_failed",measured=true,
+            n_considered=1,method=%verb,operation=%path,deadline_s=deadline,timed_out,
+            "iOS WebDriver did not acknowledge the operation");
+        (if timed_out { StatusCode::GATEWAY_TIMEOUT } else { StatusCode::BAD_GATEWAY },
+            format!("Safari WebDriver {verb} {path}: {}; deadline {deadline}s; action outcome may be unknown",
+                if timed_out { "timed out" } else { "transport failed" }))
+    };
     let mut request = client.request(method, format!("http://127.0.0.1:{port}{path}"));
     if let Some(b) = body {
         request = request.json(&b);
     }
-    let response = request.send().await.map_err(failure)?;
+    let response = request.send().await.map_err(&transport_error)?;
     let status = response.status();
-    let data: Value = response.json().await.map_err(failure)?;
+    let data: Value = response.json().await.map_err(transport_error)?;
     if !status.is_success() || data["value"]["error"].is_string() {
         // Don't log URLs, scripts or typed text echoed by the browser.
         return Err(failure(format!(
-            "Safari WebDriver HTTP {status}: {}",
+            "Safari WebDriver {verb} {path} HTTP {status}: {}",
             data["value"]["error"].as_str().unwrap_or("request failed")
         )));
     }
@@ -219,6 +229,99 @@ async fn targets() -> Response {
     }
 }
 
+// Only an explicit WebDriver "invalid session id" proves the saved session is
+// gone. Transport failures and unknown outcomes preserve ownership and never
+// cause a command to be retried on a newly created browser.
+async fn prepare_reuse(
+    slot: &mut Option<Driver>,
+    session: &str,
+    udid: &str,
+    record: &std::path::Path,
+) -> Result<bool> {
+    if slot.is_none() {
+        return Ok(false);
+    }
+    let d = owned(slot, session)?;
+    if d.udid != udid {
+        return Err((StatusCode::CONFLICT,
+            "Stop your current iOS browser before changing simulator devices".into()));
+    }
+    match d.command(reqwest::Method::GET, "/url", None).await {
+        Ok(_) => return Ok(false),
+        Err((status, error)) if status == StatusCode::BAD_GATEWAY
+            && error.ends_with(": invalid session id") => {}
+        Err(error) => return Err(error),
+    }
+    match tokio::fs::remove_file(record).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(failure(error)),
+    }
+    *slot = None;
+    tracing::warn!(target:"amux::browser_ios",session,verdict="expired_session_released",
+        measured=true,n_considered=1,"expired iOS WebDriver session released before explicit Go; no browser action replayed");
+    Ok(true)
+}
+
+// Remote WebKit navigation can select a hidden Safari tab. Native gestures
+// target the foreground tab instead, so explicit Go must align both surfaces.
+async fn navigate(d: &Driver, url: &str) -> Result<()> {
+    if !d.native {
+        d.post("/url", json!({"url":url})).await?;
+        return Ok(());
+    }
+    let result = tokio::time::timeout(Duration::from_secs(35), async {
+        // Safari deep links create tabs. Reuse the aligned foreground tab so
+        // repeated Go does not retain old pages and their streaming connections.
+        if d.eval("document.visibilityState === 'visible'", json!([])).await? == true {
+            d.post("/url", json!({"url":url})).await?;
+            require_visible_tab(d).await?;
+            tracing::info!(target:"amux::browser_ios",session=%d.owner,verdict="native_tab_reused",
+                measured=true,n_considered=1,"Safari navigation reused the visible debugger tab");
+            return Ok(());
+        }
+        d.post("/execute/sync", json!({"script":"mobile: deepLink",
+            "args":[{"url":url,"bundleId":"com.apple.mobilesafari"}]})).await?;
+        let contexts = d.post("/execute/sync", json!({"script":"mobile: getContexts","args":[]})).await?;
+        let contexts = contexts.as_array().ok_or(failure("Safari contexts unavailable"))?;
+        // Old hidden tabs can have dead debugger contexts. Prefer the URL Go
+        // just opened, then the newest contexts (also covers redirects), rather
+        // than letting an unrelated old page consume the alignment deadline.
+        let mut candidates: Vec<_> = contexts.iter().rev()
+            .filter(|c| c["bundleId"] == "com.apple.mobilesafari").collect();
+        candidates.sort_by_key(|c| c["url"].as_str()
+            .is_none_or(|actual| actual.split('#').next() != url.split('#').next()));
+        let candidate_count = candidates.len();
+        let mut considered = 0;
+        for context in candidates {
+            let Some(id) = context["id"].as_str() else { continue };
+            considered += 1;
+            d.post("/context", json!({"name":id})).await?;
+            if d.eval("document.visibilityState === 'visible'", json!([])).await? == true {
+                tracing::info!(target:"amux::browser_ios",session=%d.owner,verdict="native_tab_aligned",
+                    measured=true,n_considered=considered,n_candidates=candidate_count,
+                    requested_url_match=context["url"].as_str().is_some_and(|actual| actual.split('#').next() == url.split('#').next()),
+                    "Safari foreground and debugger tab aligned");
+                return Ok(());
+            }
+        }
+        tracing::warn!(target:"amux::browser_ios",session=%d.owner,verdict="native_tab_unavailable",
+            measured=true,n_considered=considered,"No visible Safari debugger tab after explicit Go");
+        Err((StatusCode::CONFLICT,"Safari opened the URL but its visible tab is unavailable to WebDriver; inspect the simulator before retrying Go".into()))
+    }).await;
+    result.unwrap_or_else(|_| Err((StatusCode::GATEWAY_TIMEOUT,
+        "Safari foreground alignment exceeded 35s; navigation outcome may be unknown".into())))
+}
+
+async fn require_visible_tab(d: &Driver) -> Result<()> {
+    if d.native && d.eval("document.visibilityState === 'visible'", json!([])).await? != true {
+        tracing::warn!(target:"amux::browser_ios",session=%d.owner,verdict="hidden_native_tab",
+            measured=true,n_considered=1,"Native input refused: debugger tab is not the visible Safari tab");
+        return Err((StatusCode::CONFLICT,"The debugger tab is hidden; use Go to align Safari before native input. No input was dispatched".into()));
+    }
+    Ok(())
+}
+
 async fn start(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -232,10 +335,10 @@ async fn start(
             return Err((StatusCode::BAD_REQUEST, "url must be http(s) or about:blank".into()));
         }
         let mut slot = lock_driver().await?;
+        let recovered = prepare_reuse(&mut slot, &session, udid, &record_path()).await?;
         if slot.is_some() {
             let d = owned(&mut slot, &session)?;
-            if d.udid != udid { return Err((StatusCode::CONFLICT,"Stop your current iOS browser before changing simulator devices".into())); }
-            d.post("/url", json!({"url":url})).await?;
+            navigate(d, url).await?;
         } else {
             let devices = inventory(&simctl(&["list","--json"]).await?);
             let target = devices.iter().find(|d| d["udid"] == udid).ok_or((StatusCode::BAD_REQUEST,"Simulator no longer available; refresh targets".into()))?;
@@ -268,6 +371,7 @@ async fn start(
             let mut caps = if native { json!({
                 "platformName":"iOS","browserName":"Safari","appium:automationName":"XCUITest",
                 "appium:udid":udid,"appium:platformVersion":target["version"],"appium:nativeWebTap":true,
+                "appium:newCommandTimeout":0,
                 "appium:noReset":true,"appium:forceAppLaunch":false,"appium:shouldTerminateApp":false,
                 "appium:safariInitialUrl":url,"appium:waitForIdleTimeout":1
             }) } else { json!({"platformName":"iOS","browserName":"Safari","safari:useSimulator":true,"safari:deviceUDID":udid,"acceptInsecureCerts":true}) };
@@ -295,11 +399,11 @@ async fn start(
             persist(&d).await?;
             *slot = Some(d);
             owned(&mut slot,&session)?.post("/timeouts",json!({"pageLoad":30000,"script":30000,"implicit":0})).await?;
-            owned(&mut slot,&session)?.post("/url",json!({"url":url})).await?;
+            navigate(owned(&mut slot,&session)?, url).await?;
         }
         let d = owned(&mut slot,&session)?;
         let landed = d.command(reqwest::Method::GET,"/url",None).await?;
-        let result = json!({"ok":true,"backend":"ios-simulator","session":session,"launch_url":landed,"capabilities":d.capabilities,"limitations":LIMITATIONS});
+        let result = json!({"ok":true,"backend":"ios-simulator","session":session,"launch_url":landed,"recovered_expired_session":recovered,"capabilities":d.capabilities,"limitations":LIMITATIONS});
         drop(slot);
         record_browser_event(&state,Some(&session),&session,"started",json!({"backend":"ios-simulator","requested_url":audit_url(url)})).await;
         Ok(result)
@@ -462,8 +566,55 @@ async fn element(d: &Driver, body: &Value) -> Result<String> {
         "Element missing or stale; GET /state again".into(),
     ))
 }
+// DOM hit testing cannot see UIKit's keyboard. A WebTap on a covered page
+// button otherwise types whichever keyboard key occupies that screen point.
+async fn clear_native_keyboard(d: &Driver) -> Result<bool> {
+    let path = "/appium/device/is_keyboard_shown";
+    let shown = d.command(reqwest::Method::GET, path, None).await?;
+    if shown == false {
+        return Ok(false);
+    }
+    if shown != true {
+        return Err(failure(
+            "Native keyboard visibility is unavailable; page tap refused",
+        ));
+    }
+    tracing::warn!(target:"amux::browser_ios",session=%d.owner,verdict="keyboard_blocks_page_tap",measured=true,n_considered=1,"dismissing native keyboard before locating the requested page control");
+    // Safari's Done lives in its input accessory toolbar, outside the native
+    // keyboard subtree searched by Appium's generic hideKeyboard command.
+    // Class chain uses native XCTest queries; XPath serializes the entire
+    // accessibility tree and stalls on large live terminal histories.
+    let context = d.command(reqwest::Method::GET, "/context", None).await?;
+    if !context.is_string() || context == "NATIVE_APP" {
+        return Err(failure("Safari web context unavailable; page tap refused"));
+    }
+    d.post("/context", json!({"name":"NATIVE_APP"})).await?;
+    let dismissed=async {
+        let matches=d.post("/elements",json!({"using":"-ios class chain","value":"**/XCUIElementTypeToolbar/**/XCUIElementTypeButton[`name == 'Done' AND visible == 1`]"})).await?;
+        let matches=matches.as_array().filter(|v|v.len()==1).ok_or(failure("Safari keyboard Done control unavailable or ambiguous; page tap refused"))?;
+        let id=matches[0][ELEMENT].as_str().ok_or(failure("Native Done control has no element identity"))?;
+        d.post(&format!("/element/{id}/click"),json!({})).await
+    }.await;
+    // Always restore the web context, including native lookup/tap refusal.
+    let restored = d.post("/context", json!({"name":context})).await;
+    if let Err((status, error)) = dismissed {
+        return Err((status, format!("Keyboard dismissal failed: {error}; web context restored={}", restored.is_ok())));
+    }
+    restored?;
+    if d.command(reqwest::Method::GET, path, None).await? != false {
+        return Err((
+            StatusCode::CONFLICT,
+            "Native keyboard still covers the page; tap refused without dispatch".into(),
+        ));
+    }
+    Ok(true)
+}
+
 async fn perform(d: &Driver, body: &Value) -> Result<Value> {
     let action = body["action"].as_str().unwrap_or("");
+    if matches!(action, "back" | "scroll" | "click" | "key" | "type" | "input") {
+        require_visible_tab(d).await?;
+    }
     match action {
         "eval"=> {
             let script=body["script"].as_str().filter(|s|!s.trim().is_empty()).ok_or((StatusCode::BAD_REQUEST,"script expression required".into()))?;
@@ -489,13 +640,16 @@ async fn perform(d: &Driver, body: &Value) -> Result<Value> {
             if body["selector"].is_string() || body["index"].is_u64() {
                 let id=element(d,body).await?;
                 if d.native {
+                    let keyboard_dismissed=clear_native_keyboard(d).await?;
+                    let id=element(d,body).await?;
                     d.eval("arguments[0].scrollIntoView({block:'nearest',inline:'center',behavior:'instant'})",json!([{ELEMENT:id}])).await?;
                     // Let Safari settle any scroll-snap before checking the hit target.
                     tokio::time::sleep(Duration::from_millis(100)).await;
-                    if d.eval("(function(e){var r=e.getBoundingClientRect();var hit=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);return !!(r.width&&r.height&&hit&&e.contains(hit))})(arguments[0])",json!([{ELEMENT:id}])).await? != true {
+                    if d.eval("(function(e){var r=e.getBoundingClientRect();var x=r.x+r.width/2,y=r.y+r.height/2,v=visualViewport;var visible=!v||(x>=v.offsetLeft&&x<=v.offsetLeft+v.width&&y>=v.offsetTop&&y<=v.offsetTop+v.height);var hit=document.elementFromPoint(x,y);return !!(r.width&&r.height&&visible&&hit&&e.contains(hit))})(arguments[0])",json!([{ELEMENT:id}])).await? != true {
                         return Err((StatusCode::BAD_REQUEST,"Element is hidden or covered; scroll it into view or close the covering overlay".into()));
                     }
-                    return d.post(&format!("/element/{id}/click"),json!({})).await;
+                    d.post(&format!("/element/{id}/click"),json!({})).await?;
+                    return Ok(json!({"input_method":"xcuitest","dispatched":true,"keyboard_dismissed":keyboard_dismissed}));
                 }
                 let point=d.eval("(function(e){e.scrollIntoView({block:'center',inline:'center'});var r=e.getBoundingClientRect();if(!r.width||!r.height)throw Error('Element is not visible');return {x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2)}})(arguments[0])",json!([{ELEMENT:id}])).await?;
                 d.post("/actions",json!({"actions":[{"type":"pointer","id":"pointer","parameters":{"pointerType":"mouse"},"actions":[
@@ -592,6 +746,147 @@ pub(super) fn routes() -> Router<AppState> {
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn native_go_reuses_visible_tab_without_accumulating_tabs() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let navigations = Arc::new(AtomicUsize::new(0));
+        let count = navigations.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/test/execute/sync", post(|Json(v): Json<Value>| async move {
+                // Any deep link here would open another native tab instead of
+                // reusing the visible one, retaining its streaming connections.
+                if v["script"] == "return (document.visibilityState === 'visible');" {
+                    Json(json!({"value":true}))
+                } else {
+                    Json(json!({"value":{"error":"unexpected native tab creation"}}))
+                }
+            }))
+            .route("/session/test/url", post(move |Json(v): Json<Value>| {
+                let count = count.clone();
+                async move {
+                    assert!(v["url"].as_str().unwrap().starts_with("https://example.test/"));
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"value":null}))
+                }
+            }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let d = Driver {owner:"test-owner".into(),port,pid:0,id:"test".into(),udid:"device".into(),capabilities:Value::Null,native:true,child:None};
+        for n in 0..12 {
+            navigate(&d, &format!("https://example.test/{n}")).await.unwrap();
+        }
+        assert_eq!(navigations.load(Ordering::SeqCst), 12);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn native_go_selects_visible_safari_and_hidden_input_never_dispatches() {
+        use std::sync::{Arc, Mutex};
+        for available in [true, false] {
+            let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+            let selected = Arc::new(Mutex::new(String::new()));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let events = calls.clone();
+            let context = selected.clone();
+            let changes = calls.clone();
+            let active = selected.clone();
+            let app = Router::new()
+                .route("/session/test/execute/sync", post(move |Json(v):Json<Value>| {
+                    let events=events.clone(); let context=context.clone();
+                    async move {
+                        let script=v["script"].as_str().unwrap();
+                        let value=match script {
+                            "mobile: deepLink" => {
+                                assert_eq!(v["args"][0],json!({"url":"https://example.test/redirect","bundleId":"com.apple.mobilesafari"}));
+                                events.lock().unwrap().push("navigate".into()); Value::Null
+                            },
+                            "mobile: getContexts" => json!([
+                                {"id":"WEBVIEW_other","bundleId":"other.app"},
+                                {"id":"WEBVIEW_hidden","bundleId":"com.apple.mobilesafari","url":"https://old.test/"},
+                                {"id":"WEBVIEW_front","bundleId":"com.apple.mobilesafari","url":"https://example.test/redirect#landed"},
+                                {"id":"WEBVIEW_newer","bundleId":"com.apple.mobilesafari","url":"https://different.test/"}]),
+                            _ => { assert!(script.contains("document.visibilityState"));
+                                json!(available && *context.lock().unwrap() == "WEBVIEW_front") }
+                        };
+                        Json(json!({"value":value}))
+                    }
+                }))
+                .route("/session/test/context", post(move |Json(v):Json<Value>| {
+                    let changes=changes.clone(); let active=active.clone();
+                    async move {
+                        let id=v["name"].as_str().unwrap().to_owned();
+                        changes.lock().unwrap().push(id.clone());
+                        if available && id != "WEBVIEW_front" {
+                            return Json(json!({"value":{"error":"old debugger context unavailable"}}));
+                        }
+                        *active.lock().unwrap()=id;
+                        Json(json!({"value":null}))
+                    }
+                }));
+            let server=tokio::spawn(async move {axum::serve(listener, app).await.unwrap()});
+            let d=Driver {owner:"test-owner".into(),port,pid:0,id:"test".into(),udid:"device".into(),capabilities:Value::Null,native:true,child:None};
+            let result=navigate(&d,"https://example.test/redirect").await;
+            assert_eq!(result.is_ok(),available);
+            let expected = if available { vec!["navigate","WEBVIEW_front"] }
+                else { vec!["navigate","WEBVIEW_front","WEBVIEW_newer","WEBVIEW_hidden"] };
+            assert_eq!(*calls.lock().unwrap(),expected, "Go must not touch unrelated stale contexts before its requested URL");
+            assert_eq!(require_visible_tab(&d).await.is_ok(),available);
+            *selected.lock().unwrap()="WEBVIEW_hidden".into();
+            // No input route is installed: a missing guard would dispatch and
+            // return 404, instead of the required explicit pre-dispatch refusal.
+            for action in ["click","input","type","key","scroll","back"] {
+                let error=perform(&d,&json!({"action":action,"selector":"button","text":"x","key":"Enter","dy":1})).await.unwrap_err();
+                assert_eq!(error.0,StatusCode::CONFLICT);
+                assert!(error.1.contains("No input was dispatched"));
+            }
+            assert_eq!(calls.lock().unwrap().len(),expected.len(),"No retry or input after hidden-tab refusal");
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn go_releases_only_a_proven_expired_owned_session_without_replaying_actions() {
+        use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
+        for mode in ["live", "expired", "unknown"] {
+            let reads = Arc::new(AtomicUsize::new(0));
+            let calls = reads.clone();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let app = Router::new().route("/session/test/url", get(move || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    match mode {
+                        "live" => (StatusCode::OK, Json(json!({"value":"about:blank"}))),
+                        "expired" => (StatusCode::NOT_FOUND, Json(json!({"value":{"error":"invalid session id"}}))),
+                        _ => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"value":{"error":"unknown error"}}))),
+                    }
+                }
+            }));
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let mut slot = Some(Driver { owner:"test-owner".into(), port, pid:0,
+                id:"test".into(), udid:"test-device".into(), capabilities:Value::Null,
+                native:true, child:None });
+            let temp = tempfile::tempdir().unwrap();
+            let record = temp.path().join("browser-ios.json");
+            let original = serde_json::to_vec(slot.as_ref().unwrap()).unwrap();
+            std::fs::write(&record, &original).unwrap();
+            assert_eq!(prepare_reuse(&mut slot, "other-worker", "test-device", &record).await.unwrap_err().0, StatusCode::CONFLICT);
+            assert_eq!(prepare_reuse(&mut slot, "test-owner", "other-device", &record).await.unwrap_err().0, StatusCode::CONFLICT);
+            assert_eq!(reads.load(Ordering::SeqCst), 0, "ownership and device checks must precede driver access");
+            let result = prepare_reuse(&mut slot, "test-owner", "test-device", &record).await;
+            assert_eq!(reads.load(Ordering::SeqCst), 1, "only a read probe is sent; no navigation, click or command replay");
+            match mode {
+                "expired" => { assert!(result.unwrap()); assert!(slot.is_none()); assert!(!record.exists()); }
+                "live" => { assert!(!result.unwrap()); assert!(slot.is_some()); assert_eq!(std::fs::read(&record).unwrap(), original); }
+                _ => { assert!(result.is_err()); assert!(slot.is_some()); assert_eq!(std::fs::read(&record).unwrap(), original); }
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn native_scroll_dispatches_a_bounded_device_gesture() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -604,6 +899,8 @@ mod tests {
                     assert_eq!(v["args"][0]["toY"], 100.0);
                     assert_eq!(v["args"][0]["duration"], 0.15);
                     Json(json!({"value":null}))
+                } else if v["script"].as_str().unwrap().contains("document.visibilityState") {
+                    Json(json!({"value":true}))
                 } else {
                     Json(json!({"value":{"width":402,"height":874}}))
                 }
@@ -626,6 +923,127 @@ mod tests {
         assert_eq!(result["input_method"], "xcuitest");
         assert_eq!(result["coordinate_space"], "device-points");
         server.abort();
+    }
+    #[tokio::test]
+    async fn native_click_dismisses_keyboard_or_refuses_without_dispatch() {
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        };
+        for mode in ["refused", "still-visible", "dismissed", "dismiss-and-restore-refused"] {
+            let refuse = mode != "dismissed";
+            let visible = Arc::new(AtomicBool::new(true));
+            let native_context = Arc::new(AtomicBool::new(false));
+            let taps = Arc::new(AtomicUsize::new(0));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let keyboard = visible.clone();
+            let dismiss = visible.clone();
+            let clicks = taps.clone();
+            let contexts = native_context.clone();
+            let app = Router::new()
+                .route(
+                    "/session/test/element",
+                    post(|| async { Json(json!({"value":{ELEMENT:"save"}})) }),
+                )
+                .route(
+                    "/session/test/elements",
+                    post(|Json(v): Json<Value>| async move {
+                        assert_eq!(v["using"], "-ios class chain",
+                            "keyboard lookup must not serialize the entire live page as XPath XML");
+                        assert!(v["value"]
+                            .as_str()
+                            .unwrap()
+                            .contains("XCUIElementTypeToolbar"));
+                        Json(json!({"value":[{ELEMENT:"native-done"}]}))
+                    }),
+                )
+                .route(
+                    "/session/test/context",
+                    get(|| async { Json(json!({"value":"WEBVIEW_test"})) }).post(
+                        move |Json(v): Json<Value>| {
+                            let contexts = contexts.clone();
+                            async move {
+                                if mode == "dismiss-and-restore-refused" && v["name"] != "NATIVE_APP" {
+                                    return Json(json!({"value":{"error":"restoration refused"}}));
+                                }
+                                contexts.store(v["name"] == "NATIVE_APP", Ordering::SeqCst);
+                                Json(json!({"value":null}))
+                            }
+                        },
+                    ),
+                )
+                .route(
+                    "/session/test/appium/device/is_keyboard_shown",
+                    get(move || {
+                        let keyboard = keyboard.clone();
+                        async move { Json(json!({"value":keyboard.load(Ordering::SeqCst)})) }
+                    }),
+                )
+                .route(
+                    "/session/test/execute/sync",
+                    post(|| async { Json(json!({"value":true})) }),
+                )
+                .route(
+                    "/session/test/element/native-done/click",
+                    post(move || {
+                        let dismiss = dismiss.clone();
+                        async move {
+                            if mode == "refused" || mode == "dismiss-and-restore-refused" {
+                                return (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    Json(json!({"value":{"error":"invalid element state"}})),
+                                );
+                            }
+                            if mode == "dismissed" {
+                                dismiss.store(false, Ordering::SeqCst);
+                            }
+                            (StatusCode::OK, Json(json!({"value":null})))
+                        }
+                    }),
+                )
+                .route(
+                    "/session/test/element/save/click",
+                    post(move || {
+                        let clicks = clicks.clone();
+                        async move {
+                            clicks.fetch_add(1, Ordering::SeqCst);
+                            Json(json!({"value":null}))
+                        }
+                    }),
+                );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let d = Driver {
+                owner: "test".into(),
+                port,
+                pid: 0,
+                id: "test".into(),
+                udid: "test".into(),
+                capabilities: Value::Null,
+                native: true,
+                child: None,
+            };
+            let result = perform(&d, &json!({"action":"click","selector":"#save"})).await;
+            assert_eq!(native_context.load(Ordering::SeqCst), mode == "dismiss-and-restore-refused",
+                "restore is attempted even after dismissal refusal");
+            if mode == "dismiss-and-restore-refused" {
+                let error = &result.as_ref().unwrap_err().1;
+                assert!(error.contains("invalid element state"), "original failure must survive: {error}");
+                assert!(error.contains("web context restored=false"), "restore failure must remain explicit: {error}");
+            }
+            if refuse {
+                assert!(
+                    result.is_err(),
+                    "a native keyboard must not receive the intended DOM tap"
+                );
+                assert_eq!(taps.load(Ordering::SeqCst), 0);
+            } else {
+                assert!(result.is_ok());
+                assert!(!visible.load(Ordering::SeqCst));
+                assert_eq!(taps.load(Ordering::SeqCst), 1);
+            }
+            server.abort();
+        }
     }
     #[test]
     fn discovered_version_comes_from_runtime_not_frozen_user_agent() {

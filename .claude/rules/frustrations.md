@@ -91,8 +91,14 @@ push blocked, a card closed that should not have been. "Annoying" is not a cost.
 
 ## Retiring an entry — the three dispositions
 
-An entry leaves `frustrations.md` only when the session that ORIGINATED it says the
-friction is gone. Use `scripts/frustrations-archive.py`, which moves it to
+Ethan’s latest instruction (2026-09-13, AF-780) requires the originating session
+to validate the exact entry and explicitly agree it is complete. Every entry must
+retain its originating `SESSION` and link a concrete issue on the
+amux-frustrations board. Mark that issue Verified only after the agreement and
+all resolved board gates hold; then remove the active entry. This supersedes the
+older AF-352 independent-retirement exception for this drain. Preserve ambiguous
+original labels while investigating their identity; never substitute a publishing
+committer or a new worker as the original author. Use `scripts/frustrations-archive.py`, which moves it to
 `frustrations-archive.md`, stamps who signed off, and carries the SYMPTOM and COST onto
 the card (AF-38's rule — the card is where someone hitting it again looks).
 
@@ -133,19 +139,14 @@ lesson was encoded in a replacement, and because the card "closed on something e
 (three independent confirmations of that last shape). None of those are readable from a
 status field.
 
-**Some entries have no validatable author, and that is not yours to resolve.** A session
-that was a subagent, a one-off `claude` invocation, or a lane on another machine cannot
-sign anything off. Neither can an **isolated raw-agent worker** (the harness is stripped;
-sends carrying a worker origin are refused and only the owner can reach it from the
-dashboard), and that fourth kind is the one that fools you: it is RUNNING and it is right
-there in `/api/sessions`, so the natural test — is the author still alive? — answers yes
-and you plan a handoff that cannot be delivered. LIVE IS NOT VALIDATABLE. The session
-payload already carries `isolated`; read it, or discover it from a refused send after you
-have written the message (amux-frustrations, 2026-08-28, four `desktop` entries).
-A CARD IS NOT A SUBSTITUTE: both of those read `verified`, set by the author themselves,
-and the rule above still stands — card status is not evidence. Do not retire those on your
-own judgement — that is deciding another
-party's work is finished (ethos rule 8). Surface them and let the owner decide.
+**Gone or isolated author: retain the unresolved entry (AF-780).** Preserve any
+actual earlier originating-session validation and check what it covers. If no
+such agreement exists, continue independent implementation and evidence gathering,
+but leave Verified and retirement pending. Do not impersonate the author or infer
+agreement from card status. A live isolated worker can still be unreachable; read
+`isolated` rather than attempting a prohibited peer send. The former AF-352 policy
+allowed objective retirement by a different verifier; the latest owner instruction
+above supersedes that exception for this drain.
 
 ## Then act on it
 

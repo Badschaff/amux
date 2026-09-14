@@ -1766,6 +1766,15 @@ pub struct IssueRow {
     pub callback_fired_at: Option<i64>,
     /// Visible refusal/recovery detail; never hidden in logs alone.
     pub callback_error: Option<String>,
+    /// Hard lease (RR-0052, migration 0068). `lease_owner` is the lane NAME
+    /// holding this card; NULL means no lease (every legacy card), which behaves
+    /// exactly as before. The timestamps are unix seconds; `lease_generation` is
+    /// bumped on every reclaim so a write from a dead claimant is recognizable.
+    pub lease_owner: Option<String>,
+    pub lease_acquired_at: Option<i64>,
+    pub lease_heartbeat_at: Option<i64>,
+    pub lease_expires_at: Option<i64>,
+    pub lease_generation: i64,
     /// Set ONLY when `desc` holds a bounded PREFIX rather than the whole
     /// string, which the slim list does to stop hydrating ~30 MB of prose per
     /// call (AF-346). `None` means `desc` is complete and every consumer
@@ -1936,9 +1945,10 @@ impl IssueRow {
     /// not in the shared vocabulary (a custom Python lane) — callers must
     /// refuse the transition honestly rather than guess.
     ///
-    /// `worker` is always `None`: `issues.session` is an owner NAME, not a
-    /// claim by `WorkerId` — atomic claims/leases land with RR-0052.
-    /// NO CARD MAY VANISH (AMUX-2632).
+    /// `worker` is the LEASE holder (`lease_owner`), not `session`: an owner
+    /// NAME mapped to a `WorkerId` via `foreign_worker_id` so core's
+    /// `AlreadyClaimed` becomes name-equality (RR-0052). A card with no lease is
+    /// `None` and ungated, exactly as before. NO CARD MAY VANISH (AMUX-2632).
     ///
     /// This opened `parse_status(&self.status)?`, so a status outside the
     /// closed vocabulary returned None — and the orchestrator's one caller did
@@ -1974,7 +1984,15 @@ impl IssueRow {
             title: self.title.clone(),
             desc: self.desc.clone(),
             status,
-            worker: None,
+            // RR-0052: the holder is the lease owner (lane NAME), mapped to a
+            // WorkerId via `foreign_worker_id` so core's `AlreadyClaimed` becomes
+            // name-equality. NULL lease -> None -> ungated, exactly as before.
+            worker: self
+                .lease_owner
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(crate::orchestrator::runtime::foreign_worker_id),
             item_type: core_item_type(&self.item_type),
             creator,
             created_at: ts(self.created),
@@ -2008,7 +2026,9 @@ const COLS: &str = "i.id, i.title, i.\"desc\", i.status, i.session, i.creator, i
      i.source, i.acceptance_criteria, i.decision_question, i.decision_rationale, \
      i.decision_supersedes, i.waiting_on, i.requested_by, i.callback_session, \
      i.callback_prompt, i.callback_state, i.callback_message_id, \
-     i.callback_fired_at, i.callback_error, i.ask_actor";
+     i.callback_fired_at, i.callback_error, i.ask_actor, \
+     i.lease_owner, i.lease_acquired_at, i.lease_heartbeat_at, \
+     i.lease_expires_at, COALESCE(i.lease_generation,0)";
 
 /// Read an INTEGER-typed timestamp column that some row may hold as REAL or TEXT.
 ///
@@ -2135,6 +2155,11 @@ fn issue_from_row(r: &Row<'_>) -> rusqlite::Result<IssueRow> {
         callback_fired_at: r.get(49)?,
         callback_error: r.get(50)?,
         ask_actor: r.get(51)?,
+        lease_owner: r.get(52)?,
+        lease_acquired_at: r.get(53)?,
+        lease_heartbeat_at: r.get(54)?,
+        lease_expires_at: r.get(55)?,
+        lease_generation: r.get(56)?,
         next_action: r.get(33)?,
         last_result: r.get(34)?,
         unresolved: r.get(35)?,
@@ -2914,6 +2939,70 @@ pub fn is_terminal_status(s: &str) -> bool {
     TERMINAL_STATUSES.contains(&s)
 }
 
+/// Seconds a fresh lease is granted for before it expires (RR-0052). Short
+/// enough to free a crashed worker's slot fast, long enough to survive a slow
+/// turn. The holder's activity advances the heartbeat, pushing the expiry out.
+/// `AMUX_LEASE_TTL_S` overrides (default 1800 = 30 min).
+pub fn lease_ttl_s() -> i64 {
+    std::env::var("AMUX_LEASE_TTL_S")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(1800)
+}
+
+/// Whether the PATCH door REFUSES a transition from a non-holder (RR-0052).
+/// Default OFF during rollout: leases are still written and the reaper still
+/// runs, but a cross-lane transition is only LOGGED ("would refuse"), not
+/// refused, so the would-refuse rate can be watched before enforcement flips on.
+/// `AMUX_LEASE_ENFORCE=1` turns hard refusal on.
+pub fn lease_enforcement_enabled() -> bool {
+    matches!(
+        std::env::var("AMUX_LEASE_ENFORCE").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
+/// Minimum seconds between two heartbeat writes for the same held card.
+///
+/// Every UPDATE on `issues` fires `search_issues_au`, which rewrites the card's
+/// whole search document (desc + log). The report hook fires on EVERY tool
+/// call, so an unthrottled heartbeat would reindex a busy lane's card several
+/// times a second. 60s against a 1800s TTL loses nothing a reaper can see.
+pub const LEASE_HEARTBEAT_MIN_GAP_S: i64 = 60;
+
+/// Heartbeat writes that actually moved a lease forward, process-lifetime.
+/// Published by `/api/debug/board-drive` beside the reaper's counts: leases
+/// being granted while this stays at 0 means the heartbeat path is broken and
+/// every busy holder is about to be reaped (the RR-0052 slice-2 bug, where the
+/// reaper's liveness events were never written by anything).
+pub static LEASE_HEARTBEATS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// RR-0052 heartbeat: the holder lane is alive, so push out the expiry of every
+/// `doing` card it holds. Called from the worker self-report path, which is the
+/// one signal that comes FROM the worker process (a delivered message comes from
+/// the server, and proves nothing about the receiver).
+///
+/// Deliberately a raw UPDATE of the lease columns only: `updated` and `version`
+/// are untouched, so a heartbeat never reads as a card edit, never bumps rot
+/// clocks, and never races a real PATCH on the version check.
+pub fn refresh_lease_heartbeat(conn: &Connection, holder: &str, now: i64) -> rusqlite::Result<usize> {
+    let holder = holder.trim();
+    if holder.is_empty() {
+        return Ok(0);
+    }
+    let n = conn.execute(
+        "UPDATE issues SET lease_heartbeat_at = ?2, lease_expires_at = ?2 + ?3 \
+         WHERE status = 'doing' AND lease_expires_at IS NOT NULL AND lease_owner = ?1 \
+           AND deleted IS NULL AND COALESCE(lease_heartbeat_at, 0) <= ?2 - ?4",
+        params![holder, now, lease_ttl_s(), LEASE_HEARTBEAT_MIN_GAP_S],
+    )?;
+    if n > 0 {
+        LEASE_HEARTBEATS.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(n)
+}
+
 /// A completed dependency must satisfy its type's real completion boundary.
 /// Code/ops/blockers need verification; docs and chores finish at done. Missing
 /// and discarded tasks are not proof that a required dependency was resolved.
@@ -3402,7 +3491,8 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
              decision_supersedes = ?37, waiting_on = ?38, requested_by = ?39, \
              callback_session = ?40, callback_prompt = ?41, callback_state = ?42, \
              callback_message_id = ?43, callback_fired_at = ?44, callback_error = ?45, \
-             ask_actor = ?46 \
+             ask_actor = ?46, lease_owner = ?47, lease_acquired_at = ?48, \
+             lease_heartbeat_at = ?49, lease_expires_at = ?50, lease_generation = ?51 \
          WHERE id = ?33 AND deleted IS NULL",
         params![
             row.title,
@@ -3451,6 +3541,11 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
             row.callback_fired_at,
             row.callback_error,
             row.ask_actor,
+            row.lease_owner.as_deref().filter(|s| !s.is_empty()),
+            row.lease_acquired_at,
+            row.lease_heartbeat_at,
+            row.lease_expires_at,
+            row.lease_generation,
         ],
     )?;
     if needs_terminal_summary && changed == 1 {
@@ -5062,6 +5157,7 @@ mod tests {
         // newest verified, and the 100 newest done — the lumped 100-cap
         // showed 9 of a 141-card bulk-verify while Python showed all of it.
         let mk = |i: i64, status: &str| IssueRow {
+            lease_owner: None, lease_acquired_at: None, lease_heartbeat_at: None, lease_expires_at: None, lease_generation: 0,
             desc_prefixed: None,
             id: format!("T-{i}"),
             title: String::new(),
@@ -5220,6 +5316,7 @@ mod configured_gate_tests {
 
     fn row(item_type: &str, gate: Option<&str>) -> IssueRow {
         IssueRow {
+            lease_owner: None, lease_acquired_at: None, lease_heartbeat_at: None, lease_expires_at: None, lease_generation: 0,
             desc_prefixed: None,
             id: "T-1".into(), title: String::new(), desc: String::new(),
             status: "doing".into(), session: None, creator: String::new(),

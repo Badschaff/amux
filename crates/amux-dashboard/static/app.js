@@ -479,7 +479,7 @@ function _showUpgradeModal(d) {
   wrap.id = 'upgrade-modal';
   wrap.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(5,5,10,0.88);display:flex;align-items:center;justify-content:center;padding:max(16px,env(safe-area-inset-top)) 16px max(16px,env(safe-area-inset-bottom));';
   wrap.innerHTML =
-    '<div style="background:#14142a;border:1px solid #3a3a5c;border-radius:14px;max-width:440px;width:100%;padding:26px 22px;text-align:center;max-height:90dvh;overflow-y:auto;">' +
+    '<div style="background:#14142a;color:#e6edf3;border:1px solid #3a3a5c;border-radius:14px;max-width:440px;width:100%;padding:26px 22px;text-align:center;max-height:90dvh;overflow-y:auto;">' +
       '<div style="font-size:1.15rem;font-weight:700;margin-bottom:6px;">' +
         (isBudget ? 'Your trial budget is used up' : 'Your trial has ended') + '</div>' +
       (isBudget && spent ? '<div style="color:#f0b429;font-size:1.05rem;font-weight:600;margin-bottom:10px;">$' + spent + ' of $' + budget + ' used</div>' : '') +
@@ -576,6 +576,7 @@ let sessions = [];
 // truth. A request begun before an SSE update must not finish later and put the
 // old task attribution back on screen.
 let _sessionsSnapshotEpoch = 0;
+let pausedExpanded = false;
 let archivedExpanded = false;
 let gitInfo = {};  // {sessionName: {branch, repo, _conflict}}
 let _sessionLoadError = null; // Last failed worker read; a response is not necessarily data.
@@ -1224,7 +1225,7 @@ function showConnHistory() {
   modal.onclick = e => { if (e.target === modal) modal.remove(); };
   modal.innerHTML = '<div onclick="event.stopPropagation()" style="background:var(--bg);border:1px solid var(--border);border-radius:12px;max-width:440px;width:100%;max-height:80dvh;overflow:auto;padding:1.2rem;box-shadow:0 8px 32px rgba(0,0,0,0.4);">'
     + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;"><b style="font-size:1rem;flex:1;">Connection</b>'
-    + '<span id="conn-modal-status" style="color:' + stateColor + ';font-size:0.82rem;font-weight:600;">' + stateLabel + '</span></div>'
+    + '<span id="conn-modal-status" style="color:' + stateColor + ';font-size:0.82rem;font-weight:600;">' + stateLabel + '</span><button class="btn" id="conn-modal-close" aria-label="Close connection history" onclick="this.closest(\'#conn-hist-modal\').remove()">&#x2715;</button></div>'
     + '<div style="color:var(--dim);font-size:0.76rem;margin-bottom:10px;">Connection interruptions on this device (this browser)</div>'
     + _pingWidgetHtml() + '<div id="conn-modal-read-notice">' + _sessionReadNotice() + '</div><div id="conn-modal-write-notice">' + _localWriteNotice() + '</div>' + rows + blipHtml + pendingHtml + clearHtml + '</div>';
   document.body.appendChild(modal);
@@ -1706,6 +1707,191 @@ function showToast(msg) {
   }, 3000);
 }
 
+// AF-754: the guide renders production classes, so it cannot quietly become a second theme.
+function openStyleGuide() {
+  closeSettings();
+  if (document.getElementById('ui-guide-overlay')) return;
+  const overlay = document.createElement('div');
+  overlay.id = 'ui-guide-overlay'; overlay.className = 'modal-overlay active';
+  overlay.dataset.originalLight = String(document.body.classList.contains('light'));
+  overlay.innerHTML = `<section class="modal ui-guide" role="dialog" aria-modal="true" aria-labelledby="ui-guide-title">
+    <header class="modal-header"><div><h3 id="ui-guide-title">Style guide</h3><p class="ui-help">The components used throughout amux</p></div><button class="modal-close" aria-label="Close style guide" onclick="closeStyleGuide()">×</button></header>
+    <div class="modal-body">
+      <section class="ui-guide-section"><h4>One shared visual language</h4><p class="ui-help">Original icons. Clear actions. Compact layouts with room to tap. These examples use the same CSS as the app; preview changes here before applying them across screens.</p><div class="ui-guide-row"><button id="ui-guide-theme" class="btn" onclick="_uiGuideTheme()">Preview other theme</button><span class="ui-help">Theme preview is restored when you close this guide.</span></div></section>
+      <section class="ui-guide-section"><h4>Color and surfaces</h4><div class="ui-guide-grid">${['bg','card','text','dim','accent','green','red','yellow'].map(token=>`<div class="ui-guide-swatch"><i style="background:var(--${token})" aria-hidden="true"></i><code>--${token}</code></div>`).join('')}</div><p class="ui-help">Use surface and text tokens in both themes. Pair accent fills with <code>--on-accent</code>. Status colors always have a text label.</p></section>
+      <section class="ui-guide-section"><h4>Actions</h4><div class="ui-guide-row"><button id="ui-guide-primary" class="btn primary" onclick="_uiGuideAction(this)">Primary action</button><button class="btn" onclick="_uiGuideAction(this)">Secondary action</button><button class="btn danger" onclick="_uiGuideAction(this)">Destructive example</button><button class="btn" disabled>Unavailable</button><button class="btn" aria-busy="true" disabled>Working…</button></div><p class="ui-help">Use one primary action per group. Destructive actions keep a clear label and require confirmation when they affect real data. Examples here change no account or worker data.</p><output id="ui-guide-feedback" class="ui-help" role="status" aria-live="polite">Try an action to preview feedback.</output></section>
+      <section class="ui-guide-section"><h4>Fields and validation</h4><div class="ui-guide-grid"><label class="ui-field">Name<input class="input" placeholder="Example name" autocomplete="off"><span class="ui-help">A label stays visible after typing.</span></label><label class="ui-field">Choice<select class="input"><option>First option</option><option>Second option</option></select><span class="ui-help">Use the native picker on mobile.</span></label><label class="ui-field">Invalid example<input class="input" value="Example" aria-invalid="true" aria-describedby="ui-guide-error"><span id="ui-guide-error" class="ui-error">Explain what to change, beside the field.</span></label><label class="ui-field">Notes<textarea class="input" rows="3" placeholder="An example draft"></textarea><span class="ui-help">Long content scrolls without hiding actions.</span></label></div></section>
+      <section class="ui-guide-section"><h4>Icons and status</h4><div class="ui-guide-row"><button class="settings-btn" aria-label="Example settings" onclick="_uiGuideAction(this)">&#x2699;</button><button class="btn" aria-label="Example notifications" onclick="_uiGuideAction(this)">&#x1F514;</button><span class="status-badge active">Working</span><span class="status-badge idle">Idle</span><span class="ui-help"><span style="color:var(--red)">18</span> limited</span></div><p class="ui-help">Keep the original toolbar symbols. Icon-only controls need an accessible label and a 44-pixel touch target. The compact mobile header uses a, a live dot, and counts.</p></section>
+      <section class="ui-guide-section"><h4>Dialogs and menus</h4><div class="ui-guide-rule">Use a heading, an obvious Close control, a scrolling body, and an action row that stays reachable above the keyboard. Menus anchor to their trigger and fit inside the viewport.</div><div class="ui-guide-row"><button class="btn" onclick="_uiGuideDialog()">Try confirmation dialog</button><code>.modal-overlay → .modal → .modal-header / .modal-body / .modal-footer</code></div></section>
+      <section class="ui-guide-section"><h4>Spacing and interaction</h4><div class="ui-guide-rule">Spacing: 4, 8, 12, 16, 24 pixels. Controls: 8-pixel corners. Dialogs: 12-pixel corners. Controls grow to at least 44 pixels on phones. Inputs use 16-pixel text on phones. Focus is visible; loading and disabled states explain why an action is unavailable.</div><p class="ui-help">Specialized editors, terminal output, maps, and media keep their own content layout. Their surrounding controls follow these same rules.</p></section>
+    </div><footer class="modal-footer"><span class="ui-help">Shared styles · live components</span><button class="btn" onclick="closeStyleGuide()">Close</button></footer>
+  </section>`;
+  overlay.onclick = event => { if (event.target === overlay) closeStyleGuide(); };
+  overlay.onkeydown = event => {
+    if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); closeStyleGuide(); }
+    if (event.key !== 'Tab') return;
+    const controls = [...overlay.querySelectorAll('button:not(:disabled),input,select,textarea')].filter(el=>el.getBoundingClientRect().height);
+    const first = controls[0], last = controls[controls.length - 1];
+    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+  };
+  document.body.appendChild(overlay);
+  overlay.querySelector('.modal-close').focus();
+}
+function closeStyleGuide() {
+  const overlay = document.getElementById('ui-guide-overlay');
+  if (!overlay) return;
+  document.body.classList.toggle('light', overlay.dataset.originalLight === 'true');
+  overlay.remove(); document.getElementById('settings-btn')?.focus();
+}
+function _uiGuideTheme() { document.body.classList.toggle('light'); }
+function _uiGuideAction(button) {
+  document.getElementById('ui-guide-feedback').textContent = (button.getAttribute('aria-label') || button.textContent) + ' completed. Example only; no data changed.';
+}
+async function _uiGuideDialog() {
+  const confirmed = await showConfirm('Example confirmation. This changes no account or worker data.');
+  const output = document.getElementById('ui-guide-feedback');
+  if (output) output.textContent = confirmed ? 'Example confirmed.' : 'Example cancelled.';
+}
+function _uiComponentCheck(root = document) {
+  let considered = 0;
+  const issues = [];
+  const luminance = color => color.slice(0,3).reduce((sum,value,index)=>{
+    value /= 255; return sum + [0.2126,0.7152,0.0722][index] * (value <= .04045 ? value / 12.92 : ((value + .055) / 1.055) ** 2.4);
+  },0);
+  root.querySelectorAll('.btn,.input,.modal-close').forEach(button=>{
+    const rect = button.getBoundingClientRect(), style = getComputedStyle(button);
+    if (!rect.width || !rect.height || style.visibility === 'hidden' || style.opacity === '0') return;
+    considered++;
+    if (innerWidth <= 600 && rect.height < 43.5) issues.push((button.id || button.tagName.toLowerCase()) + ':small-control');
+    if (!button.matches('.btn.primary:not(:disabled)')) return;
+    const rgb = value => (value.match(/[\d.]+/g) || []).map(Number);
+    const bg = rgb(style.backgroundColor), fg = rgb(style.color);
+    if (bg.length < 3 || fg.length < 3 || (bg.length === 4 && bg[3] !== 1)) return;
+    const a = luminance(bg), b = luminance(fg);
+    if ((Math.max(a,b)+.05)/(Math.min(a,b)+.05) < 4.5) issues.push((button.id || 'primary-button') + ':low-contrast');
+  });
+  return {measured:true,n_considered:considered,issues};
+}
+
+// AF-749: measure open dialogs against the keyboard-visible viewport. Keep
+// diagnostics free of dialog text (worker messages and credentials live here).
+const _dialogSelector = '.amux-dialog-backdrop,.amux-workspace-dialog,#cmd-history-modal,#filters-modal,#saved-messages-modal,#skill-edit-modal,#file-overlay,#mdai-overlay,#channel-drawer,#board-detail-overlay,#apikey-setup-modal,#upgrade-modal,#video-overlay,.modal-backdrop,.edit-overlay,.queue-overlay,.board-edit-overlay,.map-modal,.modal-overlay,#conn-hist-modal,#team-scope-modal,#jrnl-config-overlay,#peek-lookup-modal,[data-ical-modal],.chip-picker-overlay,.tts-overlay,.focus-overlay,.conn-picker-overlay,.mdai-picker-overlay';
+function _modalLayoutCheck() {
+  const viewport = window.visualViewport;
+  const top = viewport?.offsetTop || 0, height = viewport?.height || innerHeight;
+  let n = 0;
+  const clipped = [];
+  document.querySelectorAll(_dialogSelector).forEach(root => {
+    const style = getComputedStyle(root);
+    if (root.id === 'proxy-form-overlay' && root.style.display === 'flex' && !root.classList.contains('active')) {
+      n++; clipped.push('proxy-form-overlay:inactive'); return;
+    }
+    if (style.display === 'none' || style.opacity === '0' || style.pointerEvents === 'none') return;
+    const box = root.firstElementChild;
+    if (!box || getComputedStyle(box).opacity === '0') return;
+    const r = box.getBoundingClientRect();
+    if (!r.width || !r.height) return;
+    n++;
+    if (root.id === 'modal-backdrop') {
+      const action = box.querySelector('.modal-btns button');
+      if (action) {
+        const a = action.getBoundingClientRect(), hit = document.elementFromPoint(a.left+a.width/2,a.top+a.height/2);
+        if (!root.contains(hit) && hit?.closest('.modal-overlay.active')) clipped.push('modal-backdrop:covered-actions');
+      }
+    }
+    const heading = box.querySelector('.modal-header h3');
+    if (heading) {
+      const h = heading.getBoundingClientRect();
+      const cover = document.elementFromPoint(h.left + h.width/2, h.top + Math.min(2,h.height/2));
+      if (cover?.closest('.chrome-tabs-bar')) clipped.push((root.id || root.classList[0]) + ':behind-tab-bar');
+    }
+    const surface = box.matches('.conn-picker') || root.matches('#team-scope-modal,#jrnl-config-overlay,.amux-workspace-dialog,#upgrade-modal') ? getComputedStyle(box) : null;
+    if (surface) {
+      const rgb = value => (value.match(/[\d.]+/g) || []).map(Number);
+      const bg = rgb(surface.backgroundColor), fg = rgb(surface.color);
+      const lum = color => color.slice(0,3).reduce((sum, v, i) => {
+        v /= 255; return sum + [0.2126,0.7152,0.0722][i] * (v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4);
+      }, 0);
+      if (bg.length === 4 && bg[3] < 1) clipped.push((root.id || root.classList[0]) + ':transparent');
+      else if (bg.length >= 3 && fg.length >= 3) {
+        const a = lum(bg), b = lum(fg);
+        if ((Math.max(a,b) + 0.05) / (Math.min(a,b) + 0.05) < 4.5) clipped.push((root.id || root.classList[0]) + ':low-contrast');
+      }
+    }
+    const dismiss = root.id === 'orch-overlay' ? 'button[onclick="_orchClose()"]'
+      : root.id === 'video-overlay' ? '.vp-heading button[onclick="_closeVideo()"]'
+      : root.id === 'conn-hist-modal' ? '#conn-modal-close'
+      : root.classList.contains('chip-picker-overlay') ? 'button[onclick="closeChipPicker()"]' : null;
+    if (dismiss && !root.querySelector(dismiss)) clipped.push((root.id || root.classList[0]) + ':no-dismiss');
+    const foot = box.querySelector(':scope > .edit-actions,:scope > .board-edit-actions,:scope > .queue-actions,:scope > .map-modal-actions,:scope > .amux-modal-foot');
+    const warning = document.getElementById('sw-fail-bar');
+    if (foot && warning) {
+      const w = warning.getBoundingClientRect();
+      // A button's centre can remain tappable while its lower edge is covered.
+      // Probe the actual overlapping area, not only the centre or CSS visibility.
+      const covered = Array.from(foot.querySelectorAll('button')).some(button => {
+        const a = button.getBoundingClientRect();
+        const left = Math.max(a.left, w.left), right = Math.min(a.right, w.right);
+        const top = Math.max(a.top, w.top), bottom = Math.min(a.bottom, w.bottom);
+        if (right <= left || bottom <= top) return false;
+        return !!document.elementFromPoint((left + right) / 2, (top + bottom) / 2)?.closest('#sw-fail-bar');
+      });
+      if (covered) clipped.push((root.id || root.classList[0]) + ':footer-covered-by-warning');
+    }
+    if (foot && box.scrollHeight > box.clientHeight + 8 && getComputedStyle(foot).position === 'sticky') {
+      const f = foot.getBoundingClientRect();
+      if (f.height && r.bottom - f.bottom > 3) clipped.push((root.id || root.classList[0]) + ':footer-gap');
+    }
+    // Safari pans the fixed containing block with the keyboard; offsetTop
+    // is not in the same coordinate space as its rendered child rectangles.
+    const visibleTop = root.classList.contains('amux-dialog-viewport') ? root.getBoundingClientRect().top : top;
+    if (r.top < visibleTop - 2 || r.bottom > visibleTop + height + 2 || r.left < -2 || r.right > innerWidth + 2)
+      clipped.push(root.id || root.classList[0]);
+  });
+  return { measured: true, n_considered: n, clipped, viewport_height: height };
+}
+(function observeDialogs() {
+  let timer, previous = '', previousComponents = '';
+  const refresh = () => {
+    const vv = window.visualViewport;
+    // Pinch zoom is a reading action, not a keyboard layout change.
+    if (!vv || vv.scale <= 1.02) {
+      document.documentElement.style.setProperty('--dialog-viewport-height', (vv?.height || innerHeight) + 'px');
+      document.documentElement.style.setProperty('--dialog-viewport-top', (vv?.offsetTop || 0) + 'px');
+    }
+    document.querySelectorAll(_dialogSelector).forEach(root => { if (!root.classList.contains('amux-dialog-viewport')) root.classList.add('amux-dialog-viewport'); });
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      const result = _modalLayoutCheck(), signature = result.clipped.join(',');
+      if (signature && signature !== previous) {
+        console.warn('[amux] dialog visibility defect', result);
+        fetch('/api/client-debug', {method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({kind:'modal-layout-clipped',...result,ver:APP_VER})}).catch(() => {});
+      }
+      previous = signature;
+      const components = _uiComponentCheck(), componentSignature = components.issues.join(',');
+      if (componentSignature && componentSignature !== previousComponents) {
+        console.warn('[amux] shared component drift', components);
+        fetch('/api/client-debug', {method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({kind:'ui-component-drift',...components,ver:APP_VER})}).catch(() => {});
+      }
+      previousComponents = componentSignature;
+    }, 350);
+  };
+  new MutationObserver(records => {
+    if (records.some(r => r.type === 'childList' ? r.target === document.body :
+      r.target.matches?.(_dialogSelector) && !r.target.classList.contains('amux-dialog-viewport'))) refresh();
+    else if (records.some(r => r.type === 'attributes' && (r.target === document.body || r.target.matches?.(_dialogSelector)))) {
+      clearTimeout(timer); timer = setTimeout(refresh, 50);
+    }
+  }).observe(document.body, {childList:true,subtree:true,attributes:true,attributeFilter:['class','style']});
+  window.visualViewport?.addEventListener('resize', refresh);
+  window.visualViewport?.addEventListener('scroll', refresh);
+  window.addEventListener('resize', refresh);
+  refresh();
+})();
+
 // Modal: replaces confirm() / alert() — both blocked in PWA standalone mode
 let _modalResolve = null;
 function _modalBgClick(e) { if (e.target === document.getElementById('modal-backdrop')) _modalClose(false); }
@@ -2015,11 +2201,9 @@ function describeOp(item) {
 // Normal outbox transport stays in Messages; connection warnings describe a
 // delayed or refused operation, not every brief local acceptance.
 function _outboxNeedsAttention(q) {
-  // Blocked, or stalled past the send deadline. NOT "has ever errored" and
-  // NOT "older than 20s": one transient 5xx set q.error for the op's whole
-  // life, and 20s is inside the retry backoff, so a healthy queue on a slow
-  // server read as an incident (Ethan, 2026-09-11: "something new I don't like").
-  return q.state === 'blocked' || _outboxIsStalled(q);
+  // A saved error remains reviewable until acknowledgement clears it. Age
+  // alone uses the longer stall window so ordinary delivery remains quiet.
+  return q.state === 'blocked' || !!q.error || _outboxIsStalled(q);
 }
 function _outboxAgeMs(q) { return Date.now() - (q.timestamp || 0); }
 // AN OP THAT HAS BEEN "SENDING" FOR HOURS IS NOT SENDING.
@@ -2242,47 +2426,32 @@ async function _upqCancel(id) {
   showToast('Removed from the upload queue (NOT uploaded)');
 }
 
-// Drain is idempotent and single-flight: a second call while draining is a
-// no-op rather than a double upload.
-let _upqDraining = false;
-async function _upqDrain() {
-  if (_upqDraining) return;
-  _upqDraining = true;
-  let sent = 0, failed = 0;
-  try {
-    const deliver = async () => {
-    for (const item of await _upqList()) {
-      try {
-        if (item.surface === 'directory') {
-          const f = {...item, file:_storedUploadFile(item), stored:true, chunk:0};
-          await _runUpload(f, {render:() => {}});
-          if (f.path) { await _upqRemove(f.id); sent++; } else failed++;
-          continue;
-        }
-        const fd = new FormData();
-        fd.append('dir', item.dir);
-        fd.append('file', item.blob, item.name);
-        const r = await fetch(API + '/api/fs/upload',
-                              { method: 'POST', body: fd, _skipOutbox: true, signal:AbortSignal.timeout(30000) });
-        const d = await r.json().catch(() => ({}));
-        if (r.ok && (d.saved || []).length) { await _upqRemove(item.id); sent++; }
-        else failed++;
-      } catch (e) { failed++; }
+// Files share the reconnect checklist and replay flight with ordinary writes.
+// The byte store stays separate: it is chunked IDB, never JSON/localStorage.
+let _uploadSyncPending = false;
+function _upqDrain() { return runSyncBanner(true); }
+async function _syncOneUpload(item) {
+  const deliver = async () => {
+    const current = (await _upqList()).find(row => row.id === item.id);
+    if (!current) throw new Error('Upload changed in another tab — refresh to review');
+    if (current.surface === 'directory') {
+      const f = {...current, file:_storedUploadFile(current), stored:true, chunk:0};
+      // A finish receipt may already be durable if the page closed before removal.
+      if (!f.path || !f.url) await _runUpload(f, {render:() => {}});
+      if (!f.path || !f.url) throw new Error(f.error || 'Server has not confirmed this file');
+    } else {
+      const fd = new FormData();
+      fd.append('dir', current.dir);
+      fd.append('file', current.blob, current.name);
+      const response = await fetch(API + '/api/fs/upload', {
+        method:'POST', body:fd, _skipOutbox:true, signal:AbortSignal.timeout(30000)});
+      const result = await response.json();
+      if (!response.ok || !(result.saved || []).length) throw new Error('Server has not confirmed this file');
     }
-    };
-    if (navigator.locks?.request) await navigator.locks.request('amux-upload-replay', {ifAvailable:true}, lock => lock ? deliver() : undefined);
-    else await deliver();
-  } catch (error) { _uploadStorageError('replay-failed', error); }
-  finally { _upqDraining = false; }
-  if (sent) {
-    showToast('Uploaded ' + sent + ' queued file' + (sent === 1 ? '' : 's')
-              + (failed ? ' \u00b7 ' + failed + ' still queued' : ''));
-    if (typeof loadFiles === 'function' && typeof _filesPath !== 'undefined') loadFiles(_filesPath);
-    if (typeof loadExplore === 'function' && typeof _explorePath !== 'undefined') {
-      try { loadExplore(_explorePath); } catch (e) {}
-    }
-  }
-  _upqRenderBadge();
+    await _upqRemove(item.id);
+  };
+  if (navigator.locks?.request) return navigator.locks.request('amux-upload-replay', deliver);
+  return deliver();
 }
 
 // ONE pending count over BOTH offline stores (AMUX-2317).
@@ -2339,7 +2508,7 @@ async function _uploadOrQueue(files, dir, kind) {
 }
 
 function _resumePendingUploads() {
-  if (document.hidden) return;
+  if (document.hidden || navigator.onLine === false) return;
   _upqDrain().catch(error => _uploadStorageError('resume-failed', error));
   _restoreAttachments().then(() => {
     for (const {f, sink} of _durableAttachments.values()) {
@@ -2349,19 +2518,20 @@ function _resumePendingUploads() {
 }
 
 function setOnline(val) {
+  // A response started before the offline event can finish after it. It is
+  // evidence about that request, not permission to clear the current outage.
+  if (val && navigator.onLine === false) {
+    amuxTrack('connectivity_stale_success', {verdict:'offline_preserved', measured:true, n_considered:1});
+    return;
+  }
   const was = online;
   online = val;
   if (val) consecutiveFailures = 0;
   if (!val) _liveSSE = false;
   updateConnectionStatus();
   if (!was && val) {
-    showToast('Reconnected');
-    try { _upqDrain(); } catch (e) {}
-    // NON-quiet on reconnect: this is exactly when the user wants to watch the
-    // queue drain, item by item, as checkmarks (Ethan, 2026-09-12: "when
-    // reconnecting it should show that list of checkboxes and check marks of
-    // different synced things"). Ordinary online single-sends stay silent; only
-    // a reconnect (or a multi-item batch, see _runSyncBanner) raises the list.
+    // The visible sync checklist is the receipt; a toast would cover its rows.
+    if (!offlineQueue.length && !drafts.length) showToast('Reconnected');
     runSyncBanner(false);
     // Reconnect SSE (reset fallback so we can get back to Live mode)
     _sseFallback = false; _sseRetries = 0;
@@ -2393,7 +2563,7 @@ const _SYNC_MIN_MS = 2000, _SYNC_MAX_MS = 60000;
 function _syncBackoffReset() { _syncBackoffMs = 0; }
 function _scheduleSyncRetry() {
   clearTimeout(_syncRetryTimer);
-  const pending = offlineQueue.some(q => q.state !== 'blocked' || _outboxUncertainMessage(q)) || drafts.length;
+  const pending = offlineQueue.some(q => q.state !== 'blocked' || _outboxUncertainMessage(q)) || drafts.length || _uploadSyncPending;
   if (!pending) { _syncBackoffMs = 0; return; }
   _syncBackoffMs = _syncBackoffMs ? Math.min(_syncBackoffMs * 2, _SYNC_MAX_MS) : _SYNC_MIN_MS;
   _syncRetryTimer = setTimeout(() => { runSyncBanner(true); }, _syncBackoffMs);
@@ -2423,7 +2593,20 @@ function runSyncBanner(quiet = false) {
     });
   return _syncFlight;
 }
+function _clearSyncTransientToast() {
+  const toast = document.getElementById('toast');
+  if (!toast || !/^(Queued \(|Reconnected$|Server unreachable — offline mode$)/.test(toast.textContent)) return;
+  clearTimeout(toastTimer);
+  toast.getAnimations?.().forEach(animation => animation.cancel());
+  toast.style.opacity = ''; toast.style.transform = '';
+  toast.classList.remove('visible');
+}
+let _syncChecklist = [];
 async function _runSyncBanner(quiet = false) {
+  // A real browser offline switch cannot deliver anything. Keep work durable
+  // without painting a failed checklist over the editor on each timer tick.
+  // Server reachability still retries freely when the browser is online.
+  if (navigator.onLine === false) return;
   const banner = document.getElementById('sync-banner');
   const itemsEl = document.getElementById('sync-items');
   const titleEl = document.getElementById('sync-title-text');
@@ -2435,36 +2618,48 @@ async function _runSyncBanner(quiet = false) {
     if (q.state === 'blocked' && !_outboxUncertainMessage(q)) blockedResources.add(q.url);
     return !blockedResources.has(q.url) && !_outboxActive.has(q.id);
   });
-  const skipped = 0;
-  const totalOps = draftCount + queue.length;
+  let skipped = 0;
+  const uploads = await _upqList();
+  _uploadSyncPending = uploads.length > 0;
+  const totalOps = draftCount + queue.length + uploads.length;
   if (!totalOps) return;
 
   // Build item list
   const items = [];
-  drafts.forEach(d => items.push({ label: 'Create & start "' + d.name + '"', status: 'pending', type: 'draft', draft: d }));
-  queue.forEach(q => items.push({ label: describeOp(q), status: 'pending', type: 'queue', item: q }));
+  drafts.forEach(d => items.push({ key:'draft:' + d.name, label: 'Create & start "' + d.name + '"', status: 'pending', type: 'draft', draft: d }));
+  queue.forEach(q => items.push({ key:'queue:' + q.id, label: describeOp(q), status: 'pending', type: 'queue', item: q }));
+  uploads.forEach(file => items.push({ key:'upload:' + file.id, label: 'Upload ' + file.name, status: 'pending', type: 'upload', file }));
 
+  // A retry updates its rows; it must not erase already-acknowledged files or
+  // blocked changes from the visible reconnect receipt. Dismiss starts a new list.
+  if (banner.classList.contains('active')) {
+    const currentKeys = new Set(items.map(item => item.key));
+    items.unshift(..._syncChecklist.filter(item => !currentKeys.has(item.key)).map(item => ({...item, replay:false})));
+  }
+  _syncChecklist = items;
+  skipped = items.filter(item => item.status === 'skipped').length;
   function renderBanner() {
     const done = items.filter(i => i.status === 'done').length;
     const failed = items.filter(i => i.status === 'failed').length;
     titleEl.textContent = 'Syncing ' + done + '/' + items.length + (failed ? ' (' + failed + ' failed)' : '') + (skipped ? ' (' + skipped + ' skipped)' : '');
     itemsEl.innerHTML = items.map(i => {
-      const icon = i.status === 'done' ? '&#x2714;' : i.status === 'failed' ? '&#x2718;' : i.status === 'running' ? '&#x27A4;' : '&#x2022;';
-      return '<div class="sync-item ' + i.status + '">' + icon + ' ' + esc(i.label) + '</div>';
+      const icon = i.status === 'done' ? '&#x2714;' : i.status === 'failed' ? '&#x2718;' : i.status === 'running' ? '&#x27A4;' : i.status === 'skipped' ? '&mdash;' : '&#x2022;';
+      return '<div data-sync-id="' + esc(i.key) + '" class="sync-item ' + i.status + '">' + icon + ' ' + esc(i.label) + '</div>';
     }).join('');
   }
 
   renderBanner();
-  // Show the checklist for a reconnect/explicit run (!quiet) OR whenever there
-  // is a real BATCH to watch drain (2+ items). A lone background single-send
-  // stays silent — the "unsaved changes is too much" rule — but a queue that
-  // built up offline flushes visibly, checkmark by checkmark.
   const show = !quiet || items.length >= 2;
-  if (show) banner.classList.add('active');
+  if (show) {
+    // The checklist replaces transient queue feedback, including a toast from
+    // an offline write immediately before reconnect. Keep failure toasts intact.
+    _clearSyncTransientToast();
+    banner.classList.add('active');
+  }
 
   // A draft is a sequence of accepted writes. Keep its completed steps and
   // prompt identity across failure/reload; never call a failed start "synced".
-  for (const item of items.filter(i => i.type === 'draft')) {
+  for (const item of items.filter(i => i.type === 'draft' && i.replay !== false)) {
     item.status = 'running'; renderBanner();
     try {
       await _syncOneDraft(item.draft);
@@ -2485,14 +2680,14 @@ async function _runSyncBanner(quiet = false) {
   // re-capture its own replay (double-queue), with auth headers applied FRESH
   // (they were not stamped at queue time, and a stale token would 401).
   const failedResources = new Set();
-  for (const item of items.filter(i => i.type === 'queue')) {
+  for (const item of items.filter(i => i.type === 'queue' && i.replay !== false)) {
     const q = item.item;
-    if (failedResources.has(q.url)) { item.status = 'waiting'; item.label += ' — waiting for the previous message'; continue; }
+    if (failedResources.has(q.url)) { item.status = 'waiting'; item.label += ' — waiting for the previous message'; renderBanner(); continue; }
     item.status = 'running';
     renderBanner();
     await _outboxLock('amux-outbox-delivery:' + q.id, async () => {
     const fresh = _readQueue().find(entry => entry.id === q.id);
-    if (!fresh) { offlineQueue = _readQueue(); item.status = 'done'; return; }
+    if (!fresh) { offlineQueue = _readQueue(); item.status = 'skipped'; item.label += ' — no longer queued in this tab'; skipped++; return; }
     Object.assign(q, fresh);
     if (q.state === 'blocked' && !_outboxUncertainMessage(q)) { item.status = 'failed'; return; }
     const interaction = _interactionReplay(q);
@@ -2504,7 +2699,7 @@ async function _runSyncBanner(quiet = false) {
       q.attempted_at ||= Date.now();
       let stillQueued = false;
       await _mutateQueue(current => { const saved = current.find(entry => entry.id === q.id); if (saved) { saved.attempted_at = q.attempted_at; saved.not_attempted = false; stillQueued = true; } });
-      if (!stillQueued) { item.status = 'done'; return; }
+      if (!stillQueued) { item.status = 'skipped'; item.label += ' — removed before delivery'; skipped++; return; }
       try { if (typeof _peekMessagesRender === 'function') _peekMessagesRender(); } catch (_) {}
       const opts = { ...q.options, headers: _authHeaders(q.options.headers) };
       const r = _outboxUncertainMessage(q)
@@ -2551,7 +2746,24 @@ async function _runSyncBanner(quiet = false) {
     });
     renderBanner();
   }
-  if (!offlineQueue.length && !drafts.length) _writeError = '';
+  for (const item of items.filter(i => i.type === 'upload' && i.replay !== false)) {
+    item.status = 'running'; renderBanner();
+    try { await _syncOneUpload(item.file); item.status = 'done'; }
+    catch (error) {
+      item.status = 'failed'; item.label += ' — ' + String(error.message || error);
+      _uploadStorageError('sync-unconfirmed', error);
+    }
+    renderBanner();
+  }
+  _uploadSyncPending = (await _upqList()).length > 0;
+  if (uploads.length) {
+    _upqRenderBadge();
+    if (typeof loadFiles === 'function' && typeof _filesPath !== 'undefined') loadFiles(_filesPath);
+    if (typeof loadExplore === 'function' && typeof _explorePath !== 'undefined') {
+      try { loadExplore(_explorePath); } catch (error) {}
+    }
+  }
+  if (!offlineQueue.length && !drafts.length && !_uploadSyncPending) _writeError = '';
 
   const doneCount = items.filter(i => i.status === 'done').length;
   const failCount = items.filter(i => i.status === 'failed').length;
@@ -2564,11 +2776,12 @@ async function _runSyncBanner(quiet = false) {
   // Pending messages just flushed — clear the amber pending UI and re-pull the
   // server-side history so the Messages tab flips ⏳pending → delivered.
   try { _loadCmdHistoryFromServer().then(() => { _peekMessagesBadge(); if (typeof _peekTab !== 'undefined' && _peekTab === 'messages') _peekMessagesRender(); }); } catch(e) {}
-  if (doneCount && show) showToast(doneCount + ' queued operation' + (doneCount===1?'':'s') + ' delivered');
-  // Auto-dismiss: immediately if failures (the offline-banner already shows
-  // the pending ops, so two banners for the same thing is redundant), or after
-  // 2s on full success so the user sees the completion flash.
-  setTimeout(() => banner.classList.remove('active'), failCount || checkingCount ? 0 : 2000);
+  // Reconnect progress keeps failed steps reviewable until dismissed. Ordinary
+  // online sends stay quiet; only completed visible runs auto-dismiss.
+  if (!failCount && !checkingCount) {
+    _clearSyncTransientToast();
+    setTimeout(() => { if (!_syncFlight) banner.classList.remove('active'); }, 2000);
+  }
 }
 
 async function _syncOneDraft(draft) {
@@ -2942,7 +3155,7 @@ function _interactionDiagnostic(event) {
 let _receiptStorage;
 try { _receiptStorage = localStorage; } catch (_) {}
 const _interactions = AmuxState.createInteractions({storage:_receiptStorage, diagnostic:_interactionDiagnostic});
-const _stateFeedback = AmuxState.installFeedback(_interactions, _stateUI);
+const _stateFeedback = AmuxState.installFeedback(_interactions, _stateUI, _interactionDiagnostic);
 const _effectReconciler = AmuxState.createEffectReconciler({interactions:_interactions,
   read:async (id, signal) => {
     const response = await fetch(API + '/api/interactions/' + encodeURIComponent(id) + '/effects', {signal});
@@ -3540,7 +3753,10 @@ function toggleNotifPanel() {
   const panel = document.getElementById('notif-panel');
   if (!panel) return;
   panel.classList.toggle('active', _notifPanelOpen);
+  document.getElementById('notif-btn')?.setAttribute('aria-expanded', String(_notifPanelOpen));
   if (_notifPanelOpen) {
+    panel.scrollTop = 0;
+    _positionNotifPanel();
     _notifRenderPanel();
     _notifUpdateNativeBtn();
     _notifUpdateBannerBtn();
@@ -3549,6 +3765,25 @@ function toggleNotifPanel() {
     setTimeout(() => _notifUpdateBadge(), 300);
   }
 }
+
+function _positionNotifPanel() {
+  const panel = document.getElementById('notif-panel');
+  const button = document.getElementById('notif-btn');
+  if (!panel || !button || !_notifPanelOpen) return;
+  const anchor = button.getBoundingClientRect();
+  const width = panel.getBoundingClientRect().width;
+  const top = Math.min(anchor.bottom + 8, Math.max(12, innerHeight - 120));
+  panel.style.left = Math.max(12, Math.min(anchor.left, innerWidth - width - 12)) + 'px';
+  panel.style.top = top + 'px';
+  panel.style.maxHeight = Math.max(80, Math.min(520, innerHeight - top - 12)) + 'px';
+}
+window.addEventListener('resize', _positionNotifPanel);
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && _notifPanelOpen) {
+    toggleNotifPanel();
+    document.getElementById('notif-btn')?.focus();
+  }
+});
 
 function _notifRenderPanel() {
   const list = document.getElementById('notif-panel-list');
@@ -3585,9 +3820,7 @@ function _notifClearAll() {
 
 document.addEventListener('click', (e) => {
   if (_notifPanelOpen && !e.target.closest('#notif-panel') && !e.target.closest('#notif-btn')) {
-    _notifPanelOpen = false;
-    const panel = document.getElementById('notif-panel');
-    if (panel) panel.classList.remove('active');
+    toggleNotifPanel();
   }
 });
 
@@ -4148,7 +4381,13 @@ function _stalledChip(s) {
     + w.ready + ' ready</span>';
 }
 
+const _workerLifecyclePending = new Map();
 function _workerExecutionBadge(s, runtimeBoard) {
+  const pending = _workerLifecyclePending.get(s.name);
+  if (pending) return '<span class="status-badge idle">' + pending + '…</span>';
+  if (s.lifecycle === 'paused') return s.running
+    ? '<span class="status-badge blocked" title="Pause has not finished stopping this worker. Retry Pause.">pause incomplete</span>'
+    : '<span class="status-badge paused">paused</span>';
   let badge = '';
   if (s.status === 'starting') badge = '<span class="status-badge idle">starting</span>';
   else if (!s.running) badge = '<span class="status-badge idle">stopped</span>';
@@ -4206,9 +4445,9 @@ function updatePeekStatus() {
   // Update input placeholder based on session state
   const cmdInp = document.getElementById('peek-cmd-input');
   if (cmdInp) {
-    cmdInp.placeholder = s.status === 'active'
-      ? 'Type a message (worker is working)...'
-      : 'Type a message or drop a file...';
+    // Working state is already shown above; repeating it here clips the
+    // empty prompt inside the deliberately single-row phone composer.
+    cmdInp.placeholder = 'Message…';
   }
   // Model badge (+ reasoning effort, Claude only)
   const mb = document.getElementById('peek-model-badge');
@@ -4452,7 +4691,7 @@ function _nudgeWorkersOnBoardChange() {
   } catch (e) { /* a render hiccup must not break the ingest that called us */ }
 }
 function _grpMembers(g) {
-  const all = (sessions || []).filter(s => !s.archived);
+  const all = (sessions || []).filter(s => !s.archived && s.lifecycle !== 'paused');
   return all.filter(s => (s.tags || []).includes(g));
 }
 function _grpSummary(g) {
@@ -4567,11 +4806,9 @@ function _workerActionDefinitions(s) {
       run: "newConversation('" + name + "'," + (s.running ? 'true' : 'false') + ")" },
     { key: 'share', icon: '&#x1F517;', label: 'Share link',
       run: "closeAllMenus();shareSession('" + name + "')" },
-    s.lifecycle === 'paused'
-      ? { key: 'resume', icon: '&#x25B6;', label: 'Resume',
-          run: "resumeWorker('" + name + "')" }
-      : { key: 'pause', icon: '&#x23F8;', label: 'Pause',
-          run: "pauseWorker('" + name + "')" },
+    s.lifecycle === 'paused' && !s.running
+      ? { key: 'resume', icon: '&#x25B6;', label: 'Resume', run: "resumeWorker('" + name + "')" }
+      : { key: 'pause', icon: '&#x23F8;', label: 'Pause', run: "pauseWorker('" + name + "')" },
     { key: 'archive', icon: '&#x1F4E6;', label: 'Archive',
       run: "archiveSession('" + name + "')" },
     { separator: true },
@@ -4711,7 +4948,7 @@ function render() {
   _renderGroupsTab();
   const stripEl = document.getElementById('grp-scope-strip');
   if (stripEl && stripEl.innerHTML) { stripEl.innerHTML = ''; stripEl._want = ''; }
-  const _nonArchivedCount = sessions.filter(s => !s.archived).length;
+  const _nonArchivedCount = sessions.filter(s => !s.archived && s.lifecycle !== 'paused').length;
   if (!_nonArchivedCount && !drafts.length) {
     if (_sessionLoadError) {
       el.innerHTML = ''; // Actionable detail is in the Sync error badge modal.
@@ -4736,7 +4973,7 @@ function render() {
         : '<div class="empty"><span class="loading-spinner"></span>Connecting to server…<br>' +
           '<a href="/api/_clear_sw" style="color:var(--dim);font-size:0.75rem;margin-top:8px;display:inline-block;">Stuck? Clear cache</a></div>';
     } else {
-      el.innerHTML = '<div class="empty">No workers yet.<br>Tap <strong>+</strong> to create one.' +
+      el.innerHTML = '<div class="empty">' + (sessions.some(s => s.lifecycle === 'paused') ? 'No active workers. Resume a paused worker to continue.' : 'No workers yet.<br>Tap <strong>+</strong> to create one.') +
         (!online ? '<br><span style="color:var(--yellow)">You\'re offline — workers created now will sync when connected.</span>' : '') + '</div>';
     }
     _renderPausedSection();
@@ -4762,7 +4999,7 @@ function render() {
     </div>`;
   }).join('');
 
-  // Filter by tag (exclude archived and paused from main view)
+  // Filter by tag (exclude archived from main view)
   let list = (activeTag ? sessions.filter(s => (s.tags || []).includes(activeTag)) : sessions).filter(s => !s.archived && s.lifecycle !== 'paused');
   // Filter by search query
   const q = searchQuery.toLowerCase().trim();
@@ -4840,7 +5077,6 @@ function render() {
         </div>
         ${(s.status || s.tokens || s.last_activity || s.rate_limited_until || s.credit_limited || s.sched_on || s.sched_off || !online) ? `<div class="card-header-meta">
           ${!s.running || !s.rate_limited_until ? _workerExecutionBadge(s, runtimeBoard) : ''}
-          ${s.lifecycle === 'paused' ? '<span class="status-badge lifecycle-paused" title="Paused: no automatic work; manual actions still work">PAUSED</span>' : ''}
           ${s.running && s.status === 'waiting' ? _stalledFor(s) : ''}
           ${s.running && s.rate_limited_until ? `<span class="status-badge rate-limited" title="${s.rate_limit_weekly ? 'Weekly limit' : 'Rate-limited'} — auto-resume at ${_fmtResetTime(s.rate_limited_until)}">${s.rate_limit_weekly ? 'Weekly limit until' : 'Rate-limited until'} ${_fmtResetTime(s.rate_limited_until)}</span>` : ''}
           ${s.running && s.credit_limited ? `<span class="status-badge rate-limited" title="${esc(s.credit_limit_model || 'Model')} usage limit — switch model or top up credits (Bulk actions)${s.credit_limited_since ? '. Detected ' + timeAgo(s.credit_limited_since) + ' — clears on model change or restart' : ''}">${esc(s.credit_limit_model || 'model')} limit${s.credit_limited_since ? ` · ${timeAgo(s.credit_limited_since)}` : ''}</span>` : ''}
@@ -5038,6 +5274,7 @@ function render() {
   _restoreCardFocus(focusedId, savedInputs);
 
   _renderPausedSection();
+
   _renderArchivedSection();
 
   // Hydrate customizable chip bars on all session cards
@@ -6296,7 +6533,6 @@ function _applyEmbedView() {
   }
 })();
 
-let pausedExpanded = false;
 function togglePaused() {
   pausedExpanded = !pausedExpanded;
   _renderPausedSection();
@@ -6325,7 +6561,7 @@ function _renderPausedSection() {
     (q ? paused : allPaused).forEach(s => {
       const ago = s.last_activity ? timeAgo(s.last_activity) : '';
       const dir = s.dir ? s.dir.replace(/^\/Users\/[^/]+/, '~') : '';
-      const model = s.active_model || '';
+      const model = s.active_model || sessionConfiguredModel(s) || '';
       const body = esc(s.task_name || s.preview || s.desc || '');
       const meta = [];
       if (dir) meta.push(`<code title="${esc(s.dir)}">${esc(dir)}</code>`);
@@ -6337,7 +6573,7 @@ function _renderPausedSection() {
           ${model ? `<span class="paused-card-chip model">${esc(model)}</span>` : ''}
           <span class="paused-card-spacer"></span>
           <div class="paused-card-actions">
-            <button class="paused-resume-btn" onclick="resumeWorker('${esc(s.name)}')">Resume</button>
+            <button class="paused-resume-btn" ${_workerLifecyclePending.has(s.name) ? 'disabled' : ''} onclick="${s.running ? 'pauseWorker' : 'resumeWorker'}('${esc(s.name)}')">${_workerLifecyclePending.get(s.name) || (s.running ? 'Retry Pause' : 'Resume')}</button>
             <button class="paused-archive-btn" onclick="archiveSession('${esc(s.name)}')">Archive</button>
           </div>
         </div>
@@ -6347,7 +6583,7 @@ function _renderPausedSection() {
     });
     html += '</div>';
   }
-  el.innerHTML = html;
+  if (el.innerHTML !== html) el.innerHTML = html;
 }
 
 function toggleArchived() {
@@ -6505,17 +6741,16 @@ function _scrollToFirstRateLimited() {
 
 // AF-731: document overflow alone misses a button clipped by its flex parent.
 // Measure the actual visible control bounds, including clipping ancestors.
+const _headerControlIds = ['brand-header','conn-status','notif-btn','rate-limit-pill','active-btn','add-btn','settings-btn','interaction-feedback'];
 function _headerLayoutCheck() {
-  if (innerWidth > 480) return [];
-  const buttons = ['brand-header','conn-status','notif-btn','rate-limit-pill','active-btn','add-btn','settings-btn','interaction-feedback'];
-  const clipped = buttons.filter(id => {
+  const clipped = _headerControlIds.filter(id => {
     const el = id==='interaction-feedback' ? document.querySelector('#interaction-feedback > summary') : document.getElementById(id);
     if (!el || !el.getClientRects().length) return false;
     const r = el.getBoundingClientRect();
     if (r.left < -1 || r.right > innerWidth + 1) return true;
     if (id === 'rate-limit-pill') {
       const label = document.getElementById('rate-limit-pill-count')?.getBoundingClientRect();
-      if (label && (label.left < r.left - 1 || label.right > r.right + 1)) return true;
+      if (label?.width && (label.left < r.left - 1 || label.right > r.right + 1)) return true;
     }
     for (let p = el.parentElement; p && p !== document.body; p = p.parentElement) {
       if (!['hidden','clip','auto','scroll'].includes(getComputedStyle(p).overflowX)) continue;
@@ -6524,6 +6759,19 @@ function _headerLayoutCheck() {
     }
     return false;
   });
+  const badge = document.getElementById('notif-badge'), bell = document.getElementById('notif-btn');
+  if (badge?.getClientRects().length && bell) {
+    const b = badge.getBoundingClientRect(), r = bell.getBoundingClientRect();
+    if (b.left < r.left - 1 || b.right > r.right + 1 || b.top < r.top - 1 || b.bottom > r.bottom + 1) clipped.push('notif-badge');
+  }
+  // A wrapped row used to pass the clipping probe while consuming twice the
+  // phone's header height. Report that regression through the same log path.
+  if (innerWidth <= 600) {
+    const tops = _headerControlIds.filter(id => id !== 'interaction-feedback')
+      .map(id => document.getElementById(id)).filter(el => el?.getClientRects().length)
+      .map(el => el.getBoundingClientRect().top);
+    if (tops.length > 1 && Math.max(...tops) - Math.min(...tops) > 1) clipped.push('header-row-wrapped');
+  }
   return clipped;
 }
 (function observeMobileHeader() {
@@ -6539,14 +6787,16 @@ function _headerLayoutCheck() {
       const clipped = _headerLayoutCheck();
       const signature = clipped.join(',');
       if (signature && signature !== previous) {
-        console.warn('[amux] mobile header controls clipped', clipped);
+        console.warn('[amux] header controls clipped', clipped);
         fetch('/api/client-debug', {method:'POST',headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({kind:'mobile-header-clipped',measured:true,n_considered:8,clipped,viewport:innerWidth,ver:APP_VER})}).catch(() => {});
+          body:JSON.stringify({kind:'mobile-header-clipped',measured:true,n_considered:_headerControlIds.filter(id=>document.getElementById(id)?.getClientRects().length).length,clipped,viewport:innerWidth,surface:innerWidth<=600?'mobile':'desktop',ver:APP_VER})}).catch(() => {});
       }
       previous = signature;
     });
   });
   observer.observe(header);
+  const badge = document.getElementById('notif-badge');
+  if (badge) observer.observe(badge);
   header.querySelectorAll(':scope > div, :scope > div > *').forEach(el => observer.observe(el));
 })();
 
@@ -7463,20 +7713,37 @@ async function deleteSession(session) {
   await fetchSessions();
 }
 
-async function pauseWorker(session) {
-  closeAllMenus();
-  const done = _cardBusy(session, 'Pausing');
-  const r = await apiCall(API + '/api/workers/' + session + '/pause', { method: 'POST' });
-  done();
-  if (r) showToast(session + ' paused');
-  await fetchSessions();
-}
+async function pauseWorker(session) { return _changeWorkerPaused(session, true); }
+async function resumeWorker(session) { return _changeWorkerPaused(session, false); }
 
-async function resumeWorker(session) {
+async function _changeWorkerPaused(session, paused) {
+  if (_workerLifecyclePending.has(session)) return;
   closeAllMenus();
-  const r = await apiCall(API + '/api/workers/' + session + '/resume', { method: 'POST' });
-  if (r) showToast(session + ' resumed');
-  await fetchSessions();
+  const label = paused ? 'Pausing' : 'Resuming';
+  _workerLifecyclePending.set(session, label.toLowerCase());
+  const done = _cardBusy(session, label);
+  updatePeekStatus();
+  _renderPausedSection();
+  try {
+    const r = await apiCall(API + '/api/workers/' + encodeURIComponent(session) + (paused ? '/pause' : '/resume'), { method: 'POST' });
+    if (r) {
+      const body = await r.json();
+      // Acknowledged lifecycle is projected immediately; a slow sessions poll
+      // must not leave a stale Resume action or a Working badge behind.
+      const worker = sessions.find(s => s.name === session);
+      if (worker && body.lifecycle) {
+        worker.lifecycle = body.lifecycle;
+        if (typeof body.running === 'boolean') worker.running = body.running;
+        if (body.session === 'starting' || (!paused && body.session === 'started')) worker.status = 'starting';
+      }
+      showToast(session + (paused ? ' paused — work stopped' : ' resuming'));
+    }
+    await fetchSessions();
+  } finally {
+    _workerLifecyclePending.delete(session);
+    done();
+    render();
+  }
 }
 
 async function archiveSession(session) {
@@ -7919,24 +8186,22 @@ async function sendFromInput(name) {
   }
   const original = inp.value;
   const queued = _sendMode === 'queue' && (sessions.find(s => s.name === name) || {}).status !== 'waiting';
-  // Same contract as sendPeekCmd: clear now, deliver in the background, put
-  // the text back on refusal.
+  if (_composerPendingSends.has(name)) return;
   const draftRevision = _draftSave(name, original);
-  _composerAcceptLocal(name, original, draftRevision);
-  if (!queued) showToast('Sending to ' + name + '…');
-  (async () => {
+  _composerPendingSends.add(name);
+  _syncComposerPending();
   try {
     const identity = {};
     const result = queued ? (await steerSession(name, _expandAtMentions(msg), identity) ? 'queued' : 'failed')
       : await doSend(name, _expandAtMentions(msg), identity);
     if (!['sent', 'queued'].includes(result)) {
       _composerUnconfirmed(name, result, _files.length);
-      _composerRestore(name, original);
-      if (result !== 'declined') showToast(result === 'local-failed' ? _writeError + ' — text put back in the composer'
-        : 'Not delivered — text put back in the composer');
+      showToast(result === 'local-failed' ? _writeError + ' — draft and attachments kept'
+        : 'Message not confirmed — draft and attachments kept');
       return;
     }
     cmdHistoryAdd(text || msg, { session: name, type: queued ? 'steering' : 'direct', msg_id:identity.msg_id });
+    _composerAcceptLocal(name, original, draftRevision);
     // Remove the SENT attachments durably, not just from the on-screen array.
     // _cancelUpload deletes the IndexedDB upload row; a plain array filter left
     // it behind, so _attachmentRestore re-hydrated every sent file on the next
@@ -7950,16 +8215,17 @@ async function sendFromInput(name) {
       sent.add(f);
       if (f.previewUrl) URL.revokeObjectURL(f.previewUrl);
     }
+
     _cardFiles[name] = (_cardFiles[name] || []).filter(f => !sent.has(f));
     renderCardFiles(name);
-    if (result === 'sent') showToast('Delivered to ' + name);
-    else if (result === 'queued' && !queued) showToast(online ? 'Sent to ' + name : 'Offline — queued for ' + name + ', sends when reconnected');
+    if (result === 'sent') showToast('Sent to ' + name);
   } catch (e) {
     _composerUnconfirmed(name, 'exception', _files.length);
-    _composerRestore(name, original);
-    showToast('Not delivered — text put back in the composer');
+    showToast('Message not confirmed — draft and attachments kept');
+  } finally {
+    _composerPendingSends.delete(name);
+    _syncComposerPending();
   }
-  })();
 }
 
 // Composer labels describe the selected action, never background transport.
@@ -8108,7 +8374,7 @@ function _renderGroupsTab() {
   if (activeView !== 'groups') return;
   const el = document.getElementById('groups-container');
   if (!el) return;
-  const all = (sessions || []).filter(s => !s.archived);
+  const all = (sessions || []).filter(s => !s.archived && s.lifecycle !== 'paused');
   const groups = [...new Set(all.flatMap(s => s.tags || []))].sort();
   const grouped = new Set(all.filter(s => (s.tags || []).length).map(s => s.name));
   const activeN = all.filter(s => s.status === 'active').length;
@@ -8245,8 +8511,13 @@ function _grpGoto(g, where) {
 // same call the server made in _scope_write, which accepts exactly these shapes.
 let _scopeEditCtx = null, _scopeEditDirty = false;
 
-function _scopeEditClose() {
-  if (_scopeEditDirty && !confirm('Discard unsaved configuration changes?')) return;
+async function _scopeEditClose() {
+  if (_scopeEditDirty) {
+    const discard = await showConfirm('Discard unsaved configuration changes?', 'Discard', true);
+    fetch('/api/client-debug', {method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({kind:'scope-discard-choice',measured:true,n_considered:1,discarded:discard,ver:APP_VER})}).catch(() => {});
+    if (!discard) return;
+  }
   document.getElementById('scope-edit-backdrop').classList.remove('open');
   _scopeEditCtx = null; _scopeEditDirty = false;
 }
@@ -9015,6 +9286,7 @@ function _steerQueueFor(sess) {
   });
   return server.concat(local);
 }
+
 function _steerHumanCount(sess) {
   return _steerQueueFor(sess).filter(m => !m.system).length;
 }
@@ -9037,9 +9309,9 @@ function _steeringRender() {
   const row = m => {
     const ago = timeAgo(m.queued_at);
     const sysTag = m.system ? `<span style="font-size:0.68rem;font-weight:600;padding:1px 6px;border-radius:3px;background:rgba(148,163,184,0.15);color:var(--dim);margin-right:6px;">SYSTEM${m.guard ? ' · ' + esc(m.guard) : ''}</span>` : '';
-    // A row we optimistically added and have not yet heard back on. It shows a
-    // spinner and disabled actions so it reads as "landing", not "stuck".
-    const pendTag = m.pending ? `<span style="font-size:0.68rem;font-weight:600;padding:1px 6px;border-radius:3px;background:rgba(210,153,34,0.16);color:#d29922;margin-right:6px;">Awaiting server</span>` : '';
+    // Durable local intent has no server steering ID yet; server-only actions
+    // stay disabled until acknowledgement. Offline/error state remains explicit.
+    const pendTag = m.pending ? `<span style="font-size:0.68rem;font-weight:600;padding:1px 6px;border-radius:3px;background:rgba(210,153,34,0.16);color:#d29922;margin-right:6px;">${m.error ? 'Needs review' : online ? 'Awaiting server' : 'Saved offline'}</span>` : '';
     const dis = m.pending ? 'disabled style="opacity:0.5;font-size:0.7rem;padding:2px 8px;"' : 'style="font-size:0.7rem;padding:2px 8px;"';
     return `<div style="display:flex;align-items:flex-start;gap:10px;padding:10px 12px;background:${m.system ? 'rgba(255,255,255,0.02)' : 'var(--card-bg)'};border:1px solid ${m.pending ? 'rgba(210,153,34,0.45)' : 'var(--border)'};border-radius:8px;${m.system ? 'opacity:0.85;' : ''}">
       <div style="flex:1;min-width:0;">
@@ -10461,7 +10733,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.928';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.943';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -10939,7 +11211,7 @@ function _peekAgentsPaint() {
   label.title = state.error ? 'Use either arrow to retry' : state.selected?.description || state.selected?.id || 'Main worker';
   nav.querySelectorAll('button').forEach(b=>b.disabled=state.loading);
   const input=document.getElementById('peek-cmd-input');
-  if (input) input.placeholder=state.selected ? 'Message the main worker…' : 'Type a message or drop a file...';
+  if (input) { input.placeholder = 'Message…'; input.setAttribute('aria-label', state.selected ? 'Message the main worker' : 'Message the worker'); }
 }
 async function _peekAgentsLoad(force=false) {
   const name = peekSession;
@@ -11275,6 +11547,22 @@ let _menuBeaconCount = 0;   // card-menu-geo beacons per load (AMUX-1731)
 // Second snapshot with the keyboard UP (fires once, on first input focus) —
 // the keyboard-down beacon can't show keyboard-state bugs.
 let _kbdBeaconSent = false;
+function _peekComposerGeometry() {
+  const input = document.getElementById('peek-cmd-input');
+  if (!input || !input.getClientRects().length) return { measured: false, n_considered: 0, why_unmeasured: 'composer_hidden' };
+  const style = getComputedStyle(input);
+  const ctx = document.createElement('canvas').getContext('2d');
+  if (!ctx) return { measured: false, n_considered: 0, why_unmeasured: 'text_measurement_unavailable' };
+  ctx.font = style.fontSize + ' ' + style.fontFamily;
+  const available = input.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+  const width = ctx.measureText(input.placeholder).width;
+  const fits = width <= available + 1;
+  return { measured: true, n_considered: 1,
+    verdict: !input.value && !fits ? 'composer_placeholder_clipped' : 'composer_readable',
+    placeholder_fits: fits, empty: !input.value,
+    placeholder_width_px: Math.round(width), available_text_width_px: Math.round(available),
+    input_height_px: Math.round(input.getBoundingClientRect().height) };
+}
 function _peekKbdBeacon() {
   if (_kbdBeaconSent || window.innerWidth > 700) return;
   _kbdBeaconSent = true;
@@ -11290,7 +11578,7 @@ function _peekKbdBeacon() {
       fetch(API + '/api/client-debug', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          kind: 'peek-geo-kbd', ver: APP_VER,
+          ..._peekComposerGeometry(), kind: 'peek-geo-kbd', ver: APP_VER,
           appliedZoom: document.documentElement.style.zoom || '1',
           win: window.innerWidth + 'x' + window.innerHeight,
           vvH: Math.round(vv.height || 0), vvTop: Math.round(vv.offsetTop || 0),
@@ -11347,7 +11635,7 @@ function _peekGeoBeacon() {
     fetch(API + '/api/client-debug', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        kind: 'peek-geo', ver: APP_VER, zoom: (typeof _zoomLevel !== 'undefined' ? _zoomLevel : '?'),
+        ..._peekComposerGeometry(), kind: 'peek-geo', ver: APP_VER, zoom: (typeof _zoomLevel !== 'undefined' ? _zoomLevel : '?'),
         win: window.innerWidth + 'x' + window.innerHeight,
         vvH: Math.round(vv.height || 0), vvTop: Math.round(vv.offsetTop || 0), vvScale: vv.scale || 1,
         sab: sabH, fixedBottomAt: sabBottom,
@@ -12165,6 +12453,7 @@ let peekSelecting = false;
 let _peekScrollLocked = false;
 let _peekBufferedOutput = false;
 let _peekFollowBottom = false;
+let _peekLastScrollTop = 0;
 let _peekBottomResize = null, _peekBottomMutation = null, _peekBottomFrame = 0;
 
 function _peekKeepBottom() {
@@ -12200,7 +12489,18 @@ function _peekStopBottomWatch() {
   if (_peekBottomMutation) _peekBottomMutation.disconnect();
   cancelAnimationFrame(_peekBottomFrame); _peekBottomFrame = 0;
 }
-function _peekStopFollowing() { _peekFollowBottom = false; }
+function _peekStopFollowing(e) {
+  if (_peekFollowBottom) {
+    const body = document.getElementById('peek-body');
+    _peekLastScrollTop = body.scrollTop;
+    _peekPollBeacon('bottom-follow-paused', peekSession, {
+      verdict: 'reader_scrolling', input: e?.type || 'navigation',
+      gap_px: Math.round(body.scrollHeight - body.scrollTop - body.clientHeight),
+      measured: true, n_considered: 1,
+    });
+  }
+  _peekFollowBottom = false;
+}
 
 
 function _isScrolledToBottom(el, threshold) {
@@ -12647,7 +12947,9 @@ async function refreshPeek(liveOnly, bypassTrim) {
       _peekHistoryHTML = historyTail ? _peekHtml(historyTail) : '';
       histChanged = true;
     }
-    const atBottom = _isScrolledToBottom(body);
+    // A poll cannot infer renewed consent to follow from proximity. The
+    // reader may have moved only a few pixels up since the previous frame.
+    const atBottom = _peekFollowBottom && _isScrolledToBottom(body);
     if (atBottom && !body.querySelector('.peek-msg-current, .peek-highlight.current')) {
       _peekScrollLocked = false;
       _peekBufferedOutput = false;
@@ -14135,7 +14437,7 @@ function _syncComposerPending() {
 
 async function sendPeekCmd() {
   const session = peekSession;
-  if (!session) return;
+  if (!session || _composerPendingSends.has(session)) return;
   if (_blockedByAttachment(peekFiles)) return;
   const inp = document.getElementById('peek-cmd-input');
   const original = inp.value;
@@ -14156,22 +14458,11 @@ async function sendPeekCmd() {
     }
     message = _expandAtMentions(message);
   }
-  // CLEAR NOW, DELIVER IN THE BACKGROUND (Ethan, 2026-09-11 11:30 "optimistic
-  // send clears input instantly, fires in background"; 15:58 "it should just
-  // queue and send"). The box empties the moment you press Send; the request
-  // waits for the server on its own; a refusal puts the text back. Nothing is
-  // held in a local outbox on the ordinary path, and nothing is waited for.
+  // Persist text and upload references in the local outbox before clearing.
+  // A network refusal remains reviewable in Sync and pending Messages.
   const draftRevision = _draftSave(session, original);
-  _composerAcceptLocal(session, original, draftRevision);
-  if (peekSession === session) {
-    inp.style.borderColor = 'var(--green)';
-    setTimeout(() => { inp.style.borderColor = ''; }, 400);
-  }
-  // Immediate feedback (Ethan, 2026-09-11: "use toasts as much as possible").
-  // Queue mode's toast comes from steerSession (it owns the optimistic row);
-  // direct mode says it is on its way now, then confirms below.
-  if (!queued) showToast('Sending to ' + session + '…');
-  (async () => {
+  _composerPendingSends.add(session);
+  _syncComposerPending();
   let result = 'failed';
   try {
     const identity = {};
@@ -14179,18 +14470,12 @@ async function sendPeekCmd() {
       : await doSend(session, message, identity);
     if (!['sent', 'queued'].includes(result)) {
       _composerUnconfirmed(session, result, files.length);
-      _composerRestore(session, original);
-      if (result !== 'declined') showToast(result === 'local-failed' ? _writeError + ' — text put back in the composer'
-        : 'Not delivered — text put back in the composer');
+      showToast(result === 'local-failed' ? _writeError + ' — draft and attachments kept'
+        : 'Message not confirmed — draft and attachments kept');
       return;
     }
-    // doSend returns 'queued' for the ORDINARY online path too: the outbox
-    // interceptor accepts every composer send locally (202) and drains it in
-    // the background. So 'queued' while online means "sent, on its way", and
-    // only 'queued' while OFFLINE is the wait-for-reconnect case.
-    if (result === 'sent') showToast('Delivered to ' + session);
-    else if (result === 'queued' && !queued) showToast(online ? 'Sent to ' + session : 'Offline — queued for ' + session + ', sends when reconnected');
     cmdHistoryAdd(text || message, { session, type: queued ? 'steering' : 'direct', msg_id:identity.msg_id });
+    _composerAcceptLocal(session, original, draftRevision);
     // Remove only the acknowledged files, never a new attachment added while
     // waiting, or attachments belonging to a different worker's composer.
     const sent = new Set();
@@ -14203,16 +14488,19 @@ async function sendPeekCmd() {
       peekFiles = peekFiles.filter(f => !sent.has(f));
       _peekFilesStash(session);
       renderPeekFiles();
+      inp.style.borderColor = 'var(--green)';
+      setTimeout(() => { inp.style.borderColor = ''; }, 400);
       _refreshPeekSoon();
     } else if (_peekFilesBySession[session]) {
       _peekFilesBySession[session] = _peekFilesBySession[session].filter(f => !sent.has(f));
     }
   } catch (e) {
     _composerUnconfirmed(session, 'exception', files.length);
-    _composerRestore(session, original);
-    showToast('Not delivered — text put back in the composer');
+    showToast('Message not confirmed — draft and attachments kept');
+  } finally {
+    _composerPendingSends.delete(session);
+    _syncComposerPending();
   }
-  })();
 }
 /// A refused send puts the text back where it was typed. If the next message
 /// is already being typed there, the refused one goes above it rather than
@@ -14282,6 +14570,7 @@ async function _submitSuggestion(name, isPeek, fallbackKeys) {
 function _showSteerPrompt(text) {
   return new Promise(resolve => {
     const bg = document.createElement('div');
+    bg.className = 'amux-dialog-backdrop';
     bg.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:400;display:flex;align-items:center;justify-content:center;';
     const box = document.createElement('div');
     box.style.cssText = 'background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px;max-width:400px;width:90%;box-shadow:0 12px 40px rgba(0,0,0,0.4);max-height:min(90dvh,calc(100dvh - 24px));overflow-y:auto;overscroll-behavior:contain;';
@@ -15241,7 +15530,7 @@ function openChipPicker() {
   const existingIds = new Set(existing.map(c => c.id));
   let html = '<div class="chip-picker-overlay" onclick="if(event.target===this)closeChipPicker()">'
     + '<div class="chip-picker">'
-    + '<div class="chip-picker-header"><input id="chip-picker-search" placeholder="Search commands..." oninput="filterChipPicker()"></div>'
+    + '<div class="chip-picker-header"><input id="chip-picker-search" placeholder="Search commands..." oninput="filterChipPicker()"><button class="btn" onclick="closeChipPicker()" aria-label="Close command picker">&#x2715;</button></div>'
     + '<div class="chip-picker-body" id="chip-picker-body">'
     + '<div class="chip-picker-section">Custom</div>'
     + '<div class="chip-picker-item" data-search="create custom new" onclick="openCustomChipForm()" style="color:var(--accent);font-weight:600;">'
@@ -16273,13 +16562,16 @@ async function _loadCmdHistoryFromServer() {
     const r = await fetch(API + '/api/history?limit=500');
     if (!r.ok) return;
     const rows = await r.json();
-    if (!rows.length && _cmdHistory.length) {
+    if (!rows.length && _cmdHistory.length && !_readQueue().some(q => /\/(send|steer)$/.test(q.url.split('?')[0]))) {
+      // Pending messages are optimistic history, not past deliveries. Importing
+      // them ahead of replay manufactures sent-history before server acceptance.
       // First load with empty server but local data — migrate localStorage entries up
       const entries = _cmdHistory.map(e => typeof e === 'string' ? { text: e, type: 'direct', session: '', time: Date.now() } : e);
-      await fetch(API + '/api/history/import', {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
+      const imported = await fetch(API + '/api/history/import', {
+        _skipOutbox:true, method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ entries })
       });
+      if (!imported.ok) return;
       _cmdHistoryServerLoaded = true;
       return;
     }
@@ -16973,13 +17265,11 @@ async function _pendingCancel(id) {
 function _updatePendingPill() {
   const pill = document.getElementById('peek-pending-pill');
   if (!pill) return;
-  // The pill of 2026-09-04: a send only reaches the outbox when the server
-  // was unreachable, so each queued one is worth a small note that says what
-  // happens next. "N messages waiting — view details" (fe8cd4d4) read as an
-  // incident and sat under messages the worker already had.
-  const n = peekSession ? _pendingSendsFor(peekSession).length : 0;
+  const n = peekSession ? _pendingSendsFor(peekSession)
+    .filter(message => !online || _outboxNeedsAttention(offlineQueue[message.idx])).length : 0;
   pill.style.display = n ? '' : 'none';
-  if (n) pill.innerHTML = '&#x23F3; ' + n + ' queued ' + (online ? '(sending soon)' : '&middot; offline') + ' &mdash; tap to view';
+  if (n) pill.innerHTML = '&#x23F3; ' + n + ' message' + (n === 1 ? '' : 's')
+    + (online ? ' waiting' : ' saved offline') + ' &mdash; view details';
 }
 function _peekMessagesBadge() {
   const badge = document.getElementById('peek-tab-messages-count');
@@ -17177,7 +17467,7 @@ let _peekMsgServerRows = [];  // raw server rows accumulated across pages, curre
 let _peekMsgOffset = 0;       // server offset = count of raw server rows fetched so far
 let _peekMsgDone = false;     // no older server page remains
 let _peekMsgLoading = false;  // true while the session-scoped fetch is in flight
-const _PEEK_MSG_PAGE = 200;   // page size, matching the global _MSGS_PAGE
+const _PEEK_MSG_PAGE = 60;    // first-paint page size; 'Load older' pages the rest (AMUX-4476: 200 rows was 40-120s under fleet load)
 
 // Local entries that the server has not echoed yet (no id) must survive the
 // swap to server-scoped rows, or a message you just sent vanishes until the
@@ -18105,7 +18395,7 @@ const _MODEL_LABELS = { opus: 'Opus', sonnet: 'Sonnet', haiku: 'Haiku', fable: '
 function _mLabel(x){ return _MODEL_LABELS[x] || (x.charAt(0).toUpperCase()+x.slice(1)); }
 const _STATUS_LABELS = { starting: 'Starting', error: 'Error', working: 'Working', blocked: 'Blocked', waiting: 'Waiting', rate_limited: 'Rate limited', api_error: 'API error', idle: 'Idle', stopped: 'Stopped' };
 function renderFilterOptions() {
-  const live = sessions.filter(s => !s.archived);
+  const live = sessions.filter(s => !s.archived && s.lifecycle !== 'paused');
   // Status chips — fixed order, only states that exist (or are selected)
   const sEl = document.getElementById('filter-statuses');
   if (sEl) {
@@ -19197,6 +19487,14 @@ async function openFilePreview(path) {
       return;
     }
     _fileData = data;
+    // Markdown opens to Raw by default (Ethan, 2026-09-14): rendered Preview
+    // hides exact formatting/links/frontmatter, which is what you want first
+    // when opening a note to read or edit. Preview is one tap away. The tabs
+    // were set to Preview-active synchronously above, before is_markdown was
+    // known, so re-sync them now that it is.
+    if (data.is_markdown) _fileViewMode = 'raw';
+    document.getElementById('file-tab-preview').classList.toggle('active', _fileViewMode === 'preview');
+    document.getElementById('file-tab-raw').classList.toggle('active', _fileViewMode === 'raw');
     // Show tabs only for text files
     const isTextFile = !data.is_image && !data.is_pdf && !data.is_video && !data.is_audio && !data.is_binary && !data.is_ebook;
     if (isTextFile) {
@@ -19242,6 +19540,9 @@ async function openFilePreview(path) {
       if (cachedIsText) {
         document.getElementById('file-view-tabs').style.display = '';
       }
+      if (cached.data.is_markdown) _fileViewMode = 'raw';
+      document.getElementById('file-tab-preview').classList.toggle('active', _fileViewMode === 'preview');
+      document.getElementById('file-tab-raw').classList.toggle('active', _fileViewMode === 'raw');
       _renderFileBody(cached.data, _fileViewMode);
       return;
     }
@@ -20223,8 +20524,13 @@ let _mdaiLastRun = null;  // last successful RunResult (for the upstream-node ch
 function _mdaiAbs(p) {
   if (!p) return p;
   if (p.charAt(0) === '/') return p;
-  const h = (window._AMUX_HOME || '').replace(/\/+$/, '');
-  return (h || '') + '/' + p.replace(/^\/+/, '');
+  // List paths are relative to the .mdai SCAN ROOT (_AMUX_MDAI_ROOT), which is
+  // $HOME unless a `mdai_root` pref points into a sub-vault (e.g. ~/.amux/local).
+  // Joining onto $HOME there produced /Users/x/Foo.mdai for a file that actually
+  // lives at /Users/x/.amux/local/Foo.mdai, so every open hit "no such path"
+  // (AMUX-4477). Prefer the real scan root; fall back to $HOME when unset.
+  const root = ((window._AMUX_MDAI_ROOT || window._AMUX_HOME || '')).replace(/\/+$/, '');
+  return (root || '') + '/' + p.replace(/^\/+/, '');
 }
 // Root-relative path (under the files root, $HOME) for the upload endpoint, which
 // is how a .mdai file is WRITTEN: PUT /api/file refuses the .mdai extension (its
@@ -20981,7 +21287,7 @@ async function _connLoadFleet() {
   try {
     const arr = await (await fetch('/api/sessions')).json();
     const list = Array.isArray(arr) ? arr : [];
-    const workers = list.filter(s => !s.archived).map(s => s.name).filter(Boolean).sort();
+    const workers = list.filter(s => !s.archived && s.lifecycle !== 'paused').map(s => s.name).filter(Boolean).sort();
     const gs = new Set();
     list.forEach(s => (s.groups || []).forEach(g => g && gs.add(g)));
     _connFleet = { workers, groups: [...gs].sort() };
@@ -22896,12 +23202,17 @@ _peekScrollBody.addEventListener('pointerdown', e => {
   if (e.clientX >= bounds.right - 18) _peekStopFollowing();
 });
 document.getElementById('peek-body').addEventListener('scroll', function() {
+  const movedDown = this.scrollTop > _peekLastScrollTop + 0.5;
+  _peekLastScrollTop = this.scrollTop;
   // A layout-generated scroll is not a request to read history. User gestures
   // and explicit navigation relinquish following before their scroll occurs.
   if (_peekFollowBottom) { _peekKeepBottom(); return; }
   // Programmatic message/search jumps can land at the finite scroll boundary.
   // That scroll event is still navigation, not a request to resume live output.
-  if (_isScrolledToBottom(this) && !this.querySelector('.peek-msg-current, .peek-highlight.current')) {
+  // The first few pixels of an upward gesture are still near the bottom.
+  // Re-arming there traps slow swipes in the follow/restore loop. Resume only
+  // when the reader moves down to the actual end (allow subpixel rounding).
+  if (movedDown && _isScrolledToBottom(this, 2) && !this.querySelector('.peek-msg-current, .peek-highlight.current')) {
     _peekScrollLocked = false;
     _peekFollowBottom = true;
     _peekBufferedOutput = false;
@@ -23441,7 +23752,7 @@ function toggleFreeze() {
     // pinned workers back below active workers in group view on the same tap.
     const rendered = [...document.querySelectorAll('#cards .card[data-session]')]
       .map(card => card.dataset.session);
-    const remaining = sessions.filter(s => !s.archived && !rendered.includes(s.name))
+    const remaining = sessions.filter(s => !s.archived && s.lifecycle !== 'paused' && !rendered.includes(s.name))
       .sort(_sortFnFor(sortMode)).map(s => s.name);
     cardOrder = [...new Set([...rendered, ...remaining])];
     fetch(API + '/api/client-debug', { method: 'POST', headers: _authHeaders({ 'Content-Type': 'application/json' }),
@@ -29881,6 +30192,35 @@ function _bdAudit(kind, detail) {
   } catch (e) {}
 }
 
+// Detect the Safari failure where a stationary touch reveals hover controls
+// but never becomes a click. Swipes, child controls, and successful clicks do
+// not report failures; this observes input without synthesizing another action.
+(function() {
+  let touch = null;
+  document.addEventListener('touchstart', e => {
+    const card = e.target.closest('.board-card[data-id]');
+    touch = card && e.touches.length === 1 && !e.target.closest('button,a,input,.board-drag-handle')
+      ? { id: card.dataset.id, x: e.touches[0].clientX, y: e.touches[0].clientY, clicked: false } : null;
+  }, { passive: true });
+  document.addEventListener('touchmove', e => {
+    if (touch && (Math.abs(e.touches[0].clientX - touch.x) > 10 || Math.abs(e.touches[0].clientY - touch.y) > 10)) touch = null;
+  }, { passive: true });
+  document.addEventListener('touchcancel', () => { touch = null; }, { passive: true });
+  document.addEventListener('click', e => {
+    if (touch && e.target.closest('.board-card')?.dataset.id === touch.id) touch.clicked = true;
+  }, true);
+  document.addEventListener('touchend', () => {
+    const ended = touch;
+    if (!ended) return;
+    setTimeout(() => {
+      if (!ended.clicked && boardDetailId !== ended.id && document.visibilityState === 'visible') {
+        _bdAudit('board-tap', { verdict: 'board_tap_unopened', id: ended.id, measured: true, n_considered: 1 });
+      }
+      if (touch === ended) touch = null;
+    }, 750);
+  }, { passive: true });
+})();
+
 const _bdArtifactAuditSeen = new Set();
 function _bdArtifactHref(target) {
   try {
@@ -30116,15 +30456,42 @@ function _bdRenderMeta(item) {
 /// 3.5MB -> 554KB) it is absent entirely — so the textarea would open empty and
 /// saving would BLANK the description. This makes the modal read from the one
 /// place that always has it.
+// Only a complete, server-versioned row can authorize an offline edit. The
+// slim board list deliberately omits prose; treating it as a full row erases it.
+function _bdCompleteSnapshot(row, id) {
+  return Boolean(row && row.id === id && !row.deleted && Number.isInteger(row.rev)
+    && ['title', 'desc', 'status'].every(key => typeof row[key] === 'string')
+    && ['session', 'due', 'due_time'].every(key => Object.hasOwn(row, key) && (row[key] === null || typeof row[key] === 'string'))
+    && ['tags', 'gate'].every(key => Array.isArray(row[key]) && row[key].every(value => typeof value === 'string')));
+}
+async function _bdReadSnapshot(id) {
+  if (online && navigator.onLine !== false) {
+    try {
+      const response = await fetch(API + '/api/board/' + id, { headers: _authHeaders() });
+      // An explicit refusal/deletion is authoritative. Never resurrect it from cache.
+      if (!response.ok) { showToast(await _apiErrText(response)); return null; }
+      const full = await response.json();
+      if (!full || full.id !== id) return null;
+      if (_bdCompleteSnapshot(full, id)) {
+        try { await _idb.putIssue(full); }
+        catch (error) { _bdAudit('card-cache-write-failed', { id, verdict: 'offline_copy_unavailable', measured: true, n_considered: 1 }); }
+      }
+      return full;
+    } catch (error) { /* A transport failure may use the versioned offline copy. */ }
+  }
+  const full = await _idb.getIssue(id);
+  const complete = _bdCompleteSnapshot(full, id);
+  _bdAudit('card-offline-hydration', { id, verdict: complete ? 'versioned_copy' : 'complete_copy_missing', measured: true, n_considered: 1 });
+  return complete ? full : null;
+}
+
 async function _bdHydrate(id) {
   const generation = _boardDetailOpenGeneration;
   // Compare controls with the snapshot used when hydration began. A board
   // poll may update the cache during this GET without changing the editor.
   const cached = { ...(boardItems.find(item => item.id === id) || {}) };
   try {
-    const r = await apiCall(API + '/api/board/' + id);
-    if (!r || !r.ok) return false;
-    const full = await r.json();
+    const full = await _bdReadSnapshot(id);
     if (!full || full.id !== id || boardDetailId !== id || generation !== _boardDetailOpenGeneration) return false;  // modal moved on
     const idx = boardItems.findIndex(i => i.id === id);
     if (idx >= 0) boardItems[idx] = Object.assign({}, boardItems[idx], full);
@@ -30732,6 +31099,7 @@ async function _gateConfirm(item, targetStatusId) {
   return new Promise(resolve => {
     const label = ((typeof boardStatuses !== 'undefined' ? boardStatuses : []).find(x => x.id === targetStatusId) || {}).label || targetStatusId;
     const bg = document.createElement('div');
+    bg.className = 'amux-dialog-backdrop';
     bg.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:2000;display:flex;align-items:center;justify-content:center;padding:16px;';
     const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     const rows = gate.map((g,i) => '<label style="display:flex;gap:9px;align-items:flex-start;padding:7px 4px;cursor:pointer;font-size:0.9rem;color:var(--text);"><input type="checkbox" class="_gate-chk" data-i="'+i+'" style="width:auto;margin-top:2px;accent-color:var(--accent);"><span>'+esc(g)+'</span></label>').join('');
@@ -30784,6 +31152,7 @@ function editStatusGate(statusId) {
   const cur = (s && Array.isArray(s.gate)) ? s.gate : [];
   const esc = t => String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   const bg = document.createElement('div');
+  bg.className = 'amux-dialog-backdrop';
   bg.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:2000;display:flex;align-items:center;justify-content:center;padding:16px;';
   const box = document.createElement('div');
   box.style.cssText = 'background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px;max-width:460px;width:100%;box-shadow:0 12px 40px rgba(0,0,0,0.45);';
@@ -30825,6 +31194,7 @@ function editSessionGate(worker, statusId) {
   const cur = hasOverride ? sessionGates[worker][statusId] : _statusGateDefault(statusId);
   const esc = t => String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   const bg = document.createElement('div');
+  bg.className = 'amux-dialog-backdrop';
   bg.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:2000;display:flex;align-items:center;justify-content:center;padding:16px;';
   const box = document.createElement('div');
   box.style.cssText = 'background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px;max-width:460px;width:100%;box-shadow:0 12px 40px rgba(0,0,0,0.45);';
@@ -31299,8 +31669,19 @@ async function deleteEvent(id) {
 }
 
 async function _tunnelStatus() {
-  try { const r = await fetch(API + '/api/tunnel/status'); return await r.json(); }
-  catch(e) { return { error: String(e) }; }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {
+    const r = await fetch(API + '/api/tunnel/status', {signal:controller.signal});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return await r.json();
+  } catch(e) {
+    const reason = controller.signal.aborted ? 'timeout' : 'request_failed';
+    console.warn('[amux] tunnel status unavailable', reason);
+    fetch('/api/client-debug', {method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({kind:'tunnel-status-unavailable',measured:true,n_considered:1,reason,ver:APP_VER})}).catch(() => {});
+    return {error:'Tunnel status unavailable — try again.', why_unmeasured:reason};
+  } finally { clearTimeout(timer); }
 }
 
 // Tunnel panel in the Settings dropdown (the discoverable home for the proxy).
@@ -31363,6 +31744,7 @@ function _proxyOpenForm() {
   document.getElementById('proxy-form-scheme').value = 'http';
   document.getElementById('proxy-form-title').textContent = 'New proxy';
   document.getElementById('proxy-form-overlay').style.display = 'flex';
+  document.getElementById('proxy-form-overlay').classList.add('active');
   setTimeout(() => document.getElementById('proxy-form-name').focus(), 50);
 }
 function _proxyEdit(id, name, port, scheme) {
@@ -31372,8 +31754,9 @@ function _proxyEdit(id, name, port, scheme) {
   document.getElementById('proxy-form-scheme').value = scheme || 'http';
   document.getElementById('proxy-form-title').textContent = 'Edit proxy';
   document.getElementById('proxy-form-overlay').style.display = 'flex';
+  document.getElementById('proxy-form-overlay').classList.add('active');
 }
-function _proxyCloseForm() { document.getElementById('proxy-form-overlay').style.display = 'none'; }
+function _proxyCloseForm() { const overlay = document.getElementById('proxy-form-overlay'); overlay.classList.remove('active'); overlay.style.display = 'none'; }
 async function _proxySaveForm(btn) {
   const id = document.getElementById('proxy-form-id').value;
   const name = document.getElementById('proxy-form-name').value.trim();
@@ -31486,7 +31869,9 @@ async function _renderIcalBody(box) {
 
   // ── Public tunnel (amux cloud) ──
   html += '<div style="border:1px solid var(--border);border-radius:8px;padding:0.7rem 0.8rem;margin-bottom:0.9rem;background:var(--card,rgba(255,255,255,0.02));">';
-  if (tun && tun.running && tun.url) {
+  if (tun?.error) {
+    html += '<p role="status" style="color:var(--dim);font-size:0.82rem;">Tunnel status is unavailable. Download the calendar below, or close and try again.</p>';
+  } else if (tun && tun.running && tun.url) {
     html += '<div style="display:flex;align-items:center;gap:6px;margin-bottom:0.45rem;"><span style="width:8px;height:8px;border-radius:50%;background:#3fb950;flex-shrink:0;"></span><strong style="font-size:0.85rem;">Public tunnel active</strong><span style="color:var(--dim);font-size:0.72rem;margin-left:auto;">' + (tun.requests || 0) + ' reqs</span></div>';
     html += '<code style="display:block;background:var(--bg);padding:0.45rem 0.6rem;border-radius:6px;font-size:0.73rem;word-break:break-all;margin-bottom:0.5rem;">' + esc_url(tunUrl) + '</code>';
     html += '<div style="display:flex;gap:0.4rem;">';
@@ -31528,7 +31913,8 @@ function showIcalInfo() {
   box.setAttribute('data-ical-box', '1');
   box.className = 'amux-modal';
   box.style.cssText = 'background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:1.4rem;max-width:440px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.4);--modal-pad:1.4rem;';
-  box.innerHTML = '<p style="color:var(--dim);font-size:0.85rem;margin:0;">Loading…</p>';
+  box.innerHTML = '<p role="status" style="color:var(--dim);font-size:0.85rem;margin:0;">Loading…</p>'
+    + '<div class="amux-modal-foot"><button class="btn" onclick="this.closest(\'[data-ical-modal]\').remove()">Close</button></div>';
   modal.setAttribute('data-ical-modal', '1');
   modal.appendChild(box);
   modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
@@ -32463,6 +32849,14 @@ const _idb = (() => {
       const tx = d.transaction('kv', 'readwrite');
       tx.objectStore('kv').delete(key);
     }).catch(() => {}),
+    // Detail snapshots use the existing mirror and wait for the durable commit.
+    putIssue: row => transaction('issues', os => os.put(row)),
+    getIssue: id => open().then(d => new Promise((resolve, reject) => {
+      const tx = d.transaction('issues', 'readonly');
+      const request = tx.objectStore('issues').get(id);
+      tx.oncomplete = () => resolve(request.result || null);
+      tx.onabort = tx.onerror = () => reject(tx.error || new Error('Offline card read aborted'));
+    })).catch(() => null),
     // Apply delta: upsert live items, remove soft-deleted ones from local mirror
     applyIssueDelta: (issues) => _txw('issues', os => {
       issues.forEach(item => { if (item.deleted) os.delete(item.id); else os.put(item); });
@@ -34958,8 +35352,9 @@ async function openTeamInvite() {
 
 function _workspaceAccessModal(html) {
   const modal = document.createElement('div');
+  modal.className = 'amux-workspace-dialog';
   modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;z-index:9999;padding:12px;';
-  modal.innerHTML = `<div style="background:var(--bg2,#1a1a1a);border:1px solid var(--border,#333);border-radius:12px;padding:24px;max-width:500px;width:100%;box-sizing:border-box;max-height:calc(100dvh - 24px);overflow:auto;">${html}</div>`;
+  modal.innerHTML = `<div style="background:var(--card);border:1px solid var(--border,#333);border-radius:12px;padding:24px;max-width:500px;width:100%;box-sizing:border-box;max-height:calc(100dvh - 24px);overflow:auto;">${html}</div>`;
   document.body.appendChild(modal);
   modal.addEventListener('click', event => { if (event.target === modal) modal.remove(); });
   modal.querySelector('[data-modal-cancel]')?.addEventListener('click', () => modal.remove());
@@ -35010,7 +35405,7 @@ function _teamScopeDialog(title, email, level, name, submitLabel, hideEmail) {
   const modal = document.createElement('div');
   modal.id = 'team-scope-modal';
   modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;z-index:9999;';
-  modal.innerHTML = `<div style="background:var(--bg2,#1a1a1a);border:1px solid var(--border,#333);border-radius:12px;padding:28px;max-width:480px;width:90%;box-sizing:border-box;max-height:min(90dvh,calc(100dvh - 24px));overflow-y:auto;overscroll-behavior:contain;">
+  modal.innerHTML = `<div style="background:var(--card);border:1px solid var(--border,#333);border-radius:12px;padding:28px;max-width:480px;width:90%;box-sizing:border-box;max-height:min(90dvh,calc(100dvh - 24px));overflow-y:auto;overscroll-behavior:contain;">
     <h3 style="margin:0 0 8px;font-size:1rem;">${esc(title)}</h3>
     ${hideEmail ? '' : email ? `<p style="color:var(--dim);font-size:0.82rem;margin:0 0 14px;">${esc(email)}</p>` : `<label style="display:block;color:var(--dim);font-size:0.72rem;margin-bottom:5px;">Email (optional)</label><input id="team-invite-email" type="email" placeholder="person@example.com" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:inherit;margin-bottom:13px;">`}
     <label style="display:block;color:var(--dim);font-size:0.72rem;margin-bottom:5px;">Access level</label>
@@ -36326,7 +36721,7 @@ function _trendsFocusTheme(k) {
 function _costFillGroups(sel) {
   const el = document.getElementById('cost-group');
   if (!el) return;
-  const tags = [...new Set((sessions || []).filter(s => !s.archived).flatMap(s => s.tags || []))].sort();
+  const tags = [...new Set((sessions || []).filter(s => !s.archived && s.lifecycle !== 'paused').flatMap(s => s.tags || []))].sort();
   const cur = sel !== undefined ? sel : el.value;
   el.innerHTML = '<option value="">All workers</option>'
     + tags.map(t => '<option value="' + escJs(t) + '"' + (t === cur ? ' selected' : '') + '>' + esc(t) + '</option>').join('');
@@ -37225,14 +37620,22 @@ function _reclaimRender() {
 
   // Snapshot warning: the thing that makes cleanup look broken.
   const snapFinding = findings.find(f => f.category === 'snapshot');
-  if (snapFinding) {
+  if (scan.snapshot_count == null) {
     html += `<div class="reclaim-warn">
-      <div style="font-weight:600;margin-bottom:4px;">⚠ ${scan.snapshot_count} APFS local snapshots are holding deleted space</div>
+      <div style="font-weight:600;margin-bottom:4px;">Local snapshot status unavailable</div>
       <div style="font-size:0.78rem;line-height:1.55;">
-        Until these expire or are thinned, <b>deleting files will not increase your free space</b>.
-        The blocks stay referenced by the snapshot. This is why a cleanup can look like it did nothing.
-        <div style="margin-top:6px;">Release them from a terminal (needs sudo, so amux will not run it for you):</div>
-        <code class="reclaim-code">sudo tmutil thinlocalsnapshots / 21474836480 4</code>
+        The scan could not measure local snapshots. This does not mean there are none.
+        Remeasure backup status and free space before deciding on further deletion.
+      </div>
+    </div>`;
+  } else if (snapFinding) {
+    html += `<div class="reclaim-warn">
+      <div style="font-weight:600;margin-bottom:4px;">${scan.snapshot_count} local snapshots observed</div>
+      <div style="font-size:0.78rem;line-height:1.55;">
+        Snapshots may retain blocks shared with deleted files. Their count does not show
+        how much space they hold or how long a backup disk has been absent.
+        macOS can remove snapshots as they age or storage is needed.
+        Check backup status and remeasure free space before deciding on further deletion.
       </div>
     </div>`;
   }
@@ -38061,11 +38464,20 @@ function _msgsRenderGroupChip() {
     : '';
 }
 let _msgsOffset = 0;
-const _MSGS_PAGE = 200;
+const _MSGS_PAGE = 60;   // AMUX-4476: smaller first page for a fast click-to-display; page older on demand
 let _msgsDone = false;
+// A reset (tab switch, group/kind change) and the debounced SSE 'messages'
+// refresh can both be in flight at once — nothing cancelled either fetch.
+// Whichever concat lands SECOND used to run against the array left by the
+// other, so a message sent just before a stale fetch resolved could show
+// twice: once as the pre-capture snapshot (no card badge), once as the
+// fresh one. _msgsGen bumps on every reset; a response is only applied if
+// no newer reset has started since its fetch began.
+let _msgsGen = 0;
 
 async function _messagesLoad(reset, presetSession) {
-  if (reset !== false) { _msgsData = []; _msgsOffset = 0; _msgsDone = false; }
+  if (reset !== false) { _msgsData = []; _msgsOffset = 0; _msgsDone = false; _msgsGen++; }
+  const _gen = _msgsGen;
   try {
     // Kind-scoped at the SERVER. Filtering a mixed page client-side is what
     // showed 48 human messages out of 6547 — the human rows never made it into
@@ -38085,6 +38497,15 @@ async function _messagesLoad(reset, presetSession) {
     fetch(API + '/api/history?counts=1' + (_sf ? '&session=' + encodeURIComponent(_sf) : ''))
       .then(x => x.json()).then(c => { _msgsCounts = c; _msgsRenderChips(); }).catch(() => {});
     if (!Array.isArray(rows)) return;
+    // A newer reset (_msgsGen bumped) started and already replaced _msgsData
+    // while this fetch was in flight — applying this stale page would append
+    // a pre-capture duplicate of a row the newer load already rendered fresh.
+    if (_gen !== _msgsGen) {
+      if (typeof window._clientDebug === 'function') {
+        window._clientDebug('messages-load-stale-discarded', { gen: _gen, current: _msgsGen, rows: rows.length });
+      }
+      return;
+    }
     _msgsData = _msgsData.concat(rows.map(_msgNorm));
     _msgsOffset += rows.length;
     _msgsDone = rows.length < _MSGS_PAGE;
@@ -41134,17 +41555,17 @@ function _jrnlShowConfig() {
   const overlay = document.createElement('div');
   overlay.id = 'jrnl-config-overlay';
   overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:10000;display:flex;align-items:center;justify-content:center;';
-  overlay.innerHTML = '<div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:24px;width:400px;max-width:90vw;max-height:min(90dvh,calc(100dvh - 24px));overflow-y:auto;overscroll-behavior:contain;">' +
+  overlay.innerHTML = '<div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:24px;width:400px;max-width:90vw;max-height:min(90dvh,calc(100dvh - 24px));overflow-y:auto;overscroll-behavior:contain;">' +
     '<h3 style="margin:0 0 16px;font-size:0.95rem;">Journal Prompts</h3>' +
     '<p style="font-size:0.75rem;color:var(--dim);margin:0 0 12px;">Configure up to 3 optional prompts shown when creating entries.</p>' +
     '<label style="font-size:0.72rem;color:var(--dim);">Prompt 1</label>' +
-    '<input type="text" id="jrnl-cfg-p1" value="' + esc(_jrnlConfig.prompt1 || '') + '" placeholder="e.g. What are you grateful for?" style="width:100%;padding:6px 8px;margin:4px 0 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--fg);font-size:0.8rem;font-family:inherit;">' +
+    '<input type="text" id="jrnl-cfg-p1" value="' + esc(_jrnlConfig.prompt1 || '') + '" placeholder="e.g. What are you grateful for?" style="width:100%;padding:6px 8px;margin:4px 0 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.8rem;font-family:inherit;">' +
     '<label style="font-size:0.72rem;color:var(--dim);">Prompt 2</label>' +
-    '<input type="text" id="jrnl-cfg-p2" value="' + esc(_jrnlConfig.prompt2 || '') + '" placeholder="e.g. How are you feeling?" style="width:100%;padding:6px 8px;margin:4px 0 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--fg);font-size:0.8rem;font-family:inherit;">' +
+    '<input type="text" id="jrnl-cfg-p2" value="' + esc(_jrnlConfig.prompt2 || '') + '" placeholder="e.g. How are you feeling?" style="width:100%;padding:6px 8px;margin:4px 0 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.8rem;font-family:inherit;">' +
     '<label style="font-size:0.72rem;color:var(--dim);">Prompt 3</label>' +
-    '<input type="text" id="jrnl-cfg-p3" value="' + esc(_jrnlConfig.prompt3 || '') + '" placeholder="e.g. What did you learn today?" style="width:100%;padding:6px 8px;margin:4px 0 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--fg);font-size:0.8rem;font-family:inherit;">' +
+    '<input type="text" id="jrnl-cfg-p3" value="' + esc(_jrnlConfig.prompt3 || '') + '" placeholder="e.g. What did you learn today?" style="width:100%;padding:6px 8px;margin:4px 0 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.8rem;font-family:inherit;">' +
     '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;">' +
-    '<button onclick="document.getElementById(\'jrnl-config-overlay\').remove()" style="padding:6px 14px;background:none;border:1px solid var(--border);border-radius:6px;color:var(--fg);cursor:pointer;font-family:inherit;">Cancel</button>' +
+    '<button onclick="document.getElementById(\'jrnl-config-overlay\').remove()" style="padding:6px 14px;background:none;border:1px solid var(--border);border-radius:6px;color:var(--text);cursor:pointer;font-family:inherit;">Cancel</button>' +
     '<button onclick="_jrnlSaveConfig()" style="padding:6px 14px;background:var(--accent);color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;font-family:inherit;">Save</button>' +
     '</div></div>';
   document.body.appendChild(overlay);
@@ -41646,4 +42067,14 @@ async function _bdRecheckGate() {
   if (!ack || id !== boardDetailId) return;
   const saved = await updateBoardItem(id, {status:'verified', reverify:true, gate_checked:Array.isArray(ack) ? ack : [], expect_rev:_bdLoadedIdentity.rev});
   if (saved && id === boardDetailId) openBoardDetail(id);
+}
+
+function pickCardFiles(name) {
+  const input = document.createElement('input'); input.type = 'file'; input.multiple = true;
+  input.onchange = () => {
+    const files = Array.from(input.files || []);
+    _outboxDiagnostic('card_files_selected', {session:name, count:files.length});
+    for (const file of files) _enqueueUpload(file, _cardSink(name));
+  };
+  input.click();
 }

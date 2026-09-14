@@ -164,6 +164,8 @@ console.log(
 
 export default defineConfig({
   testDir: '.',
+  reporter: process.env.AMUX_E2E_EVIDENCE_DIR
+    ? [['line'], ['./ci-evidence-reporter.mjs']] : undefined,
   // Real providers and peer coordination require the dedicated lifecycle lab.
   testIgnore: ['**/lifecycle/live-*.spec.ts'],
   timeout: 30_000,

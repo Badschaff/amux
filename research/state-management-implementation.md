@@ -2,6 +2,41 @@
 
 Date: 2026-09-12
 
+## Deployment integration
+
+The owner requested deployment after independent review. Initial integration
+used a clean detached worktree on upstream `6a284869`, without the
+shared checkout's uncommitted work. It remains one feature commit. Integration
+preserves upstream's removal of automatic uncertain-send deletion: those requests
+remain blocked and reviewable. The service worker includes the state assets, and
+APP_VER/CACHE move together to 0.9.922. Receipt/effect reducers and Rust interaction
+storage are unchanged from the independently reviewed implementation.
+
+Clean-snapshot checks: 27 state tests passed; SPA lint had 0 errors and 48 existing
+warnings; workspace/all-target Clippy passed. The full serial server run returned
+2,651 passed, 8 failed and 33 ignored across 61 result groups. Seven failures were
+the host-admission assertion and worker-start dependencies returning the host's
+memory-pressure 503. One exposed an outdated timestamp declaration test: it
+counted exactly two `_at` millisecond columns despite the two new receipt columns.
+That test now requires the receipt columns explicitly rather than rejecting any
+future increase in the count. The production timestamp invariant already declares
+both columns and reports undeclared or incorrectly scaled timestamps.
+
+The full run's 11 interaction API tests passed, as did the board and restart
+persistence suites. The contention wrapper observed concurrent builder activity
+but confirmed the tested worktree was clean at both ends. This is not a claim
+that the full suite was green or that memory-dependent worker starts were tested
+successfully. Final targeted reruns, browser checks and live adoption evidence
+are recorded on AR-142; a commit alone does not prove deployment.
+
+The browser matrix then passed all 72 receipt, feedback, outbox and blocked-outbox
+cases across desktop, mobile and Safari. Desktop/mobile pending-state screenshots
+were visually inspected. While these gates ran, upstream advanced to `d7aa170f`.
+The final clean rebase preserves its isolated-worker refusal and resource-cleanup
+changes. Dashboard files and the receipt/effect implementation are byte-identical
+to the browser-tested candidate; the final upstream integration is checked with
+workspace/all-target Clippy, interaction API tests and isolated-peer refusal tests.
+
 Companion to [the architecture proposal](ai-native-state-management.md). This
 records what the implementation actually covers, not a claim that the entire
 migration plan or every lifecycle case has been exhaustively exercised.

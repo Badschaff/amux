@@ -21,6 +21,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Browser evidence and lifecycle cleanup controls (AF-768, AF-773)
+        run: |
+          npm ci --ignore-scripts
+          node --test tests/ci-e2e-evidence.test.mjs tests/worker-lifecycle-cleanup.test.mjs
       # AF-148 / AMUX-3524 follow-up: a client JS change that ships WITHOUT a
       # version bump reaches no browser holding the cached script, and nothing
       # said so. dashboard_assets.rs pins that APP_VER and CACHE AGREE — but
@@ -165,6 +169,8 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-frustration-scan.sh
+      - name: direct delivery verdicts survive scanner SQL and output (AF-889)
+        run: python3 scripts/test-frustration-delivery.py
       # The THEME scanner's cells (AF-341). Wired in the same commit that adds the
       # scanner, because the step above records what happens otherwise: that
       # harness existed unwired and its 6 cells ran for nobody.
@@ -181,6 +187,10 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-friction-themes.sh
+      - name: attachment metadata cannot manufacture cross-repo instructions (AF-888)
+        run: python3 scripts/test-friction-attachments.py
+      - name: peer collaboration cannot inflate board-drive nudge pressure (AF-890)
+        run: python3 scripts/test-friction-nudges.py
       # AF-360. The dashboard stamps every outgoing message with the send time
       # and had no guard against text that already carried one, so re-sending
       # produced a nested stamp. Measured live on MSG-35221. The reader strips a
@@ -212,6 +222,10 @@ jobs:
       # for AF-346, whose whole incident was a correct guard that did not run.
       # A ratchet against a recorded baseline, so the 32 stay their owners'
       # decision and number 33 cannot arrive quietly.
+      - name: Corrupt board acknowledgements retain unknown outcomes
+        run: python3 scripts/test-board-ack-unknown.py
+      - name: Cargo worktrees reuse builds without stale commit identity
+        run: python3 scripts/test-cargo-worktree-provenance.py
       - name: no harness is written and then never invoked (AF-346)
         run: |
           set -uo pipefail
@@ -297,6 +311,8 @@ jobs:
         run: |
           set -uo pipefail
           bash scripts/test-install-hook-source-ref.sh
+      - name: installer Rust builds exclude uncommitted shared-checkout sources
+        run: python3 scripts/test-install-committed-source.py
       - name: install advice does not linger after the install actually lands
         run: |
           set -uo pipefail
@@ -510,6 +526,7 @@ jobs:
           ./scripts/test-build-provenance.sh
           ./scripts/test-build-disk-clear.sh
           python3 scripts/test-cargo-target-guard.py
+          python3 scripts/test-cargo-budget.py
           ./scripts/test-build-activation-authority.sh
           ./scripts/test-build-activation-launcher.sh
           # A replacement is complete and signed before its one visible rename;

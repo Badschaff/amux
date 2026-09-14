@@ -1,0 +1,35 @@
+{
+  "overall": "INCOMPLETE",
+  "automated_scope": "AUTOMATED_SCOPE_PASSED",
+  "visual_acceptance": "FAIL: LW-12",
+  "commit": "3297d0e468d9c4e9a30857f3e90a85431d9213d2",
+  "build": "bf91fc22b6dff4ac",
+  "binary_sha256": "bf91fc22b6dff4aced9c1f028e9812c05862f15e72f34cc12263b4bfc6c93192",
+  "supplied_binary_source_verified_by_runner": false,
+  "release_identity_matches_live_commit_and_hash": true,
+  "asset_receipts": 3,
+  "asset_mismatches": 0,
+  "archive_key": "offline-post-helper-20260913-r2",
+  "selection": {
+    "project": null,
+    "grep": "LC-OFFLINE-ROUNDTRIP|LC-SYNC-PROGRESS|LC-RECEIPT"
+  },
+  "browser": {
+    "passed": 9,
+    "failed": 0,
+    "skipped": 0,
+    "flaky": 0
+  },
+  "outbox_contracts": {
+    "passed": 46,
+    "failed": 0
+  },
+  "native_model_calls": 0,
+  "screenshots_inspected": 8,
+  "portable_screenshots": [
+    "offline-2026-09-13/mobile-all-seven-acknowledgements.png",
+    "offline-2026-09-13/ios-safari-cold-offline-reload.png",
+    "offline-2026-09-13/mobile-sync-individual-checkmarks.png"
+  ],
+  "initial_attempt": "offline-post-helper-20260913 is INCOMPLETE: local self-signed TLS prevented pinning the supplied binary; no browser stage ran. The corrected run uses the explicit loopback HTTPS endpoint."
+}

@@ -389,6 +389,16 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../../migrations/0066_send_receipt_identity.sql"),
     },
     Migration {
+        version: 67,
+        name: "0067_message_capture_pending",
+        sql: include_str!("../../migrations/0067_message_capture_pending.sql"),
+    },
+    Migration {
+        version: 68,
+        name: "0068_task_lease",
+        sql: include_str!("../../migrations/0068_task_lease.sql"),
+    },
+    Migration {
         version: 69,
         name: "0069_worker_lifecycle",
         sql: include_str!("../../migrations/0069_worker_lifecycle.sql"),

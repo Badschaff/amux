@@ -65,3 +65,12 @@ pub trait AgentProtocol: Send + Sync {
     /// contract — Invariant 26).
     fn events(&self, worker: &WorkerId) -> tokio::sync::broadcast::Receiver<WorkerEvent>;
 }
+
+// The same protocol instance drives the command pump and lifecycle API.
+static PROCESS_PROTOCOL: std::sync::RwLock<Option<std::sync::Arc<dyn AgentProtocol>>> = std::sync::RwLock::new(None);
+pub fn set_process_protocol(protocol: std::sync::Arc<dyn AgentProtocol>) {
+    *PROCESS_PROTOCOL.write().unwrap() = Some(protocol);
+}
+pub fn process_protocol() -> Option<std::sync::Arc<dyn AgentProtocol>> {
+    PROCESS_PROTOCOL.read().unwrap().clone()
+}
