@@ -6269,3 +6269,56 @@ async fn drain_reports_measured_verdicts_for_a_lane() {
     assert_eq!(v["lanes"][0]["ready"], json!(1), "{v}");
     assert_eq!(v["drained"], json!(0), "{v}");
 }
+
+// ---- AMUX-4526: review/done lists every unmet acceptance check at once -------
+
+#[tokio::test]
+async fn review_and_done_are_refused_with_every_unmet_check_listed_together() {
+    let (app, _dir) = app();
+    let dep = create(&app, json!({ "title": "the prerequisite", "session": "lane-p", "type": "chore",
+        "desc": "artifact: crates/amux-server/src/api/board.rs" })).await;
+    let dep_id = dep["id"].as_str().unwrap().to_string();
+    let epic = create(&app, json!({ "title": "the parent", "session": "lane-p", "type": "chore",
+        "desc": "artifact: crates/amux-server/src/api/board.rs" })).await;
+    let epic_id = epic["id"].as_str().unwrap().to_string();
+    let child = create(&app, json!({ "title": "an open child", "session": "lane-p", "type": "chore",
+        "desc": "artifact: crates/amux-server/src/api/board.rs" })).await;
+    let child_id = child["id"].as_str().unwrap().to_string();
+    // The epic link is a PATCH field (AMUX-2992); read it back so a link that
+    // did not take fails here rather than as a missing check below.
+    let (st, _, v) = send_with(&app, "PATCH", &format!("/api/board/{child_id}"),
+        Some(json!({ "epic": epic_id })), &[("X-Amux-Session", "lane-p")]).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, _, linked) = send_with(&app, "GET", &format!("/api/board/{child_id}"), None, &[]).await;
+    assert_eq!(linked["epic"], json!(epic_id), "{linked}");
+    let (st, _, _) = send_with(&app, "PATCH", &format!("/api/board/{epic_id}"),
+        Some(json!({ "depends_on": [dep_id] })), &[("X-Amux-Session", "lane-p")]).await;
+    assert_eq!(st, StatusCode::OK);
+    move_as(&app, &epic_id, "doing", "lane-p").await;
+
+    let (st, _, v) = send_with(&app, "PATCH", &format!("/api/board/{epic_id}"),
+        Some(json!({ "status": "review" })), &[("X-Amux-Session", "lane-p")]).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], json!("acceptance_checks_failed"), "{v}");
+    let checks: Vec<(String, String)> = v["missing"].as_array().unwrap().iter()
+        .map(|m| (m["check"].as_str().unwrap().to_string(), m["card"].as_str().unwrap_or("").to_string()))
+        .collect();
+    assert_eq!(checks, vec![
+        ("dependency_resolved".to_string(), dep_id.clone()),
+        ("children_terminal".to_string(), child_id.clone()),
+    ], "both unmet checks in ONE answer: {v}");
+
+    // Clear both: the prerequisite finishes (chore completes at done) and the
+    // child is discarded. The same move now passes the preflight.
+    move_as(&app, &dep_id, "doing", "lane-p").await;
+    let (st, _, v) = send_with(&app, "PATCH", &format!("/api/board/{dep_id}"),
+        Some(json!({ "status": "done", "evidence": EV, "gate_checked": ["Outcome recorded in the item (what happened, and why it is closed)"] })),
+        &[("X-Amux-Session", "lane-p")]).await;
+    assert_eq!(st, StatusCode::OK, "prerequisite closes: {v}");
+    let (st, _, _) = send_with(&app, "PATCH", &format!("/api/board/{child_id}"),
+        Some(json!({ "status": "discarded", "force": true, "reason": "not needed after all" })),
+        &[("X-Amux-Session", "lane-p")]).await;
+    assert_eq!(st, StatusCode::OK);
+    let v = move_as(&app, &epic_id, "review", "lane-p").await;
+    assert_eq!(v["status"], json!("review"), "{v}");
+}

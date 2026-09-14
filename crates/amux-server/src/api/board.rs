@@ -9981,6 +9981,111 @@ pub async fn patch_item(
                     let gates = bs::core_gates(&eff_gate, target);
                     let target_raw = bs::status_to_db(target, &next.status);
 
+                    // ACCEPTANCE PREFLIGHT (AMUX-4526, RR-0052). Before this, a card
+                    // could be moved to review or done while a card it depends on
+                    // was still open, or while its own epic children were: nothing
+                    // on this path looked (measured 2026-09-14: 24 of 2469 cards
+                    // closed in 7 days still had an unresolved dependency, 3 epics
+                    // had open children). And every other refusal answers ONE
+                    // criterion per round trip, so a worker learns what is missing
+                    // by failing repeatedly. This lists everything at once, using
+                    // the same resolution rule dispatch uses
+                    // (`bs::dependency_resolved`) and the same evidence verdict the
+                    // done gate below uses. Force stays the audited override.
+                    if !force && matches!(target, TaskStatus::Review | TaskStatus::Done) {
+                        let mut missing: Vec<Value> = Vec::new();
+                        for dep in &next.depends_on {
+                            // A dependency that names no card (deleted, or never
+                            // existed) cannot be finished by anyone, so it is
+                            // listed and does not block: refusing would strand
+                            // the card with no truthful move. Dispatch stays
+                            // conservative and does not promote over it.
+                            let dep_status: Option<String> = match conn.query_row(
+                                "SELECT status FROM issues WHERE id=?1 AND deleted IS NULL",
+                                [dep],
+                                |r| r.get(0),
+                            ) {
+                                Ok(status) => Some(status),
+                                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                                Err(e) => return Err(e),
+                            };
+                            match dep_status {
+                                None => missing.push(json!({
+                                    "check": "dependency_exists",
+                                    "blocking": false,
+                                    "card": dep,
+                                    "fix": format!("{dep} names no card; remove it from depends_on with a reason"),
+                                })),
+                                Some(status) if !bs::dependency_resolved(conn, dep)? => missing.push(json!({
+                                    "check": "dependency_resolved",
+                                    "card": dep,
+                                    "status": status,
+                                    "fix": format!("finish {dep} (code-type work completes at verified), or remove it from depends_on with a reason if {} does not need it", next.id),
+                                })),
+                                Some(_) => {}
+                            }
+                        }
+                        let open_children: Vec<(String, String)> = {
+                            let mut st = conn.prepare(
+                                "SELECT id, status FROM issues WHERE epic=?1 AND deleted IS NULL \
+                                 AND COALESCE(archived,0)=0 \
+                                 AND status NOT IN ('done','verified','discarded','quarantined') \
+                                 ORDER BY created, id",
+                            )?;
+                            let rows = st.query_map([&next.id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                            rows.collect::<rusqlite::Result<_>>()?
+                        };
+                        for (child, child_status) in &open_children {
+                            missing.push(json!({
+                                "check": "children_terminal",
+                                "card": child,
+                                "status": child_status,
+                                "fix": format!("finish or discard {child} first; an epic is complete when its children are"),
+                            }));
+                        }
+                        if target == TaskStatus::Done && bs::done_evidence_required(next.session.as_deref()) {
+                            let verdict = bs::evidence_verdict(next.evidence.as_deref().unwrap_or(""));
+                            if verdict != bs::EvidenceVerdict::Ok {
+                                missing.push(json!({
+                                    "check": "evidence",
+                                    "verdict": format!("{verdict:?}"),
+                                    "fix": "name what was run or produced: --evidence with a command, repo path, URL, sha or #PR, or `none: <reason>`",
+                                }));
+                            }
+                        }
+                        let blocking = missing
+                            .iter()
+                            .filter(|m| m["check"] != "evidence" && m["blocking"] != json!(false))
+                            .count();
+                        if blocking > 0 {
+                            tracing::warn!(
+                                target: "amux::board", card = %next.id, to = %target_raw,
+                                caller = %caller_lane, missing = missing.len(), blocking,
+                                measured = true, n_considered = missing.len(),
+                                verdict = "acceptance_checks_failed",
+                                "board: review/done refused with the full list of unmet acceptance checks (AMUX-4526)"
+                            );
+                            return finish(
+                                &slot_w,
+                                PatchOut::Refused(
+                                    StatusCode::CONFLICT,
+                                    json!({
+                                        "error": "acceptance checks failed",
+                                        "code": "acceptance_checks_failed",
+                                        "ok": false,
+                                        "blocked": true,
+                                        "item": next.id,
+                                        "attempted_status": target_raw,
+                                        "missing": missing,
+                                        "why": "review and done claim the work is complete; a card whose dependency or epic child is still open is not, so every unmet check is listed here in one answer",
+                                        "override": "an explicit, attributed force with a reason still moves it, and is audited",
+                                    }),
+                                ),
+                                no_write(),
+                            );
+                        }
+                    }
+
                     // Global done-link constraint (Ethan, 2026-08-17): a card
                     // cannot enter `done` without pointing at the artifact it
                     // produced. It sits ALONGSIDE the ack gate, not inside it, so
