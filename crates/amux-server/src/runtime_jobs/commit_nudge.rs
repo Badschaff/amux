@@ -63,6 +63,15 @@ pub struct Ownership {
     pub partial: Option<String>,
 }
 
+impl Ownership {
+    /// The same classified-guard predicate drives headers, delivery policy and
+    /// telemetry. An edit record is not proof of ownership of today's bytes.
+    fn has_edit_record(&self, path: &str) -> bool {
+        !self.foreign.iter().any(|(p, _)| p == path)
+            && !self.unclaimed.iter().chain(&self.undecided).any(|p| p == path)
+    }
+}
+
 /// The freshness axis (MG-1467): for each dirty path, WHICH DIRECTION it
 /// differs from origin/main. Parallel to [`Ownership`], and like it,
 /// deliberately NOT constructible from a working tree. It carries an answer the
@@ -338,10 +347,9 @@ pub fn build(
         .chain(own.undecided.iter())
         .map(String::as_str)
         .collect();
-    let not_mine = |p: &str| foreign_owner.contains_key(p) || unknown_owner.contains(p);
     let whose = |paths: &[&str]| {
         let n = paths.len();
-        let n_mine = paths.iter().filter(|p| !not_mine(p)).count();
+        let n_mine = paths.iter().filter(|p| own.has_edit_record(p)).count();
         if n_mine == n {
             "of your dirty file(s)".to_string()
         } else if n_mine == 0 {
@@ -939,7 +947,6 @@ fn commit_worthy_body(dir: &str, dirty: &[String], own: &Ownership) -> Option<St
     //
     // "Not attributable to a peer" is not evidence that it is yours. Only a
     // positive claim is.
-    let foreign_paths: BTreeSet<&str> = own.foreign.iter().map(|(p, _)| p.as_str()).collect();
     let unknown_paths: BTreeSet<&str> = own
         .unclaimed
         .iter()
@@ -949,7 +956,7 @@ fn commit_worthy_body(dir: &str, dirty: &[String], own: &Ownership) -> Option<St
 
     let mine: Vec<&String> = dirty
         .iter()
-        .filter(|p| !foreign_paths.contains(p.as_str()) && !unknown_paths.contains(p.as_str()))
+        .filter(|p| own.has_edit_record(p))
         .collect();
     let unknown: Vec<&String> =
         dirty.iter().filter(|p| unknown_paths.contains(p.as_str())).collect();
@@ -1151,6 +1158,266 @@ use serde_json::{json, Value};
 fn cap_key(session: &str, now: f64) -> String {
     let day = (now / 86_400.0).floor() as i64;
     format!("commit_nudge:{session}:{day}")
+}
+
+/// AF-720: keep the whole classified population, not the ten displayed paths.
+/// Persist at most one full notice per lane using the existing prefs read API.
+struct PreparedNudge {
+    full: String,
+    compact: Option<String>,
+    detail_key: String,
+    detail: Value,
+    n_considered: usize,
+    n_with_edit_record: usize,
+    attribution_partial: bool,
+}
+
+impl PreparedNudge {
+    fn new(
+        session: &str,
+        dir: &str,
+        dirty: &[String],
+        own: &Ownership,
+        fresh: &Freshness,
+        provenance: &str,
+        full: String,
+    ) -> Self {
+        let same: BTreeSet<&str> = fresh.same.iter().map(String::as_str).collect();
+        let paths: BTreeSet<&str> = dirty.iter().map(String::as_str)
+            .filter(|p| !same.contains(p)).collect();
+        let n_considered = paths.len();
+        let n_with_edit_record = paths.iter().filter(|p| own.has_edit_record(p)).count();
+        let attribution_partial = own.partial.is_some();
+        let detail_key = format!("commit_nudge_detail:{session}");
+        let observed_at = chrono::Utc::now().to_rfc3339();
+        let mut detail_url = reqwest::Url::parse("http://localhost/api/prefs").expect("static URL");
+        detail_url.query_pairs_mut().append_pair("key", &detail_key);
+        let query = detail_url.query().expect("key query was set");
+        let compact = (n_considered > 0 && n_with_edit_record == 0).then(|| {
+            let mut text = format!(
+                "Git hygiene: {n_considered} dirty paths differ from origin/main under {dir}; \
+                 0 carry your edit record.\n\
+                 Preserve these files and continue your current task. Do not stage, restore, \
+                 or merge them based on this notice. Edit records describe attribution, \
+                 not ownership of the current bytes.\n"
+            );
+            for path in paths.iter().take(10) {
+                let direction = if fresh.diverged.iter().any(|p| p == path) {
+                    "both histories differ"
+                } else if fresh.stale.iter().any(|p| p == path) {
+                    "origin history ahead; bytes need checking"
+                } else if fresh.revived.iter().any(|p| p == path) {
+                    "old committed bytes"
+                } else {
+                    "differs from origin"
+                };
+                let generated = if fresh.generated.iter().any(|p| p == path) {
+                    "; declared generated"
+                } else { "" };
+                text.push_str(&format!("  {path} [{direction}{generated}]\n"));
+            }
+            if n_considered > 10 {
+                text.push_str(&format!("  … {} more paths in full evidence\n", n_considered - 10));
+            }
+            if let Some(why) = &own.partial {
+                text.push_str(&format!("ATTRIBUTION IS PARTIAL — {why}\n"));
+            }
+            if paths.iter().any(|p| is_append_only_shared(p)) {
+                text.push_str("Ledger reconciliation requires an ARCHIVE CHECK; preserve moved entries.\n");
+            }
+            text.push_str(&format!(
+                "Latest full guidance and untruncated path inventory: GET /api/prefs?{query} \
+                 (JSON in value; check observed_at, as a later notice replaces it).\n\
+                 No landed-path match count was measured. {provenance}; observed_at={observed_at}."
+            ));
+            text
+        });
+        let detail = json!({
+            "schema_version": 1, "session": session, "directory": dir,
+            "observed_at": observed_at, "provenance": provenance,
+            "measured": true, "n_considered": n_considered,
+            "n_with_edit_record": n_with_edit_record,
+            "n_without_edit_record": n_considered - n_with_edit_record,
+            "attribution_partial": attribution_partial,
+            "landed_paths_measured": false,
+            "paths": paths, "full_guidance": full,
+            "foreign_records": own.foreign.iter().map(|(path, owner)| json!({
+                "path": path, "owner": if owner == UNRESOLVED_OWNER { None } else { Some(owner) }
+            })).collect::<Vec<_>>(),
+            "shared_records": own.shared, "unclaimed": own.unclaimed,
+            "undecided": own.undecided,
+        });
+        Self { full, compact, detail_key, detail, n_considered, n_with_edit_record, attribution_partial }
+    }
+}
+
+async fn enqueue_nudge(store: &crate::db::SharedStore, session: &str, notice: PreparedNudge) -> bool {
+    let detail_stored = if notice.compact.is_some() {
+        let key = notice.detail_key.clone();
+        let value = notice.detail.to_string();
+        match store.write_async(move |conn| {
+            conn.execute("INSERT INTO prefs(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                rusqlite::params![key, value])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).await {
+            Ok(_) => true,
+            Err(error) => {
+                tracing::warn!(session, measured = false, n_considered = 0,
+                    why_unmeasured = %error, "commit_nudge_detail_unavailable: sending full guidance");
+                false
+            }
+        }
+    } else { false };
+    // Never replace safety guidance with a link that failed to persist.
+    let text = if detail_stored { notice.compact.as_ref().unwrap_or(&notice.full) } else { &notice.full };
+    let result = crate::api::session_verbs::steer_enqueue_store(store, session, text, "commit-nudge", "").await;
+    let queued = result.is_ok();
+    tracing::info!(
+        session, measured = true, n_considered = notice.n_considered,
+        n_with_edit_record = notice.n_with_edit_record,
+        n_without_edit_record = notice.n_considered - notice.n_with_edit_record,
+        attribution_partial = notice.attribution_partial, detail_stored,
+        format = if detail_stored { "compact" } else { "full" },
+        chars = text.chars().count(), full_chars = notice.full.chars().count(),
+        queued, message_id = ?result.as_ref().ok(), refusal = ?result.as_ref().err(),
+        "commit_nudge_enqueue"
+    );
+    queued
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+
+    fn specimen(mine_last: bool) -> PreparedNudge {
+        let mut dirty: Vec<String> = (0..25).map(|n| format!("src/path{n:02}.rs")).collect();
+        dirty[0] = "frustrations.md".into();
+        let mut own = Ownership {
+            foreign: dirty.iter().map(|p| (p.clone(), "peer".into())).collect(),
+            partial: Some("one running cotenant has no transcript".into()),
+            ..Default::default()
+        };
+        own.foreign.retain(|(p, _)| p != "src/path03.rs");
+        own.unclaimed.push("src/path03.rs".into());
+        if mine_last {
+            own.foreign.retain(|(p, _)| p != "src/path24.rs");
+            own.shared.push(("src/path24.rs".into(), "peer".into()));
+        }
+        let fresh = Freshness {
+            diverged: dirty[..5].to_vec(), generated: vec![dirty[1].clone()],
+            stale: dirty[5..].to_vec(), same: vec!["settled.rs".into()],
+            ..Default::default()
+        };
+        dirty.push("settled.rs".into()); // positive record, but not a nudge operand
+        dirty.push(dirty[0].clone()); // duplicate cannot inflate the denominator
+        let full = build("/repo", &dirty, &own, &fresh, "test origin").unwrap();
+        PreparedNudge::new("af720-fixture", "/repo", &dirty, &own, &fresh, "test origin", full)
+    }
+
+    #[test]
+    fn whole_population_controls_compaction_not_first_section_or_visible_sample() {
+        let zero = specimen(false);
+        assert_eq!(zero.n_considered, 25);
+        assert_eq!(zero.n_with_edit_record, 0);
+        let text = zero.compact.unwrap();
+        assert!(text.len() < zero.full.len() / 2, "compact must remove the full remedy payload");
+        assert!(text.contains("0 carry your edit record") && text.contains("15 more paths"));
+        assert!(text.contains("ATTRIBUTION IS PARTIAL") && text.contains("ARCHIVE CHECK"));
+        assert!(text.contains("Do not stage, restore, or merge"));
+        assert!(!text.contains("git checkout") && !text.contains("git merge-file"));
+        assert_eq!(zero.detail["paths"].as_array().unwrap().len(), 25);
+        assert!(zero.detail["paths"].as_array().unwrap().contains(&json!("src/path24.rs")));
+        let shared = specimen(true);
+        assert_eq!(shared.n_with_edit_record, 1);
+        assert!(shared.compact.is_none(), "one own/shared path beyond the first ten must keep full guidance");
+        assert!(shared.full.contains("CONTESTED") || shared.full.contains("1 with your edit record"));
+    }
+
+    #[test]
+    fn actual_queue_detail_fallback_and_refusal_are_measured() {
+        // Keep process-global tracing callsite caches out of parallel test races.
+        if std::env::var_os("AMUX_TEST_NUDGE_LOG_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "runtime_jobs::commit_nudge::delivery_tests::actual_queue_detail_fallback_and_refusal_are_measured", "--nocapture"])
+                .env("AMUX_TEST_NUDGE_LOG_CHILD", "1").output().unwrap();
+            assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes); Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = Writer(bytes.clone());
+        let subscriber = tracing_subscriber::fmt().with_ansi(false).without_time()
+            .with_writer(move || writer.clone()).finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = Arc::new(crate::db::Store::open(&tmp.path().join("nudge.db")).unwrap());
+            store.write_async(|conn| {
+                conn.execute("INSERT INTO _amux_workers(id,display_name,created_at,updated_at) VALUES('wrk_af720','af720-fixture',0,0)", [])?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            }).await.unwrap();
+            let queued_text = || -> String {
+                store.read().unwrap().query_row("SELECT text FROM steering_queue WHERE session='af720-fixture' AND guard='commit-nudge'", [], |r| r.get(0)).unwrap()
+            };
+            let zero = specimen(false);
+            let full = zero.full.clone();
+            assert!(enqueue_nudge(&store, "af720-fixture", zero).await);
+            let actual = queued_text();
+            assert!(actual.starts_with("Git hygiene: 25 dirty paths"));
+            assert!(actual.contains("/api/prefs?key=commit_nudge_detail%3Aaf720-fixture"));
+            let stored: String = store.read().unwrap().query_row("SELECT value FROM prefs WHERE key='commit_nudge_detail:af720-fixture'", [], |r| r.get(0)).unwrap();
+            let detail: Value = serde_json::from_str(&stored).unwrap();
+            assert_eq!(detail["full_guidance"], full);
+            assert_eq!(detail["n_considered"], 25);
+            assert_eq!(detail["paths"].as_array().unwrap().len(), 25);
+            // Follow the URI the actual queued notice gives the recipient.
+            use tower::ServiceExt;
+            let state = AppState {
+                store: store.clone(), started: std::time::Instant::now(),
+                build_hash: "test".into(), auth_token: None,
+                reconciled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            };
+            let uri = actual.split("GET /api/prefs").nth(1).unwrap().split_whitespace().next().unwrap();
+            let response = crate::api::prefs::routes().with_state(state).oneshot(
+                axum::http::Request::builder().uri(format!("/{uri}")).body(axum::body::Body::empty()).unwrap()
+            ).await.unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let body: Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+            let retrieved: Value = serde_json::from_str(body["value"].as_str().unwrap()).unwrap();
+            assert_eq!(retrieved, detail);
+            let positive = specimen(true);
+            let positive_full = positive.full.clone();
+            assert!(enqueue_nudge(&store, "af720-fixture", positive).await);
+            assert_eq!(queued_text(), positive_full);
+            // A real SQLite failure must retain the full payload, not a dead link.
+            store.write_async(|conn| {
+                conn.execute_batch("CREATE TRIGGER fail_nudge_detail BEFORE INSERT ON prefs WHEN NEW.key LIKE 'commit_nudge_detail:%' BEGIN SELECT RAISE(ABORT,'fixture detail unavailable'); END;")?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            }).await.unwrap();
+            let fallback = specimen(false);
+            let fallback_full = fallback.full.clone();
+            assert!(enqueue_nudge(&store, "af720-fixture", fallback).await);
+            assert_eq!(queued_text(), fallback_full);
+            assert!(!enqueue_nudge(&store, "af720-nonexistent-fixture", specimen(false)).await);
+        });
+        let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        let events: Vec<&str> = logs.lines().filter(|s| s.contains("commit_nudge_enqueue")).collect();
+        assert_eq!(events.len(), 4, "{logs}");
+        assert!(events[0].contains("n_considered=25") && events[0].contains("n_with_edit_record=0") && events[0].contains("queued=true") && events[0].contains("format=\"compact\""), "{logs}");
+        assert!(events[1].contains("n_with_edit_record=1") && events[1].contains("format=\"full\""), "{logs}");
+        assert!(events[2].contains("detail_stored=false") && events[2].contains("format=\"full\""), "{logs}");
+        assert!(events[3].contains("queued=false") && events[3].contains("refusal=Some"), "{logs}");
+        assert!(logs.contains("WARN") && logs.contains("commit_nudge_detail_unavailable"), "{logs}");
+    }
 }
 
 
@@ -2328,8 +2595,10 @@ pub async fn nudge_tick(state: &AppState, lanes: &[(String, String)], now: f64) 
                  resurrect archived entries (AMUX-3718 regression)"
             );
         }
-        let _ = crate::api::session_verbs::steer_enqueue(state, session, &msg, "commit-nudge", "").await;
-        sent += 1;
+        let notice = PreparedNudge::new(session, &label, &dirty, &own, &fresh, &provenance, msg);
+        if enqueue_nudge(&state.store, session, notice).await {
+            sent += 1;
+        }
     }
     sent
 }
