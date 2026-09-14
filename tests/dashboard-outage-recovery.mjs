@@ -347,7 +347,10 @@ test('ambiguous 200 checks acceptance and preserves ordering behind it across re
   assert.equal(saved[0].state, 'pending');assert.equal(saved[0].delivery_uncertain,true);
   await ctx.runSyncBanner();
   assert.deepEqual(calls.map(r=>r.method),['POST','GET'],'only a receipt read may follow uncertain acceptance');
-  assert.equal(calls[1].url,'/api/sessions/owned/send?msg_id=first');
+  // The receipt read carries the text (AMUX-4594), so the server can settle a
+  // reservation no live send owns from the lane transcript instead of leaving it
+  // uncertain forever. Still a GET for the SAME msg_id, and still nothing behind it.
+  assert.equal(calls[1].url,'/api/sessions/owned/send?msg_id=first&text=first');
   assert.equal(JSON.parse(stored.get('amux_offline_queue')).length,2,'later message remains durable and unsubmitted');
 });
 
