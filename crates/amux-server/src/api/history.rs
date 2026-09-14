@@ -71,6 +71,27 @@ pub fn routes() -> Router<AppState> {
 /// This is one batched query for the whole history page, not one query per
 /// message. The CTE also resolves a scalar that already names a child back to
 /// its epic root, so both old and new writers produce the same answer.
+/// The lineage query for `n` message cards. One function so the handler and the
+/// query-plan test run the same SQL (AMUX-4590). Its `linked.epic = root` arm
+/// relies on idx_issues_epic (migration 0071); without that index SQLite scans
+/// every issue once per card, which cost 9.8 s on a 500-row page.
+fn linked_cards_sql(n: usize) -> String {
+    let placeholders = (0..n).map(|_| "(?)").collect::<Vec<_>>().join(",");
+    format!(
+        "WITH message_cards(card_id) AS (VALUES {placeholders}), \
+         roots(card_id, root_id) AS ( \
+           SELECT mc.card_id, COALESCE(NULLIF(source.epic,''), mc.card_id) \
+           FROM message_cards mc LEFT JOIN issues source ON source.id=mc.card_id \
+         ) \
+         SELECT roots.card_id, linked.id, linked.title, linked.status, \
+                COALESCE(linked.archived,0), linked.session, roots.root_id \
+         FROM roots JOIN issues linked \
+           ON linked.id=roots.root_id OR linked.epic=roots.root_id \
+         WHERE COALESCE(linked.deleted,0)=0 \
+         ORDER BY roots.card_id, CASE WHEN linked.id=roots.root_id THEN 0 ELSE 1 END, linked.id"
+    )
+}
+
 fn attach_linked_cards(
     conn: &rusqlite::Connection,
     rows: &mut [Value],
@@ -89,20 +110,7 @@ fn attach_linked_cards(
         return Ok(());
     }
 
-    let placeholders = card_ids.iter().map(|_| "(?)").collect::<Vec<_>>().join(",");
-    let sql = format!(
-        "WITH message_cards(card_id) AS (VALUES {placeholders}), \
-         roots(card_id, root_id) AS ( \
-           SELECT mc.card_id, COALESCE(NULLIF(source.epic,''), mc.card_id) \
-           FROM message_cards mc LEFT JOIN issues source ON source.id=mc.card_id \
-         ) \
-         SELECT roots.card_id, linked.id, linked.title, linked.status, \
-                COALESCE(linked.archived,0), linked.session, roots.root_id \
-         FROM roots JOIN issues linked \
-           ON linked.id=roots.root_id OR linked.epic=roots.root_id \
-         WHERE COALESCE(linked.deleted,0)=0 \
-         ORDER BY roots.card_id, CASE WHEN linked.id=roots.root_id THEN 0 ELSE 1 END, linked.id"
-    );
+    let sql = linked_cards_sql(card_ids.len());
     let values: Vec<rusqlite::types::Value> =
         card_ids.iter().cloned().map(rusqlite::types::Value::Text).collect();
     let refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -1801,5 +1809,26 @@ mod tests {
         // ?session= wins over ?group= (Python: group applies only without session).
         let (_, beta) = send(&app, "GET", "/api/history?group=sales&session=beta", None).await;
         assert_eq!(beta.as_array().unwrap().len(), 2);
+    }
+
+    /// AMUX-4590. The linked-cards join must look children up through
+    /// idx_issues_epic. Without it the plan scans every issue once per message
+    /// card, which cost 9.8 s on a 500-row page and 30 to 99 s on Ethan's phone.
+    #[tokio::test]
+    async fn linked_cards_lineage_uses_the_epic_index_instead_of_scanning_issues() {
+        let (_app, state, _dir) = app_with_state();
+        let conn = state.store.read().unwrap();
+        let sql = linked_cards_sql(3);
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(["A-1", "A-2", "A-3"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(plan.iter().any(|d| d.contains("idx_issues_epic")), "the epic arm must use idx_issues_epic: {plan:#?}");
+        assert!(
+            !plan.iter().any(|d| d.trim_start().starts_with("SCAN linked")),
+            "no full scan of issues per message card: {plan:#?}"
+        );
     }
 }

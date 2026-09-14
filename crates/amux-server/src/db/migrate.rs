@@ -408,6 +408,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0070_token_ledger_message_id",
         sql: include_str!("../../migrations/0070_token_ledger_message_id.sql"),
     },
+    Migration {
+        version: 71,
+        name: "0071_issues_epic_index",
+        sql: include_str!("../../migrations/0071_issues_epic_index.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.
