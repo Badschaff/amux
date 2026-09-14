@@ -597,6 +597,7 @@ async fn async_main() {
     let protocol = Arc::new(opencode::structured::StructuredCliProtocol::with_conversation_sink(
         Arc::new(StoreConversationSink { store: store.clone() }),
     ));
+    opencode::set_process_protocol(protocol.clone());
 
     // Orchestrator runtime: reconcile once, then tick (RR-0041).
     let durable_fleet_state = {

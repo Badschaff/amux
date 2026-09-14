@@ -398,6 +398,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0068_task_lease",
         sql: include_str!("../../migrations/0068_task_lease.sql"),
     },
+    Migration {
+        version: 69,
+        name: "0069_worker_lifecycle",
+        sql: include_str!("../../migrations/0069_worker_lifecycle.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.

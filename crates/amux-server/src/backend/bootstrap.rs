@@ -231,6 +231,14 @@ impl Bootstrap {
                 queries::get_worker(&conn, &worker_id)?
             };
             let Some(row) = row else { continue };
+            let lock = crate::api::workers::lifecycle_lock(&row.display_name);
+            let _guard = lock.lock().await;
+            // Re-read under the lifecycle lock: the Starting scan can predate Pause.
+            let row = {
+                let conn = self.store.read()?;
+                queries::get_worker(&conn, &worker_id)?
+            };
+            let Some(row) = row.filter(|r| r.lifecycle.can_start() && matches!(r.state, WorkerState::Starting)) else { continue };
             let Ok(worker) = WorkerId::parse(&row.id) else { continue };
 
             let Some(backend) = self.backend(&backend_name) else {

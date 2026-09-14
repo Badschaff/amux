@@ -22,7 +22,8 @@ use amux_core::revision::{EntityType, MutationKind};
 use amux_core::search::PagedResponse;
 use amux_core::session::{backend_ref, BackendId, ExitReason};
 use amux_core::worker::{
-    apply_config, ConfigChangeResult, Worker, WorkerCapabilities, WorkerConfig, WorkerState,
+    apply_config, ConfigChangeResult, Worker, WorkerCapabilities, WorkerConfig, WorkerLifecycle,
+    WorkerState,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -73,6 +74,8 @@ pub fn routes() -> Router<AppState> {
         // `steer` are deliberately absent: the classification calls them
         // load-bearing (D1's exit condition and turn-boundary delivery), and
         // they need their store-managed semantics decided rather than extracted.
+        .route("/{id}/pause", post(pause_worker))
+        .route("/{id}/resume", post(resume_worker))
         .route("/{id}/wake", post(wake_worker))
         .route("/{id}/reset", post(reset_worker))
         .route("/{id}/clear", post(clear_worker))
@@ -278,6 +281,7 @@ fn worker_body(row: &WorkerRow) -> Value {
         "tokens": Value::Null,
         "last_activity": row.updated_at,
         "task_name": Value::Null,
+        "lifecycle": row.lifecycle.as_str(),
     })
 }
 
@@ -359,6 +363,8 @@ pub struct ListParams {
     pub offset: u64,
     #[serde(default = "default_limit")]
     pub limit: u64,
+    #[serde(default)]
+    pub lifecycle: Option<String>,
 }
 
 fn default_limit() -> u64 {
@@ -367,16 +373,28 @@ fn default_limit() -> u64 {
 
 /// List workers, PagedResponse-shaped (Invariant 40: `total`/`truncated`
 /// announce what a page omits instead of silently capping).
+/// Optional `?lifecycle=active` (or comma-separated: `active,paused`) filter.
 pub async fn list_workers(
     State(state): State<AppState>,
     Query(p): Query<ListParams>,
 ) -> Response {
     let offset = p.offset;
     let limit = p.limit.clamp(1, 1000);
+    let lifecycles: Vec<WorkerLifecycle> = p
+        .lifecycle
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .filter_map(|s| WorkerLifecycle::parse(s.trim()))
+        .collect();
     let store = state.store.clone();
     let joined = crate::db::interactions::spawn_blocking(move || -> anyhow::Result<_> {
         let conn = store.read()?;
-        Ok(queries::list_workers(&conn, offset, limit)?)
+        if lifecycles.is_empty() {
+            Ok(queries::list_workers(&conn, offset, limit)?)
+        } else {
+            Ok(queries::list_workers_by_lifecycle(&conn, &lifecycles, offset, limit)?)
+        }
     })
     .await;
     let (rows, total) = match joined {
@@ -920,6 +938,12 @@ enum StepOutcome {
 /// process spawn is the orchestrator's job (RR-0041) and lands there — this
 /// endpoint accepts the request, it does not pretend the process exists.
 pub async fn start_worker(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+    // Lifecycle refusal is independent of host capacity and must remain stable.
+    match state.store.read().and_then(|conn| Ok(queries::get_worker(&conn, &key)?)) {
+        Ok(Some(row)) if !row.lifecycle.can_start() => return err(StatusCode::CONFLICT,
+            json!({"error":"worker must be active before starting; resume it first", "lifecycle":row.lifecycle.as_str()})),
+        Ok(_) => {}, Err(e) => return internal(e),
+    }
     // Host admission check BEFORE any state is written (AMUX-3396 follow-through).
     //
     // amux published memory pressure on /health for nine days and never acted on
@@ -963,6 +987,20 @@ pub async fn start_worker(State(state): State<AppState>, Path(key): Path<String>
             let Some(row) = queries::get_worker(conn, &key_w)? else {
                 return finish(&slot_w, StepOutcome::NotFound, no_write());
             };
+            if !row.lifecycle.can_start() {
+                return finish(
+                    &slot_w,
+                    StepOutcome::Refused {
+                        error: match row.lifecycle {
+                            WorkerLifecycle::Archived => "worker is archived; restore it first",
+                            WorkerLifecycle::Deleted => "worker is deleted",
+                            _ => "worker lifecycle does not permit starting",
+                        },
+                        state: row.lifecycle.as_str().to_string(),
+                    },
+                    no_write(),
+                );
+            }
             if !matches!(row.state, WorkerState::Stopped) {
                 return finish(
                     &slot_w,
@@ -1104,15 +1142,10 @@ async fn delete_worker_inner(State(state): State<AppState>, Path(key): Path<Stri
             let now_s = chrono::Utc::now().to_rfc3339();
             let n = queries::soft_delete_worker(conn, &row.id, &now_s)?;
             if n == 0 {
-                // Raced with another delete inside the same writer queue:
-                // already gone, report absence rather than a fresh change.
                 return finish(&slot_w, StepOutcome::NotFound, no_write());
             }
-            // Deletion is SOFT: the row survives with `deleted_at` set, and
-            // the Deleted event journals a snapshot of that surviving row —
-            // replay then knows both that it was deleted and what it was
-            // (RR-0111a).
             let mut after = row.clone();
+            after.lifecycle = WorkerLifecycle::Deleted;
             after.deleted_at = Some(now_s.clone());
             after.updated_at = now_s;
             finish(
@@ -1152,6 +1185,220 @@ fn step_response(
             (applied_status, Json(body)).into_response()
         }
     }
+}
+
+// ---- lifecycle transitions ------------------------------------------------
+
+/// Serialize lifecycle transitions by resolved worker name, including typed
+/// bootstrap, so an in-flight spawn cannot complete after Pause acknowledges.
+pub(crate) fn lifecycle_lock(name: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>> = std::sync::OnceLock::new();
+    LOCKS.get_or_init(Mutex::default).lock().unwrap().entry(name.to_owned()).or_default().clone()
+}
+
+pub async fn pause_worker(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+    change_pause(state, key, true).await
+}
+
+pub async fn resume_worker(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+    change_pause(state, key, false).await
+}
+
+async fn change_pause(state: AppState, key: String, paused: bool) -> Response {
+    use crate::api::session_verbs as fleet;
+    let name = match resolve_key(&state, key.clone()).await {
+        Ok(n) => n, Err(r) => return r,
+    };
+    let lock = lifecycle_lock(&name);
+    let _guard = lock.lock().await;
+    let row = match state.store.read().and_then(|conn| Ok(queries::get_worker(&conn, &key)?)) {
+        Ok(row) => row, Err(e) => return internal(e),
+    };
+    let legacy = fleet::lane_env_exists(&name);
+    if row.is_none() && !legacy { return not_found(&key); }
+    let cfg = fleet::parse_env(&name);
+    let current = row.as_ref().map(|r| r.lifecycle).unwrap_or_else(|| {
+        if cfg.get("CC_ARCHIVED") == Some("1") { WorkerLifecycle::Archived }
+        else if cfg.get("CC_PAUSED") == Some("1") { WorkerLifecycle::Paused }
+        else { WorkerLifecycle::Active }
+    });
+    if !matches!(current, WorkerLifecycle::Active | WorkerLifecycle::Paused)
+        || cfg.get("CC_ARCHIVED") == Some("1") {
+        return err(StatusCode::CONFLICT, json!({"error":"restore the worker before pausing or resuming", "state":current.as_str()}));
+    }
+    let target = if paused { WorkerLifecycle::Paused } else { WorkerLifecycle::Active };
+    // A repeated Resume is a no-op, not a request to restart a manually stopped worker.
+    if !paused && current == target && cfg.get("CC_PAUSED") != Some("1") {
+        return (StatusCode::OK, Json(json!({"applied":false,"lifecycle":"active","name":name}))).into_response();
+    }
+    if let Some(row) = &row {
+        let response = lifecycle_transition(state.clone(), row.id.clone(),
+            &[WorkerLifecycle::Active, WorkerLifecycle::Paused], target,
+            if paused { "pause" } else { "resume" }).await;
+        if !response.status().is_success() { return response; }
+    }
+    let outcome: anyhow::Result<Value> = async {
+        fleet::set_legacy_paused(&name, paused)?;
+        if let (Some(row), Some(protocol)) = (&row, crate::opencode::process_protocol()) {
+            let worker = WorkerId::parse(&row.id)?;
+            let result = if paused { protocol.pause(&worker).await } else { protocol.resume(&worker).await };
+            if !matches!(result, Err(crate::opencode::ProtocolError::NoSession(_))) { result?; }
+        }
+        if legacy {
+            if paused {
+                fleet::stop_for_pause(&state, &name).await?;
+                Ok(json!({"running":false,"session":"stopped"}))
+            } else {
+                let (ok, detail) = fleet::start_session(&state, &name, "", false).await;
+                anyhow::ensure!(ok, "{detail}");
+                Ok(json!({"running":true,"session":"started"}))
+            }
+        } else if paused {
+            let row = row.as_ref().unwrap();
+            // End the durable session first so bootstrap cannot re-adopt it.
+            let response = stop_worker(State(state.clone()), Path(row.id.clone())).await;
+            anyhow::ensure!(response.status().is_success(), "could not end worker session");
+            let has_session = state.store.read()?.query_row(
+                "SELECT EXISTS(SELECT 1 FROM _amux_sessions WHERE worker_id=?1)", [&row.id], |r| r.get::<_, bool>(0))?;
+            if !has_session { return Ok(json!({"running":false,"session":"stopped"})); }
+            let backend = crate::backend::process_backend(&row.backend)
+                .ok_or_else(|| anyhow::anyhow!("backend '{}' is unavailable; shutdown cannot be verified", row.backend))?;
+            let process = crate::backend::ProcessRef {
+                backend_ref: backend_ref(&WorkerId::parse(&row.id)?), pid: None,
+            };
+            backend.terminate(&process).await?;
+            anyhow::ensure!(!matches!(backend.status(&process).await?, crate::backend::BackendStatus::Running), "worker is still running after pause");
+            Ok(json!({"running":false,"session":"stopped"}))
+        } else {
+            let response = start_worker(State(state.clone()), Path(key.clone())).await;
+            if !response.status().is_success() {
+                let bytes = axum::body::to_bytes(response.into_body(), 65536).await?;
+                let body: Value = serde_json::from_slice(&bytes)?;
+                anyhow::bail!("{}", body["error"].as_str().unwrap_or("worker start was refused"));
+            }
+            Ok(json!({"session":"starting"}))
+        }
+    }.await;
+    crate::api::sessions_legacy::invalidate_sessions_cache();
+    match outcome {
+        Ok(mut body) => {
+            body["applied"] = json!(current != target);
+            body["lifecycle"] = json!(target.as_str());
+            body["name"] = json!(name);
+            tracing::info!(session = name, lifecycle = target.as_str(), verdict = "worker_lifecycle_applied", "worker lifecycle and runtime transition completed");
+            (if body["session"] == "starting" { StatusCode::ACCEPTED } else { StatusCode::OK }, Json(body)).into_response()
+        }
+        Err(e) => {
+            // Fail closed: a failed Resume stays paused and can be retried.
+            if !paused {
+                if let Some(row) = &row {
+                    let _ = lifecycle_transition(state.clone(), row.id.clone(), &[WorkerLifecycle::Active, WorkerLifecycle::Paused], WorkerLifecycle::Paused, "resume_failed").await;
+                    if let Some(protocol) = crate::opencode::process_protocol() {
+                        if let Ok(worker) = WorkerId::parse(&row.id) {
+                            if let Err(rollback) = protocol.pause(&worker).await {
+                                if !matches!(rollback, crate::opencode::ProtocolError::NoSession(_)) {
+                                    tracing::error!(session = name, %rollback, "worker_protocol_rollback_failed");
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Err(rollback) = fleet::set_legacy_paused(&name, true) {
+                    tracing::error!(session = name, %rollback, "worker_lifecycle_rollback_failed");
+                }
+            }
+            tracing::warn!(session = name, %e, paused, verdict = "worker_lifecycle_failed", "worker lifecycle transition failed; completion was not acknowledged");
+            err(StatusCode::BAD_GATEWAY, json!({"error":e.to_string(),"applied":false,"name":name}))
+        }
+    }
+}
+
+/// Shared lifecycle transition logic.
+async fn lifecycle_transition(
+    state: AppState,
+    key: String,
+    from: &[WorkerLifecycle],
+    to: WorkerLifecycle,
+    verb: &'static str,
+) -> Response {
+    let slot: Arc<Mutex<Option<StepOutcome>>> = Arc::new(Mutex::new(None));
+    let slot_w = slot.clone();
+    let key_w = key.clone();
+    let from_owned: Vec<WorkerLifecycle> = from.to_vec();
+    let write = state
+        .store
+        .write_async(move |conn| {
+            let Some(row) = queries::get_worker(conn, &key_w)? else {
+                return finish(&slot_w, StepOutcome::NotFound, no_write());
+            };
+            if !from_owned.contains(&row.lifecycle) {
+                return finish(
+                    &slot_w,
+                    StepOutcome::Refused {
+                        error: "lifecycle transition not permitted from current state",
+                        state: row.lifecycle.as_str().to_string(),
+                    },
+                    no_write(),
+                );
+            }
+            if row.lifecycle == to {
+                return finish(
+                    &slot_w,
+                    StepOutcome::Noop {
+                        body: json!({
+                            "applied": false,
+                            "lifecycle": to.as_str(),
+                            "worker_id": row.id,
+                        }),
+                    },
+                    no_write(),
+                );
+            }
+            let now_s = chrono::Utc::now().to_rfc3339();
+            let n = queries::update_worker_lifecycle(
+                conn,
+                &row.id,
+                &from_owned,
+                to,
+                &now_s,
+            )?;
+            if n == 0 {
+                return finish(
+                    &slot_w,
+                    StepOutcome::Refused {
+                        error: "lifecycle transition failed (concurrent change)",
+                        state: row.lifecycle.as_str().to_string(),
+                    },
+                    no_write(),
+                );
+            }
+            let mut after = row.clone();
+            after.lifecycle = to;
+            after.updated_at = now_s;
+            if to == WorkerLifecycle::Deleted {
+                after.deleted_at = Some(after.updated_at.clone());
+            }
+            finish(
+                &slot_w,
+                StepOutcome::Applied {
+                    body: json!({
+                        "applied": true,
+                        "lifecycle": to.as_str(),
+                        "worker_id": after.id,
+                        "verb": verb,
+                    }),
+                },
+                WriteOutcome {
+                    applied: true,
+                    events: vec![ev_worker(
+                        &after,
+                        MutationKind::Updated,
+                    )],
+                },
+            )
+        })
+        .await;
+    step_response(write, slot, &key, StatusCode::OK)
 }
 
 // ---- GET /api/workers/{id}/peek -----------------------------------------
@@ -2204,6 +2451,60 @@ mod tests {
         let (_, _, back) = send(&app, "GET", &format!("/api/workers/{id}"), None).await;
         assert_eq!(back["version"], json!(0));
         assert_eq!(health_rev(&app).await, rev_before);
+    }
+
+    #[tokio::test]
+    async fn pause_lifecycle_validates_and_blocks_start() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (app, _dir) = app();
+        for verb in ["pause", "resume"] {
+            let (st, _, body) = send(&app, "POST", &format!("/api/workers/ghost/{verb}"), None).await;
+            assert_eq!(st, StatusCode::NOT_FOUND, "{body}");
+        }
+        let id = create(&app, "pause-probe").await;
+        for applied in [true, false] {
+            let (st, _, body) = send(&app, "POST", &format!("/api/workers/{id}/pause"), None).await;
+            assert_eq!(st, StatusCode::OK, "{body}");
+            assert_eq!(body["lifecycle"], "paused");
+            assert_eq!(body["running"], false);
+            assert_eq!(body["applied"], applied);
+        }
+        let (st, _, _) = send(&app, "POST", &format!("/api/workers/{id}/start"), None).await;
+        assert_eq!(st, StatusCode::CONFLICT);
+        let (st, _, body) = send(&app, "POST", &format!("/api/workers/{id}/resume"), None).await;
+        if st == StatusCode::BAD_GATEWAY {
+            assert!(body["error"].as_str().unwrap().contains("memory headroom"), "{body}");
+            let (_, _, worker) = send(&app, "GET", &format!("/api/workers/{id}"), None).await;
+            assert_eq!(worker["lifecycle"], "paused");
+            return; // Host admission denial is tested as a failed Resume, never bypassed.
+        }
+        assert_eq!(st, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(body["session"], "starting");
+        let (st, _, body) = send(&app, "POST", &format!("/api/workers/{id}/resume"), None).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert_eq!(body["applied"], false);
+    }
+
+    #[tokio::test]
+    async fn pause_legacy_failure_and_resume_failure_are_honest() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        let env = home.path().join("sessions/pause-probe.env");
+        std::fs::write(&env, "CC_PAUSED=1\nCC_BACKEND=herdr\nCC_DIR=/tmp\n").unwrap();
+        let (app, _dir) = app();
+        // Unsupported startup cannot advertise an active worker or remove its gate.
+        let (st, _, body) = send(&app, "POST", "/api/workers/pause-probe/resume", None).await;
+        assert_eq!(st, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(body["applied"], false);
+        assert_eq!(crate::api::session_verbs::parse_env("pause-probe").get("CC_PAUSED"), Some("1"));
+        std::fs::write(&env, "CC_ARCHIVED=1\n").unwrap();
+        for verb in ["pause", "resume"] {
+            let (st, _, body) = send(&app, "POST", &format!("/api/workers/pause-probe/{verb}"), None).await;
+            assert_eq!(st, StatusCode::CONFLICT, "{body}");
+        }
+        assert_eq!(std::fs::read_to_string(&env).unwrap(), "CC_ARCHIVED=1\n");
     }
 
     #[tokio::test]

@@ -8,6 +8,7 @@ test('loaded fleet header controls stay visible and operable at phone widths',as
   }))}));
   await page.goto('/');
   await expect(page.locator('#active-count')).toHaveText('52');
+  await expect(page.locator('#active-btn')).toBeHidden();
   for(const width of [320,375,402,480,481,600]){
     await page.setViewportSize({width,height:800});
     await expect(page.locator('#rate-limit-pill-count')).toHaveText('18');
@@ -15,14 +16,14 @@ test('loaded fleet header controls stay visible and operable at phone widths',as
     expect(await page.locator('#brand-name-header').evaluate(e=>getComputedStyle(e,'::after').content)).toBe('"a"');
     expect(await page.locator('#conn-status').evaluate(e=>getComputedStyle(e).fontSize)).toBe('0px');
     await expect.poll(()=>page.evaluate(()=>(window as any)._headerLayoutCheck())).toEqual([]);
-    for(const id of ['brand-header','conn-status','notif-btn','rate-limit-pill','add-btn','settings-btn','active-btn']){
+    for(const id of ['brand-header','conn-status','notif-btn','rate-limit-pill','add-btn','settings-btn']){
       const box=await page.locator('#'+id).boundingBox();
       expect(box).not.toBeNull();expect(box!.width).toBeGreaterThanOrEqual(44);expect(box!.height).toBeGreaterThanOrEqual(44);
       expect(box!.x).toBeGreaterThanOrEqual(0);expect(box!.x+box!.width).toBeLessThanOrEqual(width);
       expect(await page.locator('#'+id).evaluate(e=>{const r=e.getBoundingClientRect();return e.contains(document.elementFromPoint(r.x+r.width/2,r.y+r.height/2));})).toBe(true);
     }
     expect(await page.locator('.header-row').evaluate(e=>e.getBoundingClientRect().height)).toBeLessThanOrEqual(57);
-    const tops=await page.locator('#brand-header,#conn-status,#notif-btn,#rate-limit-pill,#active-btn,#add-btn,#settings-btn').evaluateAll(els=>els.map(e=>e.getBoundingClientRect().top));
+    const tops=await page.locator('#brand-header,#conn-status,#notif-btn,#rate-limit-pill,#add-btn,#settings-btn').evaluateAll(els=>els.map(e=>e.getBoundingClientRect().top));
     expect(Math.max(...tops)-Math.min(...tops)).toBeLessThanOrEqual(1);
     await page.locator('#settings-btn').click();await expect(page.locator('#settings-menu')).toBeVisible();
     expect(await page.locator('#settings-menu').evaluate(e=>e.getBoundingClientRect().top)).toBeGreaterThanOrEqual((await page.locator('#settings-btn').boundingBox())!.y+44);
@@ -46,6 +47,7 @@ test('header badge, controls and text tabs fit both themes from phone through de
  await page.route(/\/api\/prefs\?key=tabs_display$/,r=>r.fulfill({json:{value:'text'}}));
  await page.route(/\/api\/sessions(?:\?.*)?$/,r=>r.fulfill({json:Array.from({length:52},(_,i)=>({name:'header-test-'+i,running:true,dir:'/workspace',provider:'codex',rate_limited_until:i<23?Date.now()/1000+3600:null}))}));
  await page.goto('/');await expect(page.locator('#active-count')).toHaveText('52');
+  await expect(page.locator('#active-btn')).toBeHidden();
  for(const light of [true,false])for(const width of [375,600,601,768,1440]){
   await page.setViewportSize({width,height:900});
   await page.evaluate(light=>{document.body.classList.toggle('light',light);const badge=document.querySelector<HTMLElement>('#notif-badge')!;badge.textContent='99+';badge.style.display='flex';},light);

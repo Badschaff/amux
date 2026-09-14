@@ -576,6 +576,7 @@ let sessions = [];
 // truth. A request begun before an SSE update must not finish later and put the
 // old task attribution back on screen.
 let _sessionsSnapshotEpoch = 0;
+let pausedExpanded = false;
 let archivedExpanded = false;
 let gitInfo = {};  // {sessionName: {branch, repo, _conflict}}
 let _sessionLoadError = null; // Last failed worker read; a response is not necessarily data.
@@ -4380,7 +4381,13 @@ function _stalledChip(s) {
     + w.ready + ' ready</span>';
 }
 
+const _workerLifecyclePending = new Map();
 function _workerExecutionBadge(s, runtimeBoard) {
+  const pending = _workerLifecyclePending.get(s.name);
+  if (pending) return '<span class="status-badge idle">' + pending + '…</span>';
+  if (s.lifecycle === 'paused') return s.running
+    ? '<span class="status-badge blocked" title="Pause has not finished stopping this worker. Retry Pause.">pause incomplete</span>'
+    : '<span class="status-badge paused">paused</span>';
   let badge = '';
   if (s.status === 'starting') badge = '<span class="status-badge idle">starting</span>';
   else if (!s.running) badge = '<span class="status-badge idle">stopped</span>';
@@ -4684,7 +4691,7 @@ function _nudgeWorkersOnBoardChange() {
   } catch (e) { /* a render hiccup must not break the ingest that called us */ }
 }
 function _grpMembers(g) {
-  const all = (sessions || []).filter(s => !s.archived);
+  const all = (sessions || []).filter(s => !s.archived && s.lifecycle !== 'paused');
   return all.filter(s => (s.tags || []).includes(g));
 }
 function _grpSummary(g) {
@@ -4799,6 +4806,9 @@ function _workerActionDefinitions(s) {
       run: "newConversation('" + name + "'," + (s.running ? 'true' : 'false') + ")" },
     { key: 'share', icon: '&#x1F517;', label: 'Share link',
       run: "closeAllMenus();shareSession('" + name + "')" },
+    s.lifecycle === 'paused' && !s.running
+      ? { key: 'resume', icon: '&#x25B6;', label: 'Resume', run: "resumeWorker('" + name + "')" }
+      : { key: 'pause', icon: '&#x23F8;', label: 'Pause', run: "pauseWorker('" + name + "')" },
     { key: 'archive', icon: '&#x1F4E6;', label: 'Archive',
       run: "archiveSession('" + name + "')" },
     { separator: true },
@@ -4909,7 +4919,7 @@ function render() {
   renderActiveFilters();
   // Build tag filter bar
   const tagEl = document.getElementById('tag-filters');
-  const allTags = [...new Set(sessions.filter(s => !s.archived).flatMap(s => s.tags || []))].sort();
+  const allTags = [...new Set(sessions.filter(s => !s.archived && s.lifecycle !== 'paused').flatMap(s => s.tags || []))].sort();
   if (activeTag && !allTags.includes(activeTag)) activeTag = null;
   // Pills FILTER the worker list. Nothing more.
   //
@@ -4938,7 +4948,7 @@ function render() {
   _renderGroupsTab();
   const stripEl = document.getElementById('grp-scope-strip');
   if (stripEl && stripEl.innerHTML) { stripEl.innerHTML = ''; stripEl._want = ''; }
-  const _nonArchivedCount = sessions.filter(s => !s.archived).length;
+  const _nonArchivedCount = sessions.filter(s => !s.archived && s.lifecycle !== 'paused').length;
   if (!_nonArchivedCount && !drafts.length) {
     if (_sessionLoadError) {
       el.innerHTML = ''; // Actionable detail is in the Sync error badge modal.
@@ -4963,9 +4973,10 @@ function render() {
         : '<div class="empty"><span class="loading-spinner"></span>Connecting to server…<br>' +
           '<a href="/api/_clear_sw" style="color:var(--dim);font-size:0.75rem;margin-top:8px;display:inline-block;">Stuck? Clear cache</a></div>';
     } else {
-      el.innerHTML = '<div class="empty">No workers yet.<br>Tap <strong>+</strong> to create one.' +
+      el.innerHTML = '<div class="empty">' + (sessions.some(s => s.lifecycle === 'paused') ? 'No active workers. Resume a paused worker to continue.' : 'No workers yet.<br>Tap <strong>+</strong> to create one.') +
         (!online ? '<br><span style="color:var(--yellow)">You\'re offline — workers created now will sync when connected.</span>' : '') + '</div>';
     }
+    _renderPausedSection();
     _renderArchivedSection();
     _restoreCardFocus(focusedId);
     return;
@@ -4989,7 +5000,7 @@ function render() {
   }).join('');
 
   // Filter by tag (exclude archived from main view)
-  let list = (activeTag ? sessions.filter(s => (s.tags || []).includes(activeTag)) : sessions).filter(s => !s.archived);
+  let list = (activeTag ? sessions.filter(s => (s.tags || []).includes(activeTag)) : sessions).filter(s => !s.archived && s.lifecycle !== 'paused');
   // Filter by search query
   const q = searchQuery.toLowerCase().trim();
   let filtered = q ? list.filter(s =>
@@ -5005,6 +5016,7 @@ function render() {
   if (filterStatuses.size) filtered = filtered.filter(s => filterStatuses.has(_sessStatusKey(s)));
   if ((q || activeTag || filterProviders.size || filterModels.size || filterStatuses.size) && !filtered.length) {
     el.innerHTML = '<div class="empty">No matching workers.</div>';
+    _renderPausedSection();
     _renderArchivedSection();
     _restoreCardFocus(focusedId);
     return;
@@ -5168,6 +5180,7 @@ function render() {
     el.innerHTML = draftCards + frozenList.map(_renderSessionCard).join('');
     for (const [id, d] of Object.entries(savedInputs)) { const inp = document.getElementById(id); if (inp) { inp.value = d.value; autoGrow(inp); } }
     _restoreCardFocus(focusedId, savedInputs);
+    _renderPausedSection();
     _renderArchivedSection();
     requestAnimationFrame(initSortable);
     requestAnimationFrame(() => { document.querySelectorAll('.chips[id^="card-chips-"]').forEach(el => { const name = el.id.replace('card-chips-', ''); if (name) renderChips(el, name, false); }); });
@@ -5182,6 +5195,7 @@ function render() {
     _checkWorkerStatusOrder();
     for (const [id, d] of Object.entries(savedInputs)) { const inp = document.getElementById(id); if (inp) { inp.value = d.value; autoGrow(inp); } }
     _restoreCardFocus(focusedId, savedInputs);
+    _renderPausedSection();
     _renderArchivedSection();
     requestAnimationFrame(initSortable);
     requestAnimationFrame(() => {
@@ -5258,6 +5272,8 @@ function render() {
     if (inp) { inp.value = d.value; autoGrow(inp); }
   }
   _restoreCardFocus(focusedId, savedInputs);
+
+  _renderPausedSection();
 
   _renderArchivedSection();
 
@@ -6517,6 +6533,59 @@ function _applyEmbedView() {
   }
 })();
 
+function togglePaused() {
+  pausedExpanded = !pausedExpanded;
+  _renderPausedSection();
+}
+
+function _renderPausedSection() {
+  const el = document.getElementById('paused-section');
+  if (!el) return;
+  const allPaused = sessions.filter(s => s.lifecycle === 'paused' && !s.archived);
+  if (!allPaused.length) { el.innerHTML = ''; return; }
+  const q = searchQuery.toLowerCase().trim();
+  const paused = q ? allPaused.filter(s =>
+    s.name.toLowerCase().includes(q) ||
+    (s.dir || '').toLowerCase().includes(q) ||
+    (s.desc || '').toLowerCase().includes(q) ||
+    (s.tags || []).some(t => t.toLowerCase().includes(q))
+  ) : allPaused;
+  const showExpanded = pausedExpanded;
+  const label = q && paused.length !== allPaused.length
+    ? `${paused.length} of ${allPaused.length} paused`
+    : `${allPaused.length} paused`;
+  const chevron = `<span class="paused-chevron${showExpanded ? ' open' : ''}">&#x25B6;</span>`;
+  let html = `<div class="paused-footer" onclick="togglePaused()">${chevron} ${label}</div>`;
+  if (showExpanded) {
+    html += '<div class="paused-body">';
+    (q ? paused : allPaused).forEach(s => {
+      const ago = s.last_activity ? timeAgo(s.last_activity) : '';
+      const dir = s.dir ? s.dir.replace(/^\/Users\/[^/]+/, '~') : '';
+      const model = s.active_model || sessionConfiguredModel(s) || '';
+      const body = esc(s.task_name || s.preview || s.desc || '');
+      const meta = [];
+      if (dir) meta.push(`<code title="${esc(s.dir)}">${esc(dir)}</code>`);
+      if (ago) meta.push(`active ${ago}`);
+      (s.tags || []).forEach(t => meta.push(`<span class="paused-card-tag">#${esc(t)}</span>`));
+      html += `<div class="paused-card" data-session="${esc(s.name)}">
+        <div class="paused-card-top">
+          <span class="paused-card-name" onclick="openPeek('${esc(s.name)}')">${esc(s.name)}</span>
+          ${model ? `<span class="paused-card-chip model">${esc(model)}</span>` : ''}
+          <span class="paused-card-spacer"></span>
+          <div class="paused-card-actions">
+            <button class="paused-resume-btn" ${_workerLifecyclePending.has(s.name) ? 'disabled' : ''} onclick="${s.running ? 'pauseWorker' : 'resumeWorker'}('${esc(s.name)}')">${_workerLifecyclePending.get(s.name) || (s.running ? 'Retry Pause' : 'Resume')}</button>
+            <button class="paused-archive-btn" onclick="archiveSession('${esc(s.name)}')">Archive</button>
+          </div>
+        </div>
+        ${meta.length ? `<div class="paused-card-meta">${meta.join('<span style="opacity:0.4;">&middot;</span>')}</div>` : ''}
+        ${body ? `<div class="paused-card-preview">${body}</div>` : ''}
+      </div>`;
+    });
+    html += '</div>';
+  }
+  if (el.innerHTML !== html) el.innerHTML = html;
+}
+
 function toggleArchived() {
   archivedExpanded = !archivedExpanded;
   _renderArchivedSection();
@@ -6598,7 +6667,7 @@ function toggleActiveDropdown() {
     activeDropdownOpen = false;
     return;
   }
-  const running = sessions.filter(s => s.running);
+  const running = sessions.filter(s => s.running && s.lifecycle !== 'paused');
   if (!running.length) {
     dd.innerHTML = '<div class="active-dropdown-empty">No active workers</div>';
   } else {
@@ -6630,7 +6699,7 @@ function closeActiveDropdown(e) {
   activeDropdownOpen = false;
 }
 function updateActiveCount() {
-  const count = sessions.filter(s => s.running).length;
+  const count = sessions.filter(s => s.running && s.lifecycle !== 'paused').length;
   const el = document.getElementById('active-count');
   const btn = document.getElementById('active-btn');
   if (el) el.textContent = count;
@@ -7644,6 +7713,39 @@ async function deleteSession(session) {
   await fetchSessions();
 }
 
+async function pauseWorker(session) { return _changeWorkerPaused(session, true); }
+async function resumeWorker(session) { return _changeWorkerPaused(session, false); }
+
+async function _changeWorkerPaused(session, paused) {
+  if (_workerLifecyclePending.has(session)) return;
+  closeAllMenus();
+  const label = paused ? 'Pausing' : 'Resuming';
+  _workerLifecyclePending.set(session, label.toLowerCase());
+  const done = _cardBusy(session, label);
+  updatePeekStatus();
+  _renderPausedSection();
+  try {
+    const r = await apiCall(API + '/api/workers/' + encodeURIComponent(session) + (paused ? '/pause' : '/resume'), { method: 'POST' });
+    if (r) {
+      const body = await r.json();
+      // Acknowledged lifecycle is projected immediately; a slow sessions poll
+      // must not leave a stale Resume action or a Working badge behind.
+      const worker = sessions.find(s => s.name === session);
+      if (worker && body.lifecycle) {
+        worker.lifecycle = body.lifecycle;
+        if (typeof body.running === 'boolean') worker.running = body.running;
+        if (body.session === 'starting' || (!paused && body.session === 'started')) worker.status = 'starting';
+      }
+      showToast(session + (paused ? ' paused — work stopped' : ' resuming'));
+    }
+    await fetchSessions();
+  } finally {
+    _workerLifecyclePending.delete(session);
+    done();
+    render();
+  }
+}
+
 async function archiveSession(session) {
   closeAllMenus();
   const done = _cardBusy(session, 'Archiving');
@@ -8272,7 +8374,7 @@ function _renderGroupsTab() {
   if (activeView !== 'groups') return;
   const el = document.getElementById('groups-container');
   if (!el) return;
-  const all = (sessions || []).filter(s => !s.archived);
+  const all = (sessions || []).filter(s => !s.archived && s.lifecycle !== 'paused');
   const groups = [...new Set(all.flatMap(s => s.tags || []))].sort();
   const grouped = new Set(all.filter(s => (s.tags || []).length).map(s => s.name));
   const activeN = all.filter(s => s.status === 'active').length;
@@ -10631,7 +10733,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.942';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.943';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -18293,7 +18395,7 @@ const _MODEL_LABELS = { opus: 'Opus', sonnet: 'Sonnet', haiku: 'Haiku', fable: '
 function _mLabel(x){ return _MODEL_LABELS[x] || (x.charAt(0).toUpperCase()+x.slice(1)); }
 const _STATUS_LABELS = { starting: 'Starting', error: 'Error', working: 'Working', blocked: 'Blocked', waiting: 'Waiting', rate_limited: 'Rate limited', api_error: 'API error', idle: 'Idle', stopped: 'Stopped' };
 function renderFilterOptions() {
-  const live = sessions.filter(s => !s.archived);
+  const live = sessions.filter(s => !s.archived && s.lifecycle !== 'paused');
   // Status chips — fixed order, only states that exist (or are selected)
   const sEl = document.getElementById('filter-statuses');
   if (sEl) {
@@ -21185,7 +21287,7 @@ async function _connLoadFleet() {
   try {
     const arr = await (await fetch('/api/sessions')).json();
     const list = Array.isArray(arr) ? arr : [];
-    const workers = list.filter(s => !s.archived).map(s => s.name).filter(Boolean).sort();
+    const workers = list.filter(s => !s.archived && s.lifecycle !== 'paused').map(s => s.name).filter(Boolean).sort();
     const gs = new Set();
     list.forEach(s => (s.groups || []).forEach(g => g && gs.add(g)));
     _connFleet = { workers, groups: [...gs].sort() };
@@ -23650,7 +23752,7 @@ function toggleFreeze() {
     // pinned workers back below active workers in group view on the same tap.
     const rendered = [...document.querySelectorAll('#cards .card[data-session]')]
       .map(card => card.dataset.session);
-    const remaining = sessions.filter(s => !s.archived && !rendered.includes(s.name))
+    const remaining = sessions.filter(s => !s.archived && s.lifecycle !== 'paused' && !rendered.includes(s.name))
       .sort(_sortFnFor(sortMode)).map(s => s.name);
     cardOrder = [...new Set([...rendered, ...remaining])];
     fetch(API + '/api/client-debug', { method: 'POST', headers: _authHeaders({ 'Content-Type': 'application/json' }),
@@ -36619,7 +36721,7 @@ function _trendsFocusTheme(k) {
 function _costFillGroups(sel) {
   const el = document.getElementById('cost-group');
   if (!el) return;
-  const tags = [...new Set((sessions || []).filter(s => !s.archived).flatMap(s => s.tags || []))].sort();
+  const tags = [...new Set((sessions || []).filter(s => !s.archived && s.lifecycle !== 'paused').flatMap(s => s.tags || []))].sort();
   const cur = sel !== undefined ? sel : el.value;
   el.innerHTML = '<option value="">All workers</option>'
     + tags.map(t => '<option value="' + escJs(t) + '"' + (t === cur ? ' selected' : '') + '>' + esc(t) + '</option>').join('');

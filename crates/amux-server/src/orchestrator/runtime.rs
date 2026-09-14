@@ -62,16 +62,20 @@ fn decomposition_depth(
 /// (ethos rule 1: a view must share the predicate of the mechanism it
 /// claims to describe).
 pub fn hydrate_workers(conn: &rusqlite::Connection) -> anyhow::Result<Vec<Worker>> {
-    // (offset, limit) — a swapped pair here silently loads ZERO workers,
-    // which the recovery test caught: name the intent.
+    // Only active workers participate in orchestration. Paused, archived,
+    // and deleted workers are excluded by the lifecycle filter so the
+    // planner never assigns them work.
+    let active_only = &[amux_core::worker::WorkerLifecycle::Active];
     let (offset, limit) = (0u64, 10_000u64);
-    let (rows, _total) = crate::db::queries::list_workers(conn, offset, limit)?;
+    let (rows, _total) =
+        crate::db::queries::list_workers_by_lifecycle(conn, active_only, offset, limit)?;
     Ok(rows
         .into_iter()
         .filter_map(|row| {
             let id = amux_core::ids::WorkerId::parse(&row.id).ok()?;
             let mut w = Worker::new(id, row.config(), Default::default());
             w.state = row.state.clone();
+            w.lifecycle = row.lifecycle;
             w.version = row.version;
             Some(w)
         })
@@ -1399,6 +1403,13 @@ impl Runtime {
             rows.collect::<Result<_, _>>()?
         };
         for wid_str in worker_ids {
+            let row = { let conn = self.store.read()?; crate::db::queries::get_worker(&conn, &wid_str)? };
+            // Missing rows retain the ordinary delivery/failure path; only a
+            // known inactive worker parks its queue without consuming retries.
+            let lock = crate::api::workers::lifecycle_lock(row.as_ref().map_or(&wid_str, |r| &r.display_name));
+            let _guard = lock.lock().await;
+            let active = { let conn = self.store.read()?; crate::db::queries::get_worker(&conn, &wid_str)?.is_none_or(|r| r.lifecycle.is_drivable()) };
+            if !active { continue; }
             let Ok(worker) = amux_core::ids::WorkerId::parse(&wid_str) else {
                 continue;
             };
@@ -2100,6 +2111,45 @@ mod pump_tests {
             pickup_unowned: false,
             resume_stagger_secs: 5,
         }
+    }
+
+    #[tokio::test]
+    async fn pause_parks_immediate_commands_until_resume() {
+        use amux_core::worker::{WorkerConfig, WorkerLifecycle};
+        let store = store();
+        let protocol = Arc::new(MockProtocol::new());
+        protocol.register(wid(), AgentState::Idle);
+        let cmd_id = CommandId::from_ulid(ulid::Ulid::from_parts(1_700_000_000_000, 504));
+        let id = cmd_id.clone();
+        store.write(move |conn| {
+            let mut row = crate::db::queries::WorkerRow::new(&wid(), &WorkerConfig {
+                display_name: "paused-pump".into(), name_aliases: vec![], cwd: "/tmp".into(),
+                provider: amux_core::provider::ProviderId::new("claude"), model: None,
+                backend: amux_core::session::BackendId::herdr(), environment: Default::default(),
+                permissions: vec![], group: None,
+            }, "2026-09-14T00:00:00Z");
+            row.lifecycle = WorkerLifecycle::Paused;
+            crate::db::queries::insert_worker(conn, &row)?;
+            crate::db::commands::enqueue(conn, id, &wid(), &WorkerCommand::Continue,
+                "paused-immediate", &DeliveryTiming::Immediate, None, Utc::now())?;
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let rt = runtime_with(store.clone(), protocol.clone());
+        rt.pump_commands(Utc::now(), &BTreeMap::new()).await.unwrap();
+        assert!(protocol.calls().is_empty(), "Pause must gate even Immediate delivery");
+        {
+            let conn = store.read().unwrap();
+            let cmd = crate::db::commands::by_id(&conn, &cmd_id).unwrap().unwrap();
+            assert_eq!(cmd.state, CommandState::Queued);
+            assert_eq!(cmd.attempts, 0);
+        }
+        store.write(|conn| {
+            crate::db::queries::update_worker_lifecycle(conn, wid().as_str(),
+                &[WorkerLifecycle::Paused], WorkerLifecycle::Active, "2026-09-14T00:01:00Z")?;
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        rt.pump_commands(Utc::now(), &BTreeMap::new()).await.unwrap();
+        assert_eq!(protocol.calls().len(), 1, "Resume releases the same queued command once");
     }
 
     #[tokio::test]

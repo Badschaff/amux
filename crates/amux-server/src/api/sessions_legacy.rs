@@ -3396,6 +3396,8 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
         // conflating them reported 0 archived against a fleet with dozens.
         let archived = env.get("CC_ARCHIVED").map(|v| v == "1").unwrap_or(false)
             || blocked.contains(&name);
+        let paused = env.get("CC_PAUSED").map(|v| v == "1").unwrap_or(false);
+        let lifecycle = if archived { "archived" } else if paused { "paused" } else { "active" };
         let flags = env.get("CC_FLAGS").cloned().unwrap_or_default();
         let backend = env
             .get("CC_BACKEND")
@@ -3455,6 +3457,7 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
         );
         out.push(json!({
             "archived": archived,
+            "lifecycle": lifecycle,
             // Why a `waiting` lane is waiting, and proof a lane is genuinely
             // busy: the dashboard renders both — a status with no visible
             // reason is a status nobody can act on (ethos rule 4).
@@ -3668,9 +3671,10 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
     let mut stmt = conn.prepare(
         "SELECT w.display_name, w.state, w.provider, w.model, w.cwd,
                 (SELECT COUNT(*) FROM _amux_sessions s
-                 WHERE s.worker_id = w.id AND s.ended_at IS NULL) AS live
+                 WHERE s.worker_id = w.id AND s.ended_at IS NULL) AS live,
+                w.lifecycle
          FROM _amux_workers w
-         WHERE json_extract(w.state, '$.deleted_at') IS NULL
+         WHERE w.lifecycle != 'deleted'
          ORDER BY w.display_name",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -3680,6 +3684,8 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
         let model: Option<String> = r.get(3)?;
         let cwd: String = r.get(4)?;
         let live: i64 = r.get(5)?;
+        let lifecycle: String = r.get::<_, Option<String>>(6)?.unwrap_or_else(|| "active".into());
+        let archived = lifecycle == "archived";
         Ok(json!({
             // The Python list's load-bearing fields; ones the Rust side
             // cannot honestly fill yet are present-and-empty, NOT omitted —
@@ -3687,6 +3693,8 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
             "name": name,
             "status": python_status(&state_json),
             "running": live > 0,
+            "archived": archived,
+            "lifecycle": lifecycle,
             "provider": provider,
             "model": model.unwrap_or_default(),
             "dir": cwd,

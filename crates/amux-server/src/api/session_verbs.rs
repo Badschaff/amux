@@ -6949,7 +6949,7 @@ pub(crate) fn all_lane_names() -> Vec<String> {
         .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(String::from))
         .collect();
     names.sort();
-    names.retain(|n| parse_env(n).get("CC_ARCHIVED") != Some("1"));
+    names.retain(|n| { let cfg = parse_env(n); cfg.get("CC_ARCHIVED") != Some("1") && cfg.get("CC_PAUSED") != Some("1") });
     names
 }
 
@@ -8444,7 +8444,7 @@ fn gemini_session_flag(meta: &mut Map<String, Value>, fresh: bool) -> String {
     format!("--session-id {}", sh_quote(&id))
 }
 
-async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_conv_id: bool) -> (bool, String) {
+pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_conv_id: bool) -> (bool, String) {
     if !valid_session_name(name) {
         return (false, "invalid session name".into());
     }
@@ -8462,6 +8462,9 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
         return (false, format!("session '{name}' not found"));
     }
     let cfg = parse_env(name);
+    if cfg.get("CC_PAUSED") == Some("1") {
+        return (false, "worker is paused; resume it first".into());
+    }
     // ISOLATED (AMUX-3232): computed once here from the worker's own env so the
     // spawn path can strip the harness (env injection below, --mcp-config in
     // build_claude_cmd). Read from cfg, the same map every other CC_* flag on
@@ -9270,6 +9273,9 @@ pub(crate) async fn start_for_board_dispatch(state: &AppState, name: &str) -> Re
     if session_is_isolated(name) {
         return Err("isolated workers never receive board automation".into());
     }
+    if parse_env(name).get("CC_PAUSED") == Some("1") {
+        return Err("paused workers are excluded from board automation".into());
+    }
     let (started, detail) = start_session(state, name, "", false).await;
     if !started {
         return Err(detail);
@@ -9650,6 +9656,142 @@ async fn archive_session_issues(state: &AppState, name: &str, flag: i64) {
             })
         })
         .await;
+}
+
+/// Persist the cold-start gate and report file failures to the lifecycle API.
+pub(crate) fn set_legacy_paused(name: &str, paused: bool) -> anyhow::Result<()> {
+    if !lane_env_exists(name) { return Ok(()); }
+    let mut cfg = parse_env(name);
+    if paused { cfg.set("CC_PAUSED", "1"); } else { cfg.remove("CC_PAUSED"); }
+    cfg.write(&env_path(name))?;
+    crate::api::sessions_legacy::invalidate_sessions_cache();
+    Ok(())
+}
+
+/// Pause stops the process tree, including shell tools and local subagents.
+/// No slash command is typed into a busy provider's composer. Conversation
+/// metadata and terminal history remain available to the ordinary resume path.
+pub(crate) async fn stop_for_pause(state: &AppState, name: &str) -> anyhow::Result<()> {
+    let lock = session_op_lock(name);
+    let _guard = lock.lock().await;
+    let cfg = parse_env(name);
+    if backend_of_cfg(&cfg) == "herdr" {
+        let (ok, detail) = stop_session_process(name).await;
+        anyhow::ensure!(ok, "{detail}");
+    } else {
+        let target = st(name);
+        let pane = tmux(&["list-panes", "-t", &target, "-F", "#{pane_pid}"]).await;
+        if let Some(out) = pane.filter(|o| o.status.success()) {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let root: i32 = line.trim().parse()?;
+                terminate_pane_children(root).await?;
+            }
+        } else {
+            anyhow::ensure!(!is_running(name).await, "could not locate worker process for pause");
+        }
+        anyhow::ensure!(!is_running(name).await, "worker is still running after pause");
+    }
+    clear_stopped_report(state, name).await?;
+    tracing::info!(session = name, verdict = "pause_process_stopped", "worker pause verified process shutdown");
+    Ok(())
+}
+
+fn descendant_pids(root: i32, rows: &[(i32, i32)]) -> Vec<i32> {
+    let mut parents = vec![root];
+    let mut result = Vec::new();
+    while let Some(parent) = parents.pop() {
+        for &(pid, ppid) in rows {
+            if ppid == parent && pid > 1 && pid != root && !result.contains(&pid) {
+                result.push(pid);
+                parents.push(pid);
+            }
+        }
+    }
+    result
+}
+
+pub(crate) async fn terminate_pane_children(root: i32) -> anyhow::Result<()> {
+    terminate_owned_tree(root, false).await
+}
+
+pub(crate) async fn terminate_owned_tree(root: i32, include_root: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(root > 1, "invalid pane process id");
+    // Freeze parents before walking deeper so tools cannot fork past the
+    // snapshot while shutdown is underway. The pane shell itself stays alive.
+    struct Frozen(Vec<i32>);
+    impl Drop for Frozen {
+        fn drop(&mut self) {
+            for &pid in &self.0 { unsafe { libc::kill(pid, libc::SIGCONT); } }
+        }
+    }
+    let mut owned = Frozen(Vec::new());
+    let result = async {
+        if include_root {
+            if unsafe { libc::kill(root, libc::SIGSTOP) } == 0 { owned.0.push(root); }
+            else {
+                let e = std::io::Error::last_os_error();
+                anyhow::ensure!(e.raw_os_error() == Some(libc::ESRCH), "cannot stop process {root}: {e}");
+                return Ok(());
+            }
+        }
+        loop {
+            let out = run_cmd("ps", &["-axo", "pid=,ppid="], OP_TIMEOUT).await
+                .ok_or_else(|| anyhow::anyhow!("process tree probe timed out"))?;
+            anyhow::ensure!(out.status.success(), "process tree probe failed");
+            let rows: Vec<(i32, i32)> = String::from_utf8_lossy(&out.stdout).lines()
+                .filter_map(|line| {
+                    let mut words = line.split_whitespace();
+                    Some((words.next()?.parse().ok()?, words.next()?.parse().ok()?))
+                }).collect();
+            let fresh: Vec<i32> = descendant_pids(root, &rows).into_iter()
+                .filter(|pid| !owned.0.contains(pid)).collect();
+            if fresh.is_empty() { break; }
+            for pid in fresh {
+                // SIGSTOP cannot be caught; ESRCH means it already exited.
+                if unsafe { libc::kill(pid, libc::SIGSTOP) } != 0 {
+                    let e = std::io::Error::last_os_error();
+                    anyhow::ensure!(e.raw_os_error() == Some(libc::ESRCH), "cannot stop process {pid}: {e}");
+                } else { owned.0.push(pid); }
+            }
+        }
+        // Kill leaves first; no parent can create replacements while frozen.
+        for &pid in owned.0.iter().rev() {
+            if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
+                let e = std::io::Error::last_os_error();
+                anyhow::ensure!(e.raw_os_error() == Some(libc::ESRCH), "cannot terminate process {pid}: {e}");
+            }
+        }
+        owned.0.clear(); // Killed processes no longer need the cancellation guard.
+        sleep_ms(100).await;
+        Ok(())
+    }.await;
+    result
+}
+
+/// Sync a lifecycle change from the legacy (env-file) side to the Rust worker
+/// table. Called when the legacy archive/wake verb changes CC_ARCHIVED so the
+/// two substrates stay in agreement.
+pub(crate) async fn sync_lifecycle_to_rust_worker(
+    state: &AppState,
+    name: &str,
+    to: amux_core::worker::WorkerLifecycle,
+) {
+    use amux_core::worker::WorkerLifecycle;
+    let name = name.to_string();
+    let _ = state.store.write_async(move |conn| {
+        let Some(row) = crate::db::queries::get_worker(conn, &name)? else {
+            return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+        };
+        let from: &[WorkerLifecycle] = match to {
+            WorkerLifecycle::Archived => &[WorkerLifecycle::Active, WorkerLifecycle::Paused],
+            WorkerLifecycle::Active => &[WorkerLifecycle::Paused, WorkerLifecycle::Archived],
+            WorkerLifecycle::Paused => &[WorkerLifecycle::Active],
+            WorkerLifecycle::Deleted => &[WorkerLifecycle::Active, WorkerLifecycle::Paused, WorkerLifecycle::Archived],
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let n = crate::db::queries::update_worker_lifecycle(conn, &row.id, from, to, &now)?;
+        Ok(crate::db::WriteOutcome { applied: n > 0, events: vec![] })
+    }).await;
 }
 
 /// py:25137 reset_session — drop the conversation, keep the lane.
@@ -10502,7 +10644,8 @@ async fn peek_response(name: &str, lines: i64, live_only: bool, no_trim: bool) -
     let tmux_lines = if output.is_empty() { 0 } else { output.lines().count() };
     let is_alt = tmux_alt_screen(name).await;
     let has_codex_history = matches!(provider.as_str(), "codex" | "ollama");
-    if is_alt || has_codex_history {
+    // Saved Claude history must survive normal-screen mode after resume.
+    if is_alt || has_codex_history || provider == "claude" {
         let mut history_measurement = None;
         let (transcript, output) = if has_codex_history {
             let transcript = match transcript_history::snapshot(name, &provider, 120_000) {
@@ -10539,6 +10682,12 @@ async fn peek_response(name: &str, lines: i64, live_only: bool, no_trim: bool) -
         let mut out_compat = live_out.clone();
         if out_compat.is_empty() && !output.is_empty() {
             out_compat = collapse_blank_runs(&strip_launch_noise(output.trim()));
+        }
+        if provider == "claude" && !is_alt && !transcript.is_empty() {
+            static RECOVERED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+            if RECOVERED.get_or_init(Default::default).lock().unwrap().insert(name.to_owned()) {
+                tracing::info!(session = name, verdict = "normal_screen_history_restored", "saved Claude history retained independently of terminal mode");
+            }
         }
         let history = if transcript.is_empty() { String::new() } else { collapse_blank_runs(&transcript) };
         let ol = out_compat.lines().filter(|l| !l.trim().is_empty()).count();
@@ -15674,6 +15823,7 @@ async fn post_dispatch(
                 return jresp(StatusCode::FORBIDDEN, json!({"error": "cannot archive pinned session — unpin first"}));
             }
             let (ok, msg) = archive_session(state, name).await;
+            if ok { sync_lifecycle_to_rust_worker(state, name, amux_core::worker::WorkerLifecycle::Archived).await; }
             verb_resp(ok, msg)
         }
         "wake" => wake_verb(state, name).await,
@@ -16597,6 +16747,23 @@ pub(crate) async fn reset_verb(state: &AppState, name: &str) -> Response {
 /// implementation instead of a route alias and a re-implementation (AF-288).
 pub(crate) async fn wake_verb(state: &AppState, name: &str) -> Response {
     let (ok, msg) = wake_session(state, name).await;
+    if ok {
+        // Only restore from Archived. Paused workers keep their lifecycle
+        // on wake; explicit `resume` is required to unpause.
+        let name_owned = name.to_string();
+        let store = state.store.clone();
+        let _ = store.write_async(move |conn| {
+            use amux_core::worker::WorkerLifecycle;
+            let Some(row) = crate::db::queries::get_worker(conn, &name_owned)? else {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            };
+            let now = chrono::Utc::now().to_rfc3339();
+            let n = crate::db::queries::update_worker_lifecycle(
+                conn, &row.id, &[WorkerLifecycle::Archived], WorkerLifecycle::Active, &now,
+            )?;
+            Ok(crate::db::WriteOutcome { applied: n > 0, events: vec![] })
+        }).await;
+    }
     verb_resp(ok, msg)
 }
 
@@ -25320,6 +25487,63 @@ CLAUDE-POSTFIX-COMPLETE
         signals.shell_only.insert("amux-stopped".into());
         signals.reports = reports;
         assert!(!signals.agent_running("amux-stopped"), "a dead worker must not be rescued by its old report");
+    }
+
+    #[tokio::test]
+    async fn pause_terminates_tools_and_grandchildren_without_touching_peer() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use std::process::Stdio;
+        let mut pane = tokio::process::Command::new("sh")
+            .args(["-c", "sh -c 'sleep 120 & wait' & echo $!; read done"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+        let mut lines = BufReader::new(pane.stdout.take().unwrap()).lines();
+        let child: i32 = lines.next_line().await.unwrap().unwrap().parse().unwrap();
+        let mut peer = tokio::process::Command::new("sleep").arg("120").kill_on_drop(true).spawn().unwrap();
+        sleep_ms(100).await;
+        let ps = run_cmd("ps", &["-axo", "pid=,ppid="], OP_TIMEOUT).await.unwrap();
+        let rows: Vec<(i32,i32)> = String::from_utf8_lossy(&ps.stdout).lines().filter_map(|l| {
+            let mut w = l.split_whitespace(); Some((w.next()?.parse().ok()?, w.next()?.parse().ok()?))
+        }).collect();
+        let descendants = descendant_pids(pane.id().unwrap() as i32, &rows);
+        assert!(descendants.contains(&child));
+        assert!(descendants.len() >= 2, "fixture must include a running tool grandchild");
+        terminate_pane_children(pane.id().unwrap() as i32).await.unwrap();
+        for pid in descendants {
+            let out = run_cmd("ps", &["-p", &pid.to_string(), "-o", "stat="], OP_TIMEOUT).await.unwrap();
+            let status = String::from_utf8_lossy(&out.stdout);
+            assert!(status.trim().is_empty() || status.trim().starts_with('Z'), "owned process {pid} still runs: {status}");
+        }
+        assert!(pane.try_wait().unwrap().is_none(), "pane shell must survive");
+        assert!(peer.try_wait().unwrap().is_none(), "unrelated worker must survive");
+        pane.kill().await.unwrap(); peer.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pause_normal_screen_keeps_the_claude_history_contract() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let name = format!("pause-history-{}", std::process::id());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        std::fs::write(home.path().join(format!("sessions/{name}.env")),
+            format!("CC_PROVIDER=claude\nCC_DIR={}\n", home.path().display())).unwrap();
+        // No provider process/alternate screen. A fresh or stopped worker is
+        // still the same conversation surface, with measured empty history.
+        let body = peek_response(&name, 300, false, false).await;
+        assert_eq!(body["name"], name);
+        assert_eq!(body["history"], "");
+        assert_eq!(body["history_lines"], 0);
+        assert!(body["live"].is_string());
+    }
+
+    #[tokio::test]
+    async fn pause_prevents_legacy_start_before_provider_launch() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        std::fs::write(home.path().join("sessions/probe.env"), "CC_PAUSED=1\nCC_DIR=/tmp\n").unwrap();
+        let (state, _dir) = state();
+        let (ok, detail) = start_session(&state, "probe", "", false).await;
+        assert!(!ok); assert!(detail.contains("paused"), "{detail}");
     }
 
     #[tokio::test]

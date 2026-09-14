@@ -358,3 +358,19 @@ test('the compact phone composer keeps its empty prompt readable beside the acti
   });
   expect((await failure).postDataJSON()).toMatchObject({measured:true,n_considered:1,placeholder_fits:false});
 });
+
+
+test('saved conversation survives reopen, resize and repeated normal-screen frames', async ({page}, info) => {
+  const transcript = Array.from({length:60}, (_,i) => `❯ Saved request ${i}\n\n⏺ Saved answer ${i}\n`).join('\n');
+  await boot(page, {transcript, live:'❯ Ready for input\n', waitForBothFrames:true});
+  for (const viewport of [{width:1314,height:790},{width:820,height:690},{width:375,height:667}]) {
+    await page.setViewportSize(viewport);
+    await page.evaluate(async () => { await (window as any).refreshPeek(); });
+    await expect(page.locator('#pk-hist')).toContainText('Saved answer 59');
+    await expect(page.locator('#peek-cmd-input')).toBeVisible();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  }
+  await page.evaluate(name => { (window as any).closePeek(); (window as any).openPeek(name); }, worker);
+  await expect(page.locator('#pk-hist')).toContainText('Saved answer 59');
+  await page.screenshot({path:info.outputPath('saved-history-after-resize.png')});
+});

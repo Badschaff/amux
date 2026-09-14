@@ -216,6 +216,62 @@
 
   /* Archived sessions */
   #archived-section { padding: 0 12px 12px; }
+  .paused-footer {
+    display: flex; align-items: center; gap: 8px;
+    padding: 9px 12px; border-radius: 8px; cursor: pointer;
+    border: 1px solid #d29922; color: #d29922;
+    font-size: 0.82rem; font-weight: 600; user-select: none; margin-bottom: 8px;
+    background: var(--card);
+  }
+  .paused-footer:hover { border-color: #e5a825; }
+  .paused-chevron { font-size: 0.65rem; transition: transform 0.15s; color: #d29922; }
+  .paused-chevron.open { transform: rotate(90deg); }
+  .paused-body { margin-bottom: 6px; display: flex; flex-direction: column; gap: 5px; }
+  .paused-card {
+    display: flex; flex-direction: column; gap: 4px;
+    padding: 8px 11px; border-radius: 8px; border: 1px solid color-mix(in srgb, #d29922 40%, var(--border));
+    background: var(--card); font-size: 0.8rem;
+  }
+  .paused-card-top { display: flex; align-items: center; gap: 7px; min-width: 0; flex-wrap: wrap; }
+  .paused-card-name { font-weight: 600; color: var(--text); cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .paused-card-name:hover { color: #d29922; }
+  .paused-card-chip {
+    font-size: 0.63rem; padding: 1px 6px; border-radius: 9px; flex-shrink: 0;
+    background: var(--bg); border: 1px solid var(--border); color: var(--dim); white-space: nowrap;
+  }
+  .paused-card-chip.model { color: var(--cyan, #39d2c0); }
+  .paused-card-spacer { flex: 1; min-width: 8px; }
+  .paused-card-meta {
+    color: var(--dim); font-size: 0.7rem; display: flex; gap: 5px 10px; flex-wrap: wrap;
+    align-items: center; min-width: 0;
+  }
+  .paused-card-tag { color: #d29922; font-size: 0.68rem; }
+  .paused-card-preview {
+    color: var(--dim); font-size: 0.72rem; line-height: 1.4; min-width: 0;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .paused-card-actions { display: flex; gap: 4px; flex-shrink: 0; }
+  .paused-resume-btn {
+    padding: 3px 10px; border-radius: 5px; font-size: 0.75rem; border: 1px solid #d29922;
+    color: #d29922; background: transparent; cursor: pointer; white-space: nowrap; min-height: 28px;
+  }
+  .paused-resume-btn:hover { background: #d29922; color: #000; }
+  .paused-archive-btn {
+    padding: 3px 7px; border-radius: 5px; font-size: 0.75rem; border: 1px solid var(--border);
+    color: var(--dim); background: transparent; cursor: pointer; min-height: 28px;
+  }
+  .paused-archive-btn:hover { border-color: var(--red); color: var(--red); }
+  @media (max-width: 600px) {
+    .paused-card { padding: 10px 12px; gap: 6px; }
+    .paused-card-top { gap: 6px; }
+    .paused-card-name { font-size: 0.85rem; max-width: calc(100% - 120px); }
+    .paused-resume-btn { min-height: 44px; min-width: 44px; padding: 6px 14px; font-size: 0.82rem; }
+    .paused-archive-btn { min-height: 44px; min-width: 44px; padding: 6px 10px; font-size: 0.82rem; }
+    .paused-footer { min-height: 44px; padding: 10px 14px; font-size: 0.85rem; }
+  }
+
+  /* Archived sessions */
+  #archived-section { padding: 0 12px 12px; }
   .archived-footer {
     display: flex; align-items: center; gap: 8px;
     padding: 9px 12px; border-radius: 8px; cursor: pointer;

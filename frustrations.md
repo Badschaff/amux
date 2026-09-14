@@ -3001,3 +3001,25 @@ CARD: AF-892
 SYMPTOM: The status-hook durability fixture writes corrupt bytes directly into a live queue after observing the HTTP request, before the asynchronous acknowledgement is necessarily persisted. A controlled lock schedule shows the old raw write overwritten with an empty queue; the corruption assertion can then fail despite no production regression. CI5f036682 exited1 inside this section without naming its failed assertion; exact historical failing line remains unknown.
 COST: The checks gate is red and the log only says exit1 after the preceding successful cell, requiring source inspection and an independent concurrency control to discriminate fixture timing from hook behavior.
 FIX: Serialize corruption injection through the actual queue lock and atomically replace fixture bytes, retaining byte/schema preservation assertions. Add an ERR diagnostic naming the fixture line and command. The controlled old write loses the bytes; the corrected writer preserves them. This establishes a real fixture race, not the exact schedule of the historical CI failure. Origin validation and all resolved gates remain required before retirement.
+
+## Pause reports completion while the worker's tools continue running
+AREA: browser
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-14
+SESSION: codex
+CARD: none — POST /api/board timed out after 30 seconds; the subsequent backlog read found no matching card
+SYMPTOM: TubeScience Pause returned success and lifecycle=paused while running=true and the terminal badge still said WORKING. Resume re-rendered the old card without a verified runtime transition.
+COST: User could not stop running work; required process-tree, queue, provider-protocol and browser regression tests.
+FIX: Lifecycle integration stops owned provider/tool descendants, gates queued delivery and bootstrap, preserves the conversation reference, and acknowledges only verified transitions. Pending/failed transitions are visible and retryable. Signals: worker_lifecycle_applied, worker_lifecycle_failed, pause_process_stopped, protocol_turn_paused. Process fixtures cover Claude/Codex/Gemini and an unrelated process; browser checks cover desktop, phone and Safari.
+
+## Opening and resizing a Claude terminal makes its history disappear
+AREA: browser
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-14
+SESSION: codex
+CARD: none — filing the related lifecycle incident timed out; no matching backlog card was returned
+SYMPTOM: Ethan's recording shows mixpeek-finances briefly displaying history, then replacing it with a few native screen lines. TubeScience reproduces the same mostly blank terminal. Claude was on the normal screen (alternate_on=0), and the peek handler only hydrated its saved JSONL history in alternate-screen mode.
+COST: User lost usable conversation navigation; required matching the recording to live tmux state and repeated refresh/resize browser tests.
+FIX: Load Claude conversation history in either terminal screen mode. Signal normal_screen_history_restored identifies the recovered path. A server regression test pins normal-screen history and a browser test covers reopen, refresh and resize from desktop to phone.
