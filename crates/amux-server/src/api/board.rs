@@ -4016,6 +4016,57 @@ fn needsyou_ask_refusal(verdict: bs::AskVerdict, id: &str, session: Option<&str>
     )
 }
 
+/// The TAG door's twin of `needsyou_ask_refusal` (AMUX-4590, 2026-09-14).
+///
+/// AF-318/AMUX-3929 closed the STATUS door: a card cannot enter `needsyou`
+/// without a typed ask. The `needs:you*` TAG stayed a second, unvalidated door
+/// into the identical set of exclusions — `deps_blocking`, WIP holding
+/// (`wip_holding_ids`), and backlog dispatch (`dispatch_backlog_when_idle_in`)
+/// all skip a card on the TAG alone, with no regard for its status. A
+/// `PATCH {"tags":["needs:you"]}` carrying no `status` never reaches the
+/// status-transition gate at all, and a `POST` with `status` left at `todo`
+/// skips it the same way at creation.
+///
+/// That gap is not hypothetical: mvs-infra's live board (2026-09-14) carried
+/// `todo`-status cards tagged `needs:you` with the reason written only in
+/// `source_ref` prose — including one titled "Fix Namespace Pollution", the
+/// same shape `needsyou_refuses_a_park_that_names_no_human_act` names as the
+/// archetype the status gate was built to catch. The tag earned the card
+/// every dispatch exclusion the real ask gets, never appeared in
+/// `/api/board/needsyou` (the one queue built to surface asks), and never
+/// accrued the 3-day re-nag that status gets — an ask nobody could find.
+///
+/// Same response shape as the status door on purpose (one contract at either
+/// door), and the escape is the same one: transition the status for real.
+fn needsyou_tag_refusal_body(id: &str, session: Option<&str>, current_status: &str) -> Value {
+    tracing::warn!(
+        "needsyou_tag_gate: blocked a bare needs:you tag on {} for session {} (status stays {})",
+        id,
+        session.unwrap_or("-"),
+        current_status
+    );
+    json!({
+        "error": "a needs:you tag requires the needsyou status",
+        "code": "needsyou_tag_requires_status",
+        "ok": false,
+        "blocked": true,
+        "item": id,
+        "why": format!(
+            "Tagging a card needs:you while it stays `{current_status}` excludes it from \
+             dispatch and the WIP count exactly as a real needsyou ask does, but skips the \
+             typed-ask requirement and never appears in /api/board/needsyou — the one queue \
+             built to surface asks. If a human genuinely has to act, transition the status \
+             instead; if not, drop the tag and let the card stay dispatchable."
+        ),
+        "ask_types": bs::ASK_TYPES,
+        "how_to_fix": {
+            "fields": "ask_actor (a named person/external actor), ask_type, ask_question (a direct question containing ?), and ask_unblocks (the observable exit).",
+            "cli": "amux board needsyou <ID> --actor <name> --ask <type> --question \"...?\" --unblocks \"...\"",
+            "not_an_ask": "If nobody is actually waiting on a person, this is not a needsyou card — drop the tag rather than parking it silently.",
+        },
+    })
+}
+
 #[derive(Debug)]
 struct RequestParentRefusal {
     code: &'static str,
@@ -4434,6 +4485,23 @@ pub async fn create_item(
         None => Vec::new(),
         Some(v) => body_str_list(v).unwrap_or_default(),
     };
+    // AMUX-4590: the tag door, same predicate as the status door eleven lines
+    // up (see `needsyou_tag_refusal_body`). A card created with a bare
+    // `needs:you*` tag and any other status gets the exclusion without the
+    // accountability.
+    if tags.iter().any(|t| t.to_ascii_lowercase().starts_with("needs:you"))
+        && bs::parse_status(&status_in) != Some(TaskStatus::NeedsYou)
+    {
+        let session_for_gate = body_str(&map, "session")
+            .or_else(|| Some(actor_from_headers(&headers).1))
+            .filter(|s| !s.trim().is_empty());
+        if bs::needsyou_ask_required(session_for_gate.as_deref()) {
+            return err(
+                StatusCode::CONFLICT,
+                needsyou_tag_refusal_body("(new card)", session_for_gate.as_deref(), &status_in),
+            );
+        }
+    }
 
     // Creator attribution (AMUX-1812): the body value is a self-reported
     // CLAIM; the verified header wins, and a disagreement is recorded.
@@ -11452,6 +11520,34 @@ pub async fn patch_item(
                              recurrence files fresh"
                         );
                     }
+                }
+            }
+            // AMUX-4590: the tag door, same predicate as the status door
+            // (`ask_required` above, `needsyou_tag_refusal_body`). A
+            // `tags`-only PATCH never enters the `if target_raw != next.status`
+            // block that gate lives in, so it reached this write with zero
+            // validation. `next.status` is final here whether or not this same
+            // PATCH also carried a status change, so this fires exactly once,
+            // after both are settled, and never double-gates the sanctioned
+            // status+tag+ask PATCH that already passed `ask_required` above.
+            if let Some(tags) = &tags_change {
+                let sets_needs_you =
+                    tags.iter().any(|t| t.to_ascii_lowercase().starts_with("needs:you"));
+                let ends_as_needsyou = bs::parse_status(&next.status) == Some(TaskStatus::NeedsYou);
+                let force = map.get("force").and_then(Value::as_bool).unwrap_or(false);
+                if sets_needs_you
+                    && !ends_as_needsyou
+                    && !force
+                    && bs::needsyou_ask_required(next.session.as_deref())
+                {
+                    return finish(
+                        &slot_w,
+                        PatchOut::Refused(
+                            StatusCode::CONFLICT,
+                            needsyou_tag_refusal_body(&next.id, next.session.as_deref(), &next.status),
+                        ),
+                        no_write(),
+                    );
                 }
             }
             if let Some(tags) = &tags_change {

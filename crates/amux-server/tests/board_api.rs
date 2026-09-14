@@ -1949,6 +1949,77 @@ async fn needsyou_refuses_a_park_that_names_no_human_act() {
     assert!(got["ask_unblocks"].as_str().unwrap().contains("auto-reclaim"), "{got}");
 }
 
+/// The TAG door's twin of the test above (AMUX-4590). AF-318/AMUX-3929 closed
+/// the STATUS door; the `needs:you` TAG was a second, unvalidated door into the
+/// identical dispatch exclusions, reachable without ever touching `status`.
+///
+/// Live specimen, mvs-infra's board on 2026-09-14: a `todo` card literally
+/// titled "Fix Namespace Pollution" — the same archetype
+/// `needsyou_refuses_a_park_that_names_no_human_act` names above — carrying a
+/// bare `needs:you` tag with its reason written only in `source_ref` prose.
+#[tokio::test]
+async fn a_bare_needs_you_tag_is_refused_without_the_needsyou_status() {
+    let (app, _tmp) = app();
+    let c = create(
+        &app,
+        json!({
+            "title": "Fix Namespace Pollution",
+            "desc": "Customer-data-touching cleanup, outside the auto-fix allowlist.",
+        }),
+    )
+    .await;
+    let id = c["id"].as_str().unwrap().to_string();
+
+    // Tag-only PATCH, no `status` in the body at all: never reaches the
+    // status-transition block, so this is the gap in its purest form.
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "tags": ["needs:you"] })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], json!("needsyou_tag_requires_status"), "{v}");
+
+    // The card must be untouched by the refused write: still `todo`, no tag.
+    let (_, _, got) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert_eq!(got["status"], json!("todo"), "{got}");
+    assert!(
+        got["tags"].as_array().map(|t| t.is_empty()).unwrap_or(true),
+        "a refused tag write must not land: {got}"
+    );
+
+    // Same shape at creation: POST with `status` left at `todo`.
+    let (st, _, v) = send(
+        &app,
+        "POST",
+        "/api/board",
+        Some(json!({ "title": "Another one", "tags": ["needs:you"], "status": "todo" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], json!("needsyou_tag_requires_status"), "{v}");
+
+    // The sanctioned path is unaffected: tag and status together, with a real
+    // typed ask, still parks the card exactly as it did before this gate.
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({
+            "status": "needsyou", "gate_ack": true, "tags": ["needs:you"],
+            "ask_actor": "Ethan", "ask_type": "decision",
+            "ask_question": "OK to delete these namespaces?",
+            "ask_unblocks": "Ethan approves the candidate list",
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, _, got) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert_eq!(got["status"], json!("needsyou"), "{got}");
+}
+
 /// The ask survives a transition that a DIFFERENT gate refuses.
 ///
 /// Same two-write property as `evidence`: a PATCH is atomic, so sending the ask
