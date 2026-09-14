@@ -1578,6 +1578,174 @@ pub fn is_conversational_ack(text: &str) -> bool {
     ACK_PREFIXES.iter().any(|p| lower.starts_with(p))
 }
 
+/// A message whose primary content is a STATUS REPORT, a detailed
+/// acknowledgment, or a broadcast coordination announcement — peer coordination
+/// chatter, not a deliverable the receiving worker owns. Carding these put
+/// acks, CI/status updates and fleet announcements on every recipient's board:
+/// measured 2026-09-13, 2,691 auto-captured cards discarded fleet-wide and a
+/// single broadcast ("start all non-archived workers") minted on 55 boards at
+/// once (Ethan: "some of these tasks are a) not tasks for that worker and b)
+/// not really tasks ... be better about amux task creation").
+///
+/// Returning true means "do not mint a board WORK card"; the message still lands
+/// in `cmd_history`, so the Messages ledger keeps every message — exactly like
+/// [`is_conversational_ack`] and [`is_informational_query`] already decline.
+///
+/// Precision is asymmetric, the same way [`is_status_query`] documents: a false
+/// positive silences a real task (the worst failure), a false negative is one
+/// manual discard. So a real routed defect or delegated task from a peer MUST
+/// still card. Two guards keep that true: an opener that carries a genuine task
+/// follow-up (`capture_has_task_followup`, e.g. "main is green again; now cut
+/// the release") is NOT suppressed, and this matches report / ack / broadcast
+/// SHAPES rather than merely "a peer sent it". Unknown shapes fall through to a
+/// card (fail open).
+pub fn is_status_report(text: &str) -> bool {
+    let mut t = text.trim();
+    // A leading composer prompt glyph ("❯ ") is a capture artifact, not content.
+    t = t.trim_start_matches('❯').trim_start();
+    while t.starts_with('[') {
+        match t.find(']') {
+            Some(i) => t = t[i + 1..].trim_start(),
+            None => break,
+        }
+    }
+    let collapsed = t.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return false;
+    }
+    let lower = collapsed.to_lowercase();
+
+    // A genuine task stacked after the report/ack keeps the card ("shipped the
+    // fix; now add a changelog", "thanks, now build the tab"). This is tighter
+    // than capture_has_task_followup in two ways it must be here: it also treats
+    // a comma-led "..., now fix Y" as a break, and it does NOT read "Run 34762
+    // completed" (a CI run id) as the imperative "run", which the shared helper
+    // does — that misread would leave every "CHECKS GREEN. Run <id> …" report
+    // carded.
+    if report_has_task_request(&lower) {
+        return false;
+    }
+
+    // The first clause carries the intent.
+    let first_end = lower.find(['.', '!', '?', ';']).unwrap_or(lower.len());
+    let first = lower[..first_end].trim();
+    // Same clause in original case, for board-id tokens (MS-1496, not ms-1496).
+    let first_orig = collapsed[..first_end.min(collapsed.len())].trim();
+
+    // D. Dispatch relays: "Go: <worker> MS-1496, then MS-1497 in sequence ..." —
+    //    an orchestrator sequencing a worker's OWN existing cards. The work is
+    //    those referenced cards; the relay is not a new task. Requires a board
+    //    reference so a bare imperative ("go: fix the bug") still cards.
+    if (first.starts_with("go:") || first.starts_with("go ahead:")) && contains_card_ref(first_orig)
+    {
+        return true;
+    }
+
+    // A. Acknowledgments / receipts, at ANY length. is_conversational_ack caps
+    //    at 50 chars and so misses detailed acks like "Received, and it is mine.
+    //    Carded BACKE-4266. Thanks for the isolation ...".
+    const ACK_OPENERS: &[&str] = &[
+        "received,", "received ", "received.", "both taken", "both applies",
+        "both received", "got it", "all clear", "all-clear", "acknowledged",
+        "noted", "roger", "copy that", "understood", "will do", "standing by",
+        "thanks for", "thank you", "thanks,", "reaffirmed", "reaffirming",
+    ];
+    if ACK_OPENERS.iter().any(|p| first.starts_with(p)) {
+        return true;
+    }
+
+    // B. Broadcast / fleet-coordination announcements. One send is relayed to
+    //    many boards, so each is coordination, not one task per recipient.
+    const BROADCAST_OPENERS: &[&str] = &[
+        "quiesce", "heads-up", "heads up", "fyi ", "fyi:", "override from",
+        "override:", "override,", "do not push", "do not pull", "do not merge",
+        "hold any new", "hold all", "it is already restored", "ethan asked at",
+        "ethan asked to",
+    ];
+    if BROADCAST_OPENERS.iter().any(|p| first.starts_with(p)) {
+        return true;
+    }
+    // "ALL-CLEAR from <origin>", "HEADS-UP from <origin>, <date>:", etc.
+    if (first.contains(" from ") || first.contains(" by "))
+        && (first.starts_with("all clear")
+            || first.starts_with("all-clear")
+            || first.starts_with("heads-up")
+            || first.starts_with("heads up"))
+    {
+        return true;
+    }
+
+    // C. Completion / status reports — the clause asserts a DONE state, not an
+    //    imperative to reach it ("deployed to prod" reports; "deploy to prod" is
+    //    a task). A first clause that OPENS with a task verb is a brief that
+    //    merely mentions a report word ("Build the dashboard showing which checks
+    //    are green"), so it is left to card.
+    if capture_clause_starts_task(first) {
+        return false;
+    }
+    // Specific, unambiguous completion phrases — no length limit.
+    const REPORT_PHRASES: &[&str] = &[
+        "confirmed green", "verified on origin", "verified on main",
+        "verified in prod", "landed on origin", "landed on main", "merged to main",
+        "is refused", "was refused", "is settled in git", "is already settled",
+        "completed success", "run succeeded",
+    ];
+    if REPORT_PHRASES.iter().any(|p| first.contains(p)) {
+        return true;
+    }
+    // The bare "<subject> is green" family is looser, so it only counts in a
+    // SHORT declarative clause ("main is GREEN again", "FAST CHECKS IS GREEN"),
+    // never buried in a longer sentence.
+    const GREEN_PHRASES: &[&str] =
+        &[" is green", " are green", "back to green", "green again", "ci is green"];
+    if first.chars().count() <= 45 && GREEN_PHRASES.iter().any(|p| first.contains(p)) {
+        return true;
+    }
+
+    false
+}
+
+/// True if `s` contains a board-id token: 2+ uppercase ASCII letters, a `-`,
+/// then digits (e.g. `MS-1496`, `BACKE-4266`). No regex, so amux-core stays
+/// dependency-light. Used only to keep the dispatch-relay branch precise.
+fn contains_card_ref(s: &str) -> bool {
+    s.split(|c: char| c != '-' && !c.is_ascii_alphanumeric())
+        .any(|tok| match tok.split_once('-') {
+            Some((a, b)) => {
+                a.len() >= 2
+                    && a.chars().all(|c| c.is_ascii_uppercase())
+                    && !b.is_empty()
+                    && b.chars().all(|c| c.is_ascii_digit())
+            }
+            None => false,
+        })
+}
+
+/// An explicit task stacked after a status/ack clause, e.g. "shipped it; now
+/// fix the flake" or "thanks, then add a test". Distinct from
+/// [`capture_has_task_followup`] on purpose: it also treats a comma-led
+/// "..., now <verb>" as a clause break, and it does NOT read "Run 34762983943
+/// completed" (a CI run id) as the imperative "run".
+fn report_has_task_request(lower: &str) -> bool {
+    const MARKERS: &[&str] =
+        &["; ", " — ", " -- ", ". ", "! ", "? ", ", now ", ", then ", ", also "];
+    for marker in MARKERS {
+        for clause in lower.split(marker).skip(1) {
+            let clause = clause.trim_start_matches("now ").trim_start_matches("then ");
+            // "run <digits/hash>" is a noun (a CI run), not the imperative verb.
+            if let Some(rest) = clause.strip_prefix("run ") {
+                if rest.chars().next().is_some_and(|c| !c.is_ascii_alphabetic()) {
+                    continue;
+                }
+            }
+            if capture_clause_starts_task(clause) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// AF-699 (reported by mixpeek-orchestrator/gtm-engine, GE-896): a captured
 /// prompt is typed `code` unconditionally at both capture sites, and `code`
 /// can only close on "implemented and merged" -- which an inbound PEER REPLY
@@ -1883,6 +2051,57 @@ mod capture_tests {
             "Acceptance check only: what provider is active? Answer in one sentence. Do not create a board task, then update the docs.",
         ] {
             assert!(!is_informational_query(s), "{s:?} produces work and needs a card");
+        }
+    }
+
+    #[test]
+    fn status_reports_and_acks_are_message_only_but_real_tasks_still_card() {
+        // Live specimens pulled from the board on 2026-09-13 (AMUX-4498): peer
+        // coordination that had minted `code` cards on recipient boards.
+        for s in [
+            // Detailed acks (past the 50-char is_conversational_ack cap).
+            "Received, and it is mine. Carded BACKE-4266. Thanks for the isolation: proving the string half is gone.",
+            "Both taken, and thank you for closing it end to end.",
+            "Both applies received, and you were right to rank them.",
+            "Got it, and thanks for the exact dict shape: snapshot_id first.",
+            // Status / completion reports.
+            "[ops-server] Contract verified on origin. Names are right, no renames wanted. Wiring MOS-154 against it.",
+            "mixpeek-ops-server: FAST CHECKS IS GREEN. Run 34762983943 on b9c07d1d9e completed success.",
+            "Gtm-playbooks: main is GREEN again",
+            "GCA-210 CI confirmed GREEN: canvas-build-gate run 34788 passed.",
+            "BACKE-4200 foundation landed on origin/main",
+            // Broadcast / fleet coordination announcements.
+            "QUIESCE, one slot: hold any NEW graft until backend's push clears.",
+            "HEADS-UP from mixpeek-orchestrator, 2026-09-10 00:14: pausing grafts.",
+            "ALL-CLEAR from mixpeek-orchestrator, 2026-09-10 00:41: resume normal work.",
+            "DO NOT PUSH TO main UNTIL THIS CLEARS",
+            "IT IS ALREADY RESTORED",
+            // Dispatch relays that sequence a worker's own existing cards.
+            "Go: mixpeek-studio MS-1496, then MS-1497, then MS-1492, in sequence, tip df822085a9 at 13:15Z.",
+            "Go: gtm-playbooks GP-167 red repair (8871c25c8e), then GP-168.",
+            // Composer prompt glyph must not defeat the detector.
+            "❯ Received, and it is mine. Carded BACKE-4266.",
+        ] {
+            assert!(is_status_report(s), "{s:?} should read as a status report / ack / broadcast");
+        }
+        // Real work MUST still card — a false positive here silences a task.
+        for s in [
+            // Peer-routed defects and delegated tasks (the population to leave alone).
+            "Routing a filter-path defect that is yours, measured, and reproducible: fix the archived-card 500.",
+            "@backend please fix the OAuth redirect on the staging gateway",
+            "Contract verified on origin; add a regression test for the rename path",
+            "main is green again; ship the 0.9 release",
+            "verified on origin — please add a regression test for the rename path",
+            // Ethan's own genuine tasks from this session.
+            "make an MDAI file that checks a free public weather API every time I open it",
+            "go back to the old icon aesthetic in the toolbar",
+            "thanks for the context, now build the connectors tab and ship it",
+            // A plain human brief that merely contains a report word later.
+            "Build the CI dashboard that shows which checks are green per worker",
+            // "go:" with a real imperative and NO card reference is still work.
+            "Go: fix the archived-card 500 in the board API",
+        ] {
+            assert!(!is_status_report(s), "{s:?} is real work, must still card");
         }
     }
 

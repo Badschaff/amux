@@ -4343,6 +4343,20 @@ fn mint_capture_card(
         );
         return Ok(None);
     }
+    // A status report, a detailed ack, or a broadcast announcement is peer
+    // coordination chatter, not a deliverable this worker owns. Carding it put
+    // acks/CI-status/announcements on every recipient's board (2,691 capture
+    // cards discarded fleet-wide; one broadcast on 55 boards — AMUX-4498). It
+    // stays in cmd_history; it just does not become a work card. Surface it
+    // (two-fixes rule): grep "ledger: status report not carded" to audit the
+    // detector, so a wrongly suppressed REAL task is findable in the logs.
+    if amux_core::board::is_status_report(body) {
+        tracing::info!(
+            session = %session_name,
+            "ledger: status report not carded (recorded in cmd_history only) — AMUX-4498"
+        );
+        return Ok(None);
+    }
     // AMUX-3147: the old dedup skipped capturing ANY new task whenever the session
     // held ANY open agent card — so only the FIRST task of a work-session reached
     // the board and every later prompt was silent ("none of these have board
@@ -4593,6 +4607,7 @@ fn associate_capture_card(
     let redacted = redact_prompt_secrets(body);
     if amux_core::board::title_from_prompt(&redacted).is_some()
         && !amux_core::board::is_informational_query(&redacted)
+        && !amux_core::board::is_status_report(&redacted)
     {
         let captured_desc = format_captured_desc(&redacted);
         if let Some(id) =
