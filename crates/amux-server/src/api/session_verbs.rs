@@ -6399,6 +6399,13 @@ pub(crate) fn send_failure_status(msg: &str) -> (StatusCode, Option<&'static str
         ("durable worker directory", "record an absolute directory for this worker before restarting"),
         ("session is blocked", "remove the lane from ~/.amux/blocked-sessions.txt"),
         ("session is archived", "POST /api/sessions/<name>/wake first"),
+        // A paused worker refuses amux automation and a start until it is
+        // resumed (9af1c88b, AMUX-4574). A policy refusal with an obvious next
+        // step: before these arms it answered 500, so every sweep counted
+        // "auto-wake failed: worker is paused" as a server fault.
+        ("target is paused", "resume the worker first (amux resume); the owner's own send still works"),
+        ("worker is paused", "resume the worker first (amux resume)"),
+        ("session is paused", "resume the worker first (amux resume)"),
         ("terminal client attached", "a terminal client owns the size — detach it, or resize there"),
         ("no agents panel on screen", "open the agents panel in the pane (left arrow) first"),
         ("could not enter agent select mode", "the pane did not enter select mode — retry"),
