@@ -1766,6 +1766,15 @@ pub struct IssueRow {
     pub callback_fired_at: Option<i64>,
     /// Visible refusal/recovery detail; never hidden in logs alone.
     pub callback_error: Option<String>,
+    /// Hard lease (RR-0052, migration 0068). `lease_owner` is the lane NAME
+    /// holding this card; NULL means no lease (every legacy card), which behaves
+    /// exactly as before. The timestamps are unix seconds; `lease_generation` is
+    /// bumped on every reclaim so a write from a dead claimant is recognizable.
+    pub lease_owner: Option<String>,
+    pub lease_acquired_at: Option<i64>,
+    pub lease_heartbeat_at: Option<i64>,
+    pub lease_expires_at: Option<i64>,
+    pub lease_generation: i64,
     /// Set ONLY when `desc` holds a bounded PREFIX rather than the whole
     /// string, which the slim list does to stop hydrating ~30 MB of prose per
     /// call (AF-346). `None` means `desc` is complete and every consumer
@@ -1936,9 +1945,10 @@ impl IssueRow {
     /// not in the shared vocabulary (a custom Python lane) — callers must
     /// refuse the transition honestly rather than guess.
     ///
-    /// `worker` is always `None`: `issues.session` is an owner NAME, not a
-    /// claim by `WorkerId` — atomic claims/leases land with RR-0052.
-    /// NO CARD MAY VANISH (AMUX-2632).
+    /// `worker` is the LEASE holder (`lease_owner`), not `session`: an owner
+    /// NAME mapped to a `WorkerId` via `foreign_worker_id` so core's
+    /// `AlreadyClaimed` becomes name-equality (RR-0052). A card with no lease is
+    /// `None` and ungated, exactly as before. NO CARD MAY VANISH (AMUX-2632).
     ///
     /// This opened `parse_status(&self.status)?`, so a status outside the
     /// closed vocabulary returned None — and the orchestrator's one caller did
@@ -1974,7 +1984,15 @@ impl IssueRow {
             title: self.title.clone(),
             desc: self.desc.clone(),
             status,
-            worker: None,
+            // RR-0052: the holder is the lease owner (lane NAME), mapped to a
+            // WorkerId via `foreign_worker_id` so core's `AlreadyClaimed` becomes
+            // name-equality. NULL lease -> None -> ungated, exactly as before.
+            worker: self
+                .lease_owner
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(crate::orchestrator::runtime::foreign_worker_id),
             item_type: core_item_type(&self.item_type),
             creator,
             created_at: ts(self.created),
@@ -2008,7 +2026,9 @@ const COLS: &str = "i.id, i.title, i.\"desc\", i.status, i.session, i.creator, i
      i.source, i.acceptance_criteria, i.decision_question, i.decision_rationale, \
      i.decision_supersedes, i.waiting_on, i.requested_by, i.callback_session, \
      i.callback_prompt, i.callback_state, i.callback_message_id, \
-     i.callback_fired_at, i.callback_error, i.ask_actor";
+     i.callback_fired_at, i.callback_error, i.ask_actor, \
+     i.lease_owner, i.lease_acquired_at, i.lease_heartbeat_at, \
+     i.lease_expires_at, COALESCE(i.lease_generation,0)";
 
 /// Read an INTEGER-typed timestamp column that some row may hold as REAL or TEXT.
 ///
@@ -2135,6 +2155,11 @@ fn issue_from_row(r: &Row<'_>) -> rusqlite::Result<IssueRow> {
         callback_fired_at: r.get(49)?,
         callback_error: r.get(50)?,
         ask_actor: r.get(51)?,
+        lease_owner: r.get(52)?,
+        lease_acquired_at: r.get(53)?,
+        lease_heartbeat_at: r.get(54)?,
+        lease_expires_at: r.get(55)?,
+        lease_generation: r.get(56)?,
         next_action: r.get(33)?,
         last_result: r.get(34)?,
         unresolved: r.get(35)?,
@@ -5062,6 +5087,7 @@ mod tests {
         // newest verified, and the 100 newest done — the lumped 100-cap
         // showed 9 of a 141-card bulk-verify while Python showed all of it.
         let mk = |i: i64, status: &str| IssueRow {
+            lease_owner: None, lease_acquired_at: None, lease_heartbeat_at: None, lease_expires_at: None, lease_generation: 0,
             desc_prefixed: None,
             id: format!("T-{i}"),
             title: String::new(),
@@ -5220,6 +5246,7 @@ mod configured_gate_tests {
 
     fn row(item_type: &str, gate: Option<&str>) -> IssueRow {
         IssueRow {
+            lease_owner: None, lease_acquired_at: None, lease_heartbeat_at: None, lease_expires_at: None, lease_generation: 0,
             desc_prefixed: None,
             id: "T-1".into(), title: String::new(), desc: String::new(),
             status: "doing".into(), session: None, creator: String::new(),

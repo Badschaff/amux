@@ -393,6 +393,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0067_message_capture_pending",
         sql: include_str!("../../migrations/0067_message_capture_pending.sql"),
     },
+    Migration {
+        version: 68,
+        name: "0068_task_lease",
+        sql: include_str!("../../migrations/0068_task_lease.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.

@@ -609,6 +609,27 @@ fn gate_check(
     }
 }
 
+/// A worker may not transition a card another worker holds.
+///
+/// The refusal fires only when the card has a lease holder AND the acting party
+/// is a different worker. A human, the system, the harness, and the holder
+/// itself all pass. This is the single enforcement path for the board's hard
+/// lease (RR-0052): the server populates `task.worker` from the lease holder and
+/// passes an `Actor::Worker`, so the WorkerId equality below becomes name
+/// equality via the shared `foreign_worker_id` mapping. `Force` never calls this,
+/// so the audited bypass stays exempt.
+pub fn holder_guard(task: &Task, actor: &Actor) -> Result<(), TransitionError> {
+    if let (Some(holder), Actor::Worker { id }) = (&task.worker, actor) {
+        if holder != id {
+            return Err(TransitionError::AlreadyClaimed {
+                task: task.id.clone(),
+                holder: holder.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The board's transactional state machine (Invariant 3): one function, one
 /// code path. Pure — the caller supplies `now`, persists the returned task,
 /// and emits the `DurableEvent` attributing the change to `actor`.
@@ -620,7 +641,8 @@ fn gate_check(
 ///   transition carries; `Force` bypasses gates but never attribution;
 /// - no-ops are refused, so version bumps always mean change (Invariant 37);
 /// - task state never encodes execution state (Invariant 19): there is no
-///   transition for "rate limited" or "crashed" on purpose.
+///   transition for "rate limited" or "crashed" on purpose;
+/// - a worker may not transition a card another worker holds ([`holder_guard`]).
 pub fn apply_transition(
     task: &Task,
     transition: BoardTransition,
@@ -698,14 +720,7 @@ pub fn apply_transition(
         T::Start => match task.status {
             S::Todo => {
                 // A worker may not start a card another worker holds.
-                if let (Some(holder), Actor::Worker { id }) = (&task.worker, actor) {
-                    if holder != id {
-                        return Err(TransitionError::AlreadyClaimed {
-                            task: task.id.clone(),
-                            holder: holder.clone(),
-                        });
-                    }
-                }
+                holder_guard(task, actor)?;
                 gate_check(task, S::Doing, effective_gates, &[])?;
                 Ok(finish(task, now, |t| {
                     t.status = S::Doing;
@@ -725,6 +740,7 @@ pub fn apply_transition(
 
         T::Submit => match task.status {
             S::Doing => {
+                holder_guard(task, actor)?;
                 gate_check(task, S::Review, effective_gates, &[])?;
                 Ok(finish(task, now, |t| t.status = S::Review))
             }
@@ -736,6 +752,7 @@ pub fn apply_transition(
 
         T::RequestReview { reviewer } => match task.status {
             S::Doing => {
+                holder_guard(task, actor)?;
                 gate_check(task, S::Review, effective_gates, &[])?;
                 Ok(finish(task, now, |t| {
                     t.status = S::Review;
@@ -763,6 +780,7 @@ pub fn apply_transition(
 
         T::Complete { evidence } => match task.status {
             S::Doing => {
+                holder_guard(task, actor)?;
                 gate_check(task, S::Done, effective_gates, &evidence)?;
                 Ok(finish(task, now, |t| t.status = S::Done))
             }
@@ -795,6 +813,7 @@ pub fn apply_transition(
 
         T::RequestInput { .. } => match task.status {
             S::Doing => {
+                holder_guard(task, actor)?;
                 gate_check(task, S::NeedsYou, effective_gates, &[])?;
                 Ok(finish(task, now, |t| t.status = S::NeedsYou))
             }
@@ -815,6 +834,7 @@ pub fn apply_transition(
 
         T::Block { .. } => match task.status {
             S::Todo | S::Doing => {
+                holder_guard(task, actor)?;
                 gate_check(task, S::Blocked, effective_gates, &[])?;
                 Ok(finish(task, now, |t| t.status = S::Blocked))
             }
@@ -2613,6 +2633,53 @@ mod tests {
         let err = apply_transition(&t, BoardTransition::Start, &worker_actor("CCCC"), &[], t0())
             .unwrap_err();
         assert!(matches!(err, TransitionError::AlreadyClaimed { .. }));
+    }
+
+    #[test]
+    fn a_leased_doing_card_only_its_holder_may_transition() {
+        // RR-0052: a card in Doing held by worker BBBB. A different worker cannot
+        // submit/complete/block it; the holder, a human, and the system all can.
+        let doing = {
+            let mut t = mk(TaskStatus::Todo);
+            t.worker = Some(wid("BBBB"));
+            t.status = TaskStatus::Doing;
+            t
+        };
+        // holder_guard is the single enforcement point.
+        assert!(holder_guard(&doing, &worker_actor("BBBB")).is_ok(), "the holder passes");
+        assert!(holder_guard(&doing, &sys()).is_ok(), "the system passes");
+        assert!(
+            holder_guard(&doing, &Actor::Human { name: "ethan".into() }).is_ok(),
+            "a human passes"
+        );
+        assert!(
+            matches!(
+                holder_guard(&doing, &worker_actor("CCCC")),
+                Err(TransitionError::AlreadyClaimed { ref holder, .. }) if *holder == wid("BBBB")
+            ),
+            "a different worker is refused, naming the holder"
+        );
+        // And it fires through the real transition arms (Submit / Complete / Block).
+        for tr in [
+            BoardTransition::Submit,
+            BoardTransition::Complete { evidence: vec![] },
+            BoardTransition::Block { reason: "x".into() },
+        ] {
+            let err = apply_transition(&doing, tr, &worker_actor("CCCC"), &[], t1()).unwrap_err();
+            assert!(
+                matches!(err, TransitionError::AlreadyClaimed { .. }),
+                "a non-holder worker must not transition a leased Doing card"
+            );
+        }
+        // Force is never holder-gated (the audited bypass stays exempt).
+        assert!(apply_transition(
+            &doing,
+            BoardTransition::Force { status: TaskStatus::Todo, reason: "override".into() },
+            &worker_actor("CCCC"),
+            &[],
+            t1(),
+        )
+        .is_ok());
     }
 
     #[test]
