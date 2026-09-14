@@ -6431,7 +6431,7 @@ function toggleActiveDropdown() {
     activeDropdownOpen = false;
     return;
   }
-  const running = sessions.filter(s => s.running);
+  const running = sessions.filter(s => s.running && s.lifecycle !== 'paused');
   if (!running.length) {
     dd.innerHTML = '<div class="active-dropdown-empty">No active workers</div>';
   } else {
@@ -6463,7 +6463,7 @@ function closeActiveDropdown(e) {
   activeDropdownOpen = false;
 }
 function updateActiveCount() {
-  const count = sessions.filter(s => s.running).length;
+  const count = sessions.filter(s => s.running && s.lifecycle !== 'paused').length;
   const el = document.getElementById('active-count');
   const btn = document.getElementById('active-btn');
   if (el) el.textContent = count;
@@ -10461,7 +10461,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.925';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.926';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
