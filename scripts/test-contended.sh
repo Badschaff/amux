@@ -357,13 +357,18 @@ else
   # An instrument that rules out one cause has to say WHICH, or the next reader
   # generalises it to all of them. Which is the whole argument the top of this
   # file makes about plain `cargo test`, arriving one level up.
+  #
+  # 2026-09-14: the in-process routers that start workers now pin admission with
+  # AdmissionOverride, so that specimen no longer depends on the host. The hint
+  # below used to say "check for a 503 admission refusal", which after the pin
+  # would steer a reader to blame the host for a harness that forgot to pin.
   echo ""
   echo "contention: the auto-builder was NOT rebuilding during this run, so the shared"
   echo "contention: binary was stable under it. A failure here is NOT build contention."
   echo "contention: (Cargo's own compile for this command is not the hazard; a peer's is.)"
-  echo "contention: THAT IS THE ONLY THING RULED OUT. Host pressure still fails tests that"
-  echo "contention: start workers — check the failure body for a 503 admission refusal"
-  echo "contention: before reading a red as a regression."
+  echo "contention: THAT IS THE ONLY THING RULED OUT. Test routers pin worker admission, so"
+  echo "contention: a 503 admission refusal carrying admission_source=host means a test"
+  echo "contention: harness skipped the pin."
 fi
 
 # THE TARGET CLAUSE (AF-346). Printed regardless of colour, for the same reason

@@ -4,11 +4,13 @@
 //! a payload-population site that silently stopped journaling would fail
 //! here, not in a hand-built simulation of it.
 
+use amux_server::api::health::{Admission, AdmissionOverride};
 use amux_server::api::{router, AppState};
 use amux_server::db::replay::{self, Divergence};
 use amux_server::db::{board_store, queries, PendingEvent, Store, WriteOutcome};
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
+use axum::Extension;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -42,7 +44,9 @@ fn rig() -> Rig {
     reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
     Rig {
-        app: router(state),
+        // Pinned: the rig starts a worker, and the live admission check would
+        // make this suite fail whenever the host running it is short on memory.
+        app: router(state).layer(Extension(AdmissionOverride(Admission::Allow))),
         store,
         db_path,
         _dir: dir,

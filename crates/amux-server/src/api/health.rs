@@ -385,6 +385,26 @@ pub fn admission() -> Admission {
     admission_for(m.pressure_level, m.swap_used_mb, swap_deny_mb())
 }
 
+/// A fixed admission verdict for one router, used in place of the live host
+/// reading: `router(state).layer(Extension(AdmissionOverride(Admission::Allow)))`.
+///
+/// This exists for test harnesses, and the server never installs it.
+/// `admission()` reads the memory state of whatever machine runs the suite, so
+/// every in-process test that started a worker passed or failed with the host.
+/// On 2026-09-14, at 64 GB of swap, five lib tests and `replay_roundtrip` went
+/// red with a 503 where they expected a 202. Lanes had been re-diagnosing those
+/// same five as "host pressure" and moving on since at least 25d3d2e8, which
+/// also meant the refusal branch was only covered on a starved machine and the
+/// start branch only on a healthy one.
+///
+/// It is per router because the refusal tests and the start tests run in
+/// parallel in one process and need opposite verdicts, which an env var or a
+/// global would force them to share.
+/// A refusal names which one decided it (`admission_source`), so a harness that
+/// forgot to pin reads as `host` in the failure body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmissionOverride(pub Admission);
+
 /// One syscall per field on macOS (`sysctlbyname`), `/proc/meminfo` on Linux
 /// — no subprocess, for the fd_health reason: spawning costs the resources
 /// being measured, and fails exactly when the condition it reports is present.

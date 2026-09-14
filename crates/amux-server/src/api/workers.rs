@@ -13,6 +13,7 @@
 //! SSE/delta-sync consumers see it (Invariant 35).
 
 use super::aliases::{alias_fields, FieldStyle};
+use super::health::{Admission, AdmissionOverride};
 use super::AppState;
 use crate::db::queries::{self, SessionRow, WorkerRow};
 use crate::db::{PendingEvent, WriteOutcome};
@@ -29,7 +30,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -937,7 +938,14 @@ enum StepOutcome {
 /// the start (worker -> Starting, a live session row, events); the actual
 /// process spawn is the orchestrator's job (RR-0041) and lands there — this
 /// endpoint accepts the request, it does not pretend the process exists.
-pub async fn start_worker(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+///
+/// `admission` is `None` in the server, which reads the live host. A test
+/// router pins it with `AdmissionOverride` (see health.rs for why).
+pub async fn start_worker(
+    State(state): State<AppState>,
+    admission: Option<Extension<AdmissionOverride>>,
+    Path(key): Path<String>,
+) -> Response {
     // Lifecycle refusal is independent of host capacity and must remain stable.
     match state.store.read().and_then(|conn| Ok(queries::get_worker(&conn, &key)?)) {
         Ok(Some(row)) if !row.lifecycle.can_start() => return err(StatusCode::CONFLICT,
@@ -956,12 +964,17 @@ pub async fn start_worker(State(state): State<AppState>, Path(key): Path<String>
     // Deliberately a REFUSAL and not a kill. Draining someone's in-flight lane is
     // a decision about a human's work (ethos rule 8); declining to start a NEW one
     // costs nobody anything they had.
-    if crate::api::health::admission() == crate::api::health::Admission::Deny {
+    let (verdict, admission_source) = match admission {
+        Some(Extension(AdmissionOverride(fixed))) => (fixed, "override"),
+        None => (crate::api::health::admission(), "host"),
+    };
+    if verdict == Admission::Deny {
         let m = crate::api::health::mem_health();
         tracing::warn!(
             worker = %key,
             pressure = m.pressure,
             swap_used_mb = m.swap_used_mb,
+            admission_source,
             "REFUSED to start worker — the host is out of memory headroom. amux lanes were \
              the top holders in the 2026-08-24 jetsam, and starvation is what turns the \
              recurring WindowServer/tccd stall into a watchdog kill. Nothing was stopped; \
@@ -973,6 +986,7 @@ pub async fn start_worker(State(state): State<AppState>, Path(key): Path<String>
                 "error": "host is out of memory headroom — refusing to start another worker",
                 "pressure": m.pressure,
                 "swap_used_mb": m.swap_used_mb,
+                "admission_source": admission_source,
                 "hint": "nothing was stopped. Free memory or stop a lane, then retry. \
                          Threshold: AMUX_MEM_SWAP_DENY_MB (default 8192).",
             }),
@@ -1197,14 +1211,25 @@ pub(crate) fn lifecycle_lock(name: &str) -> Arc<tokio::sync::Mutex<()>> {
 }
 
 pub async fn pause_worker(State(state): State<AppState>, Path(key): Path<String>) -> Response {
-    change_pause(state, key, true).await
+    change_pause(state, key, true, None).await
 }
 
-pub async fn resume_worker(State(state): State<AppState>, Path(key): Path<String>) -> Response {
-    change_pause(state, key, false).await
+pub async fn resume_worker(
+    State(state): State<AppState>,
+    admission: Option<Extension<AdmissionOverride>>,
+    Path(key): Path<String>,
+) -> Response {
+    change_pause(state, key, false, admission).await
 }
 
-async fn change_pause(state: AppState, key: String, paused: bool) -> Response {
+/// `admission` only matters on Resume, which starts the worker through
+/// `start_worker` and must see the same verdict the router was built with.
+async fn change_pause(
+    state: AppState,
+    key: String,
+    paused: bool,
+    admission: Option<Extension<AdmissionOverride>>,
+) -> Response {
     use crate::api::session_verbs as fleet;
     let name = match resolve_key(&state, key.clone()).await {
         Ok(n) => n, Err(r) => return r,
@@ -1270,7 +1295,7 @@ async fn change_pause(state: AppState, key: String, paused: bool) -> Response {
             anyhow::ensure!(!matches!(backend.status(&process).await?, crate::backend::BackendStatus::Running), "worker is still running after pause");
             Ok(json!({"running":false,"session":"stopped"}))
         } else {
-            let response = start_worker(State(state.clone()), Path(key.clone())).await;
+            let response = start_worker(State(state.clone()), admission, Path(key.clone())).await;
             if !response.status().is_success() {
                 let bytes = axum::body::to_bytes(response.into_body(), 65536).await?;
                 let body: Value = serde_json::from_slice(&bytes)?;
@@ -1970,6 +1995,16 @@ mod tests {
     use tower::ServiceExt;
 
     fn app_with_token(token: Option<String>) -> (axum::Router, tempfile::TempDir) {
+        app_admitting(token, Admission::Allow)
+    }
+
+    /// Every router in this module pins host admission, so no test here passes
+    /// or fails with the memory state of the machine running it. The refusal
+    /// branch has its own `Deny` router.
+    fn app_admitting(
+        token: Option<String>,
+        verdict: Admission,
+    ) -> (axum::Router, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("amux-test.db")).unwrap();
         let state = AppState {
@@ -1979,7 +2014,7 @@ mod tests {
             auth_token: token,
         reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
-        (router(state), dir)
+        (router(state).layer(Extension(AdmissionOverride(verdict))), dir)
     }
 
     fn app() -> (axum::Router, tempfile::TempDir) {
@@ -2472,18 +2507,44 @@ mod tests {
         }
         let (st, _, _) = send(&app, "POST", &format!("/api/workers/{id}/start"), None).await;
         assert_eq!(st, StatusCode::CONFLICT);
+        // Admission is pinned to Allow, so this always reaches the success path.
+        // The denied Resume is its own test below and no longer depends on the
+        // host being out of memory when the suite runs.
         let (st, _, body) = send(&app, "POST", &format!("/api/workers/{id}/resume"), None).await;
-        if st == StatusCode::BAD_GATEWAY {
-            assert!(body["error"].as_str().unwrap().contains("memory headroom"), "{body}");
-            let (_, _, worker) = send(&app, "GET", &format!("/api/workers/{id}"), None).await;
-            assert_eq!(worker["lifecycle"], "paused");
-            return; // Host admission denial is tested as a failed Resume, never bypassed.
-        }
         assert_eq!(st, StatusCode::ACCEPTED, "{body}");
         assert_eq!(body["session"], "starting");
         let (st, _, body) = send(&app, "POST", &format!("/api/workers/{id}/resume"), None).await;
         assert_eq!(st, StatusCode::OK, "{body}");
         assert_eq!(body["applied"], false);
+    }
+
+    /// The host-admission refusal, pinned instead of inherited from the machine.
+    /// Start answers 503 before writing anything, and Resume fails closed: the
+    /// worker stays paused and stopped. Until AdmissionOverride this branch ran
+    /// only on a host that happened to be out of memory, and on that host the
+    /// start tests went red instead.
+    #[tokio::test]
+    async fn host_admission_denial_refuses_start_and_resume_without_writing() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (app, _dir) = app_admitting(None, Admission::Deny);
+        let id = create(&app, "admission-probe").await;
+
+        let (st, _, body) = send(&app, "POST", &format!("/api/workers/{id}/start"), None).await;
+        assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("memory headroom"), "{body}");
+        assert_eq!(body["admission_source"], "override", "{body}");
+        let (_, _, worker) = send(&app, "GET", &format!("/api/workers/{id}"), None).await;
+        assert_eq!(worker["state"]["state"], "stopped", "a refused start wrote state: {worker}");
+
+        let (st, _, body) = send(&app, "POST", &format!("/api/workers/{id}/pause"), None).await;
+        assert_eq!(st, StatusCode::OK, "pause does not consult admission: {body}");
+        let (st, _, body) = send(&app, "POST", &format!("/api/workers/{id}/resume"), None).await;
+        assert_eq!(st, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("memory headroom"), "{body}");
+        let (_, _, worker) = send(&app, "GET", &format!("/api/workers/{id}"), None).await;
+        assert_eq!(worker["lifecycle"], "paused", "{worker}");
+        assert_eq!(worker["state"]["state"], "stopped", "{worker}");
     }
 
     #[tokio::test]
