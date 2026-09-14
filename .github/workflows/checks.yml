@@ -230,6 +230,14 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-harness-wired.sh
+      # AF-791. The shared-target staleness notice in test-contended.sh. The
+      # fixture is a dependency-free crate in a private temp target built with
+      # --offline, so this costs two tiny compiles and no network. It only
+      # samples the build lock, so a runner with no ~/.amux does not wait on it.
+      - name: a content edit with a preserved mtime refreshes the shared target (AF-791)
+        run: |
+          set -euo pipefail
+          bash scripts/test-cargo-target-fingerprint.sh
       # AF-346 second pass + AF-336. `--test <name>` skips the LIB ENTIRELY and
       # prints the smallest number of any selector, so it is the likeliest to be
       # read as a clean suite; and the worktree clause listed every dirty file
