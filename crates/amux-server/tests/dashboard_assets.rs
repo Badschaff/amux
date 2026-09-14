@@ -1334,10 +1334,14 @@ fn reconnect_shows_the_sync_checklist() {
         js[so..so_end].contains("runSyncBanner(false)"),
         "reconnect must raise the sync banner non-quiet so the checklist is visible"
     );
-    // A multi-item batch shows even from a quiet caller.
+    // A multi-item batch shows even from a quiet caller. Uncertain sends are
+    // not counted toward the two (AMUX-4594): they stay in the replay list so
+    // they keep being re-checked, and counting them popped the checklist on
+    // every new send (Ethan, 2026-09-14: "this shouldn't be appearing when I
+    // send, too invasive").
     assert!(
-        js.contains("const show = !quiet || items.length >= 2;"),
-        "a 2+ item batch must show the checklist even when the caller is quiet"
+        js.contains("const show = !quiet || items.filter(i => !(i.type === 'queue' && _outboxUncertainMessage(i.item))).length >= 2;"),
+        "a 2+ item batch of non-uncertain items must show the checklist even when the caller is quiet"
     );
     // The per-item checkmark states must still exist.
     assert!(

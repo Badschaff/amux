@@ -1,6 +1,6 @@
 {
   "measured": true,
-  "n_considered": 1936,
+  "n_considered": 1941,
   "command_handlers": {
     "_applyEmbedView": {
       "kind": "command._applyEmbedView",
@@ -454,6 +454,12 @@
     },
     "_cdcBoardUpdate": {
       "kind": "command._cdcBoardUpdate",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_changeWorkerPaused": {
+      "kind": "command._changeWorkerPaused",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -3212,6 +3218,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "pauseWorker": {
+      "kind": "command.pauseWorker",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "peekGitPush": {
       "kind": "command.peekGitPush",
       "feedback_required": true,
@@ -3358,6 +3370,12 @@
     },
     "resetTokenStats": {
       "kind": "command.resetTokenStats",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "resumeWorker": {
+      "kind": "command.resumeWorker",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
