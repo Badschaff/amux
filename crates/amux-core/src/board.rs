@@ -1863,6 +1863,10 @@ pub fn peer_message_wants_action(text: &str) -> bool {
         "own this", "pick up", "picking this up", "to you:", "for you to",
         "yours to ", "over to you", "your turn", "waiting on you", "blocked on you",
         "at risk", "heads up:", "please review", "review request", "approve ",
+        // A delegation that asks for the result back (AMUX-4534). 8c22d717 left
+        // "Coordinate the rollout with the other lane and report back" with no
+        // marker, so the inter-session capture contract stopped carding it.
+        "report back",
     ];
     ASK_MARKERS.iter().any(|m| lower.contains(m))
 }
@@ -2282,6 +2286,8 @@ mod capture_tests {
             "Routing SP-868 to you: a gate whose input set changed.",
             "BACKE-4286 plan review: ownership accepted; please tighten the timestamp contract.",
             "Can you verify the OAuth redirect on staging?",
+            // The inter-session capture test's own specimen (AMUX-4534).
+            "Coordinate the rollout with the other lane and report back",
         ] {
             assert!(peer_message_wants_action(s), "{s:?} is a genuine ask and must card");
         }
