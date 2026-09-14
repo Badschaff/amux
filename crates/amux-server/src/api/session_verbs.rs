@@ -18607,6 +18607,23 @@ pub(crate) async fn report_post(state: &AppState, name: &str, headers: &HeaderMa
                 .unwrap_or_else(|| json!({}));
             let prev_state =
                 reports[&name_s]["state"].as_str().unwrap_or("").to_string();
+            // RR-0052 LEASE HEARTBEAT. Any self-report proves the process in this
+            // lane is alive, so it renews the lease on every card the lane holds.
+            // This runs BEFORE the resurrection guard below on purpose: that guard
+            // stops a late tool-hook from flipping a finished turn back to active,
+            // but the tool call still happened, and liveness is all a lease asks.
+            // A failed renewal must not cost the report itself, so it is logged
+            // and swallowed rather than rolled back with it.
+            if let Err(error) =
+                crate::db::board_store::refresh_lease_heartbeat(conn, &name_s, now_f64() as i64)
+            {
+                tracing::warn!(
+                    target: "amux::board", session = %name_s, %error,
+                    measured = false, n_considered = 0,
+                    verdict = "lease_heartbeat_write_failed",
+                    "report: lease heartbeat could not be written (RR-0052); held cards will age toward reclaim"
+                );
+            }
             // A HEARTBEAT MUST NOT RESURRECT A FINISHED TURN (AMUX-2538):
             // tool-hook only refreshes an already-active turn.
             if src2 == "tool-hook" && prev_state != "active" {
@@ -26512,6 +26529,36 @@ mod steer_boundary_tests {
         let (h2, since2) = status_decision_history(&conn, "never-changed", 20);
         assert!(h2.is_empty());
         assert_eq!(since2, Some(1000.0), "the record exists, this lane simply never moved");
+    }
+
+    /// RR-0052: the shipped report handler is the lease heartbeat. Driven through
+    /// `report_post` (not the store helper) because the bug this closes was a
+    /// reaper whose liveness signal nothing on the real path ever produced.
+    #[tokio::test]
+    async fn a_self_report_renews_the_reporting_lanes_lease_and_only_its_own() {
+        let (state, _d) = tstate();
+        let old = now_f64() as i64 - 1000;
+        state.store.write(move |conn| {
+            for (id, owner) in [("L-MINE", "probe"), ("L-THEIRS", "other")] {
+                conn.execute(
+                    "INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type, \
+                     lease_owner,lease_acquired_at,lease_heartbeat_at,lease_expires_at,lease_generation) \
+                     VALUES (?1,?1,'',?2,?3,?4,?4,'agent','code',?3,?4,?4,?5,1)",
+                    rusqlite::params![id, "doing", owner, old, old + 1800],
+                )?;
+            }
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let hb = |state: &AppState, id: &str| -> i64 {
+            state.store.read().unwrap()
+                .query_row("SELECT lease_heartbeat_at FROM issues WHERE id=?1", [id], |r| r.get(0))
+                .unwrap()
+        };
+        // A tool-hook with no active turn is IGNORED as a state report (AMUX-2538)
+        // and must still count as liveness: the tool call happened.
+        report_post(&state, "probe", &HeaderMap::new(), &json!({"state": "active", "source": "tool-hook"})).await;
+        assert!(hb(&state, "L-MINE") > old, "the reporting lane's lease must be renewed");
+        assert_eq!(hb(&state, "L-THEIRS"), old, "another lane's lease is not this report's to renew");
     }
 
     /// AMUX-3048: subagent start/stop events accumulate a live count in the same

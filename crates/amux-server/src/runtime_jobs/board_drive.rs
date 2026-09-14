@@ -666,9 +666,9 @@ pub struct DriveReport {
     /// unfinished dependency means no worker can honestly be working them.
     /// Published so a zero can be distinguished from a sweep that never ran.
     pub normalized_blocked_doing: usize,
-    /// Cards acted on by the RR-0052 lease reaper this tick (expired leases
-    /// reclaimed to todo, or extended because the holder was still active).
-    pub reclaimed_leases: usize,
+    /// The RR-0052 lease reaper's pass this tick: expired leases reclaimed to
+    /// todo or renewed because the holder is live, over how many it considered.
+    pub lease_reaper: LeaseReaperReport,
     pub lanes: Vec<LaneTrace>,
 }
 
@@ -5707,42 +5707,98 @@ async fn normalize_blocked_doing(state: &AppState) -> usize {
     normalized
 }
 
+/// What the lease reaper did this tick. `measured` is false when the scan for
+/// expired leases could not run, so `reclaimed: 0` from a broken probe is never
+/// mistaken for a quiet fleet (ethos rule 4).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LeaseReaperReport {
+    pub measured: bool,
+    /// Expired leases looked at (the population the two counts below are over).
+    pub n_considered: usize,
+    /// Expired, holder gone or idle: attempt abandoned, card back to `todo`.
+    pub reclaimed: usize,
+    /// Expired on paper, but the holder is provably mid-turn or running child
+    /// work, so the lease was renewed instead.
+    pub extended: usize,
+    /// Process-lifetime heartbeat renewals from worker self-reports. Leases
+    /// being granted while this stays 0 means the heartbeat path is broken.
+    pub heartbeats_total: u64,
+}
+
+/// Why an expired lease is renewed or reclaimed. Pure so the rule has tests;
+/// the async reaper only gathers the three facts.
+///
+/// An expired lease means no self-report from the holder for a whole TTL (every
+/// report renews it). That alone is not death: a hookless provider (codex,
+/// gemini) never reports, and a Claude lane in one long tool call reports
+/// nothing until it returns. So the reaper asks the same turn-boundary question
+/// steering asks before it reclaims: a holder that is mid-turn, or whose child
+/// work is still running, keeps its card.
+pub(crate) fn lease_verdict(running: bool, at_boundary: bool, child_work: bool) -> (bool, &'static str) {
+    if !running {
+        return (false, "holder_not_running");
+    }
+    if !at_boundary {
+        return (true, "holder_mid_turn");
+    }
+    if child_work {
+        return (true, "holder_child_work");
+    }
+    (false, "holder_idle_past_ttl")
+}
+
 /// RR-0052: reclaim cards whose hard lease has expired. Unlike
 /// `reclaim_stale_doing` (6h inactivity AND WIP pressure), this runs
 /// UNCONDITIONALLY: a dead worker's card must return to the queue even with an
-/// empty todo column behind it. A holder still actively working (a
-/// `session.working`/`message.delivered` event within the TTL) has its lease
-/// EXTENDED instead of reclaimed, so a heads-down worker on a long turn is never
-/// yanked mid-work. Returns the number of cards acted on (reclaimed + extended).
-pub(crate) async fn reclaim_expired_leases(state: &AppState) -> usize {
+/// empty todo column behind it.
+///
+/// LIVENESS IS ASKED OF THE FLEET, NOT THE EVENT LOG. The first version decided
+/// "still active" from `session_events` of type `session.working`,
+/// `message.delivered`, `task.status_changed` and `browser.action`. Two of those
+/// four are written by nothing in this codebase, and `message.delivered` is the
+/// SERVER delivering to the worker, which proves nothing about the worker. So a
+/// lane heads-down in tool calls read as dead and lost its card at the TTL. Now
+/// every self-report renews the lease (`refresh_lease_heartbeat`), and an expired
+/// lease is judged by `lease_verdict` from the same boundary gate steering uses.
+pub(crate) async fn reclaim_expired_leases<F: Fleet>(state: &AppState, fleet: &F) -> LeaseReaperReport {
     let ttl = bs::lease_ttl_s();
     let now = chrono::Utc::now().timestamp();
-    let expired: Vec<(String, String)> = match state.store.read() {
-        Ok(conn) => bs::list_issues(
-            &conn,
-            &["doing".to_string()],
-            &[],
-            bs::ArchivedFilter::ActiveOnly,
-        )
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|row| {
-            let owner = row.lease_owner.clone()?;
-            let exp = row.lease_expires_at?;
-            (exp < now && row.owner_type == "agent").then_some((row.id, owner))
-        })
-        .collect(),
+    let mut report = LeaseReaperReport {
+        heartbeats_total: bs::LEASE_HEARTBEATS.load(std::sync::atomic::Ordering::Relaxed),
+        ..Default::default()
+    };
+    let expired: Vec<(String, String, i64)> = match state
+        .store
+        .read()
+        .map_err(|e| e.to_string())
+        .and_then(|conn| {
+            bs::list_issues(&conn, &["doing".to_string()], &[], bs::ArchivedFilter::ActiveOnly)
+                .map_err(|e| e.to_string())
+        }) {
+        Ok(rows) => rows
+            .into_iter()
+            .filter_map(|row| {
+                let owner = row.lease_owner.clone()?;
+                let exp = row.lease_expires_at?;
+                (exp < now && row.owner_type == "agent").then_some((row.id, owner, row.lease_generation))
+            })
+            .collect(),
         Err(error) => {
             tracing::warn!(
                 target: "amux::board_drive", %error, measured = false, n_considered = 0,
                 verdict = "lease_reaper_scan_unmeasured",
                 "board_drive: could not scan for expired leases"
             );
-            return 0;
+            return report;
         }
     };
-    let mut acted = 0usize;
-    for (card, owner) in expired {
+    report.measured = true;
+    report.n_considered = expired.len();
+    for (card, owner, generation) in expired {
+        let running = fleet.is_running(&owner).await;
+        let at_boundary = if running { fleet.at_boundary(&owner).await } else { true };
+        let child_work = running && fleet.active_child_work(&owner);
+        let (keep, reason) = lease_verdict(running, at_boundary, child_work);
         let (card_w, owner_w) = (card.clone(), owner.clone());
         let reply = state
             .store
@@ -5750,68 +5806,81 @@ pub(crate) async fn reclaim_expired_leases(state: &AppState) -> usize {
                 let Some(row) = bs::get_issue(conn, &card_w)? else {
                     return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
                 };
-                // Re-check under the writer: still doing, still this owner, still expired.
+                // Re-check under the writer: still doing, same holder, same
+                // generation, still expired. A heartbeat or a re-claim that landed
+                // between the scan and here wins.
                 if row.status != "doing"
                     || row.lease_owner.as_deref() != Some(owner_w.as_str())
+                    || row.lease_generation != generation
                     || row.lease_expires_at.map(|e| e >= now).unwrap_or(true)
                 {
                     return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
                 }
-                // Liveness: did the holder lane do anything within the TTL? A
-                // working holder keeps its card; only a silent one is reclaimed.
-                let since = (now - ttl) as f64;
-                let alive: bool = conn
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM session_events WHERE session=?1 \
-                         AND type IN ('session.working','message.delivered', \
-                                      'task.status_changed','browser.action') \
-                         AND ts > ?2)",
-                        rusqlite::params![owner_w, since],
-                        |r| r.get(0),
-                    )
-                    .unwrap_or(false);
-                if alive {
+                if keep {
                     conn.execute(
                         "UPDATE issues SET lease_heartbeat_at = ?2, lease_expires_at = ?3 \
-                         WHERE id = ?1 AND status = 'doing'",
-                        rusqlite::params![card_w, now, now + ttl],
+                         WHERE id = ?1 AND status = 'doing' AND lease_generation = ?4",
+                        rusqlite::params![card_w, now, now + ttl, generation],
                     )?;
-                    tracing::info!(
-                        target: "amux::board_drive", card = %card_w, owner = %owner_w,
-                        measured = true, n_considered = 1,
-                        "board_drive: lease heartbeat extended (holder active) — RR-0052"
-                    );
                     return Ok(crate::db::WriteOutcome { applied: true, events: vec![] });
                 }
+                let idle_s = now - row.lease_heartbeat_at.unwrap_or(now);
                 let opts = crate::db::advance::AdvanceOpts {
                     expected_from: Some("doing".into()),
                     force: true,
                     skip_continuation: true,
                     skip_todo_wip: true,
                     log_line: Some(format!(
-                        "Auto-reclaimed: lease expired, holder '{owner_w}' inactive > {ttl}s (RR-0052)"
+                        "Auto-reclaimed: lease expired ({reason}), holder '{owner_w}' silent {idle_s}s > TTL {ttl}s (RR-0052)"
                     )),
                     ..Default::default()
                 };
-                match crate::db::advance::advance(conn, &card_w, "todo", "amux:lease-reaper", &opts)?
-                {
-                    Ok(_) => {
-                        tracing::info!(
-                            target: "amux::board_drive", card = %card_w, owner = %owner_w,
-                            measured = true, n_considered = 1,
-                            "board_drive: lease expired, card reclaimed to todo (holder inactive) — RR-0052"
-                        );
-                        Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                match crate::db::advance::advance(conn, &card_w, "todo", "amux:lease-reaper", &opts)? {
+                    Ok(outcome) => {
+                        // The audit row travels in the same transaction as the
+                        // reclaim, so "why did my card leave doing" is answerable
+                        // from the store, on the holder's own event stream.
+                        conn.execute(
+                            "INSERT INTO session_events (ts,session,type,data,source) VALUES (?,?,?,?,?)",
+                            rusqlite::params![
+                                now_f64(), &owner_w, "task.lease_reclaimed",
+                                json!({"issue": &card_w, "holder": &owner_w, "generation": generation,
+                                       "reason": reason, "silent_s": idle_s, "ttl_s": ttl}).to_string(),
+                                "board-drive"
+                            ],
+                        )?;
+                        Ok(crate::db::WriteOutcome { applied: true, events: outcome.events })
                     }
                     Err(_) => Ok(crate::db::WriteOutcome { applied: false, events: vec![] }),
                 }
             })
             .await;
-        if matches!(reply, Ok(r) if r.applied) {
-            acted += 1;
+        match reply {
+            Ok(r) if r.applied && !keep => {
+                report.reclaimed += 1;
+                tracing::info!(
+                    target: "amux::board_drive", card = %card, owner = %owner, reason,
+                    measured = true, n_considered = 1, verdict = "lease_reclaimed",
+                    "board_drive: lease expired, card reclaimed to todo — RR-0052"
+                );
+            }
+            Ok(r) if r.applied => {
+                report.extended += 1;
+                tracing::info!(
+                    target: "amux::board_drive", card = %card, owner = %owner, reason,
+                    measured = true, n_considered = 1, verdict = "lease_extended",
+                    "board_drive: lease expired on paper but holder is live, renewed — RR-0052"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                target: "amux::board_drive", card = %card, owner = %owner, %error,
+                measured = false, n_considered = 1, verdict = "lease_reaper_write_failed",
+                "board_drive: lease reaper could not commit — RR-0052"
+            ),
         }
     }
-    acted
+    report
 }
 
 /// One sweep over the fleet. ADVANCE BEFORE PICKUP, the same order and the same
@@ -5830,7 +5899,7 @@ pub async fn drive_tick<F: Fleet>(state: &AppState, fleet: &F) -> DriveReport {
     report.normalized_blocked_doing = normalize_blocked_doing(state).await;
     // RR-0052: reclaim expired leases before dispatch, so a dead worker's WIP
     // slot is free for the pickup below in this same tick.
-    report.reclaimed_leases = reclaim_expired_leases(state).await;
+    report.lease_reaper = reclaim_expired_leases(state, fleet).await;
     // Complete root epics before dispatch so the Messages chip and the board
     // agree that a command is finished as soon as all of its leaves are.
     report.completed_epics = complete_finished_epics(state).await;
@@ -8999,6 +9068,104 @@ mod tests {
             self.deliver(lane, text).await;
             Ok(ResumeDelivery::Queued)
         }
+    }
+
+    /// Put `id` in doing, leased to `lane`, with its lease already expired.
+    fn expired_lease_card(store: &std::sync::Arc<crate::db::Store>, id: &str) {
+        drive_card(store, id, "doing", "agent", "code");
+        let id = id.to_string();
+        let now = now_f64() as i64;
+        store.write(move |conn| {
+            conn.execute(
+                "UPDATE issues SET lease_owner='lane', lease_acquired_at=?2, lease_heartbeat_at=?2, \
+                 lease_expires_at=?3, lease_generation=1 WHERE id=?1",
+                rusqlite::params![id, now - 4000, now - 10],
+            )?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+    }
+
+    #[test]
+    fn lease_verdict_keeps_only_a_provably_live_holder() {
+        assert_eq!(lease_verdict(false, true, false), (false, "holder_not_running"));
+        assert_eq!(lease_verdict(false, false, true), (false, "holder_not_running"),
+            "a stopped lane cannot be mid-turn, whatever a stale boundary probe says");
+        assert_eq!(lease_verdict(true, false, false), (true, "holder_mid_turn"));
+        assert_eq!(lease_verdict(true, true, true), (true, "holder_child_work"));
+        assert_eq!(lease_verdict(true, true, false), (false, "holder_idle_past_ttl"));
+    }
+
+    #[tokio::test]
+    async fn an_expired_lease_on_a_mid_turn_holder_is_renewed_not_reclaimed() {
+        let (_dir, state, store) = drive_state();
+        expired_lease_card(&store, "T-LIVE");
+        let fleet = BoundaryFleet::default();
+        fleet.boundary.store(false, std::sync::atomic::Ordering::SeqCst); // mid-turn
+        let r = reclaim_expired_leases(&state, &fleet).await;
+        assert!(r.measured);
+        assert_eq!((r.n_considered, r.reclaimed, r.extended), (1, 0, 1));
+        assert_eq!(drive_status(&store, "T-LIVE"), "doing");
+        let exp: i64 = store.read().unwrap()
+            .query_row("SELECT lease_expires_at FROM issues WHERE id='T-LIVE'", [], |r| r.get(0)).unwrap();
+        assert!(exp > now_f64() as i64, "renewal must push the expiry into the future");
+        assert_eq!(drive_events(&store, "task.lease_reclaimed"), 0);
+    }
+
+    #[tokio::test]
+    async fn an_expired_lease_on_an_idle_holder_is_reclaimed_with_an_audit_row() {
+        let (_dir, state, store) = drive_state();
+        expired_lease_card(&store, "T-IDLE");
+        let fleet = BoundaryFleet::default(); // running, at boundary, no child work
+        let r = reclaim_expired_leases(&state, &fleet).await;
+        assert_eq!((r.n_considered, r.reclaimed, r.extended), (1, 1, 0));
+        assert_eq!(drive_status(&store, "T-IDLE"), "todo");
+        assert_eq!(drive_events(&store, "task.lease_reclaimed"), 1);
+        let (owner, gen): (Option<String>, i64) = store.read().unwrap()
+            .query_row("SELECT lease_owner, lease_generation FROM issues WHERE id='T-IDLE'", [],
+                |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(owner, None, "a reclaimed card carries no lease");
+        assert!(gen > 1, "release bumps the generation so a stale claimant is recognizable");
+    }
+
+    #[tokio::test]
+    async fn a_stopped_holder_loses_its_lease_even_with_child_work_reported() {
+        let (_dir, state, store) = drive_state();
+        expired_lease_card(&store, "T-DEAD");
+        let fleet = BoundaryFleet::default();
+        fleet.running.store(false, std::sync::atomic::Ordering::SeqCst);
+        fleet.active_child.store(true, std::sync::atomic::Ordering::SeqCst);
+        let r = reclaim_expired_leases(&state, &fleet).await;
+        assert_eq!((r.reclaimed, r.extended), (1, 0));
+        assert_eq!(drive_status(&store, "T-DEAD"), "todo");
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_renews_the_holders_lease_and_nobody_elses() {
+        let (_dir, _state, store) = drive_state();
+        expired_lease_card(&store, "T-HB");
+        let read = |store: &std::sync::Arc<crate::db::Store>| -> (i64, i64, i64) {
+            store.read().unwrap().query_row(
+                "SELECT lease_heartbeat_at, lease_expires_at, updated FROM issues WHERE id='T-HB'", [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap()
+        };
+        let (hb0, _, updated0) = read(&store);
+        let now = now_f64() as i64;
+        let counts = std::sync::Arc::new(std::sync::Mutex::new((0usize, 0usize, 0usize)));
+        let c2 = counts.clone();
+        store.write(move |conn| {
+            let other = bs::refresh_lease_heartbeat(conn, "someone-else", now)?;
+            let mine = bs::refresh_lease_heartbeat(conn, "lane", now)?;
+            // Throttled: a second report inside the gap writes nothing.
+            let again = bs::refresh_lease_heartbeat(conn, "lane", now + 5)?;
+            *c2.lock().unwrap() = (other, mine, again);
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        assert_eq!(*counts.lock().unwrap(), (0, 1, 0));
+        let (hb, exp, updated) = read(&store);
+        assert!(hb0 < now);
+        assert_eq!(hb, now, "the holder's report moved the heartbeat");
+        assert_eq!(exp, now + bs::lease_ttl_s());
+        assert_eq!(updated, updated0, "a heartbeat is not a card edit");
     }
 
     fn drive_state() -> (tempfile::TempDir, AppState, std::sync::Arc<crate::db::Store>) {

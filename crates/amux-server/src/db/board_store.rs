@@ -2963,6 +2963,46 @@ pub fn lease_enforcement_enabled() -> bool {
     )
 }
 
+/// Minimum seconds between two heartbeat writes for the same held card.
+///
+/// Every UPDATE on `issues` fires `search_issues_au`, which rewrites the card's
+/// whole search document (desc + log). The report hook fires on EVERY tool
+/// call, so an unthrottled heartbeat would reindex a busy lane's card several
+/// times a second. 60s against a 1800s TTL loses nothing a reaper can see.
+pub const LEASE_HEARTBEAT_MIN_GAP_S: i64 = 60;
+
+/// Heartbeat writes that actually moved a lease forward, process-lifetime.
+/// Published by `/api/debug/board-drive` beside the reaper's counts: leases
+/// being granted while this stays at 0 means the heartbeat path is broken and
+/// every busy holder is about to be reaped (the RR-0052 slice-2 bug, where the
+/// reaper's liveness events were never written by anything).
+pub static LEASE_HEARTBEATS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// RR-0052 heartbeat: the holder lane is alive, so push out the expiry of every
+/// `doing` card it holds. Called from the worker self-report path, which is the
+/// one signal that comes FROM the worker process (a delivered message comes from
+/// the server, and proves nothing about the receiver).
+///
+/// Deliberately a raw UPDATE of the lease columns only: `updated` and `version`
+/// are untouched, so a heartbeat never reads as a card edit, never bumps rot
+/// clocks, and never races a real PATCH on the version check.
+pub fn refresh_lease_heartbeat(conn: &Connection, holder: &str, now: i64) -> rusqlite::Result<usize> {
+    let holder = holder.trim();
+    if holder.is_empty() {
+        return Ok(0);
+    }
+    let n = conn.execute(
+        "UPDATE issues SET lease_heartbeat_at = ?2, lease_expires_at = ?2 + ?3 \
+         WHERE status = 'doing' AND lease_expires_at IS NOT NULL AND lease_owner = ?1 \
+           AND deleted IS NULL AND COALESCE(lease_heartbeat_at, 0) <= ?2 - ?4",
+        params![holder, now, lease_ttl_s(), LEASE_HEARTBEAT_MIN_GAP_S],
+    )?;
+    if n > 0 {
+        LEASE_HEARTBEATS.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(n)
+}
+
 /// A completed dependency must satisfy its type's real completion boundary.
 /// Code/ops/blockers need verification; docs and chores finish at done. Missing
 /// and discarded tasks are not proof that a required dependency was resolved.
