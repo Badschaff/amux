@@ -1531,6 +1531,80 @@ cmd_stop() {
   fi
 }
 
+cmd_pause() {
+  local name
+  name=$(resolve_session "${1:-}")
+  local AMUX_API="${AMUX_API:-https://localhost:8824}"
+  local resp
+  resp=$(_curl -sk -m 15 -X POST -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+    "$AMUX_API/api/workers/$name/pause" 2>/dev/null) || resp=""
+  if [[ -z "$resp" ]]; then
+    die "could not reach server to pause $name"
+  fi
+  local ok
+  ok=$(echo "$resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('lifecycle',''))" 2>/dev/null) || ok=""
+  if [[ "$ok" == "paused" ]]; then
+    echo "${YELLOW}paused${RESET} $name"
+  else
+    local err
+    err=$(echo "$resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('error','unknown'))" 2>/dev/null) || err="unknown"
+    echo "${RED}failed to pause $name:${RESET} $err"
+    return 1
+  fi
+}
+
+cmd_resume() {
+  local name
+  name=$(resolve_session "${1:-}")
+  local AMUX_API="${AMUX_API:-https://localhost:8824}"
+  local resp
+  resp=$(_curl -sk -m 15 -X POST -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+    "$AMUX_API/api/workers/$name/resume" 2>/dev/null) || resp=""
+  if [[ -z "$resp" ]]; then
+    die "could not reach server to resume $name"
+  fi
+  local ok
+  ok=$(echo "$resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('lifecycle',''))" 2>/dev/null) || ok=""
+  if [[ "$ok" == "active" ]]; then
+    echo "${GREEN}resumed${RESET} $name"
+  else
+    local err
+    err=$(echo "$resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('error','unknown'))" 2>/dev/null) || err="unknown"
+    echo "${RED}failed to resume $name:${RESET} $err"
+    return 1
+  fi
+}
+
+cmd_server() {
+  case "${1:-}" in
+    start)
+      echo "Starting amux server..."
+      launchctl kickstart gui/$(id -u)/com.amux.server-rs
+      echo "${GREEN}server started${RESET}"
+      ;;
+    stop)
+      echo "Stopping amux server..."
+      launchctl kill SIGTERM gui/$(id -u)/com.amux.server-rs
+      echo "${RED}server stopped${RESET}"
+      ;;
+    restart)
+      echo "Restarting amux server..."
+      launchctl kickstart -k gui/$(id -u)/com.amux.server-rs
+      echo "${GREEN}server restarted${RESET}"
+      ;;
+    status)
+      if _curl -sk -m 5 "$(cmd_url)/api/health" >/dev/null 2>&1; then
+        echo "${GREEN}server is running${RESET} at $(cmd_url)"
+      else
+        echo "${RED}server is not reachable${RESET}"
+      fi
+      ;;
+    *)
+      echo "Usage: amux server <start|stop|restart|status>"
+      ;;
+  esac
+}
+
 cmd_rm() {
   local name
   name=$(resolve_session "${1:-}")
@@ -1709,6 +1783,71 @@ cmd_stop_all() {
   done
 }
 
+cmd_pause_all() {
+  local AMUX_API="${AMUX_API:-https://localhost:8824}"
+  local sessions_json
+  sessions_json=$(_curl -sk -m 30 "$AMUX_API/api/sessions" 2>/dev/null) || die "could not reach server"
+  local names
+  names=$(echo "$sessions_json" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for s in data:
+    if not s.get('archived') and s.get('lifecycle', 'active') == 'active':
+        print(s['name'])
+" 2>/dev/null) || die "failed to parse sessions"
+  local paused=0 skipped=0 failed=0
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    local resp
+    resp=$(_curl -sk -m 15 -X POST -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+      "$AMUX_API/api/workers/$name/pause" 2>/dev/null) || resp=""
+    local lc
+    lc=$(echo "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('lifecycle',''))" 2>/dev/null) || lc=""
+    if [[ "$lc" == "paused" ]]; then
+      echo "${YELLOW}paused${RESET} $name"
+      paused=$((paused + 1))
+    elif [[ "$lc" == "paused" ]] || echo "$resp" | grep -q '"noop"'; then
+      echo "${DIM}$name already paused${RESET}"
+      skipped=$((skipped + 1))
+    else
+      echo "${RED}failed to pause $name${RESET}"
+      failed=$((failed + 1))
+    fi
+  done <<< "$names"
+  echo "${BOLD}pause-all:${RESET} ${YELLOW}${paused} paused${RESET} · ${skipped} skipped · ${failed} failed"
+}
+
+cmd_resume_all() {
+  local AMUX_API="${AMUX_API:-https://localhost:8824}"
+  local sessions_json
+  sessions_json=$(_curl -sk -m 30 "$AMUX_API/api/sessions" 2>/dev/null) || die "could not reach server"
+  local names
+  names=$(echo "$sessions_json" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for s in data:
+    if s.get('lifecycle') == 'paused':
+        print(s['name'])
+" 2>/dev/null) || die "failed to parse sessions"
+  local resumed=0 failed=0
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    local resp
+    resp=$(_curl -sk -m 15 -X POST -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+      "$AMUX_API/api/workers/$name/resume" 2>/dev/null) || resp=""
+    local lc
+    lc=$(echo "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('lifecycle',''))" 2>/dev/null) || lc=""
+    if [[ "$lc" == "active" ]]; then
+      echo "${GREEN}resumed${RESET} $name"
+      resumed=$((resumed + 1))
+    else
+      echo "${RED}failed to resume $name${RESET}"
+      failed=$((failed + 1))
+    fi
+  done <<< "$names"
+  echo "${BOLD}resume-all:${RESET} ${GREEN}${resumed} resumed${RESET} · ${failed} failed"
+}
+
 # Start every registered, NON-ARCHIVED worker that is not already running.
 #
 # This is the fleet's cold-start path (a machine reboot, `amux stop-all`, a
@@ -1748,6 +1887,10 @@ cmd_start_all() {
     # rather than the server so cold start does not depend on the server being
     # up yet — at boot it frequently is not.
     if grep -q '^CC_ARCHIVED="\?1' "$f" 2>/dev/null; then
+      archived=$((archived + 1))
+      continue
+    fi
+    if grep -q '^CC_PAUSED="\?1' "$f" 2>/dev/null; then
       archived=$((archived + 1))
       continue
     fi
@@ -5009,12 +5152,17 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     peek|p)           shift; cmd_peek "$@" ;;
     send)             shift; cmd_send "$@" ;;
     stop|kill)        shift; cmd_stop "$@" ;;
+    pause)            shift; cmd_pause "$@" ;;
+    resume|unpause)   shift; cmd_resume "$@" ;;
+    server)           shift; cmd_server "$@" ;;
     rm|remove|del)    shift; cmd_rm "$@" ;;
     ls|list)          shift; cmd_ls "$@" ;;
     info)             shift; cmd_info "$@" ;;
     defaults|config)  shift; cmd_defaults "$@" ;;
     start-all)        cmd_start_all ;;
     stop-all)         cmd_stop_all ;;
+    pause-all)        cmd_pause_all ;;
+    resume-all)       cmd_resume_all ;;
     serve|web)        shift; cmd_serve "$@" ;;
     board|b)          shift; cmd_board "$@" ;;
     browser|br)      shift; cmd_browser "$@" ;;

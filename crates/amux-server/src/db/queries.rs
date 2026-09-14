@@ -12,36 +12,30 @@
 //! exists because these queries are also usable from contexts that do not
 //! enjoy the writer's serialization.
 //!
-//! SOFT DELETE, without a schema change: RR-0034 wants DELETE to be soft,
-//! but `_amux_workers` (migration 0003) has no `deleted_at` column and this
-//! change is not allowed to add migrations. The marker therefore rides
-//! INSIDE the `state` JSON as a sidecar key
-//! (`{"state":"stopped","deleted_at":"..."}`): `WorkerState`'s serde
-//! tolerates unknown keys, so the column still round-trips as a valid
-//! `WorkerState`, and every query here filters on
-//! `json_extract(state, '$.deleted_at') IS NULL`. This is a named deviation
-//! — promote the marker to a real column in the next migration and delete
-//! `state_from_column`'s sidecar handling.
+//! LIFECYCLE (migration 0067): the `lifecycle` column on `_amux_workers`
+//! carries the canonical lifecycle state (active/paused/archived/deleted).
+//! This replaces the soft-delete sidecar that stored `deleted_at` inside the
+//! state JSON column, which was a named deviation resolved by 0067.
 
 use amux_core::ids::{GroupId, WorkerId};
 use amux_core::session::ExitReason;
-use amux_core::worker::{WorkerConfig, WorkerState};
+use amux_core::worker::{WorkerConfig, WorkerLifecycle, WorkerState};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::collections::BTreeMap;
 
 /// Column list shared by every worker SELECT so `worker_from_row`'s indices
-/// cannot drift from the query text.
+/// cannot drift from the query text. `lifecycle` is appended after
+/// `updated_at` (migration 0067 adds the column; ALTER TABLE ADD COLUMN
+/// appends, so existing index positions are stable).
 const WORKER_COLS: &str = "id, display_name, name_aliases, cwd, provider, model, backend, \
-     environment, permissions, group_id, state, version, created_at, updated_at";
+     environment, permissions, group_id, state, version, created_at, updated_at, lifecycle";
 
-/// The soft-delete filter (see module docs). Applied to every read AND to
-/// every guarded write, so a deleted worker can be neither resolved nor
-/// mutated back to life by accident.
-const NOT_DELETED: &str = "json_extract(state, '$.deleted_at') IS NULL";
+/// The lifecycle filter replacing the old soft-delete sidecar. Applied to
+/// every normal read and guarded write so deleted workers cannot be resolved
+/// or mutated back to life.
+const NOT_DELETED: &str = "lifecycle != 'deleted'";
 
-/// One `_amux_workers` row. `state` is the parsed `WorkerState`; the
-/// soft-delete sidecar is split out into `deleted_at` on read so consumers
-/// never see the storage trick.
+/// One `_amux_workers` row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkerRow {
     pub id: String,
@@ -55,14 +49,17 @@ pub struct WorkerRow {
     pub permissions: Vec<String>,
     pub group_id: Option<String>,
     pub state: WorkerState,
+    /// Legacy compat: derived from lifecycle == Deleted + updated_at.
+    /// Replay snapshots include this for continuity with pre-0067 events.
     pub deleted_at: Option<String>,
     pub version: u64,
     pub created_at: String,
     pub updated_at: String,
+    pub lifecycle: WorkerLifecycle,
 }
 
 impl WorkerRow {
-    /// A fresh worker: version 0, state Stopped (RR-0034 create contract).
+    /// A fresh worker: version 0, state Stopped, lifecycle Active.
     pub fn new(id: &WorkerId, config: &WorkerConfig, now: &str) -> WorkerRow {
         let mut row = WorkerRow {
             id: id.as_str().to_string(),
@@ -80,6 +77,7 @@ impl WorkerRow {
             version: 0,
             created_at: now.to_string(),
             updated_at: now.to_string(),
+            lifecycle: WorkerLifecycle::Active,
         };
         row.set_config(config);
         row
@@ -118,6 +116,7 @@ impl WorkerRow {
             "backend": self.backend,
             "environment": self.environment,
             "permissions": self.permissions,
+            "lifecycle": self.lifecycle.as_str(),
             "group_id": self.group_id,
             "state": serde_json::to_value(&self.state)
                 .unwrap_or_else(|_| serde_json::json!({"state": "stopped"})),
@@ -171,34 +170,41 @@ fn json_col<T: serde::de::DeserializeOwned>(raw: &str, idx: usize) -> rusqlite::
     serde_json::from_str(raw).map_err(|e| json_col_err(idx, e))
 }
 
-/// Serialize a `WorkerState` for the `state` column, re-attaching the
-/// soft-delete sidecar if present (see module docs).
-fn state_to_column(state: &WorkerState, deleted_at: Option<&str>) -> String {
-    let mut v = serde_json::to_value(state)
-        .unwrap_or_else(|_| serde_json::json!({"state": "stopped"}));
-    if let (Some(at), Some(obj)) = (deleted_at, v.as_object_mut()) {
-        obj.insert("deleted_at".into(), serde_json::Value::String(at.to_string()));
-    }
-    v.to_string()
+/// Serialize a `WorkerState` for the `state` column. The old soft-delete
+/// sidecar is no longer written; lifecycle carries deletion status since
+/// migration 0067.
+fn state_to_column(state: &WorkerState) -> String {
+    serde_json::to_value(state)
+        .unwrap_or_else(|_| serde_json::json!({"state": "stopped"}))
+        .to_string()
 }
 
-/// Parse the `state` column, splitting the soft-delete sidecar back out so
-/// the returned `WorkerState` is exactly the core type.
-fn state_from_column(raw: &str, idx: usize) -> rusqlite::Result<(WorkerState, Option<String>)> {
+/// Parse the `state` column. Tolerates (and strips) a leftover `deleted_at`
+/// sidecar from pre-0067 data that the migration UPDATE missed (e.g. a row
+/// inserted between migration start and the UPDATE step, though in practice
+/// the migration is atomic).
+fn state_from_column(raw: &str, idx: usize) -> rusqlite::Result<WorkerState> {
     let mut v: serde_json::Value = serde_json::from_str(raw).map_err(|e| json_col_err(idx, e))?;
-    let deleted_at = v
-        .as_object_mut()
-        .and_then(|o| o.remove("deleted_at"))
-        .and_then(|d| d.as_str().map(str::to_string));
+    if let Some(obj) = v.as_object_mut() {
+        obj.remove("deleted_at");
+    }
     let state: WorkerState = serde_json::from_value(v).map_err(|e| json_col_err(idx, e))?;
-    Ok((state, deleted_at))
+    Ok(state)
 }
 
 fn worker_from_row(r: &Row<'_>) -> rusqlite::Result<WorkerRow> {
     let name_aliases: Vec<String> = json_col(&r.get::<_, String>(2)?, 2)?;
     let environment: BTreeMap<String, String> = json_col(&r.get::<_, String>(7)?, 7)?;
     let permissions: Vec<String> = json_col(&r.get::<_, String>(8)?, 8)?;
-    let (state, deleted_at) = state_from_column(&r.get::<_, String>(10)?, 10)?;
+    let state = state_from_column(&r.get::<_, String>(10)?, 10)?;
+    let updated_at: String = r.get(13)?;
+    let lifecycle_raw: String = r.get(14)?;
+    let lifecycle = WorkerLifecycle::parse(&lifecycle_raw).unwrap_or(WorkerLifecycle::Active);
+    let deleted_at = if lifecycle == WorkerLifecycle::Deleted {
+        Some(updated_at.clone())
+    } else {
+        None
+    };
     Ok(WorkerRow {
         id: r.get(0)?,
         display_name: r.get(1)?,
@@ -214,7 +220,8 @@ fn worker_from_row(r: &Row<'_>) -> rusqlite::Result<WorkerRow> {
         deleted_at,
         version: r.get::<_, i64>(11)? as u64,
         created_at: r.get(12)?,
-        updated_at: r.get(13)?,
+        updated_at,
+        lifecycle,
     })
 }
 
@@ -228,8 +235,9 @@ fn one_worker(conn: &Connection, sql: &str, key: &str) -> rusqlite::Result<Optio
 pub fn insert_worker(conn: &Connection, row: &WorkerRow) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO _amux_workers (id, display_name, name_aliases, cwd, provider, model, \
-         backend, environment, permissions, group_id, state, version, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+         backend, environment, permissions, group_id, state, version, created_at, updated_at, \
+         lifecycle) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             row.id,
             row.display_name,
@@ -241,10 +249,11 @@ pub fn insert_worker(conn: &Connection, row: &WorkerRow) -> rusqlite::Result<()>
             serde_json::to_string(&row.environment).map_err(|e| json_col_err(7, e))?,
             serde_json::to_string(&row.permissions).map_err(|e| json_col_err(8, e))?,
             row.group_id,
-            state_to_column(&row.state, row.deleted_at.as_deref()),
+            state_to_column(&row.state),
             row.version as i64,
             row.created_at,
             row.updated_at,
+            row.lifecycle.as_str(),
         ],
     )?;
     Ok(())
@@ -316,6 +325,51 @@ pub fn list_workers(
     Ok((out, total as u64))
 }
 
+/// Workers filtered by lifecycle. When `lifecycles` is empty, returns all
+/// non-deleted workers (same as `list_workers`).
+pub fn list_workers_by_lifecycle(
+    conn: &Connection,
+    lifecycles: &[WorkerLifecycle],
+    offset: u64,
+    limit: u64,
+) -> rusqlite::Result<(Vec<WorkerRow>, u64)> {
+    if lifecycles.is_empty() {
+        return list_workers(conn, offset, limit);
+    }
+    let placeholders: Vec<String> = lifecycles.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+    let filter = format!("lifecycle IN ({})", placeholders.join(", "));
+    let mut count_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    for lc in lifecycles {
+        count_params.push(Box::new(lc.as_str().to_string()));
+    }
+    let count_refs: Vec<&dyn rusqlite::types::ToSql> = count_params.iter().map(|b| b.as_ref()).collect();
+    let total: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM _amux_workers WHERE {filter}"),
+        count_refs.as_slice(),
+        |r| r.get(0),
+    )?;
+    let mut list_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    for lc in lifecycles {
+        list_params.push(Box::new(lc.as_str().to_string()));
+    }
+    let lp_len = list_params.len();
+    list_params.push(Box::new(limit as i64));
+    list_params.push(Box::new(offset as i64));
+    let list_refs: Vec<&dyn rusqlite::types::ToSql> = list_params.iter().map(|b| b.as_ref()).collect();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {WORKER_COLS} FROM _amux_workers WHERE {filter} \
+         ORDER BY created_at, id LIMIT ?{} OFFSET ?{}",
+        lp_len + 1,
+        lp_len + 2,
+    ))?;
+    let rows = stmt.query_map(list_refs.as_slice(), worker_from_row)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok((out, total as u64))
+}
+
 /// EVERY worker row, soft-deleted included, for replay verification
 /// (RR-0111a). Deletion is soft (the row survives with `deleted_at` set) and
 /// the Deleted event journals a snapshot of that surviving row — so verify
@@ -368,10 +422,9 @@ pub fn update_worker_config(
     )
 }
 
-/// Execution-state write. Does NOT touch `version`: version counts config
-/// mutations (optimistic concurrency for editors), state is runtime telemetry
-/// — conflating them would make every heartbeat a "conflict". Refuses to
-/// touch soft-deleted rows, so a late state report cannot resurrect one.
+/// Execution-state write. Does NOT touch `version` or `lifecycle`: version
+/// counts config mutations, lifecycle is an independent dimension. Refuses
+/// to touch deleted rows, so a late state report cannot resurrect one.
 pub fn update_worker_state(
     conn: &Connection,
     id: &str,
@@ -382,20 +435,50 @@ pub fn update_worker_state(
         &format!(
             "UPDATE _amux_workers SET state = ?2, updated_at = ?3 WHERE id = ?1 AND {NOT_DELETED}"
         ),
-        params![id, state_to_column(state, None), now],
+        params![id, state_to_column(state), now],
     )
 }
 
-/// Soft delete (see module docs for the storage). Returns rows affected —
-/// 0 means already deleted or absent, so deletion is naturally idempotent
-/// without ever reporting a second delete as a fresh change (Invariant 37).
+/// Transition lifecycle. Returns rows affected (0 = no such row, already in
+/// that lifecycle, or deleted). The `from` guard prevents accidental
+/// transitions from states the caller did not expect.
+pub fn update_worker_lifecycle(
+    conn: &Connection,
+    id: &str,
+    from: &[WorkerLifecycle],
+    to: WorkerLifecycle,
+    now: &str,
+) -> rusqlite::Result<usize> {
+    if from.is_empty() {
+        return Ok(0);
+    }
+    let placeholders: Vec<String> = from.iter().enumerate().map(|(i, _)| format!("?{}", i + 4)).collect();
+    let sql = format!(
+        "UPDATE _amux_workers SET lifecycle = ?2, updated_at = ?3 \
+         WHERE id = ?1 AND lifecycle IN ({})",
+        placeholders.join(", ")
+    );
+    let mut bound: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+        Box::new(id.to_string()),
+        Box::new(to.as_str().to_string()),
+        Box::new(now.to_string()),
+    ];
+    for lc in from {
+        bound.push(Box::new(lc.as_str().to_string()));
+    }
+    let refs: Vec<&dyn rusqlite::types::ToSql> = bound.iter().map(|b| b.as_ref()).collect();
+    conn.execute(&sql, refs.as_slice())
+}
+
+/// Soft delete via lifecycle. Convenience wrapper preserving the old call
+/// shape for callers that already check preconditions.
 pub fn soft_delete_worker(conn: &Connection, id: &str, now: &str) -> rusqlite::Result<usize> {
-    conn.execute(
-        &format!(
-            "UPDATE _amux_workers SET state = json_set(state, '$.deleted_at', ?2), \
-             updated_at = ?2 WHERE id = ?1 AND {NOT_DELETED}"
-        ),
-        params![id, now],
+    update_worker_lifecycle(
+        conn,
+        id,
+        &[WorkerLifecycle::Active, WorkerLifecycle::Paused, WorkerLifecycle::Archived],
+        WorkerLifecycle::Deleted,
+        now,
     )
 }
 

@@ -60,6 +60,70 @@ pub struct WorkerCapabilities {
     pub integrations: BTreeSet<String>,
 }
 
+/// Lifecycle state: orthogonal to execution state. A worker can be
+/// `Active + Stopped`, `Paused + Idle`, or `Archived + Stopped`.
+/// Execution state says what the process is doing NOW; lifecycle says
+/// whether the worker SHOULD be doing anything at all.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerLifecycle {
+    /// Part of the active fleet: eligible for orchestration, scheduling,
+    /// messages, task assignment, and automatic driving.
+    #[default]
+    Active,
+    /// Fully configured and visible, session may remain intact, but must
+    /// not receive new automatic work or be automatically driven.
+    /// Manual inspection and explicit user actions still work.
+    Paused,
+    /// Deliberately parked/retired. Excluded from fleet discovery,
+    /// scheduling, orchestration, automatic driving, and default views.
+    /// History, config, and artifacts are preserved. Restorable.
+    Archived,
+    /// Terminal state. Removed from normal product use. Audit/tombstone
+    /// data preserved for referential integrity. Never scheduled,
+    /// started, messaged, or automatically restored.
+    Deleted,
+}
+
+impl WorkerLifecycle {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Paused => "paused",
+            Self::Archived => "archived",
+            Self::Deleted => "deleted",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "active" => Some(Self::Active),
+            "paused" => Some(Self::Paused),
+            "archived" => Some(Self::Archived),
+            "deleted" => Some(Self::Deleted),
+            _ => None,
+        }
+    }
+
+    pub fn is_drivable(self) -> bool {
+        matches!(self, Self::Active)
+    }
+
+    pub fn can_start(self) -> bool {
+        matches!(self, Self::Active | Self::Paused)
+    }
+
+    pub fn is_visible_default(self) -> bool {
+        matches!(self, Self::Active | Self::Paused)
+    }
+}
+
+impl std::fmt::Display for WorkerLifecycle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Execution state (Invariant 11: always current). Distinct from task state
 /// (Invariant 19) — a worker is Active/Idle, a task is doing/done.
 ///
@@ -102,6 +166,8 @@ pub struct Worker {
     pub config: WorkerConfig,
     pub capabilities: WorkerCapabilities,
     pub state: WorkerState,
+    #[serde(default)]
+    pub lifecycle: WorkerLifecycle,
     /// Optimistic-concurrency version (Invariant 35): increments on every
     /// config mutation, so two concurrent editors cannot silently clobber
     /// each other.
@@ -117,6 +183,7 @@ impl Worker {
             config,
             capabilities,
             state: WorkerState::Stopped,
+            lifecycle: WorkerLifecycle::Active,
             version: 0,
         }
     }
@@ -261,6 +328,7 @@ pub fn apply_config(
         config: new_config,
         capabilities: worker.capabilities,
         state,
+        lifecycle: worker.lifecycle,
         version: worker.version + 1,
     };
 
@@ -618,5 +686,79 @@ mod tests {
         let back: Worker = serde_json::from_str(&json).unwrap();
         assert_eq!(w, back);
         assert_eq!(back.id(), w.id());
+    }
+
+    // ---- lifecycle ---------------------------------------------------------
+
+    #[test]
+    fn lifecycle_serde_round_trips() {
+        for lc in [
+            WorkerLifecycle::Active,
+            WorkerLifecycle::Paused,
+            WorkerLifecycle::Archived,
+            WorkerLifecycle::Deleted,
+        ] {
+            let json = serde_json::to_string(&lc).unwrap();
+            let back: WorkerLifecycle = serde_json::from_str(&json).unwrap();
+            assert_eq!(lc, back);
+        }
+    }
+
+    #[test]
+    fn lifecycle_parse_round_trips() {
+        for lc in [
+            WorkerLifecycle::Active,
+            WorkerLifecycle::Paused,
+            WorkerLifecycle::Archived,
+            WorkerLifecycle::Deleted,
+        ] {
+            assert_eq!(WorkerLifecycle::parse(lc.as_str()), Some(lc));
+        }
+        assert_eq!(WorkerLifecycle::parse("bogus"), None);
+    }
+
+    #[test]
+    fn lifecycle_drivable_only_active() {
+        assert!(WorkerLifecycle::Active.is_drivable());
+        assert!(!WorkerLifecycle::Paused.is_drivable());
+        assert!(!WorkerLifecycle::Archived.is_drivable());
+        assert!(!WorkerLifecycle::Deleted.is_drivable());
+    }
+
+    #[test]
+    fn lifecycle_can_start_active_and_paused() {
+        assert!(WorkerLifecycle::Active.can_start());
+        assert!(WorkerLifecycle::Paused.can_start());
+        assert!(!WorkerLifecycle::Archived.can_start());
+        assert!(!WorkerLifecycle::Deleted.can_start());
+    }
+
+    #[test]
+    fn config_change_preserves_lifecycle() {
+        let mut w = worker();
+        w.lifecycle = WorkerLifecycle::Paused;
+        let mut new_cfg = base_config();
+        new_cfg.display_name = "renamed".into();
+        let (w1, _) = apply_config(
+            w,
+            new_cfg,
+            &caps(true),
+            t("2026-08-09T12:00:00Z"),
+            None,
+            || SessionId::from_ulid(fixed_ulid("AAAA")),
+        );
+        assert_eq!(w1.lifecycle, WorkerLifecycle::Paused);
+    }
+
+    #[test]
+    fn default_lifecycle_is_active() {
+        assert_eq!(WorkerLifecycle::default(), WorkerLifecycle::Active);
+    }
+
+    #[test]
+    fn worker_deserialize_without_lifecycle_defaults_active() {
+        let json = r#"{"id":"wrk_01JGXV0000000000000000TEST","config":{"display_name":"backend","name_aliases":[],"cwd":"/tmp","provider":"claude","model":"fable-5","backend":"herdr","environment":{},"permissions":["bash"],"group":null},"capabilities":{"tools":[],"repositories":[],"browser":false,"integrations":[]},"state":{"state":"stopped"},"version":0}"#;
+        let w: Worker = serde_json::from_str(json).unwrap();
+        assert_eq!(w.lifecycle, WorkerLifecycle::Active);
     }
 }

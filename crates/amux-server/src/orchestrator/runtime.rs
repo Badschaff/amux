@@ -62,16 +62,20 @@ fn decomposition_depth(
 /// (ethos rule 1: a view must share the predicate of the mechanism it
 /// claims to describe).
 pub fn hydrate_workers(conn: &rusqlite::Connection) -> anyhow::Result<Vec<Worker>> {
-    // (offset, limit) — a swapped pair here silently loads ZERO workers,
-    // which the recovery test caught: name the intent.
+    // Only active workers participate in orchestration. Paused, archived,
+    // and deleted workers are excluded by the lifecycle filter so the
+    // planner never assigns them work.
+    let active_only = &[amux_core::worker::WorkerLifecycle::Active];
     let (offset, limit) = (0u64, 10_000u64);
-    let (rows, _total) = crate::db::queries::list_workers(conn, offset, limit)?;
+    let (rows, _total) =
+        crate::db::queries::list_workers_by_lifecycle(conn, active_only, offset, limit)?;
     Ok(rows
         .into_iter()
         .filter_map(|row| {
             let id = amux_core::ids::WorkerId::parse(&row.id).ok()?;
             let mut w = Worker::new(id, row.config(), Default::default());
             w.state = row.state.clone();
+            w.lifecycle = row.lifecycle;
             w.version = row.version;
             Some(w)
         })

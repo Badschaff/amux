@@ -212,6 +212,9 @@ fn score(task: &Task, hints: Option<&PriorityHints>, now: DateTime<Utc>) -> i64 
 }
 
 fn worker_available(w: &Worker, live_leases: usize, wip_limit: usize) -> bool {
+    if !w.lifecycle.is_drivable() {
+        return false;
+    }
     if live_leases >= wip_limit {
         return false;
     }

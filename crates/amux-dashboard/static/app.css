@@ -209,6 +209,67 @@
   .card-menu-item.danger { color: var(--red); }
   .card-menu-sep { height: 1px; background: var(--border); }
 
+  /* Lifecycle: PAUSED badge on worker cards */
+  .status-badge.lifecycle-paused {
+    background: #d29922; color: #000; font-weight: 700; font-size: 0.65rem;
+    letter-spacing: 0.03em;
+  }
+  /* Paused section accordion (above active workers) */
+  #paused-section { padding: 0 12px; }
+  .paused-footer {
+    display: flex; align-items: center; gap: 8px;
+    padding: 9px 12px; border-radius: 8px; cursor: pointer;
+    border: 1px solid #d29922; color: #d29922;
+    font-size: 0.82rem; font-weight: 600; user-select: none; margin-bottom: 8px;
+    background: var(--card);
+  }
+  .paused-footer:hover { border-color: #e5a825; }
+  .paused-chevron { font-size: 0.65rem; transition: transform 0.15s; color: #d29922; }
+  .paused-chevron.open { transform: rotate(90deg); }
+  .paused-body { margin-bottom: 6px; display: flex; flex-direction: column; gap: 5px; }
+  .paused-card {
+    display: flex; flex-direction: column; gap: 4px;
+    padding: 8px 11px; border-radius: 8px; border: 1px solid color-mix(in srgb, #d29922 40%, var(--border));
+    background: var(--card); font-size: 0.8rem;
+  }
+  .paused-card-top { display: flex; align-items: center; gap: 7px; min-width: 0; flex-wrap: wrap; }
+  .paused-card-name { font-weight: 600; color: var(--text); cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .paused-card-name:hover { color: #d29922; }
+  .paused-card-chip {
+    font-size: 0.63rem; padding: 1px 6px; border-radius: 9px; flex-shrink: 0;
+    background: var(--bg); border: 1px solid var(--border); color: var(--dim); white-space: nowrap;
+  }
+  .paused-card-chip.model { color: var(--cyan, #39d2c0); }
+  .paused-card-spacer { flex: 1; min-width: 8px; }
+  .paused-card-meta {
+    color: var(--dim); font-size: 0.7rem; display: flex; gap: 5px 10px; flex-wrap: wrap;
+    align-items: center; min-width: 0;
+  }
+  .paused-card-tag { color: #d29922; font-size: 0.68rem; }
+  .paused-card-preview {
+    color: var(--dim); font-size: 0.72rem; line-height: 1.4; min-width: 0;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .paused-card-actions { display: flex; gap: 4px; flex-shrink: 0; }
+  .paused-resume-btn {
+    padding: 3px 10px; border-radius: 5px; font-size: 0.75rem; border: 1px solid #d29922;
+    color: #d29922; background: transparent; cursor: pointer; white-space: nowrap; min-height: 28px;
+  }
+  .paused-resume-btn:hover { background: #d29922; color: #000; }
+  .paused-archive-btn {
+    padding: 3px 7px; border-radius: 5px; font-size: 0.75rem; border: 1px solid var(--border);
+    color: var(--dim); background: transparent; cursor: pointer; min-height: 28px;
+  }
+  .paused-archive-btn:hover { border-color: var(--red); color: var(--red); }
+  @media (max-width: 600px) {
+    .paused-card { padding: 10px 12px; gap: 6px; }
+    .paused-card-top { gap: 6px; }
+    .paused-card-name { font-size: 0.85rem; max-width: calc(100% - 120px); }
+    .paused-resume-btn { min-height: 44px; min-width: 44px; padding: 6px 14px; font-size: 0.82rem; }
+    .paused-archive-btn { min-height: 44px; min-width: 44px; padding: 6px 10px; font-size: 0.82rem; }
+    .paused-footer { min-height: 44px; padding: 10px 14px; font-size: 0.85rem; }
+  }
+
   /* Archived sessions */
   #archived-section { padding: 0 12px 12px; }
   .archived-footer {
@@ -1472,6 +1533,7 @@
     align-items: center; gap: 6px; font-variant-numeric: tabular-nums;
     -webkit-tap-highlight-color: transparent;
   }
+  #rate-limit-pill-count { display:none; }
   .btn-rate-limit.show { display: flex; }
   .btn-rate-limit:active { background: rgba(248,81,73,0.22); }
   .active-dropdown {
@@ -1575,14 +1637,29 @@
       content: ''; position: absolute; left: 50%; top: 50%;
       width: 44px; height: 44px; transform: translate(-50%, -50%);
     }
-    .header-row { gap: 4px; flex-wrap: nowrap; }
-    .header-row h1 { font-size: 1.1rem; flex-shrink: 0; }
-    /* overflow:hidden so a group that can't fit its own children (the bell
-       button next to the "Live" pill, both flex-shrink:0) clips at its OWN
-       boundary instead of bleeding into the sibling group and overlapping
-       the rate-limit pill's text (Ethan, phone screenshot, 2026-09-11). */
-    .header-row > div { gap: 6px !important; flex-shrink: 1; min-width: 0; overflow: hidden; }
-    .btn-rate-limit { max-width: 90px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 6px 8px; flex-shrink: 0; }
+    /* Compact labels, full touch targets. At 320px the action-status icon
+       can wrap; no control is clipped to make a nominally single row fit. */
+    .header-row { gap:1px; padding:8px; flex-wrap:wrap; justify-content:flex-start; }
+    .header-row > .header-brand, .header-row > .header-actions { display:contents !important; }
+    .header-row #brand-header, .header-row #conn-status, .header-row #notif-btn,
+    .header-row .header-add-btn, .header-row .settings-btn, .header-row .btn-active,
+    .header-row .btn-rate-limit { flex:0 0 44px; width:44px; min-width:44px; height:44px; min-height:44px; box-sizing:border-box; justify-content:center; padding:4px; }
+    .header-row #brand-header { font-size:1.25rem; }
+    .header-row #brand-icon-header { display:none; }
+    .header-row #brand-name-header { font-size:0; }
+    .header-row #brand-name-header::after { content:'a'; font-size:1.25rem; }
+    .header-row #conn-status { display:flex; font-size:0; gap:0; background:transparent; transition:color .2s,background-color .2s; }
+    .header-row #conn-status::before { width:12px; height:12px; margin:0; }
+    .header-row .active-wrap, .header-row .header-add-wrap, .header-row .settings-wrap { flex:0 0 auto; }
+    .header-row .btn-active { gap:3px; font-size:0.85rem; }
+    .header-row .btn-rate-limit { max-width:44px; overflow:visible; white-space:nowrap; }
+    .header-row #rate-limit-pill-text { display:none; }
+    .header-row #rate-limit-pill-count { display:inline-block; font-size:0.85rem; font-weight:600; }
+    .header-row #interaction-feedback { flex:0 0 44px; margin-left:auto; }
+    .header-row #interaction-feedback > summary { box-sizing:border-box; width:44px; height:44px; min-height:44px; padding:0; justify-content:center; }
+    .header-row #interaction-feedback > summary > span { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); white-space:nowrap; }
+    .header-row #interaction-feedback > summary > svg:last-child { display:none; }
+
   }
 
   /* Header + dropdown */

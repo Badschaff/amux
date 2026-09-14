@@ -9494,6 +9494,78 @@ async fn archive_session_issues(state: &AppState, name: &str, flag: i64) {
         .await;
 }
 
+/// Legacy cascade for the new lifecycle archive endpoint: sets CC_ARCHIVED=1
+/// in the env file (if it exists) and archives the worker's board cards.
+/// Does NOT stop the session (the caller handles that).
+pub(crate) async fn archive_legacy_cascade(state: &AppState, name: &str) {
+    let f = env_path(name);
+    if f.exists() {
+        let mut cfg = parse_env(name);
+        cfg.set("CC_ARCHIVED", "1");
+        let _ = cfg.write(&f);
+    }
+    archive_session_issues(state, name, 1).await;
+}
+
+/// Legacy cascade for pause: sets CC_PAUSED=1 in the env file so cold-start
+/// (which reads env files without the server) skips paused workers.
+pub(crate) fn pause_legacy_cascade(name: &str) {
+    let f = env_path(name);
+    if f.exists() {
+        let mut cfg = parse_env(name);
+        cfg.set("CC_PAUSED", "1");
+        let _ = cfg.write(&f);
+    }
+}
+
+/// Legacy cascade for resume: removes CC_PAUSED from the env file.
+pub(crate) fn resume_legacy_cascade(name: &str) {
+    let f = env_path(name);
+    if f.exists() {
+        let mut cfg = parse_env(name);
+        cfg.remove("CC_PAUSED");
+        let _ = cfg.write(&f);
+    }
+}
+
+/// Legacy cascade for the new lifecycle restore endpoint: removes CC_ARCHIVED
+/// from the env file (if it exists) and un-archives the worker's board cards.
+pub(crate) async fn restore_legacy_cascade(state: &AppState, name: &str) {
+    let f = env_path(name);
+    if f.exists() {
+        let mut cfg = parse_env(name);
+        cfg.remove("CC_ARCHIVED");
+        let _ = cfg.write(&f);
+    }
+    archive_session_issues(state, name, 0).await;
+}
+
+/// Sync a lifecycle change from the legacy (env-file) side to the Rust worker
+/// table. Called when the legacy archive/wake verb changes CC_ARCHIVED so the
+/// two substrates stay in agreement.
+pub(crate) async fn sync_lifecycle_to_rust_worker(
+    state: &AppState,
+    name: &str,
+    to: amux_core::worker::WorkerLifecycle,
+) {
+    use amux_core::worker::WorkerLifecycle;
+    let name = name.to_string();
+    let _ = state.store.write_async(move |conn| {
+        let Some(row) = crate::db::queries::get_worker(conn, &name)? else {
+            return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+        };
+        let from: &[WorkerLifecycle] = match to {
+            WorkerLifecycle::Archived => &[WorkerLifecycle::Active, WorkerLifecycle::Paused],
+            WorkerLifecycle::Active => &[WorkerLifecycle::Paused, WorkerLifecycle::Archived],
+            WorkerLifecycle::Paused => &[WorkerLifecycle::Active],
+            WorkerLifecycle::Deleted => &[WorkerLifecycle::Active, WorkerLifecycle::Paused, WorkerLifecycle::Archived],
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let n = crate::db::queries::update_worker_lifecycle(conn, &row.id, from, to, &now)?;
+        Ok(crate::db::WriteOutcome { applied: n > 0, events: vec![] })
+    }).await;
+}
+
 /// py:25137 reset_session — drop the conversation, keep the lane.
 async fn reset_session(state: &AppState, name: &str) -> (bool, String) {
     let f = env_path(name);
@@ -15491,6 +15563,7 @@ async fn post_dispatch(
                 return jresp(StatusCode::FORBIDDEN, json!({"error": "cannot archive pinned session — unpin first"}));
             }
             let (ok, msg) = archive_session(state, name).await;
+            if ok { sync_lifecycle_to_rust_worker(state, name, amux_core::worker::WorkerLifecycle::Archived).await; }
             verb_resp(ok, msg)
         }
         "wake" => wake_verb(state, name).await,
@@ -16419,6 +16492,23 @@ pub(crate) async fn reset_verb(state: &AppState, name: &str) -> Response {
 /// implementation instead of a route alias and a re-implementation (AF-288).
 pub(crate) async fn wake_verb(state: &AppState, name: &str) -> Response {
     let (ok, msg) = wake_session(state, name).await;
+    if ok {
+        // Only restore from Archived. Paused workers keep their lifecycle
+        // on wake; explicit `resume` is required to unpause.
+        let name_owned = name.to_string();
+        let store = state.store.clone();
+        let _ = store.write_async(move |conn| {
+            use amux_core::worker::WorkerLifecycle;
+            let Some(row) = crate::db::queries::get_worker(conn, &name_owned)? else {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            };
+            let now = chrono::Utc::now().to_rfc3339();
+            let n = crate::db::queries::update_worker_lifecycle(
+                conn, &row.id, &[WorkerLifecycle::Archived], WorkerLifecycle::Active, &now,
+            )?;
+            Ok(crate::db::WriteOutcome { applied: n > 0, events: vec![] })
+        }).await;
+    }
     verb_resp(ok, msg)
 }
 
