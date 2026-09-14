@@ -15764,7 +15764,7 @@ async fn post_dispatch(
             Some(path) => j200(json!({"ok": true, "path": path})),
             None => j200(json!({"ok": false, "message": "nothing to backup"})),
         },
-        "send" => send_post(state, name, headers, body).await,
+        "send" => send_post_detached(state, name, headers, body).await,
         "instructions" => instructions_post_verb(state, name, body).await,
         "keys" => keys_verb(name, body).await,
         "resize" => resize_verb(name, body).await,
@@ -16461,7 +16461,7 @@ pub(crate) async fn send_verb(
             json!({"error": format!("session '{name}' not found")}),
         );
     }
-    send_post(state, name, headers, body).await
+    send_post_detached(state, name, headers, body).await
 }
 
 /// Isolation is a reachability boundary for both direct and queued peer
@@ -16506,6 +16506,58 @@ async fn isolated_peer_refusal(state: &AppState, name: &str, headers: &HeaderMap
         "ok": false, "error": reason, "blocked": "isolated", "code": "isolated_target",
         "what_to_do": "An isolated worker is reachable only by its owner from the dashboard; no approval can authorize peer delivery.",
     })))
+}
+
+/// A send runs in its own task, so a client that gives up mid-send cannot drop
+/// it between reserving the message ID and settling it (AMUX-4589).
+///
+/// `send_post` reserves the ID in `send_dedup_gate`, then waits on the lane: the
+/// send lock, a generating turn, submit verification. Mobile Safari over the
+/// tailnet aborts a long request, and axum drops the handler future with it, so
+/// neither `send_dedup_accept` nor `send_dedup_forget` ran. The reservation was
+/// left with no receipt, and every retry of the same ID answered 503 "pending"
+/// for two minutes and 409 "uncertain" after that. Measured 2026-09-14: the
+/// dashboard's stuck "1 sending" over mixpeek-homepage-claude, 14 retries in
+/// 100 seconds. The restart path already avoided this by answering early; this
+/// covers every other path. The task's answer is identical to `send_post`'s.
+async fn send_post_detached(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
+    // Two-fix rule: the case this exists for says so in the log when it happens.
+    struct ClientLeft {
+        session: String,
+        answered: bool,
+    }
+    impl Drop for ClientLeft {
+        fn drop(&mut self) {
+            if !self.answered {
+                tracing::warn!(
+                    target: "amux::message_acceptance",
+                    session = %self.session,
+                    verdict = "client_left_mid_send",
+                    measured = true,
+                    n_considered = 1,
+                    "the client left before the send answered; the send continues detached and \
+                     settles its message ID, so a retry reads the real outcome (AMUX-4589)"
+                );
+            }
+        }
+    }
+    let mut watch = ClientLeft { session: name.to_string(), answered: false };
+    let (st, n, h, b) = (state.clone(), name.to_string(), headers.clone(), body.clone());
+    let joined = tokio::spawn(async move { send_post(&st, &n, &h, &b).await }).await;
+    watch.answered = true;
+    match joined {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!(
+                target: "amux::message_acceptance", session = %name, %error,
+                "send task ended without answering (AMUX-4589)"
+            );
+            jresp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"ok": false, "error": "send task ended without answering; retry the same message ID"}),
+            )
+        }
+    }
 }
 
 async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
@@ -16670,6 +16722,12 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     // Owner sends (dashboard, human) pass through so the human can answer the
     // dialog directly.
     if matches!(send_origin, SendOrigin::Automation) && lane_is_blocked(state, name) {
+        // A refusal releases the ID it reserved (AMUX-4589). Returning with the
+        // reservation in place made a retry of the same ID read "pending" for two
+        // minutes over a message nobody typed.
+        if !msg_id.is_empty() {
+            send_dedup_forget(state, name, &msg_id).await;
+        }
         return jresp(
             StatusCode::CONFLICT,
             json!({
@@ -25184,6 +25242,51 @@ CLAUDE-POSTFIX-COMPLETE
         let conn = state.store.read().unwrap();
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM send_dedup",[],|r|r.get::<_,i64>(0)).unwrap(),1);
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM cmd_history",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    }
+
+    /// AMUX-4589. The client leaves while the send is parked on the lane lock,
+    /// after the ID was reserved. The ID must still settle: a retry reads a
+    /// receipt or a clean slate, never "pending" until the two-minute cutoff.
+    #[tokio::test]
+    async fn a_send_whose_client_left_still_settles_its_message_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        std::fs::create_dir_all(sessions_dir()).unwrap();
+        // NO env file, on purpose. With one, the not-running path auto-wakes the
+        // lane, and tmux is the machine's real server: the first version of this
+        // test started a live `amux-client-left-fixture` session that the fleet
+        // then adopted and credited with a peer's commit. Without one, the send
+        // answers "not running" and settles its ID without touching tmux.
+        let name = "client-left-fixture";
+        let (state, _store_dir) = state();
+        let body = json!({"text":"hello", "record_history":true, "no_board":true, "msg_id":"client-left-1"});
+        let held = lane_send_lock(name).lock_owned().await;
+        let left = tokio::time::timeout(
+            Duration::from_millis(300),
+            send_post_detached(&state, name, &HeaderMap::new(), &body),
+        )
+        .await;
+        assert!(left.is_err(), "the fixture must still be parked on the lane lock when the client leaves");
+        let pending: i64 = state.store.read().unwrap()
+            .query_row("SELECT COUNT(*) FROM send_dedup WHERE session=?1 AND msg_id='client-left-1' AND receipt_id IS NULL", [name], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pending, 1, "the ID was reserved before the client left, which is the stranded state");
+        drop(held);
+        let mut settled = false;
+        for _ in 0..100 {
+            let conn = state.store.read().unwrap();
+            let row: Option<Option<String>> = conn
+                .query_row("SELECT receipt_id FROM send_dedup WHERE session=?1 AND msg_id='client-left-1'", [name], |r| r.get(0))
+                .ok();
+            drop(conn);
+            // Forgotten (no row) or accepted (a receipt): both are settled.
+            if !matches!(row, Some(None)) {
+                settled = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(settled, "the message ID stayed reserved with no receipt after its client left");
     }
 
     #[tokio::test]
