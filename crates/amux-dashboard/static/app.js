@@ -10631,7 +10631,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.941';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.942';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -19385,6 +19385,14 @@ async function openFilePreview(path) {
       return;
     }
     _fileData = data;
+    // Markdown opens to Raw by default (Ethan, 2026-09-14): rendered Preview
+    // hides exact formatting/links/frontmatter, which is what you want first
+    // when opening a note to read or edit. Preview is one tap away. The tabs
+    // were set to Preview-active synchronously above, before is_markdown was
+    // known, so re-sync them now that it is.
+    if (data.is_markdown) _fileViewMode = 'raw';
+    document.getElementById('file-tab-preview').classList.toggle('active', _fileViewMode === 'preview');
+    document.getElementById('file-tab-raw').classList.toggle('active', _fileViewMode === 'raw');
     // Show tabs only for text files
     const isTextFile = !data.is_image && !data.is_pdf && !data.is_video && !data.is_audio && !data.is_binary && !data.is_ebook;
     if (isTextFile) {
@@ -19430,6 +19438,9 @@ async function openFilePreview(path) {
       if (cachedIsText) {
         document.getElementById('file-view-tabs').style.display = '';
       }
+      if (cached.data.is_markdown) _fileViewMode = 'raw';
+      document.getElementById('file-tab-preview').classList.toggle('active', _fileViewMode === 'preview');
+      document.getElementById('file-tab-raw').classList.toggle('active', _fileViewMode === 'raw');
       _renderFileBody(cached.data, _fileViewMode);
       return;
     }
