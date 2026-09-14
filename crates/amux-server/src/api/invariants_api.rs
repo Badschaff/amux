@@ -124,6 +124,8 @@ async fn health(
         "failures": latest.iter().filter(|l| l["status"] == "fail").map(|l| json!({
             "invariant_id": l["invariant_id"], "entity": l["entity"],
             "expected": l["expected"], "observed": l["observed"],
+            // AMUX-4538: the check's causal slice, e.g. a per-card sample.
+            "evidence": l["evidence"],
         })).collect::<Vec<_>>(),
         "unknowns": latest.iter().filter(|l| l["status"] == "unknown").map(|l| json!({
             "invariant_id": l["invariant_id"], "why": l["observed"],
@@ -215,6 +217,7 @@ fn live_body(results: &[crate::invariants::InvariantResult], state: &AppState) -
         "failures": results.iter().filter(|r| r.status == Status::Fail).map(|r| json!({
             "invariant_id": r.invariant_id, "entity": r.entity_key,
             "expected": r.expected, "observed": r.observed,
+            "evidence": r.evidence,
         })).collect::<Vec<_>>(),
         "unknowns": results.iter().filter(|r| r.status == Status::Unknown).map(|r| json!({
             "invariant_id": r.invariant_id, "why": r.observed,

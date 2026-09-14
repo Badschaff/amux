@@ -249,7 +249,7 @@ pub fn latest_per_invariant(store: &SharedStore) -> anyhow::Result<Vec<serde_jso
                       WHERE r.invariant_id = ids.id) AS mt
                FROM ids WHERE id IS NOT NULL
          )
-         SELECT r.invariant_id, r.status, r.entity_key, r.expected, r.observed, r.ts
+         SELECT r.invariant_id, r.status, r.entity_key, r.expected, r.observed, r.ts, r.evidence
            FROM _amux_invariant_result r
            JOIN latest l ON l.invariant_id = r.invariant_id AND l.mt = r.ts
           ORDER BY r.invariant_id",
@@ -258,15 +258,29 @@ pub fn latest_per_invariant(store: &SharedStore) -> anyhow::Result<Vec<serde_jso
     let rows = stmt
         .query_map([], |r| {
             let ts: f64 = r.get(5)?;
-            Ok(json!({
+            let status: String = r.get(1)?;
+            let mut row = json!({
                 "invariant_id": r.get::<_, String>(0)?,
-                "status":       r.get::<_, String>(1)?,
+                "status":       status,
                 "entity":       r.get::<_, String>(2)?,
                 "expected":     r.get::<_, String>(3)?,
                 "observed":     r.get::<_, String>(4)?,
                 "checked_at":   ts,
                 "age_s":        (now - ts).max(0.0),
-            }))
+            });
+            // AMUX-4538. Checks store their causal slice in `evidence` (a
+            // failure's per-card sample, for instance) and this read dropped
+            // it, so a verdict that said "see evidence.sample" pointed at a
+            // field no endpoint returned. Carried on non-pass rows only: the
+            // pass rows are ~640 and their evidence is a population count the
+            // verdict already implies.
+            if row["status"] != "pass" {
+                let raw: String = r.get(6)?;
+                if !raw.trim().is_empty() && raw.trim() != "{}" {
+                    row["evidence"] = serde_json::from_str(&raw).unwrap_or(serde_json::Value::String(raw));
+                }
+            }
+            Ok(row)
         })?
         .flatten()
         .collect();
@@ -290,6 +304,30 @@ pub fn result_log_stats(store: &SharedStore) -> anyhow::Result<(i64, f64)> {
 mod tests {
     use super::*;
     use crate::invariants::InvariantResult;
+
+    /// AMUX-4538. A failing check's stored evidence reaches the reader through
+    /// the SHIPPED writer (`record`) and reader (`latest_per_invariant`); a
+    /// passing row carries none.
+    #[tokio::test]
+    async fn a_failing_rows_stored_evidence_is_returned_and_a_pass_row_carries_none() {
+        let (s, _d) = store();
+        record(
+            &s,
+            vec![
+                InvariantResult::fail("test.evidence_fail", "every card complete", "2 of 5 incomplete")
+                    .evidence(json!({"sample": [{"id": "A-1", "gaps": ["priority"]}], "n_considered": 5})),
+                InvariantResult::pass("test.evidence_pass").evidence(json!({"n_considered": 9})),
+            ],
+            1,
+        )
+        .await;
+        let rows = latest_per_invariant(&s).unwrap();
+        let fail = rows.iter().find(|r| r["invariant_id"] == "test.evidence_fail").expect("fail row");
+        assert_eq!(fail["evidence"]["sample"][0]["id"], "A-1", "{fail}");
+        assert_eq!(fail["evidence"]["n_considered"], 5, "{fail}");
+        let pass = rows.iter().find(|r| r["invariant_id"] == "test.evidence_pass").expect("pass row");
+        assert!(pass.get("evidence").is_none(), "pass rows stay small: {pass}");
+    }
 
     fn store() -> (SharedStore, tempfile::TempDir) {
         let d = tempfile::tempdir().unwrap();
