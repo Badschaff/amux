@@ -4711,7 +4711,7 @@ function render() {
   _renderGroupsTab();
   const stripEl = document.getElementById('grp-scope-strip');
   if (stripEl && stripEl.innerHTML) { stripEl.innerHTML = ''; stripEl._want = ''; }
-  const _nonArchivedCount = sessions.filter(s => !s.archived && s.lifecycle !== 'paused').length;
+  const _nonArchivedCount = sessions.filter(s => !s.archived).length;
   if (!_nonArchivedCount && !drafts.length) {
     if (_sessionLoadError) {
       el.innerHTML = ''; // Actionable detail is in the Sync error badge modal.
@@ -6296,7 +6296,7 @@ function _applyEmbedView() {
   }
 })();
 
-let pausedExpanded = true;
+let pausedExpanded = false;
 function togglePaused() {
   pausedExpanded = !pausedExpanded;
   _renderPausedSection();
@@ -10461,7 +10461,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.924';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.925';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.

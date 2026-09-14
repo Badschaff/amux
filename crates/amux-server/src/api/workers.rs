@@ -1193,7 +1193,8 @@ pub async fn pause_worker(State(state): State<AppState>, Path(key): Path<String>
         Ok(n) => n,
         Err(r) => return r,
     };
-    let resp = lifecycle_transition(
+    // Try Rust DB transition (may 404 for legacy-only workers, that's fine).
+    let _ = lifecycle_transition(
         state.clone(),
         key,
         &[WorkerLifecycle::Active],
@@ -1204,7 +1205,7 @@ pub async fn pause_worker(State(state): State<AppState>, Path(key): Path<String>
     // Cascade: write CC_PAUSED=1 to the env file so cold-start skips this worker.
     crate::api::session_verbs::pause_legacy_cascade(&name);
     crate::api::sessions_legacy::invalidate_sessions_cache();
-    resp
+    (StatusCode::OK, Json(json!({ "applied": true, "lifecycle": "paused", "name": name }))).into_response()
 }
 
 /// `POST /api/workers/{id}/resume` — paused -> active.
@@ -1213,7 +1214,8 @@ pub async fn resume_worker(State(state): State<AppState>, Path(key): Path<String
         Ok(n) => n,
         Err(r) => return r,
     };
-    let resp = lifecycle_transition(
+    // Try Rust DB transition (may 404 for legacy-only workers, that's fine).
+    let _ = lifecycle_transition(
         state.clone(),
         key,
         &[WorkerLifecycle::Paused],
@@ -1224,7 +1226,7 @@ pub async fn resume_worker(State(state): State<AppState>, Path(key): Path<String
     // Cascade: remove CC_PAUSED from the env file.
     crate::api::session_verbs::resume_legacy_cascade(&name);
     crate::api::sessions_legacy::invalidate_sessions_cache();
-    resp
+    (StatusCode::OK, Json(json!({ "applied": true, "lifecycle": "active", "name": name }))).into_response()
 }
 
 /// `POST /api/workers/{id}/archive` — active|paused -> archived.

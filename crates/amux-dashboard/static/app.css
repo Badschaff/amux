@@ -215,7 +215,7 @@
     letter-spacing: 0.03em;
   }
   /* Paused section accordion (above active workers) */
-  #paused-section { padding: 0 12px; }
+  #paused-section { padding: 0 12px; margin-top: 18px; }
   .paused-footer {
     display: flex; align-items: center; gap: 8px;
     padding: 9px 12px; border-radius: 8px; cursor: pointer;

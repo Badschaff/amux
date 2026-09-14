@@ -389,9 +389,9 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../../migrations/0066_send_receipt_identity.sql"),
     },
     Migration {
-        version: 67,
-        name: "0067_worker_lifecycle",
-        sql: include_str!("../../migrations/0067_worker_lifecycle.sql"),
+        version: 69,
+        name: "0069_worker_lifecycle",
+        sql: include_str!("../../migrations/0069_worker_lifecycle.sql"),
     },
 ];
 

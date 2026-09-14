@@ -6791,7 +6791,10 @@ pub(crate) fn all_lane_names() -> Vec<String> {
         .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(String::from))
         .collect();
     names.sort();
-    names.retain(|n| parse_env(n).get("CC_ARCHIVED") != Some("1"));
+    names.retain(|n| {
+        let cfg = parse_env(n);
+        cfg.get("CC_ARCHIVED") != Some("1") && cfg.get("CC_PAUSED") != Some("1")
+    });
     names
 }
 
@@ -9111,6 +9114,9 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
 pub(crate) async fn start_for_board_dispatch(state: &AppState, name: &str) -> Result<(), String> {
     if session_is_isolated(name) {
         return Err("isolated workers never receive board automation".into());
+    }
+    if parse_env(name).get("CC_PAUSED") == Some("1") {
+        return Err("paused workers are excluded from board automation".into());
     }
     let (started, detail) = start_session(state, name, "", false).await;
     if !started {
