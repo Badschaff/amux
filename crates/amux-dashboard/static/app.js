@@ -1213,9 +1213,41 @@ function showConnHistory() {
       + Math.round(_CONN_BLIP_MS / 1000) + 's each, recovered automatically. Not listed above.</div></div>'
     : '';
   const pending = offlineQueue.length + drafts.length;
-  const pendingHtml = pending
-    ? '<div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);font-size:0.8rem;color:var(--dim);">' + pending + ' operation' + (pending === 1 ? '' : 's') + ' queued while offline. <a href="#" onclick="event.preventDefault();document.getElementById(\'conn-hist-modal\').remove();showQueueModal();" style="color:var(--accent);">View queue</a></div>'
-    : '';
+  // Render pending outbox items inline in the connection modal so the user
+  // can see what "N pending" means without opening a second modal (Ethan
+  // 2026-09-14: "this should be in the 1 pending modal").
+  let pendingHtml = '';
+  if (pending) {
+    const itemRows = offlineQueue.map(q => {
+      const age = Math.floor((Date.now() - q.timestamp) / 60000);
+      const timeStr = age < 1 ? 'just now' : age + 'm ago';
+      const uncertain = _outboxUncertainMessage(q);
+      const blocked = q.state === 'blocked' && !uncertain;
+      const ico = blocked ? '🔴' : uncertain ? '🟡' : '⏳';
+      const status = blocked ? 'failed' : uncertain ? 'checking' : 'queued';
+      const dismissId = 'conn-dismiss-' + esc(q.id);
+      return '<div style="display:flex;gap:8px;align-items:baseline;padding:5px 2px;font-size:0.82rem;">'
+        + '<span style="flex-shrink:0;">' + ico + '</span>'
+        + '<div style="flex:1;min-width:0;"><div>' + esc(describeOp(q)) + '</div>'
+        + (q.error ? '<div style="color:' + (uncertain ? 'var(--yellow,#d29922)' : 'var(--red,#e55)') + ';font-size:0.72rem;">' + esc(q.error).substring(0, 100) + '</div>' : '')
+        + '</div>'
+        + '<span style="color:var(--dim);flex-shrink:0;font-variant-numeric:tabular-nums;font-size:0.76rem;">' + timeStr + '</span>'
+        + (blocked ? ' <button type="button" onclick="_dismissQueuedOp(\'' + escJs(q.id) + '\');document.getElementById(\'conn-hist-modal\')?.remove();showConnHistory();" style="background:none;border:none;color:var(--dim);cursor:pointer;font-size:0.85rem;padding:0 2px;" title="Dismiss">&#x2715;</button>' : '')
+        + '</div>';
+    }).join('');
+    const draftRows = drafts.map(d =>
+      '<div style="display:flex;gap:8px;align-items:baseline;padding:5px 2px;font-size:0.82rem;">'
+        + '<span style="flex-shrink:0;">📝</span>'
+        + '<div style="flex:1;min-width:0;">Create &amp; start ' + esc(d.name) + '</div>'
+        + '<span style="color:var(--dim);flex-shrink:0;font-size:0.76rem;">draft</span></div>'
+    ).join('');
+    pendingHtml = '<div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);">'
+      + '<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;"><b style="font-size:0.85rem;">Pending operations</b>'
+      + '<span style="font-size:0.72rem;color:var(--dim);">' + pending + '</span></div>'
+      + draftRows + itemRows
+      + '<div style="margin-top:6px;"><button class="btn" onclick="event.preventDefault();document.getElementById(\'conn-hist-modal\').remove();runSyncBanner();" style="font-size:0.75rem;">Retry now</button></div>'
+      + '</div>';
+  }
   const clearHtml = _connEvents.length
     ? '<button onclick="_connEvents=[];localStorage.removeItem(\'amux_conn_events\');document.getElementById(\'conn-hist-modal\').remove();" style="margin-top:12px;background:none;border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-size:0.75rem;color:var(--dim);cursor:pointer;">Clear history</button>'
     : '';
@@ -2290,7 +2322,13 @@ function updateConnectionStatus() {
   // Announce only what the user can actually act on: we are offline, an op
   // failed, or an op has been waiting long enough that it is no longer "about
   // to send". Anything younger is in flight and stays silent.
-  const stuck = offlineQueue.filter(_outboxNeedsAttention);
+  //
+  // Items that are only "awaiting confirmation" (uncertain delivery) are not
+  // actionable from the banner. They belong in the connection badge and
+  // the connection modal, not in a persistent banner that eats screen space
+  // (Ethan 2026-09-14: "takes up too much real estate, should be in the
+  // pending modal"). Exclude them from the stuck count that triggers the banner.
+  const stuck = offlineQueue.filter(q => _outboxNeedsAttention(q) && !_outboxUncertainMessage(q));
   const worthShowing = !online || stuck.length || drafts.length;
   if (!hasPending || !worthShowing) {
     banner.classList.remove('active');
@@ -2778,7 +2816,9 @@ async function _runSyncBanner(quiet = false) {
   try { _loadCmdHistoryFromServer().then(() => { _peekMessagesBadge(); if (typeof _peekTab !== 'undefined' && _peekTab === 'messages') _peekMessagesRender(); }); } catch(e) {}
   // Reconnect progress keeps failed steps reviewable until dismissed. Ordinary
   // online sends stay quiet; only completed visible runs auto-dismiss.
-  if (!failCount && !checkingCount) {
+  // "Checking" (awaiting confirmation) items are surfaced by the connection
+  // badge and modal, so the sync banner does not need to stay up for them.
+  if (!failCount) {
     _clearSyncTransientToast();
     setTimeout(() => { if (!_syncFlight) banner.classList.remove('active'); }, 2000);
   }
@@ -2849,8 +2889,23 @@ function _outboxUncertainMessage(q) {
   return !!_outboxMessageId(q) && (q.delivery_uncertain === true ||
     (q.state === 'blocked' && /acceptance is uncertain|delivery unconfirmed/i.test(q.error || '')));
 }
+// 10 minutes. After this, stop auto-checking and let the user decide.
+const _OUTBOX_CONFIRM_TIMEOUT_MS = 10 * 60 * 1000;
 async function _outboxConfirmMessage(q, opts) {
   q.delivery_uncertain = true;
+  // If we have been checking for longer than the timeout, give up and mark
+  // the item as blocked so the user can dismiss or force-retry. The infinite
+  // loop was costing screen real estate and sync capacity for 50+ minutes
+  // (Ethan 2026-09-14 incident).
+  const checkingSince = q.attempted_at || q.timestamp || Date.now();
+  if (Date.now() - checkingSince > _OUTBOX_CONFIRM_TIMEOUT_MS) {
+    _outboxDiagnostic('acceptance_timed_out', {id:q.id, measured:true, n_considered:1,
+      age_min:Math.round((Date.now() - checkingSince) / 60000)});
+    q.delivery_uncertain = false;
+    throw Object.assign(
+      new Error('Confirmation timed out after ' + Math.round((Date.now() - checkingSince) / 60000) + 'm. Dismiss or retry.'),
+      {outboxBlocked:true});
+  }
   const msgId = (/\/steer$/.test(q.url) ? 'steer:' : '') + _outboxMessageId(q);
   const url = q.url.replace(/\/(send|steer)$/, '/send') + '?msg_id=' + encodeURIComponent(msgId);
   const response = await _boundedMutationFetch(url, {method:'GET', headers:opts.headers, cache:'no-store'});
@@ -5894,8 +5949,12 @@ let hiddenTabs = (function() {
     const s = localStorage.getItem('amux_hidden_tabs');
     if (s !== null) return new Set(JSON.parse(s));
   } catch(e) {}
-  // Default visible tabs: sessions, files, scheduler, board, workspace, notes, skills, browser
-  return new Set(['logs','metrics','torrents','terminal']);
+  // Default visible tabs: sessions, files, scheduler, board, workspace, notes, skills, browser, logs
+  // Logs was hidden by default and kept disappearing on localStorage eviction
+  // (Ethan 2026-09-14: "logs are still off in the screen"). Main tab visibility
+  // falls back to this set when localStorage is empty and server-side prefs
+  // haven't loaded yet, so anything here is invisible until the user opts in.
+  return new Set(['metrics','torrents','terminal']);
 })();
 
 let tabOrder = (function() {
@@ -10733,7 +10792,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.944';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.945';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
