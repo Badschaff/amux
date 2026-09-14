@@ -1157,6 +1157,75 @@ const CAPTURE_FILLER: [&str; 19] = [
 /// never a model call (ethos rule 2: the Python system paid a full
 /// `claude -p` boot, ~12-15k input tokens, for a 3-word label, and the
 /// throttle that cost forced is why most commands never reached the board).
+/// Strip ONE leading bare clock-time prefix, returning the remainder, or `None`
+/// if `t` does not open with one. Some workers prefix every peer message with a
+/// UTC time like `11:2xZ.` (the minute may be masked with `x`), which then became
+/// the card TITLE ("11:2xZ") and, sitting in the first clause, hid the real
+/// content from every capture classifier (AMUX-4498, 23 timestamp-titled cards
+/// across the fleet). Grammar: `HH:MM`, optional `:SS`, each minute/second
+/// character a digit or `x`; an optional single trailing letter (a zone like `Z`);
+/// then a separator (`.`, space, `,`, `;`, `:`, `-`). No regex, so amux-core
+/// stays dependency-light.
+fn strip_leading_time_prefix(t: &str) -> Option<&str> {
+    let b = t.as_bytes();
+    let mut i = 0;
+    let digit = |c: u8| c.is_ascii_digit();
+    let mm = |c: u8| c.is_ascii_digit() || c == b'x' || c == b'X';
+    // HH: 1-2 digits
+    if i < b.len() && digit(b[i]) {
+        i += 1;
+        if i < b.len() && digit(b[i]) {
+            i += 1;
+        }
+    } else {
+        return None;
+    }
+    // :MM
+    if i < b.len() && b[i] == b':' && i + 2 < b.len() && mm(b[i + 1]) && mm(b[i + 2]) {
+        i += 3;
+    } else {
+        return None;
+    }
+    // optional :SS
+    if i + 2 < b.len() && b[i] == b':' && mm(b[i + 1]) && mm(b[i + 2]) {
+        i += 3;
+    }
+    // optional single zone letter
+    if i < b.len() && b[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    // must be followed by a separator, or the "time" was really the whole word.
+    if i < b.len() && matches!(b[i], b'.' | b' ' | b',' | b';' | b':' | b'-') {
+        Some(t[i..].trim_start_matches(['.', ' ', ',', ';', ':', '-']))
+    } else {
+        None
+    }
+}
+
+/// Strip the leading capture prefixes a message accretes before its real
+/// content: `[HH:MM AM]` / `[amux-origin: ...]` bracket stamps and bare clock
+/// times (see [`strip_leading_time_prefix`]), repeatedly and in any order.
+/// Shared by every capture classifier so a stamped/timestamped message is judged
+/// on its content, not its prefix. Does NOT handle `[no-board]`, which is
+/// `title_from_prompt`'s early-return concern.
+pub(crate) fn strip_capture_prefixes(text: &str) -> &str {
+    let mut t = text.trim().trim_start_matches('❯').trim_start();
+    loop {
+        if t.starts_with('[') {
+            if let Some(i) = t.find(']') {
+                t = t[i + 1..].trim_start();
+                continue;
+            }
+        }
+        if let Some(rest) = strip_leading_time_prefix(t) {
+            t = rest;
+            continue;
+        }
+        break;
+    }
+    t
+}
+
 /// Mirrors Python `_autotask_title` + the `_AUTOTASK_SKIP` guards.
 ///
 /// Returns `None` when the text is NOT a task: a control word steering the
@@ -1175,13 +1244,23 @@ pub fn title_from_prompt(text: &str) -> Option<String> {
         if lower.starts_with("[no-board]") || lower.starts_with("[no_board]") {
             return None;
         }
-        if !t.starts_with('[') {
-            break;
+        if t.starts_with('[') {
+            match t.find(']') {
+                Some(i) => {
+                    t = t[i + 1..].trim_start();
+                    continue;
+                }
+                None => break,
+            }
         }
-        match t.find(']') {
-            Some(i) => t = t[i + 1..].trim_start(),
-            None => break,
+        // A bare leading clock time ("11:2xZ.") is a prefix, not a title
+        // (AMUX-4498). Strip it here too, after the [no-board] check so the
+        // opt-out still wins.
+        if let Some(rest) = strip_leading_time_prefix(t) {
+            t = rest;
+            continue;
         }
+        break;
     }
     let collapsed = t.split_whitespace().collect::<Vec<_>>().join(" ");
     let bare = collapsed
@@ -1303,15 +1382,9 @@ fn capture_has_task_followup(lower: &str) -> bool {
 /// question ("can you fix X?", "does this build?") does not start with a status
 /// opener and is left to card as normal.
 pub fn is_status_query(text: &str) -> bool {
-    let mut t = text.trim();
-    // Drop the same leading "[03:47 PM] " / "[amux-origin: ...]" stamps
-    // title_from_prompt strips, so a stamped status query still matches.
-    while t.starts_with('[') {
-        match t.find(']') {
-            Some(i) => t = t[i + 1..].trim_start(),
-            None => break,
-        }
-    }
+    // Drop the same leading "[03:47 PM] " / "[amux-origin: ...]" stamps and bare
+    // clock times title_from_prompt strips, so a stamped query still matches.
+    let t = strip_capture_prefixes(text);
     let collapsed = t.split_whitespace().collect::<Vec<_>>().join(" ");
     // A long prompt is not a bare query, whatever it opens with.
     if collapsed.chars().count() > 100 {
@@ -1355,13 +1428,7 @@ pub fn is_status_query(text: &str) -> bool {
 /// that require running work ("does this build?") remain cardable. Unknown
 /// shapes fail open to a card so the classifier can never silently lose work.
 pub fn is_informational_query(text: &str) -> bool {
-    let mut t = text.trim();
-    while t.starts_with('[') {
-        match t.find(']') {
-            Some(i) => t = t[i + 1..].trim_start(),
-            None => break,
-        }
-    }
+    let t = strip_capture_prefixes(text);
     let collapsed = t.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.is_empty() {
         return false;
@@ -1540,13 +1607,7 @@ fn is_non_mutating_answer_tail(tail: &str) -> bool {
 /// matches a known ack pattern are suppressed. Unknown shapes fail open to a
 /// card so the filter cannot silently lose work.
 pub fn is_conversational_ack(text: &str) -> bool {
-    let mut t = text.trim();
-    while t.starts_with('[') {
-        match t.find(']') {
-            Some(i) => t = t[i + 1..].trim_start(),
-            None => break,
-        }
-    }
+    let t = strip_capture_prefixes(text);
     let collapsed: String = t.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.chars().count() >= 50 {
         return false;
@@ -1600,15 +1661,7 @@ pub fn is_conversational_ack(text: &str) -> bool {
 /// SHAPES rather than merely "a peer sent it". Unknown shapes fall through to a
 /// card (fail open).
 pub fn is_status_report(text: &str) -> bool {
-    let mut t = text.trim();
-    // A leading composer prompt glyph ("❯ ") is a capture artifact, not content.
-    t = t.trim_start_matches('❯').trim_start();
-    while t.starts_with('[') {
-        match t.find(']') {
-            Some(i) => t = t[i + 1..].trim_start(),
-            None => break,
-        }
-    }
+    let t = strip_capture_prefixes(text);
     let collapsed = t.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.is_empty() {
         return false;
@@ -1744,6 +1797,54 @@ fn report_has_task_request(lower: &str) -> bool {
         }
     }
     false
+}
+
+/// Does an inbound PEER message carry a genuine ask — a request or delegation
+/// the recipient is expected to act on — as opposed to status, acknowledgment,
+/// review, approval, or coordination chatter?
+///
+/// Provenance is the reliable discriminator the capture path was missing.
+/// Workers talk to each other constantly ("LANDED <sha>", "verified on origin",
+/// "read and recorded", "correcting myself", "all three landed"), and every such
+/// message was minting a `code` work card on the RECIPIENT's board (Ethan,
+/// 2026-09-14: "workers are populating their board with bogus [tasks] ... be
+/// better about amux task creation"). Measured on 200 recent peer capture cards:
+/// 82% carried no ask.
+///
+/// Used to gate the MINT path for peer-origin messages only: a peer message with
+/// no ask stays in Messages and mints no card. HUMAN and SCHEDULE prompts never
+/// pass through this gate, so Ethan's own instructions are unaffected. A peer
+/// message that references a card the recipient already owns is still linked by
+/// `associate_capture_card`'s reuse path, which runs before the mint.
+///
+/// The error is asymmetric and biased toward carding: a false "wants action"
+/// mints a discardable card (recoverable), a false "no action" drops a peer's
+/// routed task from the board (but it is still in Messages, and the peer can
+/// re-ping). So the ask markers are generous, and a `?` always counts.
+pub fn peer_message_wants_action(text: &str) -> bool {
+    let t = strip_capture_prefixes(text);
+    let lower = t.to_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    // A direct question to the recipient is an ask.
+    if lower.contains('?') {
+        return true;
+    }
+    // Explicit request / delegation / hand-off markers. Generous on purpose
+    // (see the doc above): carding a borderline is the safe direction.
+    const ASK_MARKERS: &[&str] = &[
+        "please ", "can you", "could you", "would you", "will you",
+        "request", "requesting", "route ", "routing ", "reroute", "assign",
+        "attach ", "action needed", "action required", "your action",
+        "your call", "you need to", "you have to", "you must", "you should ",
+        "needs your", "need your", "need you to", "want you to",
+        "hand off", "handing ", "handoff", "hand this", "take over", "take this",
+        "own this", "pick up", "picking this up", "to you:", "for you to",
+        "yours to ", "over to you", "your turn", "waiting on you", "blocked on you",
+        "at risk", "heads up:", "please review", "review request", "approve ",
+    ];
+    ASK_MARKERS.iter().any(|m| lower.contains(m))
 }
 
 /// AF-699 (reported by mixpeek-orchestrator/gtm-engine, GE-896): a captured
@@ -2102,6 +2203,67 @@ mod capture_tests {
             "Go: fix the archived-card 500 in the board API",
         ] {
             assert!(!is_status_report(s), "{s:?} is real work, must still card");
+        }
+    }
+
+    #[test]
+    fn a_bare_leading_clock_time_is_a_prefix_not_a_title() {
+        // AMUX-4498: workers prefix peer messages with a UTC time ("11:2xZ.",
+        // minute masked with x), which became the card title and hid the content.
+        assert_eq!(
+            title_from_prompt("11:2xZ. Read and recorded the fix shape, it is the right one"),
+            Some("Read and recorded the fix shape, it is the right one".into()),
+            "the time prefix must be stripped before the title"
+        );
+        assert_eq!(
+            title_from_prompt("08:15Z. deploy the gateway change to staging and verify"),
+            Some("Deploy the gateway change to staging and verify".into())
+        );
+        assert_eq!(
+            title_from_prompt("[mixpeek-cicd] 07:3xZ. fix the flaky auth test on CI"),
+            Some("Fix the flaky auth test on CI".into()),
+            "a time after a bracket stamp is also stripped"
+        );
+        // A real title that merely CONTAINS a time is untouched.
+        assert_eq!(
+            title_from_prompt("Add a 9:30 standup reminder to the scheduler"),
+            Some("Add a 9:30 standup reminder to the scheduler".into())
+        );
+        // The opt-out still wins over a time prefix.
+        assert_eq!(
+            title_from_prompt("[no-board] 11:24Z. what is the status of the deploy?"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_peer_message_cards_only_when_it_carries_an_ask() {
+        // Peer status/ack/coordination (no ask) — must NOT card. Live 2026-09-14.
+        for s in [
+            "11:2xZ. Read, and the fix shape is the right one: UNVERIFIABLE with the missing source named",
+            "LANDED: 24610b2acc1aed. My half of the red is in. Verified on origin.",
+            "11:3xZ. Recorded: dd0511188f, a150e1279d, each prefix compiled on its own disp",
+            "mvs-pitr. All three landed, tags cleaned, final gate hash posted to MO-3344.",
+            "CORRECTING MYSELF ON MHC-800: do not retire it.",
+            "ON THE RAIL NOW: f5f5a07d81. Mine to un-red.",
+            "RC-163 fix noted (95e0f254b4). Root matches my split.",
+            "905cd71b21 verified through to the live page. The eight 404s are gone.",
+            "[ops-server] LAND IT as-is. Reviewed the diff. APPROVED, no changes wanted.",
+        ] {
+            assert!(!peer_message_wants_action(s), "{s:?} carries no ask; a peer must not card it");
+        }
+        // Genuine peer requests / delegations — must still card.
+        for s in [
+            "Push window request: one AEO fix, 08fa4653b9, +12/-0, homepage only.",
+            "mvs-pitr: REQUEST, under Ethan's rule of 2026-09-10, pick up MO-3344.",
+            "slot? mixpeek-frustrations sweep-test-isolation-hardening code",
+            "Two of your commits are at risk from a local commit; you have to rebase.",
+            "Please attach the exact hardened test candidate path plus sha256 now.",
+            "Routing SP-868 to you: a gate whose input set changed.",
+            "BACKE-4286 plan review: ownership accepted; please tighten the timestamp contract.",
+            "Can you verify the OAuth redirect on staging?",
+        ] {
+            assert!(peer_message_wants_action(s), "{s:?} is a genuine ask and must card");
         }
     }
 

@@ -4299,6 +4299,7 @@ fn mint_capture_card(
     session_name: &str,
     body: &str,
     now_ms: i64,
+    from_peer: bool,
 ) -> rusqlite::Result<Option<crate::db::board_store::IssueRow>> {
     // Redact secret shapes BEFORE anything derives a title/desc from the prompt —
     // both come from `body`, and the board is fleet-readable (AMUX-3384).
@@ -4354,6 +4355,24 @@ fn mint_capture_card(
         tracing::info!(
             session = %session_name,
             "ledger: status report not carded (recorded in cmd_history only) — AMUX-4498"
+        );
+        return Ok(None);
+    }
+    // Provenance gate: a PEER message (from another worker) mints a work card
+    // only when it carries a genuine ask. Workers narrate status to each other
+    // constantly ("LANDED <sha>", "verified on origin", "read and recorded",
+    // "all three landed") and each was carding a `code` task on the recipient's
+    // board (Ethan, 2026-09-14: "workers are populating their board with bogus
+    // ... be better about amux task creation"; 82% of 200 recent peer capture
+    // cards carried no ask). Human/schedule prompts never reach here with
+    // from_peer=true, so Ethan's own instructions are unaffected, and a peer
+    // message naming a card the recipient already owns was already linked by the
+    // reuse path above this call. Surface it (two-fixes rule): grep
+    // "ledger: peer message without an ask not carded".
+    if from_peer && !amux_core::board::peer_message_wants_action(body) {
+        tracing::info!(
+            session = %session_name,
+            "ledger: peer message without an ask not carded (recorded in cmd_history only) — AMUX-4498"
         );
         return Ok(None);
     }
@@ -4564,6 +4583,7 @@ fn associate_capture_card(
     body: &str,
     now_ms: i64,
     intake: &super::board_intake::Plan,
+    from_peer: bool,
 ) -> rusqlite::Result<Option<CaptureAssociation>> {
     let mut live_owned = Vec::new();
     for id in prompt_card_refs(body) {
@@ -4592,7 +4612,7 @@ fn associate_capture_card(
     if let Some(row) = super::board_intake::apply(conn, intake, &title, body, now_ms / 1000)? {
         return Ok(Some(CaptureAssociation {row, created:false}));
     }
-    if let Some(mut row) = mint_capture_card(conn, session_name, body, now_ms)? {
+    if let Some(mut row) = mint_capture_card(conn, session_name, body, now_ms, from_peer)? {
         row.log = Some(crate::db::board_store::append_log(row.log.as_deref(), &chrono::Local::now().format("%H:%M").to_string(), &format!("{}; disposition=create", intake.log_line())));
         crate::db::board_store::save_patched(conn, &mut row)?;
         return Ok(Some(CaptureAssociation { row, created: true }));
@@ -4608,6 +4628,7 @@ fn associate_capture_card(
     if amux_core::board::title_from_prompt(&redacted).is_some()
         && !amux_core::board::is_informational_query(&redacted)
         && !amux_core::board::is_status_report(&redacted)
+        && !(from_peer && !amux_core::board::peer_message_wants_action(&redacted))
     {
         let captured_desc = format_captured_desc(&redacted);
         if let Some(id) =
@@ -4963,6 +4984,9 @@ pub(crate) async fn capture_recorded_message(state: &AppState, row_id: i64) {
         std::sync::Arc::new(std::sync::Mutex::new(None));
     let associated_w = associated.clone();
     let sess_log = cap_session.clone();
+    // A message whose cmd_history type is `session` came from a peer worker (not
+    // a human or a schedule); the mint gate holds it to a higher bar (AMUX-4498).
+    let from_peer = cap_ctype == "session";
     let peer_requester =
         (cap_ctype == "session" && !cap_origin.trim().is_empty()).then(|| cap_origin.clone());
     let intake = super::board_intake::plan(
@@ -4996,6 +5020,7 @@ pub(crate) async fn capture_recorded_message(state: &AppState, row_id: i64) {
                 &cap_text_for_capture,
                 now_ms,
                 &intake,
+                from_peer,
             )? {
                 Some(mut association) => {
                     if let Some(requester) = peer_requester.as_deref() {
@@ -12676,6 +12701,10 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                 std::sync::Arc::new(std::sync::Mutex::new(None));
             let associated_w = associated.clone();
             let peer_requester = sender.clone();
+            // A non-empty `sender` means a peer worker sent this (a human/schedule
+            // steer has none); the mint gate holds peer messages to a higher bar
+            // (AMUX-4498).
+            let from_peer = !sender.trim().is_empty();
             let _intake_guard = super::board_intake::lock(&sess3, "agent").await;
             let intake = super::board_intake::plan(&state.store, &sess3, "agent",
                 &amux_core::board::title_from_prompt(&text3).unwrap_or_default(), &text3).await;
@@ -12700,7 +12729,7 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                     if already > 0 {
                         return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
                     }
-                    match associate_capture_card(conn, &sess3, &text3, now_ms, &intake)? {
+                    match associate_capture_card(conn, &sess3, &text3, now_ms, &intake, from_peer)? {
                         Some(mut association) => {
                             if !peer_requester.trim().is_empty() {
                                 arm_peer_callback(conn, &mut association.row, &peer_requester)?;
@@ -26189,7 +26218,7 @@ mod steer_boundary_tests {
                     now_ms / 1000,
                 )?;
                 // The open manual card must NOT block a new user task.
-                let first = super::mint_capture_card(conn, "s", "build the connectors tab", now_ms)?;
+                let first = super::mint_capture_card(conn, "s", "build the connectors tab", now_ms, false)?;
                 assert!(first.is_some(), "a new task must card even with an open manual card");
                 assert_eq!(first.as_ref().unwrap().status, "backlog", "a delivered prompt must preserve the active manual claim");
                 assert!(first.as_ref().unwrap().source_ref.is_some());
@@ -26206,12 +26235,12 @@ mod steer_boundary_tests {
                     ],
                 )?;
                 // An identical transport retry within the window IS deduped.
-                let retry = super::mint_capture_card(conn, "s", "build the connectors tab", now_ms + 1_000)?;
+                let retry = super::mint_capture_card(conn, "s", "build the connectors tab", now_ms + 1_000, false)?;
                 assert!(retry.is_none(), "an identical retry within the window must dedup");
                 // A different task two seconds later is not a retry. The old
                 // time-only shim silently swallowed it before any model could
                 // classify or decompose it.
-                let rapid = super::mint_capture_card(conn, "s", "also wire slack", now_ms + 2_000)?;
+                let rapid = super::mint_capture_card(conn, "s", "also wire slack", now_ms + 2_000, false)?;
                 assert!(rapid.is_some(), "a distinct rapid task must card immediately");
                 Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
             })
@@ -26235,7 +26264,7 @@ mod steer_boundary_tests {
         state
             .store
             .write_async(move |conn| {
-                let first = super::mint_capture_card(conn, "s", "recover and continue", now_ms)?;
+                let first = super::mint_capture_card(conn, "s", "recover and continue", now_ms, false)?;
                 let first_id = first.as_ref().expect("the first delivery must card").id.clone();
                 // The direct path links the minted id to the row it recorded. The
                 // steering duplicate never gets a row of its own, which is why the
@@ -26249,7 +26278,7 @@ mod steer_boundary_tests {
                 // THE BUG: the same prompt, steering-delivered 17 minutes later.
                 // Far outside any retry window, and the card is still open.
                 let late = now_ms + 17 * 60 * 1_000;
-                let dup = super::mint_capture_card(conn, "s", "recover and continue", late)?;
+                let dup = super::mint_capture_card(conn, "s", "recover and continue", late, false)?;
                 assert!(
                     dup.is_none(),
                     "a prompt whose capture card is still open must not card twice, \
@@ -26261,7 +26290,7 @@ mod steer_boundary_tests {
                 // green above means "deduped" rather than "blocked everything".
                 conn.execute("UPDATE issues SET status='done' WHERE id=?1", rusqlite::params![first_id])?;
                 let after_close =
-                    super::mint_capture_card(conn, "s", "recover and continue", late + 1_000)?;
+                    super::mint_capture_card(conn, "s", "recover and continue", late + 1_000, false)?;
                 assert!(
                     after_close.is_some(),
                     "once the card is closed an identical prompt is new work and must card"
@@ -26270,7 +26299,7 @@ mod steer_boundary_tests {
                 // A DIFFERENT lane holding an identical open capture must not block
                 // this one: the duplicate is per-session, and the incident was one
                 // prompt broadcast to 56 lanes that each legitimately needed a card.
-                let peer = super::mint_capture_card(conn, "other", "recover and continue", late)?;
+                let peer = super::mint_capture_card(conn, "other", "recover and continue", late, false)?;
                 assert!(peer.is_some(), "a peer lane's open capture must not suppress this lane's");
                 Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
             })
