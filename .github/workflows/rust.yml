@@ -37,6 +37,16 @@ on:
   pull_request:
     paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', 'e2e/**', 'amux', 'scripts/**', 'cloud/**', 'eslint.config.mjs', '.github/workflows/rust.yml']
 
+# No group ran the full ~20min check+e2e once per push with nothing
+# superseding anything, so a burst of pushes to main paid full price for
+# every one of them (mixpeek-cicd, 2026-09-14: rust was 82% of this repo's
+# GitHub Actions minutes, $222/mo of that in e2e alone). Group by PR number
+# when this is a pull_request run, by ref otherwise (push to main) — a new
+# push cancels its own stale run rather than racing it to completion.
+concurrency:
+  group: rust-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
     runs-on: ubuntu-latest
