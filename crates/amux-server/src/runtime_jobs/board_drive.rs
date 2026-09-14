@@ -1906,7 +1906,7 @@ fn drainable_backlog_rows(conn: &Connection, session: &str, now: f64) -> rusqlit
            AND NOT (COALESCE(i.source_ref,'') <> '' AND COALESCE(i.last_verified_at,0) > ?3) \
            AND COALESCE(i.blocked_on,'') = '' \
            AND NOT (COALESCE(i.source,'')='capture' AND COALESCE(i.source_ref,'') <> '') \
-         ORDER BY COALESCE(i.created,0) ASC, i.id ASC",
+         ORDER BY COALESCE(i.pinned,0) DESC, COALESCE(i.created,0) ASC, i.id ASC",
         )
         .and_then(|mut st| {
             st.query_map(rusqlite::params![session, reclaim_cut, verified_cut], |r| {
@@ -2029,7 +2029,7 @@ fn promote_blocked_self_owned_deps(conn: &Connection, session: &str, now: f64) -
     let reclaim_cut = now - reclaim_cooldown_s();
     let ids: Vec<String> = conn
         .prepare(&format!(
-            "SELECT i.id FROM issues i WHERE {DISPATCHABLE_WHERE} ORDER BY COALESCE(i.created,0) ASC"
+            "SELECT i.id FROM issues i WHERE {DISPATCHABLE_WHERE} ORDER BY COALESCE(i.pinned,0) DESC, COALESCE(i.created,0) ASC"
         ))
         .and_then(|mut st| {
             st.query_map(rusqlite::params![session, fresh_cut, reclaim_cut], |r| {
@@ -3339,8 +3339,12 @@ pub fn select_pickup_with(
     let ids: Vec<String> = if pickup_scoring_enabled() {
         let raw: Vec<String> = conn
             .prepare(&format!(
+                // Pinned first so a newer pinned card is never truncated out of
+                // the 256-card scoring window before its pin boost applies; then
+                // oldest-first so a deep queue never drops the oldest before it
+                // can score.
                 "SELECT i.id FROM issues i WHERE {DISPATCHABLE_WHERE} \
-                 ORDER BY i.created ASC LIMIT 256"
+                 ORDER BY COALESCE(i.pinned,0) DESC, i.created ASC LIMIT 256"
             ))
             .and_then(|mut st| {
                 st.query_map(rusqlite::params![session, fresh_cut, reclaim_cut], |r| {
@@ -3382,7 +3386,7 @@ pub fn select_pickup_with(
     } else {
         conn.prepare(&format!(
             "SELECT i.id FROM issues i WHERE {DISPATCHABLE_WHERE} \
-             ORDER BY COALESCE(i.pos, 0) ASC, i.created ASC LIMIT 16"
+             ORDER BY COALESCE(i.pinned,0) DESC, COALESCE(i.pos, 0) ASC, i.created ASC LIMIT 16"
         ))
         .and_then(|mut st| {
             st.query_map(rusqlite::params![session, fresh_cut, reclaim_cut], |r| {
@@ -9838,6 +9842,21 @@ mod tests {
         add_full(&conn, "PIN", "lane", "todo", "code", now as i64, -50.0, 1); // pinned, fresh
         let p = select_pickup_with(&conn, "lane", now, false);
         assert_eq!(claimed(&p), Some("PIN"), "a pinned card is the hard human override");
+    }
+
+    #[test]
+    fn a_pinned_backlog_card_drains_before_an_older_unpinned_one() {
+        // The scored TODO pickup already honors pin; this pins the BACKLOG drain
+        // order, which bypasses scoring and was strict FIFO by age. A human who
+        // pins a backlog task expects the lane to promote THAT one first when it
+        // drains its backlog, not the oldest by accident (AMUX-4498 follow-up).
+        let conn = board_db();
+        let now = 1_000_000.0;
+        add_full(&conn, "OLDB", "lane", "backlog", "code", now as i64 - 5 * 86400, 0.0, 0);
+        add_full(&conn, "PINB", "lane", "backlog", "code", now as i64, 0.0, 1); // pinned, fresher
+        let order = drainable_backlog_ids(&conn, "lane", now);
+        assert_eq!(order.first().map(String::as_str), Some("PINB"),
+            "a pinned backlog card must drain first, ahead of an older unpinned one: {order:?}");
     }
 
     #[test]
