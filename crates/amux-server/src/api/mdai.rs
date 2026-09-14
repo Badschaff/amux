@@ -669,13 +669,43 @@ pub trait HttpFetcher: Send + Sync {
     fn fetch(&self, f: &Fetch, bearer: Option<&str>) -> Result<String, String>;
 }
 
+/// Is this URL's host the local machine? (AMUX-4573)
+///
+/// amux serves its own API over a self-signed certificate on loopback, so a
+/// verifying client cannot reach it: an MDAI file that fetched
+/// `https://localhost:8824/...` failed with "error sending request" while
+/// `curl -sk` worked. Certificate verification is relaxed for exactly these
+/// hosts, where the request never leaves the machine, and nowhere else; a
+/// hostname that merely resolves to 127.0.0.1 does not count, because that is a
+/// DNS answer an attacker can shape.
+pub(crate) fn is_loopback_fetch(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    matches!(
+        parsed.host_str(),
+        Some("localhost") | Some("127.0.0.1") | Some("[::1]") | Some("::1")
+    )
+}
+
 /// Production fetcher: blocking reqwest, same as [`ApiModel`] uses.
 pub struct ReqwestFetcher;
 
 impl HttpFetcher for ReqwestFetcher {
     fn fetch(&self, f: &Fetch, bearer: Option<&str>) -> Result<String, String> {
+        // Loopback only: amux's own API is self-signed (see is_loopback_fetch).
+        // Redirects are OFF whenever verification is relaxed. The setting is
+        // per client, so a loopback answer that redirected to another host
+        // would otherwise be followed with verification still relaxed.
+        let loopback = is_loopback_fetch(&f.url);
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(FETCH_TIMEOUT_S))
+            .danger_accept_invalid_certs(loopback)
+            .redirect(if loopback {
+                reqwest::redirect::Policy::none()
+            } else {
+                reqwest::redirect::Policy::default()
+            })
             .build()
             .map_err(|e| e.to_string())?;
         let mut req = match f.method.as_str() {
@@ -2884,5 +2914,29 @@ mod tests {
         assert_eq!(doc2.sources[1].prompt, DEFAULT_EDGE_PROMPT);
 
         std::env::remove_var("AMUX_FILES_ROOT");
+    }
+}
+
+#[cfg(test)]
+mod loopback_fetch_tests {
+    use super::is_loopback_fetch;
+
+    #[test]
+    fn only_a_literal_loopback_host_relaxes_certificate_verification() {
+        for url in [
+            "https://localhost:8824/api/usage/report.md",
+            "https://127.0.0.1:8824/health",
+            "https://[::1]:8824/health",
+        ] {
+            assert!(is_loopback_fetch(url), "{url} is the local machine");
+        }
+        for url in [
+            "https://example.com/",
+            "https://localhost.example.com/",
+            "https://127.0.0.1.nip.io/",
+            "not a url",
+        ] {
+            assert!(!is_loopback_fetch(url), "{url} must keep full verification");
+        }
     }
 }
