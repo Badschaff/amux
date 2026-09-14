@@ -308,6 +308,8 @@ fn routes_with_probes(probes: UsageProbes) -> Router<AppState> {
     Router::new()
         .route("/", axum::routing::get(get_usage))
         .route("/attribution", axum::routing::get(get_attribution))
+        // AMUX-4584: the same numbers as markdown, deterministic, for MDAI.
+        .route("/report.md", axum::routing::get(get_usage_report_md))
         .layer(Extension(probes))
         .layer(Extension(Arc::new(tokio::sync::Mutex::new(
             UsageCache::default(),
@@ -935,6 +937,229 @@ async fn get_attribution(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+// AMUX-4584: GET /api/usage/report.md — the token-usage dashboard as markdown.
+//
+// Deterministic by construction: SQL over token_ledger plus the same prompt
+// attribution join /api/usage/attribution uses, rendered with format!. No model
+// call, so an MDAI file that `fetch:`es this URL renders the same bytes for the
+// same ledger (ethos rule 2: compute what you can compute).
+//
+// Every table states the population it was computed over and is sorted by cost,
+// so "where is most of my token usage going" is answered by reading top-down.
+// Known limits are printed in the report itself, not left to a comment, because
+// the reader of a dashboard never reads the source.
+
+#[derive(serde::Deserialize, Default)]
+struct ReportQuery {
+    days: Option<i64>,
+    limit: Option<usize>,
+}
+
+fn md_money(v: f64) -> String {
+    format!("${:.2}", v)
+}
+
+fn md_tokens(v: i64) -> String {
+    let s = v.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::new();
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
+fn md_cell(s: &str) -> String {
+    s.replace('|', "\\|").replace('\n', " ")
+}
+
+fn pct(part: f64, total: f64) -> String {
+    if total > 0.0 {
+        format!("{:.1}%", part / total * 100.0)
+    } else {
+        "0.0%".to_string()
+    }
+}
+
+/// One grouped breakdown: `(label, cost, tokens, turns)` rows, already sorted.
+fn md_table(title: &str, key_header: &str, rows: &[(String, f64, i64, i64)], total_cost: f64) -> String {
+    let mut s = format!("\n## {title}\n\n| {key_header} | Cost | Share | Tokens | Turns |\n|---|---:|---:|---:|---:|\n");
+    if rows.is_empty() {
+        s.push_str("| (none in window) | | | | |\n");
+    }
+    for (k, cost, tokens, turns) in rows {
+        s.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            md_cell(if k.is_empty() { "(unattributed)" } else { k }),
+            md_money(*cost),
+            pct(*cost, total_cost),
+            md_tokens(*tokens),
+            turns
+        ));
+    }
+    s
+}
+
+const REPORT_TOKENS: &str = "(input + cache_read + cache_write + output)";
+
+fn grouped(
+    conn: &rusqlite::Connection,
+    select_key: &str,
+    cutoff: i64,
+    limit: usize,
+) -> rusqlite::Result<Vec<(String, f64, i64, i64)>> {
+    let sql = format!(
+        "SELECT {select_key} AS k, COALESCE(SUM(cost_usd),0), COALESCE(SUM{REPORT_TOKENS},0), COUNT(*) \
+         FROM token_ledger WHERE ts > ?1 GROUP BY k ORDER BY 2 DESC LIMIT ?2"
+    );
+    let mut st = conn.prepare(&sql)?;
+    let rows = st.query_map(rusqlite::params![cutoff, limit as i64], |r| {
+        Ok((
+            r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+            r.get::<_, f64>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, i64>(3)?,
+        ))
+    })?;
+    rows.collect()
+}
+
+/// Render the report. Pure over a connection so a test can pin its shape.
+pub(crate) fn render_usage_report(conn: &rusqlite::Connection, days: i64, limit: usize, now: i64) -> rusqlite::Result<String> {
+    let cutoff = now - days * 86_400;
+    let total_rows: i64 = conn.query_row("SELECT COUNT(*) FROM token_ledger", [], |r| r.get(0))?;
+    let (total_cost, total_tokens, turns): (f64, i64, i64) = conn.query_row(
+        &format!("SELECT COALESCE(SUM(cost_usd),0), COALESCE(SUM{REPORT_TOKENS},0), COUNT(*) FROM token_ledger WHERE ts > ?1"),
+        [cutoff],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let fresh: Option<i64> = conn.query_row("SELECT MAX(ts) FROM token_ledger", [], |r| r.get(0))?;
+    let (cache_read, input_side): (i64, i64) = conn.query_row(
+        "SELECT COALESCE(SUM(cache_read),0), COALESCE(SUM(input + cache_read + cache_write),0) FROM token_ledger WHERE ts > ?1",
+        [cutoff],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+
+    let mut md = String::new();
+    md.push_str(&format!("# Token usage, last {days} day(s)\n\n"));
+    md.push_str(&format!(
+        "- **Total:** {} across {} API responses, {} tokens {REPORT_TOKENS}\n",
+        md_money(total_cost),
+        turns,
+        md_tokens(total_tokens)
+    ));
+    md.push_str(&format!("- **Cache hit:** {} of input-side tokens were cache reads\n", pct(cache_read as f64, input_side as f64)));
+    md.push_str(&format!(
+        "- **Measured:** {} ledger rows in window of {} total; ledger fresh through {}\n",
+        turns,
+        total_rows,
+        fresh.map(|t| chrono::DateTime::from_timestamp(t, 0).map(|d| d.to_rfc3339()).unwrap_or_default()).unwrap_or_else(|| "never".into())
+    ));
+    md.push_str("- **Cost basis:** list price per model from runtime_jobs/token_ledger.rs (or ~/.amux/prices.json), not the plan invoice\n");
+
+    md.push_str(&md_table("By worker", "Worker", &grouped(conn, "session", cutoff, limit)?, total_cost));
+    md.push_str(&md_table("By model", "Model", &grouped(conn, "model", cutoff, limit)?, total_cost));
+    md.push_str(&md_table(
+        "Main conversation vs subagents",
+        "Kind",
+        &grouped(conn, "CASE WHEN conversation LIKE 'agent-%' THEN 'subagent' ELSE 'main' END", cutoff, limit)?,
+        total_cost,
+    ));
+
+    // Prompt source: the same join /api/usage/attribution uses. It sees
+    // cmd_history only; steering-delivered nudges are credited to the prompt
+    // before them until AMUX-4582 lands, and the report says so.
+    let mut st = conn.prepare(
+        "WITH lg AS (SELECT ts, session, cost_usd, input, cache_read, cache_write, output FROM token_ledger WHERE ts > ?1) \
+         SELECT COALESCE((SELECT h.type FROM cmd_history h WHERE h.session = lg.session AND h.ts/1000 <= lg.ts \
+                          ORDER BY h.ts DESC LIMIT 1), '') AS trig, \
+                SUM(cost_usd), SUM(input + cache_read + cache_write + output), COUNT(*) \
+         FROM lg GROUP BY 1 ORDER BY 2 DESC",
+    )?;
+    let sources: Vec<(String, f64, i64, i64)> = st
+        .query_map([cutoff], |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    md.push_str(&md_table("By what triggered the turn", "Source (cmd_history.type)", &sources, total_cost));
+
+    // By card: attributed rows only; the stale task_windows problem is named.
+    md.push_str(&md_table(
+        "By board card",
+        "Card",
+        &grouped(conn, "NULLIF(task, '')", cutoff, limit)?,
+        total_cost,
+    ));
+
+    md.push_str(&md_table(
+        "By day (UTC)",
+        "Day",
+        &{
+            let mut st = conn.prepare(&format!(
+                "SELECT date(ts, 'unixepoch') AS d, SUM(cost_usd), SUM{REPORT_TOKENS}, COUNT(*) FROM token_ledger \
+                 WHERE ts > ?1 GROUP BY d ORDER BY d DESC"
+            ))?;
+            let rows: Vec<(String, f64, i64, i64)> = st
+                .query_map([cutoff], |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            rows
+        },
+        total_cost,
+    ));
+
+    md.push_str(&md_table(
+        "Top conversations",
+        "Worker / conversation",
+        &grouped(conn, "session || ' / ' || conversation", cutoff, limit)?,
+        total_cost,
+    ));
+
+    md.push_str(
+        "\n## Known limits of these numbers\n\n\
+         - Subagent rows indexed before migration 70 can be billed more than once per API response (AMUX-4580); newer rows are keyed by message id.\n\
+         - Card attribution reads `token_ledger.task`, filled from `task_windows`, which has had no writer since 2026-08-09 (AMUX-4581).\n\
+         - Nudges, schedule fires and auto-compacts delivered through the steering queue are credited to the prompt before them (AMUX-4582).\n\
+         - Codex and Gemini usage is not captured yet (AMUX-4583).\n",
+    );
+    Ok(md)
+}
+
+
+/// GET /api/usage/report.md?days=N&limit=M (AMUX-4584). `days` 1..365 (default 7),
+/// `limit` rows per breakdown 1..200 (default 25). text/markdown.
+async fn get_usage_report_md(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<ReportQuery>,
+) -> Response {
+    let days = q.days.unwrap_or(7).clamp(1, 365);
+    let limit = q.limit.unwrap_or(25).clamp(1, 200);
+    let store = state.store.clone();
+    let out = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+        let conn = store.read()?;
+        Ok(render_usage_report(&conn, days, limit, chrono::Utc::now().timestamp())?)
+    })
+    .await;
+    match out {
+        Ok(Ok(md)) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+            md,
+        )
+            .into_response(),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string(), "measured": false })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string(), "measured": false })),
         )
             .into_response(),
     }
@@ -1752,5 +1977,46 @@ mod tests {
     #[test]
     fn ttl_default_and_override() {
         assert_eq!(usage_ttl(), Duration::from_secs(DEFAULT_USAGE_TTL_S));
+    }
+}
+
+#[cfg(test)]
+mod usage_report_tests {
+    use super::render_usage_report;
+
+    #[test]
+    fn the_markdown_report_is_sorted_by_cost_and_states_its_population() {
+        let conn = crate::db::migrate::test_memdb();
+        let now = 1_789_400_000i64;
+        for (session, conv, model, cost, out) in [
+            ("amux", "c1", "claude-opus-5", 5.0, 100),
+            ("amux", "agent-x", "claude-opus-5", 1.0, 10),
+            ("studio-plg", "c2", "claude-sonnet-5", 9.0, 50),
+        ] {
+            conn.execute(
+                "INSERT INTO token_ledger (ts, session, conversation, model, input, cache_read, cache_write, output, cost_usd, task) \
+                 VALUES (?1, ?2, ?3, ?4, 10, 20, 30, ?5, ?6, '')",
+                rusqlite::params![now - 60, session, conv, model, out, cost],
+            ).unwrap();
+        }
+        // Outside a 1-day window: must not be counted.
+        conn.execute(
+            "INSERT INTO token_ledger (ts, session, conversation, model, input, cache_read, cache_write, output, cost_usd, task) \
+             VALUES (?1, 'old', 'c9', 'claude-opus-5', 1, 1, 1, 1, 100.0, '')",
+            [now - 3 * 86_400],
+        ).unwrap();
+        let md = render_usage_report(&conn, 1, 25, now).unwrap();
+        assert!(md.starts_with("# Token usage, last 1 day(s)"), "{md}");
+        assert!(md.contains("$15.00 across 3 API responses"), "window excludes the old row: {md}");
+        assert!(md.contains("3 ledger rows in window of 4 total"), "population stated: {md}");
+        let worker = md.split("## By worker").nth(1).unwrap();
+        let studio = worker.find("studio-plg").unwrap();
+        let amux = worker.find("| amux |").unwrap();
+        assert!(studio < amux, "sorted by cost, the $9 worker first: {worker}");
+        assert!(md.contains("| subagent | $1.00 |"), "subagent vs main split: {md}");
+        assert!(!md.contains("| old |"), "the out-of-window worker is absent");
+        assert!(md.contains("## Known limits of these numbers"));
+        // Deterministic: the same ledger renders the same bytes.
+        assert_eq!(md, render_usage_report(&conn, 1, 25, now).unwrap());
     }
 }
