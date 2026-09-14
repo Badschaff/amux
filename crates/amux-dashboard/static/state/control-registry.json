@@ -1,6 +1,6 @@
 {
   "measured": true,
-  "n_considered": 1916,
+  "n_considered": 1922,
   "command_handlers": {
     "_applyEmbedView": {
       "kind": "command._applyEmbedView",
@@ -314,12 +314,6 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "_bwClearInspect": {
-      "kind": "command._bwClearInspect",
-      "feedback_required": true,
-      "target": "control-or-request",
-      "queue_policy": "transport-declared"
-    },
     "_bwClick": {
       "kind": "command._bwClick",
       "feedback_required": true,
@@ -328,12 +322,6 @@
     },
     "_bwClickIndex": {
       "kind": "command._bwClickIndex",
-      "feedback_required": true,
-      "target": "control-or-request",
-      "queue_policy": "transport-declared"
-    },
-    "_bwFetchViewport": {
-      "kind": "command._bwFetchViewport",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -356,6 +344,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_bwInit": {
+      "kind": "command._bwInit",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_bwKey": {
       "kind": "command._bwKey",
       "feedback_required": true,
@@ -368,8 +362,20 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_bwLoadTargets": {
+      "kind": "command._bwLoadTargets",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_bwNewProfile": {
       "kind": "command._bwNewProfile",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_bwOnBackend": {
+      "kind": "command._bwOnBackend",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -394,6 +400,12 @@
     },
     "_bwSetLive": {
       "kind": "command._bwSetLive",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_bwStopIos": {
+      "kind": "command._bwStopIos",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1628,6 +1640,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_outboxConfirmMessage": {
+      "kind": "command._outboxConfirmMessage",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_outboxDiagnostic": {
       "kind": "command._outboxDiagnostic",
       "feedback_required": true,
@@ -1912,12 +1930,6 @@
     },
     "_proxyStop": {
       "kind": "command._proxyStop",
-      "feedback_required": true,
-      "target": "control-or-request",
-      "queue_policy": "transport-declared"
-    },
-    "_pruneUnrecoverableOutbox": {
-      "kind": "command._pruneUnrecoverableOutbox",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"

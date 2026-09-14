@@ -2140,3 +2140,25 @@ CARD: AMUX-4417
 SYMPTOM: After integrating the latest toolbar change, LC-COMPOSER-LAYOUT failed on all three projects: the 320px phone input shrank to 155px instead of its available 308px.
 COST: Long drafts become difficult to read beside More and Queue.
 FIX: Remove the conflicting ac-wrap flex override, retain compact chrome and aligned action controls, and preserve the full-width mobile writing row. Existing composer-layout diagnostics record inputW and actionDelta; the browser case checks short/long drafts, Send/Queue, narrow/landscape viewports and attachment-menu reachability.
+
+## A delivered mobile message stays failed, and its local copy appears beside its server copy
+AREA: browser
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-735
+SYMPTOM: Owner screenshots show messages received in this conversation remaining 409 acceptance-uncertain for an hour. Steering receipt polling used the unprefixed ID although the server stores steer:<id>; both Messages and Steering independently rendered local and server representations.
+COST: Repeated manual Retry, duplicate-looking rows, and a false failed-operation banner on the phone.
+FIX: In progress: retain unknown acceptance and retry bounded receipt reads, use the correct steering namespace, and join display rows by transport identity. AF-736 tracks the duplicate representation; simulator verification remains outstanding.
+
+## Safari Simulator acknowledges pointer input without applying the requested click
+AREA: browser
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-12
+SESSION: amux-frustrations
+CARD: AF-732
+SYMPTOM: Safari WebDriver on local iOS 26.5 returns success for element clicks and pointer actions while a form remains unfocused; send-keys similarly succeeds without changing the field. Native screenshots include insets absent from DOM coordinates.
+COST: Simulator end-to-end interaction tests fail despite successful API replies; repeated compile/test cycles delayed usable browser integration.
+FIX: In progress: test native XCTest input through Appium, require observed effects in the harness, and preserve input-method and failure diagnostics instead of claiming successful native input from transport status.
