@@ -3397,7 +3397,8 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
         let archived = env.get("CC_ARCHIVED").map(|v| v == "1").unwrap_or(false)
             || blocked.contains(&name);
         let paused = env.get("CC_PAUSED").map(|v| v == "1").unwrap_or(false);
-        let lifecycle = if archived { "archived" } else if paused { "paused" } else { "active" };
+        // One label rule with the peer-interaction gate (AMUX-4566).
+        let lifecycle = crate::api::session_verbs::lifecycle_label(archived, paused);
         let flags = env.get("CC_FLAGS").cloned().unwrap_or_default();
         let backend = env
             .get("CC_BACKEND")
