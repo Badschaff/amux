@@ -528,6 +528,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <button id="tab-calendar" onclick="switchView('calendar')"><span class="tab-ico">🗓</span><span class="tab-lbl">Calendar</span></button>
   <button id="tab-scheduler" onclick="switchView('scheduler')"><span class="tab-ico">⏱</span><span class="tab-lbl">Scheduler</span></button>
   <button id="tab-files" onclick="switchView('files')"><span class="tab-ico">🗂</span><span class="tab-lbl">Files</span></button>
+  <button id="tab-record" onclick="switchView('record')"><span class="tab-ico">🎙</span><span class="tab-lbl">Record</span></button>
   <button id="tab-mdai" onclick="switchView('mdai')"><span class="tab-ico">&#x2726;</span><span class="tab-lbl">MDAI</span></button>
   <button id="tab-proxies" onclick="switchView('proxies')"><span class="tab-ico">⇄</span><span class="tab-lbl">Proxies</span></button>
   <button id="tab-email" onclick="switchView('email')"><span class="tab-ico">📥</span><span class="tab-lbl">Email</span></button>
@@ -681,6 +682,42 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     </summary>
     <div id="scheduler-audit"></div>
   </details>
+</div>
+
+<!-- Record view (AMUX-4625): tap to record on this device; each second is
+     saved locally as it arrives and the recording syncs to the configured
+     folder when amux is reachable. -->
+<div id="record-view" style="display:none;flex-direction:column;flex:1;min-height:0;">
+  <div class="recorder-wrap">
+    <div class="recorder-hero">
+      <button id="recorder-btn" class="recorder-btn" type="button" onclick="_recorderToggle()" aria-pressed="false" aria-label="Start recording">
+        <span class="recorder-btn-dot" aria-hidden="true"></span>
+      </button>
+      <div class="recorder-readout">
+        <div id="recorder-elapsed" class="recorder-elapsed">0:00</div>
+        <div class="recorder-level" aria-hidden="true"><div id="recorder-level-fill" class="recorder-level-fill"></div></div>
+        <div id="recorder-status" class="recorder-status" role="status" aria-live="polite">Tap to record. Each second is saved on this device as it records.</div>
+      </div>
+    </div>
+    <div class="recorder-sync-row">
+      <span id="recorder-sync-summary" class="recorder-sync-summary"></span>
+      <button class="btn" type="button" onclick="_recorderSync(true)">Sync now</button>
+    </div>
+    <div id="recorder-list" class="recorder-list"></div>
+    <details class="recorder-settings">
+      <summary>Settings</summary>
+      <div class="ui-field">
+        <label for="recorder-dir">Recordings folder on the amux machine</label>
+        <div class="recorder-dir-row">
+          <input id="recorder-dir" class="input" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="~/Recordings">
+          <button class="btn primary" type="button" onclick="_recorderSaveDir()">Save</button>
+        </div>
+        <div id="recorder-dir-help" class="ui-help"></div>
+      </div>
+      <label class="recorder-check"><input id="recorder-location" type="checkbox" onchange="_recorderSetLocation(this.checked)"> Save my location with each recording</label>
+      <div id="recorder-transcriber" class="ui-help"></div>
+    </details>
+  </div>
 </div>
 
 <div id="files-view" style="display:none;flex-direction:column;flex:1;min-height:0;">

@@ -125,6 +125,7 @@ pub mod ids {
     pub const STATUS_HISTORY: &str = "status-history";
     pub const TOKEN_LEDGER: &str = "token-ledger";
     pub const BOARD_HYGIENE: &str = "board-hygiene";
+    pub const RECORDINGS_TRANSCRIBE: &str = "recordings-transcribe";
 }
 
 /// Every id above, enumerated. `mod ids` is a set of constants and Rust cannot
@@ -168,6 +169,7 @@ pub const ALL_IDS: &[&str] = &[
     ids::STATUS_HISTORY,
     ids::TOKEN_LEDGER,
     ids::BOARD_HYGIENE,
+    ids::RECORDINGS_TRANSCRIBE,
 ];
 
 /// An env var this job reads at startup. It is a READOUT, never a switch: a
@@ -682,6 +684,18 @@ pub const CATALOG: &[Doc] = &[
         }],
         pref: None,
         detail: None,
+    },
+    Doc {
+        id: ids::RECORDINGS_TRANSCRIBE,
+        name: "Recording transcripts",
+        purpose: "Transcribes recordings synced from the Record tab with a local whisper.cpp model and writes each transcript beside its audio; without it recordings sync but never become text.",
+        env: &[EnvControl {
+            var: "AMUX_RECORDINGS_TRANSCRIBE_SECS",
+            effect: "tick seconds; 0 disables the job",
+            off: Some("0"),
+        }],
+        pref: None,
+        detail: Some("/api/recordings/config"),
     },
 ];
 

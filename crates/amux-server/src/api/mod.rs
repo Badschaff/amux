@@ -58,6 +58,7 @@ pub mod offline_origin;
 pub mod messages;
 pub mod org;
 pub mod prefs;
+pub mod recordings;
 pub mod policy;
 pub mod planning;
 pub mod proxies;
@@ -287,6 +288,9 @@ pub fn router(state: AppState) -> Router {
         .merge(interactions::routes())
         .nest("/api/settings", settings::routes())
         .nest("/api/push", crate::push::routes())
+        // Record tab (AMUX-4624): device recordings synced into a folder and
+        // transcribed locally. The folder is the store; see the module docs.
+        .nest("/api/recordings", recordings::routes())
         .nest("/api/dictation", dictation::routes())
         // Transcription lives at the TOP-LEVEL /api/dictate (python parity);
         // the dictation module owns it and answers NATIVELY (AMUX-2598:

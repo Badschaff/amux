@@ -68,6 +68,7 @@ pub mod pane_size;
 /// The live registry of the jobs below — see [`registry`] for why it is
 /// derived from the spawn sites rather than declared alongside them.
 pub mod queue_disposition;
+pub mod recordings_transcribe;
 pub mod registry;
 mod poll_watch;
 pub mod scheduler;

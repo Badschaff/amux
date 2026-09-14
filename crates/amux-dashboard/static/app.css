@@ -6617,3 +6617,54 @@ select.input { height:var(--control-height); }
   .btn { min-width:44px; }
   .input, .modal-body .input { font-size:16px; }
 }
+
+/* Record tab (AMUX-4625) */
+#tab-record.recording .tab-ico { color:var(--red); }
+.recorder-wrap { display:flex; flex-direction:column; gap:var(--space-4); padding:var(--space-4); padding-bottom:calc(var(--space-6) + env(safe-area-inset-bottom)); overflow-y:auto; flex:1; min-height:0; max-width:760px; width:100%; box-sizing:border-box; margin:0 auto; }
+.recorder-hero { display:flex; align-items:center; gap:var(--space-4); padding:var(--space-4); background:var(--card); border:1px solid var(--border); border-radius:var(--radius-dialog); }
+.recorder-btn { width:104px; height:104px; min-width:104px; border-radius:50%; border:3px solid var(--border); background:var(--bg); display:flex; align-items:center; justify-content:center; cursor:pointer; -webkit-tap-highlight-color:transparent; flex-shrink:0; }
+.recorder-btn:focus-visible { outline:2px solid var(--accent); box-shadow:var(--focus-ring); }
+.recorder-btn-dot { width:44px; height:44px; border-radius:50%; background:var(--red); transition:border-radius .15s ease, width .15s ease, height .15s ease; }
+.recorder-btn.recording { border-color:var(--red); }
+.recorder-btn.recording .recorder-btn-dot { width:36px; height:36px; border-radius:8px; }
+.recorder-readout { display:flex; flex-direction:column; gap:var(--space-2); min-width:0; flex:1; }
+.recorder-elapsed { font-size:2rem; font-weight:600; font-variant-numeric:tabular-nums; color:var(--text); line-height:1.1; }
+.recorder-level { height:8px; border-radius:4px; background:var(--bg); border:1px solid var(--border); overflow:hidden; }
+.recorder-level-fill { height:100%; width:100%; background:var(--green); transform:scaleX(0.02); transform-origin:left center; }
+.recorder-status { color:var(--dim); font-size:.85rem; line-height:1.4; overflow-wrap:anywhere; }
+.recorder-sync-row { display:flex; align-items:center; gap:var(--space-3); flex-wrap:wrap; justify-content:space-between; }
+.recorder-sync-summary { color:var(--dim); font-size:.85rem; min-width:0; }
+.recorder-list { display:flex; flex-direction:column; gap:var(--space-2); }
+.recorder-note { overflow-wrap:anywhere; }
+.recorder-empty { color:var(--dim); font-size:.9rem; padding:var(--space-4) 0; text-align:center; }
+.recorder-day { color:var(--dim); font-size:.75rem; font-weight:600; letter-spacing:.04em; text-transform:uppercase; margin-top:var(--space-2); }
+.recorder-item { background:var(--card); border:1px solid var(--border); border-radius:var(--radius-control); padding:var(--space-3); display:flex; flex-direction:column; gap:var(--space-1); min-width:0; }
+.recorder-item-head { display:flex; align-items:baseline; gap:var(--space-2); flex-wrap:wrap; }
+.recorder-when { font-weight:600; color:var(--text); }
+.recorder-meta { color:var(--dim); font-size:.8rem; }
+.recorder-sync { font-size:.85rem; overflow-wrap:anywhere; color:var(--text); }
+.recorder-sync-failed { color:var(--red); }
+.recorder-sync-recording { color:var(--red); }
+.recorder-sync-local, .recorder-sync-syncing { color:var(--yellow); }
+.recorder-sync-synced { color:var(--green); }
+.recorder-sync-empty { color:var(--dim); }
+.recorder-transcript-state { font-size:.8rem; color:var(--dim); }
+.recorder-excerpt { font-size:.85rem; color:var(--text); line-height:1.45; overflow-wrap:anywhere; }
+.recorder-actions { display:flex; gap:var(--space-2); flex-wrap:wrap; margin-top:var(--space-1); }
+.recorder-settings { background:var(--card); border:1px solid var(--border); border-radius:var(--radius-control); padding:var(--space-3); }
+.recorder-settings summary { cursor:pointer; font-weight:600; min-height:44px; display:flex; align-items:center; }
+.recorder-settings[open] summary { margin-bottom:var(--space-2); }
+.recorder-dir-row { display:flex; gap:var(--space-2); align-items:center; }
+.recorder-dir-row .input { flex:1; min-width:0; }
+.recorder-check { display:flex; align-items:center; gap:var(--space-2); min-height:44px; margin:var(--space-2) 0; font-size:var(--control-font); }
+.recorder-check input { width:22px; height:22px; }
+.recorder-transcript { white-space:pre-wrap; overflow-wrap:anywhere; max-height:55vh; overflow-y:auto; margin-top:var(--space-2); line-height:1.5; }
+@media (max-width: 600px) {
+  .recorder-wrap { padding:var(--space-3); padding-bottom:calc(var(--space-6) + env(safe-area-inset-bottom)); }
+  .recorder-hero { flex-direction:column; text-align:center; }
+  .recorder-readout { width:100%; align-items:stretch; }
+  .recorder-actions .btn { flex:1 1 auto; min-height:44px; }
+  .recorder-sync-row .btn { min-height:44px; }
+  .recorder-dir-row { flex-direction:column; align-items:stretch; }
+  .recorder-dir-row .btn { min-height:44px; }
+}

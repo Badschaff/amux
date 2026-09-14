@@ -10821,7 +10821,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.948';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.949';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -24871,7 +24871,7 @@ function switchView(view) {
   const _svViews = [
     ['session', 'sessions', ''], ['board', 'board', ''], ['groups', 'groups', ''],
     ['calendar', 'calendar', 'flex'], ['scheduler', 'scheduler', ''],
-    ['files', 'files', 'flex'], ['mdai', 'mdai', 'flex'], ['proxies', 'proxies', 'flex'],
+    ['files', 'files', 'flex'], ['record', 'record', 'flex'], ['mdai', 'mdai', 'flex'], ['proxies', 'proxies', 'flex'],
     ['logs', 'logs', 'flex'], ['messages', 'messages', 'flex'], ['skills', 'skills', 'flex'],
     ['sql', 'sql', 'flex'], ['map', 'map', 'flex'], ['metrics', 'metrics', 'flex'],
     ['cost', 'cost', 'flex'], ['disk', 'disk', 'flex'], ['torrents', 'torrents', 'flex'], ['terminal', 'terminal', ''],
@@ -24907,6 +24907,7 @@ function switchView(view) {
   if (view === 'sessions') { fetchSessions(); _dbgLog('Workers refreshed on navigation'); }
   if (view === 'messages') _messagesLoad(true, '');
   if (view === 'files') { loadFiles(_filesPath); _filesRenderBookmarks(); }
+  if (view === 'record') _recorderInit();
   if (view === 'mdai') _mdaiTabLoad();
   if (view === 'email') _emailLoad();
   if (view === 'connectors') _connectorsTabLoad();
@@ -42173,3 +42174,708 @@ function pickCardFiles(name) {
   };
   input.click();
 }
+
+// ── Record tab (AMUX-4625) ───────────────────────────────────────────────────
+// One tap records audio on this device. Every 1 s chunk is written to its OWN
+// IndexedDB database the moment it arrives, so a reload, a crash or iOS killing
+// the backgrounded PWA keeps everything captured up to the last second. When
+// amux is reachable each finished recording is uploaded once to the folder set
+// in this tab; the server writes the recording's datetime into the file and a
+// sidecar, and transcribes it locally. The device copy is dropped only after
+// the server's sha256 matches the bytes this device holds, so an unsynced
+// recording is never discarded automatically.
+const _RECORDER_DB = 'amux-recorder';
+const _RECORDER_MIMES = ['audio/mp4;codecs=mp4a.40.2', 'audio/webm;codecs=opus', 'audio/mp4', 'audio/webm'];
+const _RECORDER_MAX_AUTO = 8;   // server-refused uploads stop auto-retrying after this; Retry still works
+let _recorderDbP = null;
+let _recorderStream = null, _recorderMedia = null, _recorderLive = null;
+let _recorderSeq = 0, _recorderWrites = Promise.resolve(), _recorderStarting = false, _recorderFinalizing = '';
+let _recorderStopReason = '', _recorderTimer = 0, _recorderRaf = 0, _recorderAudioCtx = null, _recorderAnalyser = null;
+let _recorderWake = null, _recorderSyncing = false, _recorderSyncTimer = 0, _recorderRecovered = false;
+let _recorderServer = [], _recorderServerDir = '', _recorderServerErr = '', _recorderConfig = null;
+let _recorderLocal = [], _recorderAudioEl = null, _recorderInited = false;
+
+function _recorderUsed() { try { return localStorage.getItem('amux_recorder_used') === '1'; } catch (e) { return false; } }
+
+function _recorderDb() {
+  if (_recorderDbP) return _recorderDbP;
+  _recorderDbP = new Promise((resolve, reject) => {
+    const req = indexedDB.open(_RECORDER_DB, 1);
+    req.onupgradeneeded = () => {
+      const d = req.result;
+      if (!d.objectStoreNames.contains('recs')) d.createObjectStore('recs', {keyPath: 'id'});
+      if (!d.objectStoreNames.contains('chunks')) d.createObjectStore('chunks', {keyPath: ['rec', 'seq']});
+    };
+    req.onsuccess = () => {
+      const d = req.result;
+      d.onversionchange = () => { d.close(); _recorderDbP = null; };
+      resolve(d);
+    };
+    req.onerror = () => { _recorderDbP = null; reject(req.error || new Error('recorder storage unavailable')); };
+  });
+  return _recorderDbP;
+}
+function _recorderReq(req) {
+  return new Promise((resolve, reject) => { req.onsuccess = () => resolve(req.result); req.onerror = () => reject(req.error); });
+}
+// A write resolves only when its transaction COMMITS; an abort rejects, so a
+// caller can never report "saved" for a chunk the browser refused.
+function _recorderTx(stores, write) {
+  return _recorderDb().then(d => new Promise((resolve, reject) => {
+    const tx = d.transaction(stores, 'readwrite');
+    tx.oncomplete = () => resolve();
+    tx.onabort = tx.onerror = () => reject(tx.error || new Error('recorder storage transaction aborted'));
+    try { write(tx); } catch (e) { try { tx.abort(); } catch (_) {} reject(e); }
+  }));
+}
+function _recorderChunkRange(id) { return IDBKeyRange.bound([id, 0], [id, Infinity]); }
+async function _recorderList() { const d = await _recorderDb(); return _recorderReq(d.transaction('recs').objectStore('recs').getAll()); }
+async function _recorderGet(id) { const d = await _recorderDb(); return _recorderReq(d.transaction('recs').objectStore('recs').get(id)); }
+async function _recorderChunks(id) {
+  const d = await _recorderDb();
+  return _recorderReq(d.transaction('chunks').objectStore('chunks').getAll(_recorderChunkRange(id)));
+}
+// Read-modify-write inside ONE transaction: a chunk append and a sync patch on
+// the same recording cannot overwrite each other's fields.
+function _recorderPatch(id, patch) {
+  return _recorderTx(['recs'], tx => {
+    const s = tx.objectStore('recs');
+    const r = s.get(id);
+    r.onsuccess = () => { if (r.result) s.put(Object.assign(r.result, patch)); };
+  });
+}
+function _recorderAddChunk(id, seq, blob, at) {
+  return _recorderTx(['recs', 'chunks'], tx => {
+    tx.objectStore('chunks').put({rec: id, seq, blob, size: blob.size});
+    const s = tx.objectStore('recs');
+    const r = s.get(id);
+    r.onsuccess = () => {
+      const m = r.result;
+      if (!m) return;
+      m.seq = Math.max(m.seq || 0, seq + 1);
+      m.bytes = (m.bytes || 0) + blob.size;
+      m.last_chunk_at = at;
+      if (seq === 0 && blob.type) m.mime = blob.type;   // what was actually recorded
+      s.put(m);
+    };
+  });
+}
+function _recorderDropChunks(id) { return _recorderTx(['chunks'], tx => { tx.objectStore('chunks').delete(_recorderChunkRange(id)); }); }
+
+function _recorderStatus(t) { const el = document.getElementById('recorder-status'); if (el) el.textContent = t; }
+function _recorderClock(ms) {
+  const s = Math.max(0, Math.floor((ms || 0) / 1000));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = String(s % 60).padStart(2, '0');
+  return h ? h + ':' + String(m).padStart(2, '0') + ':' + sec : m + ':' + sec;
+}
+function _recorderSize(b) {
+  b = b || 0;
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b / 1024).toFixed(b < 102400 ? 1 : 0) + ' KB';
+  return (b / 1048576).toFixed(1) + ' MB';
+}
+function _recorderHex(buf) { return Array.from(new Uint8Array(buf), x => x.toString(16).padStart(2, '0')).join(''); }
+
+function _recorderToggle() {
+  if (_recorderLive) _recorderStop('stopped');
+  else _recorderStart();
+}
+
+async function _recorderStart() {
+  if (_recorderStarting || _recorderLive) return;
+  if (!navigator.mediaDevices || !window.MediaRecorder) { _recorderStatus('This browser cannot record audio.'); return; }
+  _recorderStarting = true;
+  _recorderStatus('Starting the microphone…');
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({audio: {channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true}});
+  } catch (e) {
+    _recorderStarting = false;
+    _recorderStatus('Microphone unavailable: ' + ((e && (e.message || e.name)) || 'permission denied'));
+    return;
+  }
+  const release = () => { try { stream.getTracks().forEach(t => t.stop()); } catch (e) {} };
+  const candidates = _RECORDER_MIMES.filter(m => !MediaRecorder.isTypeSupported || MediaRecorder.isTypeSupported(m));
+  const mime = candidates[0] || '';
+  let rec;
+  try { rec = new MediaRecorder(stream, Object.assign({audioBitsPerSecond: 32000}, mime ? {mimeType: mime} : {})); }
+  catch (e) {
+    try { rec = new MediaRecorder(stream); }
+    catch (e2) { release(); _recorderStarting = false; _recorderStatus('Recorder unavailable: ' + (e2.message || e2.name)); return; }
+  }
+  const now = Date.now();
+  const meta = {
+    id: 'r' + now.toString(36) + Math.random().toString(36).slice(2, 6),
+    started_at: now, ended_at: 0, dur_ms: 0, tz_offset_min: -new Date(now).getTimezoneOffset(),
+    mime: rec.mimeType || mime || 'audio/webm', device: String(navigator.userAgent || '').slice(0, 160),
+    location: null, state: 'recording', seq: 0, bytes: 0, last_chunk_at: now,
+    attempts: 0, net_failures: 0, last_attempt: 0, error: '', path: '', file: '', upload_sha256: '', recovered: false,
+  };
+  try { await _recorderTx(['recs'], tx => { tx.objectStore('recs').put(meta); }); }
+  catch (e) {
+    release(); _recorderStarting = false;
+    _recorderStatus('Not recording: this device refused storage (' + ((e && e.message) || 'unknown') + ')');
+    return;
+  }
+  try { localStorage.setItem('amux_recorder_used', '1'); } catch (e) {}
+  _recorderStream = stream; _recorderMedia = rec; _recorderLive = meta;
+  _recorderSeq = 0; _recorderWrites = Promise.resolve(); _recorderStopReason = '';
+  _recorderAttach(rec, meta, candidates.slice(1));
+  stream.getAudioTracks().forEach(t => t.addEventListener('ended', () => {
+    _recorderStop('the microphone was released, usually because the app went to the background or another app took it');
+  }));
+  try { rec.start(1000); }
+  catch (e) {
+    release(); _recorderStream = null; _recorderMedia = null; _recorderLive = null; _recorderStarting = false;
+    await _recorderPatch(meta.id, {state: 'empty', error: 'recorder did not start'}).catch(() => {});
+    _recorderStatus('Recorder did not start: ' + (e.message || e.name));
+    _recorderRender();
+    return;
+  }
+  _recorderStarting = false;
+  _recorderWakeLock();
+  _recorderStartMeter();
+  clearInterval(_recorderTimer);
+  _recorderTimer = setInterval(_recorderTick, 500);
+  _recorderTick();
+  let wantLocation = false;
+  try { wantLocation = localStorage.getItem('amux_recorder_location') === '1'; } catch (e) {}
+  if (wantLocation) _recorderLocate(meta.id);
+  _recorderRender();
+}
+
+function _recorderAttach(rec, meta, fallbacks) {
+  rec.ondataavailable = ev => {
+    if (!ev.data || !ev.data.size) return;
+    const seq = _recorderSeq++, at = Date.now(), blob = ev.data;
+    meta.bytes += blob.size; meta.last_chunk_at = at;
+    _recorderWrites = _recorderWrites
+      .then(() => _recorderAddChunk(meta.id, seq, blob, at))
+      .catch(e => { meta.write_error = (e && e.message) || 'write failed'; _recorderStatus('A second of audio could not be saved: ' + meta.write_error); });
+  };
+  rec.onstop = () => { if (!rec._recorderReplaced) _recorderFinalize(meta.id); };
+  rec.onerror = ev => {
+    const why = (ev && ev.error && ev.error.message) || 'unknown error';
+    // A browser can CLAIM a format it cannot encode: Chromium without an AAC
+    // encoder passes isTypeSupported('audio/mp4') and then fails with "Encoder
+    // initialization failed". Before any audio exists, move to the next format
+    // on the same microphone stream instead of ending the recording.
+    if (_recorderSeq === 0 && fallbacks.length && _recorderLive === meta && _recorderStream) {
+      rec._recorderReplaced = true;
+      try { if (rec.state !== 'inactive') rec.stop(); } catch (e) {}
+      let next = null;
+      try { next = new MediaRecorder(_recorderStream, {audioBitsPerSecond: 32000, mimeType: fallbacks[0]}); } catch (e) { next = null; }
+      if (next) {
+        meta.mime = next.mimeType || fallbacks[0];
+        _recorderPatch(meta.id, {mime: meta.mime}).catch(() => {});
+        _recorderMedia = next;
+        _recorderAttach(next, meta, fallbacks.slice(1));
+        try { next.start(1000); return; } catch (e) { next._recorderReplaced = false; }
+      }
+    }
+    _recorderStop('the recorder failed (' + why + ')');
+  };
+}
+
+function _recorderStop(reason) {
+  const rec = _recorderMedia;
+  if (!_recorderLive) return;
+  if (!_recorderStopReason) _recorderStopReason = reason || 'stopped';
+  if (rec && rec.state !== 'inactive') {
+    try { rec.stop(); return; } catch (e) {}
+  }
+  _recorderFinalize(_recorderLive.id);   // already inactive: onstop may never come
+}
+
+async function _recorderFinalize(id) {
+  if (!id || !_recorderLive || _recorderLive.id !== id || _recorderFinalizing === id) return;
+  _recorderFinalizing = id;
+  clearInterval(_recorderTimer); _recorderTimer = 0;
+  _recorderStopMeter();
+  _recorderReleaseWake();
+  try { _recorderStream && _recorderStream.getTracks().forEach(t => t.stop()); } catch (e) {}
+  _recorderStream = null; _recorderMedia = null;
+  await _recorderWrites;   // the last dataavailable fires before stop, so every chunk is queued here
+  const reason = _recorderStopReason || 'stopped';
+  let m = null;
+  try { m = await _recorderGet(id); } catch (e) {}
+  const endedAt = Date.now();
+  try {
+    if (!m || !m.seq) {
+      await _recorderPatch(id, {state: 'empty', ended_at: endedAt, error: 'nothing was captured'});
+      _recorderStatus('Nothing was captured' + (reason === 'stopped' ? '.' : ': ' + reason + '.'));
+    } else {
+      const dur = Math.max(0, endedAt - m.started_at);
+      await _recorderPatch(id, {state: 'local', ended_at: endedAt, dur_ms: dur});
+      _recorderStatus((reason === 'stopped' ? 'Saved on this device' : 'Recording ended: ' + reason + '. Saved what was captured')
+        + ' (' + _recorderClock(dur) + ', ' + _recorderSize(m.bytes) + ').');
+    }
+  } catch (e) {
+    _recorderStatus('Recording stopped, but its details could not be saved: ' + ((e && e.message) || 'storage error'));
+  }
+  _recorderLive = null; _recorderFinalizing = ''; _recorderStopReason = '';
+  await _recorderRender();
+  _recorderSync();
+}
+
+async function _recorderWakeLock() {
+  if (!_recorderLive || _recorderWake || !('wakeLock' in navigator)) return;
+  try {
+    _recorderWake = await navigator.wakeLock.request('screen');
+    _recorderWake.addEventListener('release', () => { _recorderWake = null; });
+  } catch (e) { _recorderWake = null; }
+}
+function _recorderReleaseWake() {
+  try { if (_recorderWake) _recorderWake.release(); } catch (e) {}
+  _recorderWake = null;
+}
+
+function _recorderLocate(id) {
+  if (!navigator.geolocation) return;
+  try {
+    navigator.geolocation.getCurrentPosition(p => {
+      const loc = {lat: +p.coords.latitude.toFixed(6), lon: +p.coords.longitude.toFixed(6), accuracy_m: Math.round(p.coords.accuracy || 0)};
+      if (_recorderLive && _recorderLive.id === id) _recorderLive.location = loc;
+      _recorderPatch(id, {location: loc}).catch(() => {});
+    }, () => {}, {enableHighAccuracy: false, timeout: 10000, maximumAge: 60000});
+  } catch (e) {}
+}
+function _recorderSetLocation(on) {
+  try { localStorage.setItem('amux_recorder_location', on ? '1' : '0'); } catch (e) {}
+  if (on && _recorderLive) _recorderLocate(_recorderLive.id);
+}
+
+function _recorderStartMeter() {
+  try {
+    _recorderAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (_recorderAudioCtx.state === 'suspended') _recorderAudioCtx.resume().catch(() => {});
+    const src = _recorderAudioCtx.createMediaStreamSource(_recorderStream);
+    _recorderAnalyser = _recorderAudioCtx.createAnalyser();
+    _recorderAnalyser.fftSize = 512;
+    src.connect(_recorderAnalyser);
+  } catch (e) { return; }   // the meter is cosmetic; recording never depends on it
+  const data = new Uint8Array(_recorderAnalyser.fftSize);
+  const fill = document.getElementById('recorder-level-fill');
+  const draw = () => {
+    if (!_recorderLive || !_recorderAnalyser) return;
+    _recorderAnalyser.getByteTimeDomainData(data);
+    let sum = 0;
+    for (let i = 0; i < data.length; i++) { const v = (data[i] - 128) / 128; sum += v * v; }
+    const level = Math.min(1, Math.sqrt(sum / data.length) * 4);
+    if (fill) fill.style.transform = 'scaleX(' + Math.max(0.02, level).toFixed(3) + ')';
+    _recorderRaf = requestAnimationFrame(draw);
+  };
+  draw();
+}
+function _recorderStopMeter() {
+  if (_recorderRaf) cancelAnimationFrame(_recorderRaf);
+  _recorderRaf = 0; _recorderAnalyser = null;
+  try { if (_recorderAudioCtx) _recorderAudioCtx.close(); } catch (e) {}
+  _recorderAudioCtx = null;
+  const fill = document.getElementById('recorder-level-fill');
+  if (fill) fill.style.transform = 'scaleX(0.02)';
+}
+function _recorderTick() {
+  const el = document.getElementById('recorder-elapsed');
+  if (!_recorderLive) { if (el) el.textContent = '0:00'; return; }
+  const ms = Date.now() - _recorderLive.started_at;
+  if (el) el.textContent = _recorderClock(ms);
+  if (!_recorderLive.write_error) _recorderStatus('Recording · ' + _recorderSize(_recorderLive.bytes) + ' saved on this device · tap to stop');
+}
+
+// A recording left 'recording' by a reload or a crash is finished with what it
+// captured; one left 'syncing' by a killed upload goes back in the queue.
+async function _recorderRecover() {
+  if (_recorderRecovered) return;
+  _recorderRecovered = true;
+  const liveId = _recorderLive && _recorderLive.id;
+  for (const m of await _recorderList()) {
+    if (m.id === liveId) continue;
+    if (m.state === 'recording') {
+      const end = m.last_chunk_at || m.started_at;
+      await _recorderPatch(m.id, {state: m.seq ? 'local' : 'empty', recovered: true, ended_at: end, dur_ms: Math.max(0, end - m.started_at)});
+    } else if (m.state === 'syncing') {
+      await _recorderPatch(m.id, {state: 'local'});
+    }
+  }
+}
+
+function _recorderReady(m, force) {
+  if (!['local', 'failed'].includes(m.state)) return false;
+  if (force) return true;
+  if (m.state === 'failed' && (m.attempts || 0) >= _RECORDER_MAX_AUTO) return false;
+  const wait = m.state === 'failed'
+    ? Math.min(600000, 5000 * Math.pow(2, m.attempts || 0))
+    : Math.min(60000, 2000 * Math.pow(2, m.net_failures || 0));
+  return Date.now() - (m.last_attempt || 0) > wait;
+}
+
+async function _recorderSync(force) {
+  if (_recorderSyncing || navigator.onLine === false) return;
+  if (!_recorderUsed() && !_recorderInited) return;
+  _recorderSyncing = true;
+  let synced = 0;
+  try {
+    await _recorderRecover();
+    const liveId = _recorderLive && _recorderLive.id;
+    const recs = (await _recorderList()).filter(m => m.id !== liveId).sort((a, b) => a.started_at - b.started_at);
+    for (const m of recs) {
+      if (!_recorderReady(m, force === true)) continue;
+      if (await _recorderUpload(m)) synced++;
+      if (navigator.onLine === false) break;
+    }
+  } catch (e) {
+    _recorderStatus('Sync stopped: ' + ((e && e.message) || 'storage error'));
+  } finally { _recorderSyncing = false; }
+  if (synced) showToast(synced + ' recording' + (synced === 1 ? '' : 's') + ' synced');
+  _recorderScheduleSync();
+  if (activeView === 'record') {
+    if (synced) await _recorderLoadServer();
+    _recorderRender();
+  }
+}
+
+async function _recorderScheduleSync() {
+  let pending = 0;
+  try { pending = (await _recorderList()).filter(m => ['local', 'failed', 'syncing'].includes(m.state)).length; } catch (e) {}
+  if (pending && !_recorderSyncTimer) _recorderSyncTimer = setInterval(() => _recorderSync(), 60000);
+  if (!pending && _recorderSyncTimer) { clearInterval(_recorderSyncTimer); _recorderSyncTimer = 0; }
+}
+
+async function _recorderUpload(m) {
+  const chunks = await _recorderChunks(m.id);
+  if (!chunks.length) {
+    await _recorderPatch(m.id, {state: 'empty', error: 'no audio on this device'});
+    return false;
+  }
+  const type = m.mime || chunks[0].blob.type || 'audio/webm';
+  const blob = new Blob(chunks.map(c => c.blob), {type});
+  await _recorderPatch(m.id, {state: 'syncing', last_attempt: Date.now(), error: ''});
+  if (activeView === 'record') _recorderRender();
+  let sha = '';
+  try { sha = _recorderHex(await crypto.subtle.digest('SHA-256', await blob.arrayBuffer())); } catch (e) { sha = ''; }
+  const q = new URLSearchParams({
+    id: m.id, started_at: String(m.started_at), ended_at: String(m.ended_at || m.last_chunk_at || m.started_at),
+    dur_ms: String(m.dur_ms || 0), tz_offset_min: String(m.tz_offset_min || 0), mime: type, device: m.device || '',
+  });
+  if (m.location) {
+    q.set('lat', String(m.location.lat)); q.set('lon', String(m.location.lon));
+    if (m.location.accuracy_m != null) q.set('accuracy_m', String(m.location.accuracy_m));
+  }
+  if (m.recovered) q.set('recovered', '1');
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 300000);
+  let r;
+  try {
+    r = await fetch(API + '/api/recordings/upload?' + q.toString(), {
+      method: 'POST', headers: _authHeaders({'Content-Type': type.split(';')[0]}), body: blob, signal: ctl.signal,
+    });
+  } catch (e) {
+    clearTimeout(timer);
+    // Unreachable is not a refusal: it does not use up the retry budget.
+    await _recorderPatch(m.id, {state: 'local', error: 'Waiting for a connection to amux', net_failures: (m.net_failures || 0) + 1, last_attempt: Date.now()});
+    return false;
+  }
+  clearTimeout(timer);
+  let d = null;
+  try { d = await r.json(); } catch (e) { d = null; }
+  if (r.ok && d && d.ok) {
+    const serverSha = String(d.upload_sha256 || '');
+    const done = {path: d.path || '', file: d.file || '', upload_sha256: serverSha, synced_at: Date.now(), net_failures: 0, error: ''};
+    if (sha && serverSha === sha) {
+      await _recorderPatch(m.id, Object.assign(done, {state: 'synced', keep_local: false}));
+      await _recorderDropChunks(m.id);   // the folder holds identical bytes
+      return true;
+    }
+    if (!sha) {
+      // This browser could not hash, so nothing proves the copies match: keep ours.
+      await _recorderPatch(m.id, Object.assign(done, {state: 'synced', keep_local: true}));
+      return true;
+    }
+    await _recorderPatch(m.id, {state: 'failed', attempts: (m.attempts || 0) + 1, net_failures: 0,
+      error: 'The folder copy does not match this device (folder sha256 ' + (serverSha.slice(0, 12) || 'missing') + ', device ' + sha.slice(0, 12) + '). The audio stays here.'});
+    return false;
+  }
+  if (r.status === 409 && d && d.kind === 'id_conflict') {
+    await _recorderPatch(m.id, {state: 'conflict', attempts: (m.attempts || 0) + 1, net_failures: 0,
+      error: d.error || 'The folder already holds different audio under this recording id.'});
+    return false;
+  }
+  const msg = (d && (d.error || d.message)) || ('HTTP ' + r.status);
+  await _recorderPatch(m.id, {state: 'failed', attempts: (m.attempts || 0) + 1, net_failures: 0, error: String(msg).slice(0, 240)});
+  return false;
+}
+
+async function _recorderRetry(id) {
+  await _recorderPatch(id, {state: 'local', attempts: 0, net_failures: 0, last_attempt: 0, error: ''});
+  await _recorderRender();
+  _recorderSync(true);
+}
+
+async function _recorderLoadServer() {
+  try {
+    const r = await fetch(API + '/api/recordings?limit=100', {cache: 'no-store'});
+    const d = await r.json().catch(() => null);
+    if (!r.ok || !d) { _recorderServerErr = (d && d.error) || ('Folder listing unavailable (HTTP ' + r.status + ')'); return; }
+    _recorderServer = Array.isArray(d.recordings) ? d.recordings : [];
+    _recorderServerDir = d.dir || '';
+    _recorderServerErr = '';
+  } catch (e) {
+    _recorderServerErr = 'Offline: showing recordings on this device only';
+  }
+}
+
+async function _recorderLoadConfig() {
+  try {
+    const r = await fetch(API + '/api/recordings/config', {cache: 'no-store'});
+    const d = await r.json().catch(() => null);
+    _recorderConfig = r.ok && d ? d : {error: (d && d.error) || ('HTTP ' + r.status)};
+  } catch (e) { _recorderConfig = {error: 'Offline'}; }
+  _recorderRenderSettings();
+}
+
+async function _recorderSaveDir() {
+  const inp = document.getElementById('recorder-dir');
+  const help = document.getElementById('recorder-dir-help');
+  const dir = ((inp && inp.value) || '').trim();
+  if (!dir) { if (help) help.textContent = 'Enter a folder path.'; if (inp) inp.setAttribute('aria-invalid', 'true'); return; }
+  try {
+    const r = await fetch(API + '/api/recordings/config', {
+      method: 'POST', headers: _authHeaders({'Content-Type': 'application/json'}), body: JSON.stringify({dir}),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      if (inp) inp.setAttribute('aria-invalid', 'true');
+      if (help) help.textContent = 'Not saved: ' + (d.error || ('HTTP ' + r.status));
+      return;
+    }
+    if (inp) inp.removeAttribute('aria-invalid');
+    showToast('Recordings folder saved');
+  } catch (e) {
+    if (help) help.textContent = 'Not saved: amux is unreachable.';
+    return;
+  }
+  await _recorderLoadConfig();
+  await _recorderLoadServer();
+  _recorderRender();
+}
+
+function _recorderRenderSettings() {
+  const c = _recorderConfig || {};
+  const inp = document.getElementById('recorder-dir');
+  const help = document.getElementById('recorder-dir-help');
+  const tr = document.getElementById('recorder-transcriber');
+  const loc = document.getElementById('recorder-location');
+  try { if (loc) loc.checked = localStorage.getItem('amux_recorder_location') === '1'; } catch (e) {}
+  if (c.error) { if (help) help.textContent = 'Settings unavailable: ' + c.error; return; }
+  if (inp && document.activeElement !== inp) inp.value = c.dir || '';
+  if (help) {
+    const src = {env: 'Set by AMUX_RECORDINGS_DIR on the server, which overrides this field.', pref: 'Saved in amux settings.', default: 'Default folder.'}[c.dir_source] || '';
+    help.textContent = src + (c.dir_exists === false ? ' The folder does not exist yet; the first sync creates it.' : '')
+      + (c.ffmpeg === false ? ' ffmpeg is missing on the server, so the datetime is kept on the file and sidecar only.' : '');
+  }
+  if (tr) {
+    const t = c.transcriber || {};
+    tr.textContent = t.available
+      ? 'Transcripts: on, locally with ' + (t.engine || 'a local engine') + (t.model ? ' (' + t.model + ')' : '') + '.'
+      : 'Transcripts: off. ' + (t.why_unavailable || 'No local transcriber is configured on the server.');
+  }
+}
+
+function _recorderMerged() {
+  const byId = new Map();
+  for (const s of _recorderServer) byId.set(s.id, {id: s.id, server: s, local: null});
+  for (const l of _recorderLocal) {
+    const row = byId.get(l.id) || {id: l.id, server: null, local: null};
+    row.local = l;
+    byId.set(l.id, row);
+  }
+  const rows = Array.from(byId.values());
+  rows.forEach(r => { r.started = (r.local && r.local.started_at) || (r.server && r.server.started_at) || 0; });
+  return rows.sort((a, b) => b.started - a.started);
+}
+function _recorderHasLocalAudio(l) { return !!l && l.state !== 'empty' && (l.state !== 'synced' || !!l.keep_local); }
+
+function _recorderSyncWords(row) {
+  const l = row.local;
+  if (!l) return {cls: 'synced', text: 'Synced to the folder'};
+  const err = l.error ? ': ' + l.error : '';
+  switch (l.state) {
+    case 'recording': return {cls: 'recording', text: 'Recording'};
+    case 'syncing': return {cls: 'syncing', text: 'Syncing'};
+    case 'synced': return {cls: 'synced', text: l.keep_local ? 'Synced to the folder (also kept on this device)' : 'Synced to the folder'};
+    case 'failed': return {cls: 'failed', text: 'Sync failed' + err};
+    case 'conflict': return {cls: 'failed', text: 'Not synced' + (err || ': the folder holds different audio under this id')};
+    case 'empty': return {cls: 'empty', text: 'Nothing was captured'};
+    default: return {cls: 'local', text: 'On this device, waiting to sync' + (l.error ? ' (' + l.error + ')' : '')};
+  }
+}
+function _recorderTranscriptWords(row) {
+  const t = row.server && row.server.transcript;
+  if (!t) return row.local && row.local.state === 'empty' ? '' : 'Transcript after sync';
+  return ({pending: 'Transcript queued', running: 'Transcribing', done: 'Transcript ready',
+    failed: 'Transcription failed' + (t.error ? ': ' + t.error : ''),
+    unavailable: 'No local transcriber' + (t.error ? ': ' + t.error : '')})[t.status] || ('Transcript ' + (t.status || 'unknown'));
+}
+
+async function _recorderRender() {
+  try { _recorderLocal = await _recorderList(); } catch (e) { _recorderLocal = []; }
+  const on = !!_recorderLive;
+  const btn = document.getElementById('recorder-btn');
+  if (btn) {
+    btn.classList.toggle('recording', on);
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    btn.setAttribute('aria-label', on ? 'Stop recording' : 'Start recording');
+  }
+  const tab = document.getElementById('tab-record');
+  if (tab) tab.classList.toggle('recording', on);
+  if (!on) _recorderTick();
+  const summary = document.getElementById('recorder-sync-summary');
+  const waiting = _recorderLocal.filter(m => ['local', 'failed', 'syncing', 'conflict'].includes(m.state)).length;
+  if (summary) {
+    summary.textContent = waiting
+      ? waiting + ' recording' + (waiting === 1 ? '' : 's') + (navigator.onLine === false ? ' will sync when amux is reachable' : ' waiting to sync')
+      : (_recorderLocal.length || _recorderServer.length ? 'Everything recorded here is synced' : '');
+  }
+  const list = document.getElementById('recorder-list');
+  if (!list) return;
+  const rows = _recorderMerged();
+  let h = '';
+  if (_recorderServerErr) h += '<div class="ui-help recorder-note">' + esc(_recorderServerErr) + '</div>';
+  if (_recorderServerDir) h += '<div class="ui-help recorder-note">Folder: ' + esc(_recorderServerDir) + '</div>';
+  if (!rows.length) h += '<div class="recorder-empty">No recordings yet.</div>';
+  let day = '';
+  for (const row of rows) {
+    const l = row.local, s = row.server;
+    const d = new Date(row.started || Date.now());
+    const dayKey = d.toLocaleDateString([], {weekday: 'short', month: 'short', day: 'numeric', year: 'numeric'});
+    if (dayKey !== day) { day = dayKey; h += '<div class="recorder-day">' + esc(dayKey) + '</div>'; }
+    const dur = (l && (l.state === 'recording' ? Date.now() - l.started_at : l.dur_ms)) || (s && s.dur_ms) || 0;
+    const bytes = (s && s.bytes) || (l && l.bytes) || 0;
+    const sync = _recorderSyncWords(row);
+    const tWords = _recorderTranscriptWords(row);
+    const excerpt = s && s.transcript && s.transcript.excerpt ? s.transcript.excerpt : '';
+    const id = esc(row.id);
+    const canPlay = (l && _recorderHasLocalAudio(l) && l.state !== 'recording') || (s && s.path);
+    let actions = '';
+    if (canPlay) actions += '<button class="btn" type="button" onclick="_recorderPlay(\'' + id + '\')">Play</button>';
+    if (s && s.transcript && s.transcript.status === 'done') actions += '<button class="btn" type="button" onclick="_recorderShowTranscript(\'' + id + '\')">Transcript</button>';
+    if (l && (l.state === 'failed' || l.state === 'conflict')) actions += '<button class="btn primary" type="button" onclick="_recorderRetry(\'' + id + '\')">Retry sync</button>';
+    if (s && s.transcript && (s.transcript.status === 'failed' || s.transcript.status === 'unavailable')) actions += '<button class="btn" type="button" onclick="_recorderRetranscribe(\'' + id + '\')">Transcribe again</button>';
+    if (l && l.state !== 'recording' && l.state !== 'syncing' && (l.state !== 'synced' || l.keep_local)) actions += '<button class="btn danger" type="button" onclick="_recorderDeleteLocal(\'' + id + '\')">Delete from this device</button>';
+    h += '<div class="recorder-item" data-rec-id="' + id + '" data-sync-state="' + esc((l && l.state) || 'synced') + '">'
+      + '<div class="recorder-item-head"><span class="recorder-when">' + esc(d.toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'})) + '</span>'
+      + '<span class="recorder-meta">' + esc(_recorderClock(dur)) + ' · ' + esc(_recorderSize(bytes)) + (l && l.recovered ? ' · recovered after a reload' : '') + '</span></div>'
+      + '<div class="recorder-sync recorder-sync-' + sync.cls + '">' + esc(sync.text) + '</div>'
+      + (tWords ? '<div class="recorder-transcript-state">' + esc(tWords) + '</div>' : '')
+      + (excerpt ? '<div class="recorder-excerpt">' + esc(excerpt) + '</div>' : '')
+      + (actions ? '<div class="recorder-actions">' + actions + '</div>' : '')
+      + '</div>';
+  }
+  list.innerHTML = h;
+}
+
+async function _recorderPlay(id) {
+  try {
+    if (_recorderAudioEl) {
+      _recorderAudioEl.pause();
+      if (_recorderAudioEl.dataset.objectUrl) URL.revokeObjectURL(_recorderAudioEl.dataset.objectUrl);
+    }
+    const l = await _recorderGet(id).catch(() => null);
+    let src = '', objectUrl = '';
+    if (l && _recorderHasLocalAudio(l)) {
+      const ch = await _recorderChunks(id);
+      if (ch.length) { objectUrl = URL.createObjectURL(new Blob(ch.map(c => c.blob), {type: l.mime || ch[0].blob.type})); src = objectUrl; }
+    }
+    if (!src) {
+      const s = _recorderServer.find(x => x.id === id);
+      if (s && s.path) src = _authUrl(API + '/api/file/raw?path=' + encodeURIComponent(s.path));
+    }
+    if (!src) { showToast('No audio to play'); return; }
+    _recorderAudioEl = new Audio(src);
+    _recorderAudioEl.dataset.objectUrl = objectUrl;
+    await _recorderAudioEl.play();
+  } catch (e) { showToast('Playback failed: ' + ((e && (e.message || e.name)) || 'unknown')); }
+}
+
+async function _recorderShowTranscript(id) {
+  let d;
+  try {
+    const r = await fetch(API + '/api/recordings/' + encodeURIComponent(id), {cache: 'no-store'});
+    d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+  } catch (e) { showToast('Transcript unavailable: ' + ((e && e.message) || 'offline')); return; }
+  const t = d.transcript || {};
+  const when = d.recorded_at_local || new Date(d.started_at || Date.now()).toLocaleString();
+  const text = t.text || t.error || 'No transcript yet.';
+  const copy = await showFormModal('Transcript',
+    '<div class="ui-help">' + esc(when) + (d.dur_ms ? ' · ' + esc(_recorderClock(d.dur_ms)) : '') + '</div>'
+    + '<div class="recorder-transcript">' + esc(text) + '</div>', 'Copy text');
+  if (copy && t.text) {
+    try { await navigator.clipboard.writeText(t.text); showToast('Transcript copied'); } catch (e) { showToast('Copy failed'); }
+  }
+}
+
+async function _recorderRetranscribe(id) {
+  try {
+    const r = await fetch(API + '/api/recordings/' + encodeURIComponent(id) + '/transcribe', {
+      method: 'POST', headers: _authHeaders({'Content-Type': 'application/json'}), body: '{}',
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) { showToast('Not queued: ' + (d.error || ('HTTP ' + r.status))); return; }
+    showToast('Transcription queued');
+  } catch (e) { showToast('Not queued: amux is unreachable'); return; }
+  await _recorderLoadServer();
+  _recorderRender();
+}
+
+async function _recorderDeleteLocal(id) {
+  if (_recorderLive && _recorderLive.id === id) return;
+  const l = await _recorderGet(id).catch(() => null);
+  if (!l) return;
+  if (l.state !== 'synced' && l.state !== 'empty') {
+    const ok = await showConfirm('This recording has not synced, so its audio exists only on this device. Delete it?', 'Delete', true);
+    if (!ok) return;
+  }
+  try {
+    await _recorderTx(['recs', 'chunks'], tx => {
+      tx.objectStore('chunks').delete(_recorderChunkRange(id));
+      tx.objectStore('recs').delete(id);
+    });
+  } catch (e) { showToast('Not deleted: ' + ((e && e.message) || 'storage error')); return; }
+  _recorderRender();
+}
+
+async function _recorderInit() {
+  if (!_recorderInited) {
+    _recorderInited = true;
+    try { await _recorderRecover(); } catch (e) {}
+  }
+  _recorderRender();
+  _recorderLoadConfig();
+  await _recorderLoadServer();
+  await _recorderRender();
+  _recorderSync();
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') {
+    // Flush the partial second so a suspension loses as little as possible.
+    try { if (_recorderMedia && _recorderMedia.state === 'recording') _recorderMedia.requestData(); } catch (e) {}
+    return;
+  }
+  if (_recorderLive) {
+    const tracks = _recorderStream ? _recorderStream.getAudioTracks() : [];
+    if (!_recorderMedia || _recorderMedia.state === 'inactive' || !tracks.some(t => t.readyState === 'live')) {
+      _recorderStop('recording stopped while the app was in the background');
+    } else {
+      _recorderWakeLock();
+    }
+  }
+  if (_recorderUsed()) _recorderSync();
+});
+window.addEventListener('pagehide', () => {
+  try { if (_recorderMedia && _recorderMedia.state === 'recording') _recorderMedia.requestData(); } catch (e) {}
+});
+window.addEventListener('online', () => { if (_recorderUsed()) setTimeout(() => _recorderSync(), 1500); });
+if (_recorderUsed()) setTimeout(() => _recorderSync(), 5000);

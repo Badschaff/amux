@@ -1683,6 +1683,11 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/dictation/dict/{id}", methods: &["PATCH", "DELETE"] },
     RouteEntry { path: "/api/dictation/config", methods: ANY },
     RouteEntry { path: "/api/dictate", methods: &["POST"] },
+    RouteEntry { path: "/api/recordings", methods: &["GET"] },
+    RouteEntry { path: "/api/recordings/config", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/recordings/upload", methods: &["POST"] },
+    RouteEntry { path: "/api/recordings/{id}", methods: &["GET"] },
+    RouteEntry { path: "/api/recordings/{id}/transcribe", methods: &["POST"] },
     RouteEntry { path: "/api/tts", methods: &["POST"] },
     RouteEntry { path: "/api/tts/voices", methods: &["GET"] },
     // -- torrents / org / gmail

@@ -718,7 +718,7 @@ async fn raw(req: Request) -> Response {
 /// Absolute candidates FIRST — launchd has no shell PATH, so a bare `which`
 /// lookup reports ffmpeg missing on the machine it is installed on — then a
 /// $PATH scan for everything else.
-fn find_bin(name: &str) -> Option<PathBuf> {
+pub(crate) fn find_bin(name: &str) -> Option<PathBuf> {
     for d in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/opt/local/bin"] {
         let c = Path::new(d).join(name);
         if c.is_file() {

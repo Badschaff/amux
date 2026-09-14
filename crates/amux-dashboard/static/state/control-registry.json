@@ -1,6 +1,6 @@
 {
   "measured": true,
-  "n_considered": 1941,
+  "n_considered": 1988,
   "command_handlers": {
     "_applyEmbedView": {
       "kind": "command._applyEmbedView",
@@ -2038,6 +2038,78 @@
     },
     "_reclaimUnskip": {
       "kind": "command._reclaimUnskip",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_recorderAttach": {
+      "kind": "command._recorderAttach",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_recorderFinalize": {
+      "kind": "command._recorderFinalize",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_recorderInit": {
+      "kind": "command._recorderInit",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_recorderRetranscribe": {
+      "kind": "command._recorderRetranscribe",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_recorderRetry": {
+      "kind": "command._recorderRetry",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_recorderSaveDir": {
+      "kind": "command._recorderSaveDir",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_recorderScheduleSync": {
+      "kind": "command._recorderScheduleSync",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_recorderStart": {
+      "kind": "command._recorderStart",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_recorderStop": {
+      "kind": "command._recorderStop",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_recorderSync": {
+      "kind": "command._recorderSync",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_recorderToggle": {
+      "kind": "command._recorderToggle",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_recorderUpload": {
+      "kind": "command._recorderUpload",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
