@@ -704,6 +704,12 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     // a timestamp column is a two-part change and this file is the second part.
     ("issues", "entered_state_at", false),
     ("issues", "last_verified_at", false),
+    // SECONDS, MEASURED on the live database 2026-09-14 (RR-0052 leases,
+    // migration 0068): MAX(lease_heartbeat_at) 1789414128 and
+    // MAX(lease_expires_at) 1789415928 against a `now` of 1789414183.
+    ("issues", "lease_acquired_at", false),
+    ("issues", "lease_expires_at", false),
+    ("issues", "lease_heartbeat_at", false),
     ("layout_presets", "created_at", false),
     ("logs", "ts", false),
     ("mdai_runs", "ts", false),
@@ -738,6 +744,11 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     ("steering_history", "delivered_at", false),
     ("steering_history", "queued_at", false),
     ("steering_queue", "queued_at", false),
+    // SECONDS, MEASURED on the live database 2026-09-14 (RR-0052 attempts,
+    // db/attempts.rs): MAX(started_at) 1789414003 and MAX(ended_at) 1789413676
+    // against a `now` of 1789414183.
+    ("task_attempts", "ended_at", false),
+    ("task_attempts", "started_at", false),
     ("token_ledger", "ts", false),
     ("waitlist", "ts", false), // UNVERIFIED: no rows yet; seconds is the convention every sibling follows
 ];
