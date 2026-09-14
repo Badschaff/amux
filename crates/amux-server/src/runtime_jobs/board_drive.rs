@@ -7349,6 +7349,115 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
 /// todo == do not claim, do not dispatch, and say so in the trace so the rate
 /// of these races is visible (the API being down and pickup running off a
 /// stale view is the same failure this closes — the write sees the real row).
+/// What `POST /api/board/lease-next` hands a worker (RR-0052 Invariant 3).
+#[derive(Debug, Clone, Serialize)]
+pub struct LeaseNext {
+    /// `already_holding` | `leased` | `none`
+    pub verdict: &'static str,
+    pub card: Option<String>,
+    /// The same text auto-pickup would have queued, so a pulling worker and a
+    /// pushed one start from identical instructions.
+    pub prompt: Option<String>,
+    /// Why nothing was leased, in the selector's own words.
+    pub reason: Option<String>,
+    pub drain: crate::runtime_jobs::board_drain::DrainState,
+}
+
+/// RR-0052 Invariant 3: "workers receive tasks; they don't browse for work."
+///
+/// The PULL half of dispatch. Selection is `select_pickup` and the claim is
+/// `claim_card` / `claim_card_from_outcome`, exactly what `drive_lane` runs, so
+/// there is still one scheduler: a worker that asks gets the card the driver
+/// would have pushed, and the lease, attempt and `task.claimed` marker come from
+/// the same transaction. Only delivery differs: the prompt is returned instead
+/// of queued.
+///
+/// Holding comes first. A lane that already holds a leased `doing` card gets
+/// THAT card back, not a second one: one worker, one task.
+pub async fn lease_next(state: &AppState, lane: &str) -> LeaseNext {
+    let now = now_f64() as i64;
+    let held = state.store.read().ok().and_then(|conn| {
+        conn.query_row(
+            "SELECT id FROM issues WHERE status='doing' AND deleted IS NULL AND COALESCE(archived,0)=0 \
+             AND (lease_owner=?1 OR (lease_owner IS NULL AND session=?1)) \
+             ORDER BY COALESCE(lease_acquired_at, updated) DESC LIMIT 1",
+            [lane],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|id| bs::get_issue(&conn, &id).ok().flatten())
+        .map(|row| (row.id.clone(), resume_prompt(&conn, lane, &row)))
+    });
+    let drain = |state: &AppState| {
+        state
+            .store
+            .read()
+            .map(|conn| crate::runtime_jobs::board_drain::drain_state(&conn, lane, now))
+            .unwrap_or_else(|_| crate::runtime_jobs::board_drain::drain_state_unmeasured(lane))
+    };
+    if let Some((card, prompt)) = held {
+        return LeaseNext {
+            verdict: "already_holding",
+            card: Some(card),
+            prompt: Some(prompt),
+            reason: Some("this lane already holds a card; finish it, or end it with review/done, needs, or fail".into()),
+            drain: drain(state),
+        };
+    }
+    // A claim can lose a race with another writer between selection and CAS.
+    // Re-select a bounded number of times rather than hand back "none" while
+    // runnable work exists.
+    let mut reason = String::from("no selection ran");
+    for _ in 0..3 {
+        let pickup = match state.store.read() {
+            Ok(conn) => select_pickup(&conn, lane, now_f64()),
+            Err(error) => {
+                reason = format!("board unreadable: {error}");
+                break;
+            }
+        };
+        match pickup {
+            Pickup::Claim { card, prompt } => {
+                if claim_card(state, lane, &card).await {
+                    return LeaseNext { verdict: "leased", card: Some(card), prompt: Some(prompt), reason: None, drain: drain(state) };
+                }
+                reason = format!("{card} was claimed by another writer first");
+            }
+            Pickup::DrainBacklog { card, prompt, .. } => {
+                if claim_card_from_outcome(state, lane, &card, "backlog").await == ClaimCardOutcome::Claimed {
+                    return LeaseNext { verdict: "leased", card: Some(card), prompt: Some(prompt), reason: None, drain: drain(state) };
+                }
+                reason = format!("{card} left backlog before the claim landed");
+            }
+            Pickup::PromoteDeps { blocked_card, promoted } => {
+                reason = format!(
+                    "{blocked_card} waits on this lane's own backlog {}; the board driver promotes them on its next tick",
+                    promoted.join(", ")
+                );
+                break;
+            }
+            Pickup::ReclaimStale { card, held_h, .. } => {
+                reason = format!("{card} has been held untouched {held_h:.1}h; the board driver reclaims it before new work");
+                break;
+            }
+            Pickup::Decompose { ids, .. } => {
+                reason = format!("only capture shells are queued ({}); split them into real tasks first", ids.join(", "));
+                break;
+            }
+            Pickup::None { reason: why, detail } => {
+                reason = format!("{why}: {detail}");
+                break;
+            }
+        }
+    }
+    tracing::info!(
+        target: "amux::board_drive", lane, measured = true, n_considered = 1,
+        verdict = "lease_next_none", reason = %reason,
+        "board: lease-next found nothing to lease (RR-0052 Invariant 3)"
+    );
+    LeaseNext { verdict: "none", card: None, prompt: None, reason: Some(reason), drain: drain(state) }
+}
+
 pub async fn claim_card(state: &AppState, session: &str, card: &str) -> bool {
     claim_card_from(state, session, card, "todo").await
 }

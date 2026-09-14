@@ -83,6 +83,9 @@ pub fn routes() -> Router<AppState> {
         // items are not moving" (AMUX board sweep, 2026-08-09).
         // Before the /{id} wildcard, or "clear-done" is swallowed as an id.
         .route("/clear-done", post(clear_done))
+        // RR-0052 Invariant 3: the pull half of dispatch. Static, so it sits
+        // before the /{id} wildcard like clear-done.
+        .route("/lease-next", post(lease_next_item))
         .route("/{id}", get(get_item).patch(patch_item).delete(delete_item))
         .route("/{id}/archive", post(archive_item))
         .route("/{id}/restore", post(restore_item))
@@ -4929,6 +4932,26 @@ mod task_asset_resolution_tests {
             "a bare dotfile resolves from the producing worker's directory"
         );
     }
+}
+
+/// POST /api/board/lease-next (RR-0052 Invariant 3: workers receive tasks,
+/// they do not browse for them). The caller's lane gets back the card it
+/// already holds, or one claimed by the driver's own selector, or a reason
+/// there is nothing to lease plus the lane's drain state. Same identity rules
+/// as `/claim`: a lease with no worker behind it is refused.
+pub async fn lease_next_item(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let (_actor, lane) = actor_from_headers(&headers);
+    if lane == "api-anonymous" || lane.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "lease-next needs a worker: send X-Amux-Session: <your session> (`amux board lease` does this)",
+            })),
+        )
+            .into_response();
+    }
+    let out = crate::runtime_jobs::board_drive::lease_next(&state, &lane).await;
+    (StatusCode::OK, Json(json!(out))).into_response()
 }
 
 pub async fn get_item(

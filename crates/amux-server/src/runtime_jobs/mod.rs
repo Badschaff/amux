@@ -48,6 +48,7 @@
 //!   3: the honest refusal beats the quiet lie).
 
 pub mod autofix;
+pub mod board_drain;
 pub mod board_drive;
 pub mod board_hygiene;
 pub mod message_capture;

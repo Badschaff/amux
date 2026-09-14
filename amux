@@ -3681,6 +3681,29 @@ status-CHANGE verbs (done, verified, review, backlog), not on this one." ;;
       # did.
       echo "$result" | _board_outcome "$id" "" "status update posted to the card LOG (\`board progress\` is the one that appends to desc)"; return $?
       ;;
+    lease|lease-next)
+      # RR-0052 Invariant 3: ask the scheduler for exactly one task instead of
+      # browsing the board. Returns the card this lane already holds, or claims
+      # the one the board driver would have dispatched, or says why there is
+      # nothing to lease together with the lane's drain state.
+      [[ -n "${AMUX_SESSION:-${AMUX_WORKER:-}}" ]] || die "amux board lease needs AMUX_SESSION (the lane asking for work)"
+      local result
+      result=$(_curl -sk -X POST -H "X-Amux-Session: ${AMUX_SESSION:-${AMUX_WORKER:-}}" "$AMUX_API/api/board/lease-next")
+      if [[ "${1:-}" == "--json" ]]; then echo "$result"; return 0; fi
+      echo "$result" | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+if "error" in d: print("error:", d["error"]); sys.exit(1)
+v=d.get("verdict"); dr=d.get("drain") or {}
+if v in ("leased","already_holding"):
+    print(("LEASED " if v=="leased" else "ALREADY HOLDING ")+str(d.get("card")))
+    print(d.get("prompt") or "")
+else:
+    print("NOTHING TO LEASE: "+str(d.get("reason")))
+print("drain: %s (ready %s, running %s, blocked %s, review %s, needs human %s, parked %s)" % (
+    dr.get("verdict"), dr.get("ready"), len(dr.get("running") or []), len(dr.get("blocked") or []),
+    dr.get("review"), dr.get("needs_human"), dr.get("parked")))'
+      return $?
+      ;;
     claim)
       # Atomic claim (the assignment notifications tell every session to run
       # this — it fell through to help and exited 0 until AMUX-2140).
@@ -4132,6 +4155,7 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
                                    (--stdin/--file for the TITLE. Unknown flags are
                                     REFUSED, not folded into the title — AEAB-17.)
   amux board claim <ID>            Atomically claim a todo/backlog card for this worker
+  amux board lease [--json]        Ask the scheduler for exactly one task: the card you hold, or the next one the driver would dispatch (RR-0052)
   amux board assign <ID> <worker>  Reassign a card to a worker (the claim 409's sanctioned exit)
   amux board needs <ID> "<title>"  Report a blocker: file <title> as a NEW task and make
                                    <ID> depend on it. The driver parks <ID> and resumes it

@@ -1265,6 +1265,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/board/changes", methods: &["GET"] },
     RouteEntry { path: "/api/board/derived", methods: &["GET"] },
     RouteEntry { path: "/api/board/clear-done", methods: &["POST"] },
+    RouteEntry { path: "/api/board/lease-next", methods: &["POST"] },
     RouteEntry { path: "/api/board/overlap", methods: &["POST"] },
     RouteEntry { path: "/api/board/overlap/deployment-permit", methods: &["GET"] },
     RouteEntry { path: "/api/board/overlap/{coordination_id}", methods: &["GET"] },
