@@ -144,7 +144,17 @@ struct Turn {
     model: String,
     tokens: [i64; 4],
     cost: f64,
+    /// `message.id` of the API response this usage belongs to (AMUX-4580).
+    /// The key that makes billing exact; None only for lines that carry no id.
+    message_id: Option<String>,
+    request_id: Option<String>,
 }
+
+/// Usage lines dropped because their `message.id` was already billed in the
+/// same pass, process-lifetime (AMUX-4580). Published beside the insert count so
+/// a subagent-heavy day shows how much double billing the key prevented.
+pub static LEDGER_DUPLICATE_MESSAGES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Parse one JSONL from `offset` onward. Returns the new offset and the turns.
 ///
@@ -169,6 +179,8 @@ fn parse_from(path: &Path, offset: u64, fallback_ts: i64, owner: &str, table: &[
     let mut new_off = offset;
     let mut out = Vec::new();
     let mut prev_sig: Option<(i64, i64, i64)> = None;
+    // AMUX-4580: responses already billed in this pass, by message id.
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for raw in BufReader::new(f).split(b'\n') {
         let Ok(mut bytes) = raw else { break };
         // `split` strips the delimiter; the cursor must still count it or every
@@ -199,11 +211,26 @@ fn parse_from(path: &Path, offset: u64, fallback_ts: i64, owner: &str, table: &[
             g("cache_creation_input_tokens"),
             g("output_tokens"),
         ];
-        let sig = (tokens[0], tokens[1], tokens[3]);
-        if prev_sig == Some(sig) {
-            continue;
+        // KEYED BY THE RESPONSE WHEN THE TRANSCRIPT NAMES IT (AMUX-4580). One
+        // API response's usage is repeated for its thinking, text and tool_use
+        // parts, and in subagent transcripts not always on adjacent lines, so
+        // the adjacent signature below missed the repeats and billed one
+        // response several times. The id cannot merge two real turns: they have
+        // different ids even when their counts match. Lines without an id keep
+        // the adjacent-signature rule, which is still right for them.
+        let message_id = msg["id"].as_str().filter(|s| !s.is_empty()).map(str::to_string);
+        if let Some(id) = message_id.as_deref() {
+            if !seen_ids.insert(id.to_string()) {
+                LEDGER_DUPLICATE_MESSAGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            }
+        } else {
+            let sig = (tokens[0], tokens[1], tokens[3]);
+            if prev_sig == Some(sig) {
+                continue;
+            }
+            prev_sig = Some(sig);
         }
-        prev_sig = Some(sig);
         if tokens.iter().sum::<i64>() == 0 {
             continue;
         }
@@ -219,6 +246,8 @@ fn parse_from(path: &Path, offset: u64, fallback_ts: i64, owner: &str, table: &[
             model: model.clone(),
             tokens,
             cost: turn_cost_usd(table, &model, tokens),
+            message_id,
+            request_id: e["requestId"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
         });
     }
     (new_off, out)
@@ -374,9 +403,16 @@ pub async fn index_once_at(
             let mut n = 0usize;
             {
                 let mut ins = conn.prepare(
+                    // A response already billed by an EARLIER pass (the cursor
+                    // resumed mid-message, or a repeat landed after a flush)
+                    // updates its row to the larger output instead of adding one.
                     "INSERT INTO token_ledger
-                       (ts, session, conversation, model, input, cache_read, cache_write, output, cost_usd)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                       (ts, session, conversation, model, input, cache_read, cache_write, output, cost_usd,
+                        message_id, request_id)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+                     ON CONFLICT(conversation, message_id) WHERE message_id IS NOT NULL
+                     DO UPDATE SET output = MAX(output, excluded.output),
+                                   cost_usd = MAX(cost_usd, excluded.cost_usd)",
                 )?;
                 let mut cur = conn.prepare(
                     "INSERT INTO ledger_cursor (conversation, offset, mtime) VALUES (?1,?2,?3)
@@ -386,7 +422,8 @@ pub async fn index_once_at(
                     for t in turns {
                         ins.execute(rusqlite::params![
                             t.ts, t.session, t.conversation, t.model,
-                            t.tokens[0], t.tokens[1], t.tokens[2], t.tokens[3], t.cost
+                            t.tokens[0], t.tokens[1], t.tokens[2], t.tokens[3], t.cost,
+                            t.message_id, t.request_id
                         ])?;
                         n += 1;
                     }
@@ -502,6 +539,35 @@ mod tests {
         format!(
             r#"{{"timestamp":"{ts}","message":{{"model":"{model}","usage":{{"input_tokens":{inp},"cache_read_input_tokens":{cr},"cache_creation_input_tokens":{cw},"output_tokens":{out}}}}}}}"#
         )
+    }
+
+    fn line_with_id(model: &str, ts: &str, id: &str, inp: i64, cr: i64, cw: i64, out: i64) -> String {
+        format!(
+            r#"{{"timestamp":"{ts}","requestId":"req_{id}","message":{{"id":"{id}","model":"{model}","usage":{{"input_tokens":{inp},"cache_read_input_tokens":{cr},"cache_creation_input_tokens":{cw},"output_tokens":{out}}}}}}}"#
+        )
+    }
+
+    /// AMUX-4580, the live specimen's shape: one response's usage repeated on
+    /// NON-adjacent lines (a different response in between) is billed once, and
+    /// two different responses with identical counts are both billed.
+    #[test]
+    fn one_response_is_billed_once_by_message_id_even_when_its_repeats_are_not_adjacent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-sub.jsonl");
+        let body = [
+            line_with_id("opus", "2026-09-14T18:00:00Z", "msg_A", 32, 10865, 4512, 3),
+            line_with_id("opus", "2026-09-14T18:00:01Z", "msg_B", 32, 10865, 4512, 3),
+            line_with_id("opus", "2026-09-14T18:00:02Z", "msg_A", 32, 10865, 4512, 3),
+            line_with_id("opus", "2026-09-14T18:00:03Z", "msg_A", 32, 10865, 4512, 3),
+        ]
+        .join("\n")
+            + "\n";
+        std::fs::write(&path, &body).unwrap();
+        let (_, turns) = parse_from(&path, 0, 1_786_000_000, "lane", &table());
+        let ids: Vec<_> = turns.iter().map(|t| t.message_id.clone().unwrap()).collect();
+        assert_eq!(ids, vec!["msg_A".to_string(), "msg_B".to_string()],
+            "msg_A billed once despite non-adjacent repeats; msg_B kept though its counts match");
+        assert_eq!(turns[0].request_id.as_deref(), Some("req_msg_A"));
     }
 
     #[test]

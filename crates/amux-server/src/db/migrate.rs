@@ -403,6 +403,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0069_worker_lifecycle",
         sql: include_str!("../../migrations/0069_worker_lifecycle.sql"),
     },
+    Migration {
+        version: 70,
+        name: "0070_token_ledger_message_id",
+        sql: include_str!("../../migrations/0070_token_ledger_message_id.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.
