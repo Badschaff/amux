@@ -9726,8 +9726,8 @@ pub(crate) async fn stop_for_pause(state: &AppState, name: &str) -> anyhow::Resu
         let (ok, detail) = stop_session_process(name).await;
         anyhow::ensure!(ok, "{detail}");
     } else {
-        let target = st(name);
-        let pane = tmux(&["list-panes", "-t", &target, "-F", "#{pane_pid}"]).await;
+        let st = st(name);
+        let pane = tmux(&["list-panes", "-t", &st, "-F", "#{pane_pid}"]).await;
         if let Some(out) = pane.filter(|o| o.status.success()) {
             for line in String::from_utf8_lossy(&out.stdout).lines() {
                 let root: i32 = line.trim().parse()?;
