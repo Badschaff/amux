@@ -1195,7 +1195,7 @@ impl PreparedNudge {
         let query = detail_url.query().expect("key query was set");
         let compact = (n_considered > 0 && n_with_edit_record == 0).then(|| {
             let mut text = format!(
-                "Git hygiene: {n_considered} dirty paths differ from origin/main under {dir}; \
+                "Git hygiene: {n_considered} dirty paths considered under {dir}; \
                  0 carry your edit record.\n\
                  Preserve these files and continue your current task. Do not stage, restore, \
                  or merge them based on this notice. Edit records describe attribution, \
@@ -1209,7 +1209,7 @@ impl PreparedNudge {
                 } else if fresh.revived.iter().any(|p| p == path) {
                     "old committed bytes"
                 } else {
-                    "differs from origin"
+                    "dirty in this checkout"
                 };
                 let generated = if fresh.generated.iter().any(|p| p == path) {
                     "; declared generated"
@@ -1236,6 +1236,7 @@ impl PreparedNudge {
             "schema_version": 1, "session": session, "directory": dir,
             "observed_at": observed_at, "provenance": provenance,
             "measured": true, "n_considered": n_considered,
+            "measurement_scope": "recipient_edit_records",
             "n_with_edit_record": n_with_edit_record,
             "n_without_edit_record": n_considered - n_with_edit_record,
             "attribution_partial": attribution_partial,
@@ -1274,6 +1275,8 @@ async fn enqueue_nudge(store: &crate::db::SharedStore, session: &str, notice: Pr
     let queued = result.is_ok();
     tracing::info!(
         session, measured = true, n_considered = notice.n_considered,
+        measurement_scope = "recipient_edit_records",
+        origin_provenance = notice.detail["provenance"].as_str().unwrap_or("unavailable"),
         n_with_edit_record = notice.n_with_edit_record,
         n_without_edit_record = notice.n_considered - notice.n_with_edit_record,
         attribution_partial = notice.attribution_partial, detail_stored,
@@ -1288,6 +1291,67 @@ async fn enqueue_nudge(store: &crate::db::SharedStore, session: &str, notice: Pr
 #[cfg(test)]
 mod delivery_tests {
     use super::*;
+
+    async fn compact_from_repo(dir: &str, requested: Vec<String>) -> (String, Vec<String>, String) {
+        let (dirty, provenance) = drop_paths_identical_to_origin(dir, requested).await;
+        let fresh = freshness_from_repo(dir, &dirty).await;
+        let own = Ownership { unclaimed: dirty.clone(), ..Default::default() };
+        let full = build(dir, &dirty, &own, &fresh, &provenance).unwrap();
+        let notice = PreparedNudge::new("af720-fixture", dir, &dirty, &own, &fresh, &provenance, full);
+        (notice.compact.unwrap(), dirty, provenance)
+    }
+
+    fn assert_neutral_comparison(text: &str) {
+        assert!(text.contains("dirty paths considered"), "{text}");
+        assert!(text.contains("[dirty in this checkout]"), "{text}");
+        assert!(!text.contains("dirty paths differ from origin/main"), "{text}");
+        assert!(!text.contains("[differs from origin]"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn compact_missing_origin_preserves_unknown_comparison() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git").args(["init", "-q", "--initial-branch=main"])
+            .current_dir(tmp.path()).status().unwrap().success());
+        std::fs::write(tmp.path().join("draft.txt"), "uncommitted fixture\n").unwrap();
+        let (text, dirty, provenance) = compact_from_repo(tmp.path().to_str().unwrap(), vec!["draft.txt".into()]).await;
+        assert_eq!(dirty, ["draft.txt"]);
+        assert!(provenance.contains("NOT compared against origin"));
+        assert!(text.contains(&provenance));
+        assert_neutral_comparison(&text);
+    }
+
+    #[tokio::test]
+    async fn compact_failed_operand_and_measured_difference_have_honest_population() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| std::process::Command::new("git")
+            .args(["-c", "core.hooksPath=/dev/null"]).args(args).current_dir(tmp.path()).output().unwrap();
+        assert!(git(&["init", "-q", "--initial-branch=main"]).status.success());
+        assert!(git(&["config", "user.email", "fixture@example.invalid"]).status.success());
+        assert!(git(&["config", "user.name", "Fixture"]).status.success());
+        for name in ["same.txt", "changed.txt", "unreadable.txt"] {
+            std::fs::write(tmp.path().join(name), "base\n").unwrap();
+        }
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-qm", "fixture base"]).status.success());
+        assert!(git(&["remote", "add", "origin", "."]).status.success());
+        std::fs::write(tmp.path().join("changed.txt"), "changed\n").unwrap();
+        std::fs::remove_file(tmp.path().join("unreadable.txt")).unwrap();
+        let requested = ["same.txt", "changed.txt", "unreadable.txt"].map(String::from).to_vec();
+        let (text, dirty, provenance) = compact_from_repo(tmp.path().to_str().unwrap(), requested).await;
+        assert!(provenance.contains("just fetched"));
+        assert_eq!(dirty, ["changed.txt", "unreadable.txt"]);
+        // Origin is readable; one local operand is not. The other is a real
+        // measured difference, and SAME was actually removed by the filter.
+        assert!(!git(&["hash-object", "--", "unreadable.txt"]).status.success());
+        assert!(git(&["rev-parse", "--verify", "origin/main:unreadable.txt"]).status.success());
+        let local = git(&["hash-object", "--", "changed.txt"]);
+        let remote = git(&["rev-parse", "--verify", "origin/main:changed.txt"]);
+        assert!(local.status.success() && remote.status.success());
+        assert_ne!(local.stdout, remote.stdout);
+        assert!(text.starts_with("Git hygiene: 2 dirty paths"));
+        assert_neutral_comparison(&text);
+    }
 
     fn specimen(mine_last: bool) -> PreparedNudge {
         let mut dirty: Vec<String> = (0..25).map(|n| format!("src/path{n:02}.rs")).collect();
@@ -1412,6 +1476,7 @@ mod delivery_tests {
         let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
         let events: Vec<&str> = logs.lines().filter(|s| s.contains("commit_nudge_enqueue")).collect();
         assert_eq!(events.len(), 4, "{logs}");
+        assert!(events.iter().all(|event| event.contains("measurement_scope=\"recipient_edit_records\"") && event.contains("origin_provenance=\"test origin\"")), "{logs}");
         assert!(events[0].contains("n_considered=25") && events[0].contains("n_with_edit_record=0") && events[0].contains("queued=true") && events[0].contains("format=\"compact\""), "{logs}");
         assert!(events[1].contains("n_with_edit_record=1") && events[1].contains("format=\"full\""), "{logs}");
         assert!(events[2].contains("detail_stored=false") && events[2].contains("format=\"full\""), "{logs}");

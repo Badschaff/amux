@@ -93,3 +93,30 @@ exit 0, and workspace/all-target Clippy with `-D warnings` exit 0. These
 fixtures do not send a production nudge or mutate a
 peer's checkout. Publication, independent review, fresh live behavior and
 resolved Verified gates remain separate requirements.
+
+## Review correction: origin availability
+
+Independent amux-research review of published `5d1651cd` found a P2 wording
+defect: the compact lede claimed that paths differ from origin, although the
+existing filter deliberately retains paths when origin or a local operand
+cannot be read. The footer did not make that affirmative lede truthful.
+
+The correction calls these "dirty paths considered" and labels the fallback
+"dirty in this checkout". It preserves the existing provenance and classified
+history labels. The detail and actual enqueue log now name the measurement
+scope as `recipient_edit_records`; the log also records `origin_provenance`.
+These attribution counts are not a claim that every origin comparison ran.
+
+Two new real-Git regressions failed before the wording change (0 passed,
+2 failed): a repository with no origin, and a repository with a readable origin
+but a failed local `hash-object` operand. The latter includes both a genuinely
+changed/readable file and a SAME file that the actual filter removes. Neither
+test replaces the filesystem probe with a fabricated successful comparison.
+See `provenance-red.log` and the subsequent `provenance-*` gates.
+After correction, the full nudge group passed 57/0 with four threads;
+workspace check and all-target Clippy with `-D warnings` both exited 0.
+
+The first candidate is live at build `f9ac99cb032046d9`, but that adoption is
+not review approval. The original historical measurement and approved portions
+of the independent review remain valid. The P2 correction needs an exact new
+review and publication readback before this card can be treated as complete.
