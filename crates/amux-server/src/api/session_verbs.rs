@@ -5423,6 +5423,15 @@ async fn steer_enqueue_precond_with_id(
         return Err("target is an isolated (raw-agent) worker: amux automation is not \
                     delivered into it. The owner's own send still works.");
     }
+    // ONLY ACTIVE WORKERS RECEIVE AUTOMATION (AMUX-4574), at the same chokepoint
+    // and with the same opt-out discriminator as isolation: every automated
+    // producer names itself in `guard`, the owner's send passes "". Measured on
+    // 2026-09-14: 48 task callbacks were queued into 8 paused lanes in the ten
+    // minutes after they were paused, all waiting to land at once on resume.
+    if !guard.is_empty() && lane_is_paused(name) {
+        return Err("target is paused: amux automation is not queued for a paused worker. \
+                    Resume it first (amux resume); the owner's own send still works.");
+    }
     // REFUSE A PERMANENT BLOCK HERE, not in the handlers (AF-188).
     //
     // `steer_mutate` and `auto_deliver` each refused archived targets; this
@@ -7215,6 +7224,11 @@ pub(crate) async fn deliver_automated(
     if parse_env(name).get("CC_ARCHIVED") == Some("1") {
         return refuse(format!("target '{name}' is archived — not delivered, not woken"));
     }
+    // AMUX-4574: a paused lane is not a wake target for a schedule either; say so
+    // in the run row instead of letting auto-wake fail with a 500.
+    if parse_env(name).get("CC_PAUSED") == Some("1") {
+        return refuse(format!("target '{name}' is paused — not delivered, not woken; resume it to receive schedules"));
+    }
     // A blocked session is on a permission/approval dialog. Delivering input
     // could accidentally answer that dialog. The message stays queued (via the
     // steering hold below) and delivers when the block clears.
@@ -7426,6 +7440,13 @@ async fn send_text_inner(
     // happened to find the lane at a selector was laundered into an owner send.
     if let Some(refusal) = isolation_refusal(name, origin) {
         return (false, refusal.into());
+    }
+    // AMUX-4574: same rule at the layer that types, before the herdr branch
+    // returns past every other check.
+    if origin == SendOrigin::Automation && lane_is_paused(name) {
+        return (false, "target is paused: amux automation is not delivered into a paused worker. \
+                        The owner's own send still works."
+            .into());
     }
     let cfg = parse_env(name);
     if !iterm2_id(&cfg).is_empty() {
@@ -8437,6 +8458,11 @@ pub(crate) fn start_block_reason(name: &str, cfg: &EnvFile) -> Option<String> {
     }
     if cfg.get("CC_ARCHIVED") == Some("1") {
         return Some("session is archived; wake it first".into());
+    }
+    // AMUX-4574. Resume clears CC_PAUSED before it starts the worker
+    // (workers.rs change_pause), so this refuses only a start that bypasses resume.
+    if cfg.get("CC_PAUSED") == Some("1") {
+        return Some("session is paused; resume it first (amux resume)".into());
     }
     None
 }
@@ -11485,6 +11511,7 @@ pub(crate) enum SteerDelivery {
 pub(crate) fn lane_block_reason_from(
     env_exists: bool,
     archived: bool,
+    paused: bool,
     running: bool,
     rate_limited: bool,
 ) -> Option<&'static str> {
@@ -11493,6 +11520,12 @@ pub(crate) fn lane_block_reason_from(
     }
     if archived {
         return Some("archived");
+    }
+    // AMUX-4574. After archived (archived outranks paused, as /api/sessions
+    // labels it) and before not-running: a paused lane is stopped ON PURPOSE,
+    // and "not running" would tell a sender to start something the owner paused.
+    if paused {
+        return Some("paused");
     }
     if !running {
         return Some("not-running");
@@ -11555,11 +11588,21 @@ pub(crate) fn lane_is_archived(name: &str) -> bool {
     env_path(name).exists() && parse_env(name).get("CC_ARCHIVED") == Some("1")
 }
 
+/// Is this lane paused (AMUX-4574)? Same shape as `lane_is_archived` and the same
+/// flag `/api/sessions` reads (`CC_PAUSED=1`, see `lifecycle_label`). Paused is
+/// not permanent (resume clears it), so a held row waits rather than being
+/// dead-lettered, but no AUTOMATION is queued for, typed into, or woken in a
+/// paused lane: only active workers do work (Ethan, 2026-09-14).
+pub(crate) fn lane_is_paused(name: &str) -> bool {
+    env_path(name).exists() && parse_env(name).get("CC_PAUSED") == Some("1")
+}
+
 pub(crate) async fn lane_block_reason(name: &str) -> Option<&'static str> {
     let env_exists = env_path(name).exists();
     let archived = lane_is_archived(name);
+    let paused = env_exists && !archived && lane_is_paused(name);
     // Don't pay a tmux query for a lane already known unreachable.
-    let running = env_exists && !archived && is_running(name).await;
+    let running = env_exists && !archived && !paused && is_running(name).await;
     let meta = load_meta(name);
     let since = meta_i64(&meta, "rate_limited_since");
     let reset_at = meta_i64(&meta, "rate_limited_until");
@@ -11568,12 +11611,12 @@ pub(crate) async fn lane_block_reason(name: &str) -> Option<&'static str> {
     // the banner to disappear first stranded headless lanes whose first new
     // prompt is what makes Claude move again. Credit caps still have no clock
     // and remain presence-gated until payment/banner clear.
-    let rate_limited = env_exists && !archived && if kind == "credit-banner" {
+    let rate_limited = env_exists && !archived && !paused && if kind == "credit-banner" {
         since > 0
     } else {
         rate_limit_still_blocks(since, reset_at, now_i64())
     };
-    lane_block_reason_from(env_exists, archived, running, rate_limited)
+    lane_block_reason_from(env_exists, archived, paused, running, rate_limited)
 }
 
 /// When this lane's rate limit lifts, or 0 if unknown (AMUX-3815).
@@ -11719,6 +11762,10 @@ pub(crate) fn block_reason_refused(reason: &str, name: &str) -> String {
              could never be delivered. Un-archiving is a human's call. Nothing was queued, so \
              nothing is sitting undelivered."
         ),
+        "paused" => format!(
+            "NOT SENT — '{name}' is paused, and only active workers receive automated work. \
+             Resuming it is the owner's call (amux resume {name}). Nothing was queued."
+        ),
         other => format!("NOT SENT — '{name}' is not deliverable ({other}). Nothing was queued."),
     }
 }
@@ -11748,6 +11795,10 @@ pub(crate) fn block_reason_explain(reason: &str, name: &str) -> String {
              caps — amux waits until the sweep confirms the banner is gone. Nothing is required of \
              you; the deadline that normally forces a message into a running turn does not apply, \
              because a rate-limited lane cannot act on it."
+        ),
+        "paused" => format!(
+            "HELD — '{name}' is paused. The message is stored and delivers only after the owner \
+             resumes the lane (amux resume {name}); nothing forces it through while it is paused."
         ),
         other => format!("NOT DELIVERABLE — '{name}': {other}."),
     }
@@ -13447,6 +13498,12 @@ pub async fn steer_deliver_for_session(state: &AppState, session: &str) -> bool 
         return false;
     }
     if !env_path(session).exists() {
+        return false;
+    }
+    // AMUX-4574: a paused lane holds its queue even if a pane is still up; the
+    // owner resumes it, delivery never does.
+    if lane_is_paused(session) {
+        skip(session, "", "paused");
         return false;
     }
     if !is_running(session).await {
@@ -21858,6 +21915,29 @@ mod tests {
         }
     }
 
+    /// AMUX-4574 through the shipped chokepoint: automation (a non-empty guard)
+    /// is refused for a paused lane and nothing is queued; the owner's send (an
+    /// empty guard) is accepted; resuming restores automation.
+    #[tokio::test]
+    async fn automation_is_refused_for_a_paused_lane_at_the_queue_but_the_owner_is_not() {
+        let (st, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("resting.env"), "CC_TAGS=alpha\nCC_PAUSED=1\n").unwrap();
+        let refused = steer_enqueue_idempotent(&st, "resting", "your request finished", "task-callback:T-1", "requester", "cb-1").await;
+        assert!(refused.as_ref().is_err_and(|e| e.contains("paused")), "automation must be refused: {refused:?}");
+        let queued: i64 = st.store.read().unwrap().query_row(
+            "SELECT COUNT(*) FROM steering_queue WHERE session='resting'", [], |r| r.get(0)).unwrap();
+        assert_eq!(queued, 0, "a refused automation send leaves no queued row");
+        let owner = steer_enqueue_idempotent(&st, "resting", "owner note", "", "", "owner-1").await;
+        assert!(owner.is_ok(), "the owner's own send is never gated: {owner:?}");
+        std::fs::write(sessions.join("resting.env"), "CC_TAGS=alpha\n").unwrap();
+        let resumed = steer_enqueue_idempotent(&st, "resting", "your request finished", "task-callback:T-2", "requester", "cb-2").await;
+        assert!(resumed.is_ok(), "resuming restores automation: {resumed:?}");
+    }
+
+
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
@@ -29235,13 +29315,13 @@ mod steer_max_age_tests {
     fn the_three_stalled_lanes_are_distinguished_from_a_merely_busy_one() {
         // amux-agent — 15.2h queued, skip reason `no-env-file`.
         assert_eq!(
-            lane_block_reason_from(false, false, false, false),
+            lane_block_reason_from(false, false, false, false, false),
             Some("no-env-file"),
             "amux-agent: a lane with no env file is not a worker, and no deadline reaches it"
         );
         // amux-rust-execution — 4.3h queued, and mixpeek-orchestrator at 15.2h.
         assert_eq!(
-            lane_block_reason_from(true, false, false, false),
+            lane_block_reason_from(true, false, false, false, false),
             Some("not-running"),
             "amux-rust-execution / mixpeek-orchestrator: a stopped lane waits to be STARTED, \
              not to be free"
@@ -29250,7 +29330,7 @@ mod steer_max_age_tests {
         // exactly this state at the same moment, and they are the reason the
         // other three were invisible: all five reported the same "queued".
         assert_eq!(
-            lane_block_reason_from(true, false, true, false),
+            lane_block_reason_from(true, false, false, true, false),
             None,
             "a running, unarchived lane is deliverable — busy is not blocked, and conflating \
              the two is the whole defect"
@@ -29258,13 +29338,26 @@ mod steer_max_age_tests {
         // Archived is its own answer rather than being collapsed into
         // `not-running`: un-archiving is a human's call (ethos rule 8), so the
         // sender needs to be told which of the two they are looking at.
-        assert_eq!(lane_block_reason_from(true, true, false, false), Some("archived"));
+        assert_eq!(lane_block_reason_from(true, true, false, false, false), Some("archived"));
         assert_eq!(
-            lane_block_reason_from(true, true, true, false),
+            lane_block_reason_from(true, true, false, true, false),
             Some("archived"),
             "an archived lane that still has a live pane is still refused — the send path \
              refuses archived, so the queue must not promise otherwise"
         );
+    }
+
+    /// AMUX-4574: paused is its own answer, between archived and not-running.
+    #[test]
+    fn a_paused_lane_holds_between_archived_and_not_running() {
+        assert_eq!(lane_block_reason_from(true, false, true, false, false), Some("paused"),
+            "a paused lane is stopped on purpose; 'not-running' would tell a sender to start it");
+        assert_eq!(lane_block_reason_from(true, false, true, true, true), Some("paused"),
+            "a paused lane with a live pane or a rate limit is still paused");
+        assert_eq!(lane_block_reason_from(true, true, true, false, false), Some("archived"),
+            "archived outranks paused, as /api/sessions labels it");
+        assert_eq!(lane_block_reason_from(true, false, false, true, false), None,
+            "CONTROL: an active running lane is deliverable");
     }
 
     /// AMUX-2238: a send to a rate-limited lane HOLDS, and is never dropped.
@@ -29284,13 +29377,13 @@ mod steer_max_age_tests {
     #[test]
     fn a_rate_limited_lane_holds_its_queue_and_never_dead_letters() {
         assert_eq!(
-            lane_block_reason_from(true, false, true, true),
+            lane_block_reason_from(true, false, false, true, true),
             Some("rate-limited"),
             "a running lane that cannot take work must block, or the send is delivered into a \
              limit and lost"
         );
         assert_eq!(
-            lane_block_reason_from(true, false, true, false),
+            lane_block_reason_from(true, false, false, true, false),
             None,
             "CONTROL: a running lane with no limit is deliverable — if this ever returns a \
              block, every send in the fleet queues forever"
@@ -29299,13 +29392,13 @@ mod steer_max_age_tests {
         // PRECEDENCE. Both cells, because either direction of a reorder is a
         // real bug and only asserting one of them would let the other through.
         assert_eq!(
-            lane_block_reason_from(true, false, false, true),
+            lane_block_reason_from(true, false, false, false, true),
             Some("not-running"),
             "a stopped lane is not-running first: telling a sender 'rate-limited' would send \
              them to wait on a limit when the lane needs STARTING"
         );
         assert_eq!(
-            lane_block_reason_from(true, true, true, true),
+            lane_block_reason_from(true, true, false, true, true),
             Some("archived"),
             "archived still outranks it — un-archiving is a human's call and no limit release \
              will ever make an archived lane deliverable"
@@ -29353,8 +29446,8 @@ mod steer_max_age_tests {
     /// and autofix cards that could never clear.
     #[test]
     fn archived_is_the_one_blocked_reason_that_must_not_be_queued() {
-        assert_eq!(lane_block_reason_from(true, true, false, false), Some("archived"));
-        assert_eq!(lane_block_reason_from(true, true, true, false), Some("archived"));
+        assert_eq!(lane_block_reason_from(true, true, false, false, false), Some("archived"));
+        assert_eq!(lane_block_reason_from(true, true, false, true, false), Some("archived"));
         // The refusal has to publish what to do, or the sender hand-rolls
         // something worse to get past it (the AMUX-2325 shape).
         let msg = block_reason_explain("archived", "old-lane");
