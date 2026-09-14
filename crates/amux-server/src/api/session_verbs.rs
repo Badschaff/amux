@@ -2247,6 +2247,11 @@ pub fn reviewer_unreachable_reason(owner: &str, reviewer: &str) -> Option<String
              needsyou if a human owes the review"
         ));
     }
+    // A paused or archived reviewer is named as such, not given the cross-group
+    // advice below: no CC_RECEIVE_ANY makes an inactive lane a peer (AMUX-4566).
+    if let Some(why) = lifecycle_interaction_refusal(owner, lane_lifecycle(owner), reviewer, lane_lifecycle(reviewer)) {
+        return Some(why);
+    }
     // The SAME rule worker-to-worker messaging uses, so a reviewer you cannot
     // message can never become a reviewer you are waiting on.
     cross_group_send_ok(owner, reviewer).err().map(|why| {
@@ -15954,6 +15959,56 @@ pub(crate) fn session_is_isolated(name: &str) -> bool {
     env_flag_on(parse_env(name).get("CC_ISOLATED"))
 }
 
+/// The lifecycle label for a tmux lane: archived beats paused beats active.
+/// ONE function, called by `/api/sessions` (sessions_legacy) and by the peer
+/// interaction gate below, so the gate can never disagree with the dashboard
+/// about who is active (AMUX-4566).
+pub(crate) fn lifecycle_label(archived: bool, paused: bool) -> &'static str {
+    if archived {
+        "archived"
+    } else if paused {
+        "paused"
+    } else {
+        "active"
+    }
+}
+
+/// A lane's lifecycle from its env file, parsed exactly as `/api/sessions`
+/// parses it (`CC_ARCHIVED=1`, `CC_PAUSED=1`).
+pub(crate) fn lane_lifecycle(name: &str) -> &'static str {
+    let env = parse_env(name);
+    lifecycle_label(env.get("CC_ARCHIVED") == Some("1"), env.get("CC_PAUSED") == Some("1"))
+}
+
+/// ACTIVE WORKERS INTERACT ONLY WITH ACTIVE WORKERS (Ethan, 2026-09-14 14:32,
+/// AMUX-4566). A paused or archived lane is out of the fleet: it does not
+/// message, request or route to peers, and no peer reaches it. Pure over the
+/// two lifecycles so every combination is testable without env files. The
+/// owner is not a worker and never passes through here (callers return early
+/// for an empty origin).
+pub(crate) fn lifecycle_interaction_refusal(
+    origin: &str,
+    origin_lifecycle: &str,
+    target: &str,
+    target_lifecycle: &str,
+) -> Option<String> {
+    if origin_lifecycle != "active" {
+        return Some(format!(
+            "interaction refused: '{origin}' is {origin_lifecycle}. Only active workers interact \
+             with other workers; resume it first (`amux resume {origin}` or the dashboard)."
+        ));
+    }
+    if target_lifecycle != "active" {
+        return Some(format!(
+            "interaction refused: '{target}' is {target_lifecycle}. Active workers interact only \
+             with active workers, so no peer message, request or review reaches a \
+             {target_lifecycle} lane. The owner can still send to it from the dashboard, or \
+             resume it (`amux resume {target}`)."
+        ));
+    }
+    None
+}
+
 /// The footer telling a recipient they cannot reply to this sender, or None.
 ///
 /// The isolation flag is a PARAMETER, not read here. `session_is_isolated` goes to
@@ -16034,6 +16089,14 @@ fn dirs_home() -> Option<std::path::PathBuf> {
 pub(crate) fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static str, String> {
     if origin.is_empty() || origin == target {
         return Ok("self-or-human");
+    }
+    // LIFECYCLE (AMUX-4566), in the one resolver every peer path shares, so a
+    // direct send, a board request callback and reviewer routing all refuse a
+    // paused or archived lane the same way.
+    if let Some(why) =
+        lifecycle_interaction_refusal(origin, lane_lifecycle(origin), target, lane_lifecycle(target))
+    {
+        return Err(why);
     }
     // ISOLATED TARGET (AMUX-3232): a raw agent is not a peer/relay target. The
     // OWNER (empty origin) already returned above, so this refuses ONLY a PEER
@@ -16341,6 +16404,29 @@ pub(crate) async fn send_verb(
 /// messages. Check before recording history/dedupe/queue state, independently
 /// of the configurable group policy. Authenticated dashboard members remain
 /// human owners; the scope guard has already checked their resource access.
+/// AMUX-4566 on the send path, BEFORE the group gate: a group refusal mints a
+/// single-use cross-group approval grant, and no grant can make a paused or
+/// archived lane a peer, so this answer must never reach that branch.
+async fn lifecycle_peer_refusal(state: &AppState, name: &str, headers: &HeaderMap) -> Option<Response> {
+    let origin: String = hdr_worker(headers).trim().chars().take(64).collect();
+    if super::org::local_member_actor(headers).is_some() || origin.is_empty() || origin == name {
+        return None;
+    }
+    let (origin_lc, target_lc) = (lane_lifecycle(&origin), lane_lifecycle(name));
+    let reason = lifecycle_interaction_refusal(&origin, origin_lc, name, target_lc)?;
+    tracing::warn!(origin = %origin, target = %name, origin_lifecycle = origin_lc,
+        target_lifecycle = target_lc, verdict = "lifecycle_refused", "{reason}");
+    emit_event(state, name, "send.lifecycle_refused",
+        Some(json!({"origin": origin, "target": name,
+                    "origin_lifecycle": origin_lc, "target_lifecycle": target_lc})),
+        None, "lifecycle").await;
+    Some(jresp(StatusCode::CONFLICT, json!({
+        "ok": false, "error": reason, "blocked": "lifecycle", "code": "lifecycle_not_active",
+        "origin_lifecycle": origin_lc, "target_lifecycle": target_lc,
+        "what_to_do": "Only active workers interact. Resume the paused lane (amux resume <name>) or ask the owner; no approval grant changes this.",
+    })))
+}
+
 async fn isolated_peer_refusal(state: &AppState, name: &str, headers: &HeaderMap) -> Option<Response> {
     let origin = hdr_worker(headers);
     if super::org::local_member_actor(headers).is_some()
@@ -16360,6 +16446,9 @@ async fn isolated_peer_refusal(state: &AppState, name: &str, headers: &HeaderMap
 
 async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
     if let Some(refusal) = isolated_peer_refusal(state, name, headers).await {
+        return refusal;
+    }
+    if let Some(refusal) = lifecycle_peer_refusal(state, name, headers).await {
         return refusal;
     }
     // GROUP SCOPING, before anything is delivered or recorded. The origin is the
@@ -21706,6 +21795,32 @@ mod tests {
         assert!(body.get("grant_id").is_none(), "an impossible send must not ask for approval: {body}");
     }
 
+    /// AMUX-4566 through the shipped handler: a send between a paused lane and an
+    /// active one is a 409 naming both lifecycles, and it never reaches the
+    /// cross-group branch that mints an approval grant.
+    #[tokio::test]
+    async fn a_lifecycle_peer_refusal_is_a_409_and_never_mints_an_approval_request() {
+        let (state, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        // Different groups on purpose: if the lifecycle check did not run first,
+        // the group gate would answer instead and mint a grant.
+        std::fs::write(sessions.join("caller.env"), "CC_TAGS=alpha\nCC_SEND_ALLOW=\n").unwrap();
+        std::fs::write(sessions.join("resting.env"), "CC_TAGS=beta\nCC_PAUSED=1\n").unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-amux-session", "caller".parse().unwrap());
+        let response = send_post(&state, "resting", &headers, &json!({"text": "do work"})).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["blocked"], json!("lifecycle"), "{body}");
+        assert_eq!(body["code"], json!("lifecycle_not_active"), "{body}");
+        assert_eq!(body["target_lifecycle"], json!("paused"), "{body}");
+        assert_eq!(body["origin_lifecycle"], json!("active"), "{body}");
+        assert!(body.get("grant_id").is_none(), "no approval can make a paused lane a peer: {body}");
+    }
+
     #[tokio::test]
     async fn isolated_peer_queue_refuses_before_history_or_dedupe_but_owner_retry_survives() {
         let (st, dir) = state();
@@ -26762,6 +26877,44 @@ mod steer_boundary_tests {
         let (h2, since2) = status_decision_history(&conn, "never-changed", 20);
         assert!(h2.is_empty());
         assert_eq!(since2, Some(1000.0), "the record exists, this lane simply never moved");
+    }
+
+    /// AMUX-4566: every lifecycle pairing, on the pure rule.
+    #[test]
+    fn only_active_workers_interact_with_active_workers() {
+        assert_eq!(lifecycle_interaction_refusal("a", "active", "b", "active"), None);
+        for lc in ["paused", "archived"] {
+            let from = lifecycle_interaction_refusal("a", lc, "b", "active").expect("inactive sender refused");
+            assert!(from.contains("'a' is") && from.contains(lc) && from.contains("amux resume a"), "{from}");
+            let to = lifecycle_interaction_refusal("a", "active", "b", lc).expect("inactive target refused");
+            assert!(to.contains("'b' is") && to.contains(lc) && to.contains("owner can still send"), "{to}");
+        }
+        assert_eq!(lifecycle_label(true, true), "archived", "archived outranks paused, as /api/sessions reports");
+        assert_eq!(lifecycle_label(false, true), "paused");
+        assert_eq!(lifecycle_label(false, false), "active");
+    }
+
+    /// AMUX-4566 through the shared resolver, with real env files: the paused
+    /// flag written by `amux pause` closes every peer path, and the owner is
+    /// untouched.
+    #[test]
+    fn the_shared_send_resolver_refuses_a_paused_lane_both_ways_but_never_the_owner() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("mkdir");
+        let w = |n: &str, body: &str| std::fs::write(sessions.join(format!("{n}.env")), body).expect("write");
+        w("live", "CC_TAGS=\"amux\"\n");
+        w("resting", "CC_TAGS=\"amux\"\nCC_PAUSED=1\n");
+        w("gone", "CC_TAGS=\"amux\"\nCC_ARCHIVED=1\n");
+        assert!(cross_group_send_ok("live", "resting").is_err(), "no peer reaches a paused lane");
+        assert!(cross_group_send_ok("resting", "live").is_err(), "a paused lane reaches no peer");
+        assert!(cross_group_send_ok("live", "gone").is_err(), "no peer reaches an archived lane");
+        assert!(cross_group_send_ok("", "resting").is_ok(), "the owner is not a worker and is never gated");
+        assert!(reviewer_unreachable_reason("live", "resting").is_some_and(|r| r.contains("paused")),
+            "a paused lane cannot be the reviewer a card waits on");
+        w("resting", "CC_TAGS=\"amux\"\n");
+        assert!(cross_group_send_ok("live", "resting").is_ok(), "resuming restores the peer path");
     }
 
     /// RR-0052: the shipped report handler is the lease heartbeat. Driven through
