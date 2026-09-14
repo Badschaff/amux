@@ -240,6 +240,42 @@ fn advance_custom(
 }
 
 /// Status change + metadata updates shared by typed and custom paths.
+/// Set or clear a card's hard lease (RR-0052) to match a status change. Shared
+/// by the board_drive path (`apply_common`) and the PATCH door so the two can
+/// never disagree about who holds a card.
+///
+/// - Entering `doing` grants `holder` the lease (heartbeat now, expiry now+TTL);
+///   a brand-new holder bumps the generation (a fresh claim = a fresh attempt),
+///   a self-reclaim only advances the heartbeat.
+/// - Any other status (todo/backlog/review/blocked/needsyou/terminal) releases
+///   the lease and bumps the generation, so a stale-claimant write is
+///   recognizable and no non-doing card carries a lease.
+pub fn apply_lease_transition(
+    row: &mut IssueRow,
+    new_status: &str,
+    holder: Option<&str>,
+    now: i64,
+) {
+    if new_status == "doing" {
+        if let Some(holder) = holder.filter(|s| !s.trim().is_empty()) {
+            let fresh = row.lease_owner.as_deref() != Some(holder);
+            row.lease_owner = Some(holder.to_string());
+            row.lease_acquired_at = Some(now);
+            row.lease_heartbeat_at = Some(now);
+            row.lease_expires_at = Some(now + bs::lease_ttl_s());
+            if fresh {
+                row.lease_generation += 1;
+            }
+        }
+    } else if row.lease_owner.is_some() {
+        row.lease_owner = None;
+        row.lease_acquired_at = None;
+        row.lease_heartbeat_at = None;
+        row.lease_expires_at = None;
+        row.lease_generation += 1;
+    }
+}
+
 fn apply_common(
     _conn: &Connection,
     row: &mut IssueRow,
@@ -255,6 +291,12 @@ fn apply_common(
     if let Some(ref session) = opts.assign_to {
         row.session = Some(session.clone());
     }
+
+    // RR-0052 hard lease. This is the single board_drive claim/reclaim/promote
+    // choke point, so setting/clearing the lease here keeps the driver and the
+    // PATCH door from ever disagreeing about who holds a card.
+    let holder = opts.assign_to.clone().or_else(|| row.session.clone());
+    apply_lease_transition(row, new_status, holder.as_deref(), now);
 
     if let Some(ref line) = opts.log_line {
         let stamp = chrono::Local::now().format("%H:%M").to_string();
@@ -425,6 +467,44 @@ pub fn apply_status_side_effects(row: &mut IssueRow, destination: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lease_is_granted_on_doing_and_released_off_it() {
+        let mut row = IssueRow::default();
+        // Entering doing grants the lease to the holder and bumps generation.
+        apply_lease_transition(&mut row, "doing", Some("lane-a"), 1000);
+        assert_eq!(row.lease_owner.as_deref(), Some("lane-a"));
+        assert_eq!(row.lease_acquired_at, Some(1000));
+        assert_eq!(row.lease_heartbeat_at, Some(1000));
+        assert_eq!(row.lease_expires_at, Some(1000 + bs::lease_ttl_s()));
+        assert_eq!(row.lease_generation, 1);
+
+        // A self-reclaim (same holder, still doing) only advances the heartbeat.
+        apply_lease_transition(&mut row, "doing", Some("lane-a"), 1500);
+        assert_eq!(row.lease_generation, 1, "same holder keeps the generation");
+        assert_eq!(row.lease_heartbeat_at, Some(1500));
+        assert_eq!(row.lease_expires_at, Some(1500 + bs::lease_ttl_s()));
+
+        // A different holder claiming (still doing) is a fresh attempt.
+        apply_lease_transition(&mut row, "doing", Some("lane-b"), 1600);
+        assert_eq!(row.lease_owner.as_deref(), Some("lane-b"));
+        assert_eq!(row.lease_generation, 2);
+
+        // Leaving doing releases the lease and bumps the generation.
+        apply_lease_transition(&mut row, "todo", None, 1700);
+        assert_eq!(row.lease_owner, None);
+        assert_eq!(row.lease_expires_at, None);
+        assert_eq!(row.lease_generation, 3);
+
+        // A no-lease card leaving a non-doing status is a no-op.
+        let g = row.lease_generation;
+        apply_lease_transition(&mut row, "backlog", None, 1800);
+        assert_eq!(row.lease_generation, g, "no lease to release, no bump");
+
+        // An empty holder never grants a lease.
+        apply_lease_transition(&mut row, "doing", Some("  "), 1900);
+        assert_eq!(row.lease_owner, None);
+    }
 
     #[test]
     fn advance_opts_default_is_sane() {

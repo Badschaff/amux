@@ -2939,6 +2939,30 @@ pub fn is_terminal_status(s: &str) -> bool {
     TERMINAL_STATUSES.contains(&s)
 }
 
+/// Seconds a fresh lease is granted for before it expires (RR-0052). Short
+/// enough to free a crashed worker's slot fast, long enough to survive a slow
+/// turn. The holder's activity advances the heartbeat, pushing the expiry out.
+/// `AMUX_LEASE_TTL_S` overrides (default 1800 = 30 min).
+pub fn lease_ttl_s() -> i64 {
+    std::env::var("AMUX_LEASE_TTL_S")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(1800)
+}
+
+/// Whether the PATCH door REFUSES a transition from a non-holder (RR-0052).
+/// Default OFF during rollout: leases are still written and the reaper still
+/// runs, but a cross-lane transition is only LOGGED ("would refuse"), not
+/// refused, so the would-refuse rate can be watched before enforcement flips on.
+/// `AMUX_LEASE_ENFORCE=1` turns hard refusal on.
+pub fn lease_enforcement_enabled() -> bool {
+    matches!(
+        std::env::var("AMUX_LEASE_ENFORCE").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
 /// A completed dependency must satisfy its type's real completion boundary.
 /// Code/ops/blockers need verification; docs and chores finish at done. Missing
 /// and discarded tasks are not proof that a required dependency was resolved.
@@ -3427,7 +3451,8 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
              decision_supersedes = ?37, waiting_on = ?38, requested_by = ?39, \
              callback_session = ?40, callback_prompt = ?41, callback_state = ?42, \
              callback_message_id = ?43, callback_fired_at = ?44, callback_error = ?45, \
-             ask_actor = ?46 \
+             ask_actor = ?46, lease_owner = ?47, lease_acquired_at = ?48, \
+             lease_heartbeat_at = ?49, lease_expires_at = ?50, lease_generation = ?51 \
          WHERE id = ?33 AND deleted IS NULL",
         params![
             row.title,
@@ -3476,6 +3501,11 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
             row.callback_fired_at,
             row.callback_error,
             row.ask_actor,
+            row.lease_owner.as_deref().filter(|s| !s.is_empty()),
+            row.lease_acquired_at,
+            row.lease_heartbeat_at,
+            row.lease_expires_at,
+            row.lease_generation,
         ],
     )?;
     if needs_terminal_summary && changed == 1 {

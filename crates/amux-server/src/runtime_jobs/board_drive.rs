@@ -666,6 +666,9 @@ pub struct DriveReport {
     /// unfinished dependency means no worker can honestly be working them.
     /// Published so a zero can be distinguished from a sweep that never ran.
     pub normalized_blocked_doing: usize,
+    /// Cards acted on by the RR-0052 lease reaper this tick (expired leases
+    /// reclaimed to todo, or extended because the holder was still active).
+    pub reclaimed_leases: usize,
     pub lanes: Vec<LaneTrace>,
 }
 
@@ -5704,6 +5707,113 @@ async fn normalize_blocked_doing(state: &AppState) -> usize {
     normalized
 }
 
+/// RR-0052: reclaim cards whose hard lease has expired. Unlike
+/// `reclaim_stale_doing` (6h inactivity AND WIP pressure), this runs
+/// UNCONDITIONALLY: a dead worker's card must return to the queue even with an
+/// empty todo column behind it. A holder still actively working (a
+/// `session.working`/`message.delivered` event within the TTL) has its lease
+/// EXTENDED instead of reclaimed, so a heads-down worker on a long turn is never
+/// yanked mid-work. Returns the number of cards acted on (reclaimed + extended).
+pub(crate) async fn reclaim_expired_leases(state: &AppState) -> usize {
+    let ttl = bs::lease_ttl_s();
+    let now = chrono::Utc::now().timestamp();
+    let expired: Vec<(String, String)> = match state.store.read() {
+        Ok(conn) => bs::list_issues(
+            &conn,
+            &["doing".to_string()],
+            &[],
+            bs::ArchivedFilter::ActiveOnly,
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|row| {
+            let owner = row.lease_owner.clone()?;
+            let exp = row.lease_expires_at?;
+            (exp < now && row.owner_type == "agent").then_some((row.id, owner))
+        })
+        .collect(),
+        Err(error) => {
+            tracing::warn!(
+                target: "amux::board_drive", %error, measured = false, n_considered = 0,
+                verdict = "lease_reaper_scan_unmeasured",
+                "board_drive: could not scan for expired leases"
+            );
+            return 0;
+        }
+    };
+    let mut acted = 0usize;
+    for (card, owner) in expired {
+        let (card_w, owner_w) = (card.clone(), owner.clone());
+        let reply = state
+            .store
+            .write_async(move |conn| {
+                let Some(row) = bs::get_issue(conn, &card_w)? else {
+                    return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+                };
+                // Re-check under the writer: still doing, still this owner, still expired.
+                if row.status != "doing"
+                    || row.lease_owner.as_deref() != Some(owner_w.as_str())
+                    || row.lease_expires_at.map(|e| e >= now).unwrap_or(true)
+                {
+                    return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+                }
+                // Liveness: did the holder lane do anything within the TTL? A
+                // working holder keeps its card; only a silent one is reclaimed.
+                let since = (now - ttl) as f64;
+                let alive: bool = conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM session_events WHERE session=?1 \
+                         AND type IN ('session.working','message.delivered', \
+                                      'task.status_changed','browser.action') \
+                         AND ts > ?2)",
+                        rusqlite::params![owner_w, since],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(false);
+                if alive {
+                    conn.execute(
+                        "UPDATE issues SET lease_heartbeat_at = ?2, lease_expires_at = ?3 \
+                         WHERE id = ?1 AND status = 'doing'",
+                        rusqlite::params![card_w, now, now + ttl],
+                    )?;
+                    tracing::info!(
+                        target: "amux::board_drive", card = %card_w, owner = %owner_w,
+                        measured = true, n_considered = 1,
+                        "board_drive: lease heartbeat extended (holder active) — RR-0052"
+                    );
+                    return Ok(crate::db::WriteOutcome { applied: true, events: vec![] });
+                }
+                let opts = crate::db::advance::AdvanceOpts {
+                    expected_from: Some("doing".into()),
+                    force: true,
+                    skip_continuation: true,
+                    skip_todo_wip: true,
+                    log_line: Some(format!(
+                        "Auto-reclaimed: lease expired, holder '{owner_w}' inactive > {ttl}s (RR-0052)"
+                    )),
+                    ..Default::default()
+                };
+                match crate::db::advance::advance(conn, &card_w, "todo", "amux:lease-reaper", &opts)?
+                {
+                    Ok(_) => {
+                        tracing::info!(
+                            target: "amux::board_drive", card = %card_w, owner = %owner_w,
+                            measured = true, n_considered = 1,
+                            "board_drive: lease expired, card reclaimed to todo (holder inactive) — RR-0052"
+                        );
+                        Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                    }
+                    Err(_) => Ok(crate::db::WriteOutcome { applied: false, events: vec![] }),
+                }
+            })
+            .await;
+        if matches!(reply, Ok(r) if r.applied) {
+            acted += 1;
+        }
+    }
+    acted
+}
+
 /// One sweep over the fleet. ADVANCE BEFORE PICKUP, the same order and the same
 /// two calls Python's idle edge used (py:14389): a lane holding a doing/review
 /// card cannot be helped by pickup — WIP-1 forbids a second card — so a
@@ -5718,6 +5828,9 @@ pub async fn drive_tick<F: Fleet>(state: &AppState, fleet: &F) -> DriveReport {
     // A blocked card cannot be current Doing state. Normalize first so every
     // later predicate in this tick reads the same durable lifecycle truth.
     report.normalized_blocked_doing = normalize_blocked_doing(state).await;
+    // RR-0052: reclaim expired leases before dispatch, so a dead worker's WIP
+    // slot is free for the pickup below in this same tick.
+    report.reclaimed_leases = reclaim_expired_leases(state).await;
     // Complete root epics before dispatch so the Messages chip and the board
     // agree that a command is finished as soon as all of its leaves are.
     report.completed_epics = complete_finished_epics(state).await;

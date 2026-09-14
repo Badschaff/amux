@@ -10705,7 +10705,35 @@ pub async fn patch_item(
                             })
                     };
 
-                    match apply_transition(&task, tx, &actor, &[], now) {
+                    // RR-0052: for a real worker-lane caller, hand the transition
+                    // an Actor::Worker so core's holder_guard fires when a lease
+                    // held by a DIFFERENT lane is touched. Only when enforcement
+                    // is on; otherwise keep the System actor (no refusal) but log
+                    // what WOULD be refused, so the cross-lane rate is watchable
+                    // before the flag flips on. `Force` and empty callers (human,
+                    // anonymous, local member) are never gated.
+                    let transition_actor = if !caller_lane.is_empty()
+                        && !matches!(&tx, BoardTransition::Force { .. })
+                    {
+                        let caller_wid =
+                            crate::orchestrator::runtime::foreign_worker_id(&caller_lane);
+                        if bs::lease_enforcement_enabled() {
+                            Actor::Worker { id: caller_wid }
+                        } else {
+                            if task.worker.as_ref().is_some_and(|h| *h != caller_wid) {
+                                tracing::info!(
+                                    target: "amux::board", card = %next.id,
+                                    caller = %caller_lane, measured = true, n_considered = 1,
+                                    "ledger: lease would-refuse (AMUX_LEASE_ENFORCE off): cross-lane transition on a leased card (AMUX-4498/RR-0052)"
+                                );
+                            }
+                            actor.clone()
+                        }
+                    } else {
+                        actor.clone()
+                    };
+
+                    match apply_transition(&task, tx, &transition_actor, &[], now) {
                         Ok(updated) => {
                             let from_raw = next.status.clone();
                             let stamp = hhmm();
@@ -10742,6 +10770,19 @@ pub async fn patch_item(
                             // Gap 4: waiting_on side effects before status change.
                             crate::db::advance::apply_status_side_effects(&mut next, &target_raw);
                             next.status = target_raw.clone();
+                            // RR-0052: mirror apply_common's lease set/clear on the
+                            // PATCH write path so the driver and PATCH never disagree.
+                            let lease_holder: Option<String> = if caller_lane.is_empty() {
+                                next.session.clone()
+                            } else {
+                                Some(caller_lane.clone())
+                            };
+                            crate::db::advance::apply_lease_transition(
+                                &mut next,
+                                &target_raw,
+                                lease_holder.as_deref(),
+                                now.timestamp(),
+                            );
                             next.version = i64::try_from(updated.version).unwrap_or(next.version + 1);
 
                             // REVISIT DATE ON THE TWO STATUSES NOTHING DRAINS
