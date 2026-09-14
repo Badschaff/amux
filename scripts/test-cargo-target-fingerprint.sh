@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -u
+set -eu
 set -o pipefail
 
 # AF-791: verifies shared-target stale-output detection in test-contended.
