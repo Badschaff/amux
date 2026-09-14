@@ -222,10 +222,13 @@ fn worker_card_and_peek_share_actions_and_the_canonical_file_entry() {
     let inventory_end = inventory_tail.find("function _renderWorkerActionMenu")
         .expect("the shared renderer must follow its inventory");
     let inventory = &inventory_tail[..inventory_end];
+    // 29 SOURCE entries since 9af1c88b: `pause` and `resume` are the two arms of
+    // one ternary, so the source carries both while a worker renders exactly one
+    // of them. This counts the inventory in source, not the rendered menu.
     assert_eq!(
         inventory.matches("{ key: '").count(),
-        27,
-        "the full running Claude worker fixture has 27 shared worker actions"
+        29,
+        "the shared worker-action inventory has 29 source entries (27 actions plus the pause/resume pair)"
     );
 
     let browse_start = app.find("function _browseWorkerFiles(name, source)")
