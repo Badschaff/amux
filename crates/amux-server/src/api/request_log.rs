@@ -1526,6 +1526,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/board/contract", methods: &["GET"] },
     RouteEntry { path: "/api/board/derived", methods: &["GET"] },
     RouteEntry { path: "/api/board/ready", methods: &["GET"] },
+    RouteEntry { path: "/api/board/drain", methods: &["GET"] },
     RouteEntry { path: "/api/board/changes", methods: &["GET"] },
     RouteEntry { path: "/api/board/bulk-migrate", methods: &["POST"] },
     RouteEntry { path: "/api/board/{id}/decompose", methods: &["POST"] },

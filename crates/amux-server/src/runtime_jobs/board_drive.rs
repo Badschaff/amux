@@ -669,6 +669,11 @@ pub struct DriveReport {
     /// The RR-0052 lease reaper's pass this tick: expired leases reclaimed to
     /// todo or renewed because the holder is live, over how many it considered.
     pub lease_reaper: LeaseReaperReport,
+    /// `blocked` cards moved back to `todo` this tick because every one of their
+    /// `depends_on` resolved (RR-0052 Invariant 5). `promote_ready_backlog`
+    /// only ever scanned `backlog`, so a dependency-blocked card stayed blocked
+    /// after its blocker finished; this count is how that pass is watched.
+    pub unblocked_blocked: usize,
     pub lanes: Vec<LaneTrace>,
 }
 
@@ -2101,6 +2106,93 @@ fn promotable_deps(conn: &Connection, row: &bs::IssueRow) -> Option<Vec<String>>
 /// fires, fighting the owner's park. MG-1388 was re-activated five times in two
 /// hours against mixpeek-general's explicit re-parks (2026-08-15); that is ethos
 /// rule 8, the harness deciding what was the owning session's to decide.
+/// RR-0052 Invariant 5, the half the driver never did: a card in status
+/// `blocked` whose every `depends_on` has resolved was never moved again,
+/// because `promote_ready_backlog` scans `backlog` only. Selection mirrors that
+/// arm: agent-owned, live, non-archived, a NON-EMPTY `depends_on` that
+/// `deps_blocking` (the dispatch predicate) finds fully resolved, and nothing
+/// else holding the card: no free-text `blocked_on` watch, no live `source_ref`
+/// trigger. A blocked card with no dependency at all is left alone; its block is
+/// prose only its owner can clear, and the drain view reports it `unblockable`.
+pub(crate) fn blocked_dep_unblocks(conn: &Connection) -> Vec<(String, Vec<String>)> {
+    let rows = match bs::list_issues(conn, &["blocked".to_string()], &[], bs::ArchivedFilter::ActiveOnly) {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(
+                target: "amux::board_drive", %error, measured = false, n_considered = 0,
+                verdict = "blocked_unblock_scan_unmeasured",
+                "board_drive: could not scan blocked cards for resolved dependencies"
+            );
+            return vec![];
+        }
+    };
+    rows.into_iter()
+        .filter(|r| blocked_card_is_releasable(conn, r))
+        .map(|r| (r.id.clone(), r.depends_on.clone()))
+        .collect()
+}
+
+fn blocked_card_is_releasable(conn: &Connection, row: &bs::IssueRow) -> bool {
+    row.status == "blocked"
+        && row.owner_type == "agent"
+        && row.archived == 0
+        && !row.depends_on.is_empty()
+        && row.blocked_on.as_deref().map(str::trim).unwrap_or("").is_empty()
+        && !parked_on_live_trigger(row)
+        && deps_blocking(conn, row).is_empty()
+}
+
+/// Move every releasable `blocked` card to `todo`, re-checking the same
+/// predicate under the writer. Returns how many moved.
+pub(crate) async fn unblock_resolved_blocked(state: &AppState) -> usize {
+    let candidates = match state.store.read() {
+        Ok(conn) => blocked_dep_unblocks(&conn),
+        Err(_) => return 0,
+    };
+    let mut moved = 0usize;
+    for (card, deps) in candidates {
+        let card_w = card.clone();
+        let reply = state
+            .store
+            .write_async(move |conn| {
+                let Some(row) = bs::get_issue(conn, &card_w)? else {
+                    return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+                };
+                if !blocked_card_is_releasable(conn, &row) {
+                    return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+                }
+                let opts = crate::db::advance::AdvanceOpts {
+                    expected_from: Some("blocked".into()),
+                    skip_continuation: true,
+                    skip_todo_wip: true,
+                    log_line: Some("Auto-unblocked: every depends_on resolved (RR-0052 drain)".into()),
+                    ..Default::default()
+                };
+                match crate::db::advance::advance(conn, &card_w, "todo", "board_drive", &opts)? {
+                    Ok(outcome) => Ok(crate::db::WriteOutcome { applied: true, events: outcome.events }),
+                    Err(refusal) => {
+                        tracing::warn!(
+                            target: "amux::board_drive", card = %card_w, ?refusal,
+                            measured = true, n_considered = 1, verdict = "blocked_unblock_refused",
+                            "board_drive: a resolved blocked card could not move to todo"
+                        );
+                        Ok(crate::db::WriteOutcome { applied: false, events: vec![] })
+                    }
+                }
+            })
+            .await;
+        if matches!(reply, Ok(r) if r.applied) {
+            moved += 1;
+            tracing::info!(
+                target: "amux::board_drive", card = %card, deps = %deps.join(","),
+                measured = true, n_considered = 1, verdict = "blocked_unblocked",
+                "board_drive: blocked -> todo, every depends_on resolved (RR-0052)"
+            );
+        }
+    }
+    moved
+}
+
 fn parked_on_live_trigger(row: &bs::IssueRow) -> bool {
     row.source_ref
         .as_deref()
@@ -5948,6 +6040,7 @@ pub async fn drive_tick<F: Fleet>(state: &AppState, fleet: &F) -> DriveReport {
     report.promoted = promoted;
     report.held_on_trigger = held_on_trigger;
     report.promoted_due = promoted_due;
+    report.unblocked_blocked = unblock_resolved_blocked(state).await;
     report.revisit_due_total = revisit_due_total;
     for lane in fleet.lanes() {
         let trace = drive_lane(state, fleet, &lane).await;
@@ -6021,6 +6114,7 @@ pub async fn drive_session(state: &AppState, lane: &str) -> LaneTrace {
     let _ = normalize_blocked_doing(state).await;
     let _ = complete_finished_epics(state).await;
     let _ = promote_ready_backlog(state).await;
+    let _ = unblock_resolved_blocked(state).await;
     let _ = promote_due_backlog(state).await;
     let trace = drive_lane(state, &fleet, lane).await;
     publish_lane(trace.clone());
@@ -9224,6 +9318,42 @@ mod tests {
             )?;
             Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
         }).unwrap();
+    }
+
+    #[test]
+    fn a_blocked_card_is_released_only_when_its_dependencies_are_all_that_held_it() {
+        let conn = crate::db::migrate::test_memdb();
+        let ins = |id: &str, status: &str, deps: &str, blocked_on: Option<&str>, source_ref: Option<&str>| {
+            conn.execute(
+                "INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type,depends_on,blocked_on,source_ref) \
+                 VALUES (?1,?1,'',?2,'lane',1,1,'agent','chore',?3,?4,?5)",
+                rusqlite::params![id, status, deps, blocked_on, source_ref],
+            ).unwrap();
+        };
+        ins("DONE-DEP", "verified", "[]", None, None);
+        ins("OPEN-DEP", "doing", "[]", None, None);
+        ins("FREE", "blocked", "[\"DONE-DEP\"]", None, None);
+        ins("WATCHED", "blocked", "[\"DONE-DEP\"]", Some("vendor ships the fix"), None);
+        ins("TRIGGERED", "blocked", "[\"DONE-DEP\"]", None, Some("staging deploy is green"));
+        ins("STILL", "blocked", "[\"OPEN-DEP\"]", None, None);
+        ins("PROSE", "blocked", "[]", None, None);
+        let got: Vec<String> = blocked_dep_unblocks(&conn).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(got, vec!["FREE".to_string()],
+            "only a card whose dependencies were the whole block is released");
+    }
+
+    #[tokio::test]
+    async fn the_driver_moves_a_resolved_blocked_card_to_todo() {
+        let (_dir, state, store) = drive_state();
+        drive_card(&store, "B-DEP", "verified", "agent", "chore");
+        drive_card(&store, "B-CARD", "blocked", "agent", "chore");
+        store.write(|conn| {
+            conn.execute("UPDATE issues SET depends_on='[\"B-DEP\"]' WHERE id='B-CARD'", [])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        assert_eq!(unblock_resolved_blocked(&state).await, 1);
+        assert_eq!(drive_status(&store, "B-CARD"), "todo");
+        assert_eq!(unblock_resolved_blocked(&state).await, 0, "a second pass has nothing left to move");
     }
 
     #[test]

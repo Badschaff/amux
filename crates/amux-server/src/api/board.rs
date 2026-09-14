@@ -61,6 +61,9 @@ pub fn routes() -> Router<AppState> {
         // Static /ready outranks /{id}. The read side of the dependency graph
         // (AMUX-3948) — READY is a query, never a stored status.
         .route("/ready", get(ready_frontier))
+        // RR-0052 Invariant 5: is this lane's board drained, and if not, what is
+        // in the way. Static, before /{id}.
+        .route("/drain", get(board_drain))
         // CDC catch-up: lets clients replay missed board mutations after a
         // reconnect, keyed by the seq cursor from board_change_log.
         .route("/changes", get(board_changes))
@@ -4931,6 +4934,55 @@ mod task_asset_resolution_tests {
             dotenv.to_string_lossy(),
             "a bare dotfile resolves from the producing worker's directory"
         );
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DrainParams {
+    session: Option<String>,
+}
+
+/// GET /api/board/drain[?session=<lane>] (RR-0052 Invariant 5). The drain answer
+/// per lane from `runtime_jobs::board_drain::drain_state`, the same dependency
+/// predicate dispatch uses. Without `session` it covers every lifecycle-active
+/// lane, since a paused or archived lane is not being driven. `measured` and
+/// `n_considered` travel with it, as every diagnostic here owes (AF-320).
+pub async fn board_drain(State(state): State<AppState>, Query(p): Query<DrainParams>) -> Response {
+    let now = chrono::Utc::now().timestamp();
+    let lanes: Vec<String> = match p.session.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(lane) => vec![lane.to_string()],
+        None => crate::api::session_verbs::all_lane_names()
+            .into_iter()
+            .filter(|lane| crate::api::session_verbs::lane_lifecycle(lane) == "active")
+            .collect(),
+    };
+    let store = state.store.clone();
+    let joined = crate::db::interactions::spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = store.read()?;
+        Ok(lanes
+            .iter()
+            .map(|lane| crate::runtime_jobs::board_drain::drain_state(&conn, lane, now))
+            .collect::<Vec<_>>())
+    })
+    .await;
+    match joined {
+        Ok(Ok(states)) => {
+            let drained = states.iter().filter(|s| s.verdict == "drained").count();
+            let unmeasured = states.iter().filter(|s| !s.measured).count();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "measured": unmeasured == 0,
+                    "n_considered": states.len(),
+                    "drained": drained,
+                    "unmeasured": unmeasured,
+                    "lanes": states,
+                })),
+            )
+                .into_response()
+        }
+        Ok(Err(e)) => internal(e),
+        Err(e) => internal(e),
     }
 }
 

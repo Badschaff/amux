@@ -6250,3 +6250,22 @@ async fn lease_next_hands_a_lane_one_task_then_the_same_one_then_says_why_there_
     assert_eq!(v["drain"]["measured"], json!(true), "{v}");
     assert_eq!(v["drain"]["verdict"], json!("waiting_on_review"), "{v}");
 }
+
+// ---- RR-0052 Invariant 5: the board says whether a lane is drained ----------
+
+#[tokio::test]
+async fn drain_reports_measured_verdicts_for_a_lane() {
+    let (app, _dir) = app();
+    let (st, _, v) = send(&app, "GET", "/api/board/drain?session=lane-d", None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["measured"], json!(true), "{v}");
+    assert_eq!(v["n_considered"], json!(1), "{v}");
+    assert_eq!(v["lanes"][0]["verdict"], json!("drained"), "an empty lane is drained: {v}");
+
+    create(&app, json!({ "title": "Implement the drain unit", "session": "lane-d", "type": "chore",
+        "desc": "SCOPE: work\n- [ ] do it", "next_action": "Implement the scoped work" })).await;
+    let (_, _, v) = send(&app, "GET", "/api/board/drain?session=lane-d", None).await;
+    assert_eq!(v["lanes"][0]["verdict"], json!("draining"), "{v}");
+    assert_eq!(v["lanes"][0]["ready"], json!(1), "{v}");
+    assert_eq!(v["drained"], json!(0), "{v}");
+}
