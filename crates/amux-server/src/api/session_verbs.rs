@@ -3910,6 +3910,9 @@ pub(crate) fn ensure_fleet_tables(conn: &rusqlite::Connection) -> rusqlite::Resu
     // A reservation is not acceptance. Older rows have no receipt and remain
     // uncertain rather than being upgraded into a fabricated delivery receipt.
     let _ = conn.execute("ALTER TABLE send_dedup ADD COLUMN receipt_id TEXT", []);
+    // What a reservation is for, so a stranded check can refuse a text that was
+    // not the one reserved (AMUX-4594).
+    let _ = conn.execute("ALTER TABLE send_dedup ADD COLUMN text_sha TEXT", []);
     // Python's steering_queue predates `guard` and gained it via ALTER; a DB
     // created by Python's schema block lacks it. Add-if-missing, ignore
     // "duplicate column".
@@ -5714,6 +5717,187 @@ fn send_receipt(state: &AppState, name: &str, msg_id: &str) -> Response {
     let mut response = response;
     response.headers_mut().insert(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
     response
+}
+
+fn text_sha256(text: &str) -> String {
+    use sha2::Digest;
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(64);
+    for b in sha2::Sha256::digest(text.as_bytes()) {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// Records what a reservation is FOR (AMUX-4594), so a later stranded check
+/// compares the transcript against the text that was reserved rather than
+/// whatever a caller claims.
+async fn send_dedup_note_text(state: &AppState, name: &str, msg_id: &str, text: &str) {
+    if msg_id.is_empty() {
+        return;
+    }
+    let (session, identity, sha) = (name.to_string(), msg_id.to_string(), text_sha256(text));
+    let _ = state
+        .store
+        .write_async(move |conn| {
+            conn.execute(
+                "UPDATE send_dedup SET text_sha=?1 WHERE session=?2 AND msg_id=?3 AND receipt_id IS NULL",
+                rusqlite::params![sha, session, identity],
+            )?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        })
+        .await;
+}
+
+/// Longest text the stranded check will judge. Claude Code stores a pasted or
+/// multi-line prompt in a different shape than it was sent, so a miss on one
+/// could not be told from non-delivery, and releasing on that guess could
+/// deliver twice.
+const STRANDED_TEXT_MAX: usize = 800;
+
+/// Whether a Claude transcript holds a user prompt that is exactly `text` (or
+/// `text` after an amux origin stamp), dated at or after `since` (unix seconds,
+/// 60 s of skew). `None` when the answer cannot be trusted: the file is
+/// unreadable, or the part read starts after `since`, which covers both a file
+/// too large for the tail read and a conversation that began after the
+/// reservation (the prompt could be in an older transcript).
+fn transcript_has_prompt_since(path: &std::path::Path, text: &str, since: i64) -> Option<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL: u64 = 16 * 1024 * 1024;
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let start = len.saturating_sub(TAIL);
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    let hay = String::from_utf8_lossy(&buf);
+    let needle = serde_json::to_string(text).ok()?;
+    let needle = needle.trim_matches('"');
+    let stamped = format!("\n\n{text}");
+    let mut earliest: Option<i64> = None;
+    let mut found = false;
+    // A tail read can begin mid-line; the first partial line is skipped.
+    for line in hay.lines().skip(usize::from(start > 0)) {
+        let at_of = |v: &Value| {
+            v["timestamp"]
+                .as_str()
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| t.timestamp())
+        };
+        if earliest.is_none() && line.contains("\"timestamp\"") {
+            if let Ok(v) = serde_json::from_str::<Value>(line) {
+                earliest = at_of(&v);
+            }
+        }
+        if found || !line.contains(needle) || !line.contains("\"type\":\"user\"") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        let Some(content) = v["message"]["content"].as_str() else { continue };
+        if v["type"] == "user"
+            && (content == text || content.ends_with(&stamped))
+            && at_of(&v).is_none_or(|t| t >= since - 60)
+        {
+            found = true;
+        }
+    }
+    if found {
+        return Some(true);
+    }
+    match earliest {
+        Some(t) if t <= since => Some(false),
+        _ => None,
+    }
+}
+
+fn stranded_answer(body: Value) -> Response {
+    let mut response = j200(body);
+    response
+        .headers_mut()
+        .insert(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
+    response
+}
+
+/// The receipt read, plus a verdict for a reservation no live send owns
+/// (AMUX-4594). Before this a reservation left by a dropped request answered
+/// `accepted:false` forever, and the dashboard showed "checking automatically"
+/// for as long as the tab stayed open: 64 such rows across 26 lanes on
+/// 2026-09-14, the oldest from 09-10, one of them Ethan's 3:17 PM "continue"
+/// to mixpeek-homepage-claude, which never reached the worker.
+///
+/// Stranded means no receipt, older than the gate's 120 s pending window, and
+/// no send task in this process holds it. Delivery is then decided from the one
+/// piece of evidence amux has, the lane's transcript:
+/// - the text is there after the reservation: record a receipt, so the sender
+///   stops waiting and nothing is resent;
+/// - the transcript covers the reservation and the text is not there: release
+///   it, so the sender can send once with the same ID;
+/// - anything else (no transcript, no text, a text too long to judge, a text
+///   that does not match what was reserved): say `delivered: "unknown"` and
+///   keep the reservation, because releasing on a guess could deliver twice.
+async fn send_receipt_resolving(state: &AppState, name: &str, msg_id: &str, text: &str) -> Response {
+    let base = send_receipt(state, name, msg_id);
+    if base.status() != StatusCode::ACCEPTED {
+        return base;
+    }
+    let row = (|| -> rusqlite::Result<(i64, Option<String>)> {
+        let conn = state.store.read().map_err(|_| rusqlite::Error::InvalidQuery)?;
+        conn.query_row(
+            "SELECT ts, text_sha FROM send_dedup WHERE session=?1 AND msg_id=?2 AND receipt_id IS NULL",
+            rusqlite::params![name, msg_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+    })();
+    // No row (an ID never reserved) or a schema without text_sha yet: the plain
+    // receipt answer is already the truth.
+    let Ok((ts, text_sha)) = row else { return base };
+    if now_i64().saturating_sub(ts) <= 120 || send_is_in_flight(name, msg_id) {
+        return base;
+    }
+    let judgeable = !text.is_empty()
+        && text.len() <= STRANDED_TEXT_MAX
+        && !text.contains('\n')
+        && text_sha.as_deref().is_none_or(|sha| sha == text_sha256(text));
+    let evidence = if judgeable {
+        session_jsonl_path(name).map(|path| (transcript_has_prompt_since(&path, text, ts), path))
+    } else {
+        None
+    };
+    match evidence {
+        Some((Some(true), path)) => {
+            let id = format!("reconciled-{msg_id}");
+            send_dedup_accept(state, name, msg_id, &id).await;
+            tracing::warn!(
+                target: "amux::message_acceptance", session = name, verdict = "stranded_reservation_reconciled",
+                measured = true, n_considered = 1, transcript = %path.display(),
+                "a stranded reservation's text is in the lane transcript; recorded its receipt (AMUX-4594)"
+            );
+            stranded_answer(json!({"ok": true, "accepted": true, "reconciled": true, "id": id, "msg_id": msg_id}))
+        }
+        Some((Some(false), path)) => {
+            send_dedup_forget(state, name, msg_id).await;
+            tracing::warn!(
+                target: "amux::message_acceptance", session = name, verdict = "stranded_reservation_released",
+                measured = true, n_considered = 1, transcript = %path.display(),
+                "a stranded reservation's text never reached the lane transcript; released it so the sender can send once (AMUX-4594)"
+            );
+            stranded_answer(json!({
+                "ok": true, "accepted": false, "released": true, "delivered": false, "msg_id": msg_id,
+                "evidence": format!("no prompt matching the text after the reservation in {}", path.display()),
+            }))
+        }
+        _ => {
+            tracing::warn!(
+                target: "amux::message_acceptance", session = name, verdict = "stranded_reservation_unknown",
+                measured = false, n_considered = 1, judgeable,
+                "a stranded reservation cannot be settled from a transcript; kept, and the sender is told (AMUX-4594)"
+            );
+            stranded_answer(json!({
+                "ok": true, "accepted": false, "stranded": true, "delivered": "unknown", "msg_id": msg_id,
+                "next": "look at the worker's terminal, then resend or dismiss",
+            }))
+        }
+    }
 }
 
 async fn send_dedup_accept(state: &AppState, name: &str, msg_id: &str, receipt_id: &str) {
@@ -14685,7 +14869,9 @@ async fn get_dispatch(
     qs: &[(String, String)],
 ) -> Response {
     match action {
-        "send" if subid.is_empty() => send_receipt(state, name, qs_first(qs, "msg_id", "")),
+        "send" if subid.is_empty() => {
+            send_receipt_resolving(state, name, qs_first(qs, "msg_id", ""), qs_first(qs, "text", "")).await
+        }
         "" => {
             // Bare GET → the SAME record the list endpoint serves (py:74892).
             match crate::api::sessions_legacy::legacy_sessions_values(state.store.clone()).await {
@@ -16508,6 +16694,50 @@ async fn isolated_peer_refusal(state: &AppState, name: &str, headers: &HeaderMap
     })))
 }
 
+/// Message IDs a send task in THIS process is still working on (AMUX-4594).
+/// A reservation outside this set with no receipt belongs to no live send: a
+/// handler dropped before AMUX-4589, or a process that has since restarted.
+fn send_in_flight() -> &'static std::sync::Mutex<std::collections::HashSet<(String, String)>> {
+    static IN_FLIGHT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(String, String)>>> =
+        std::sync::OnceLock::new();
+    IN_FLIGHT.get_or_init(Default::default)
+}
+
+/// Holds a message ID in [`send_in_flight`] and removes it when dropped, which
+/// includes a send task that panics.
+struct InFlightSend(Option<(String, String)>);
+
+impl InFlightSend {
+    fn enter(name: &str, msg_id: &str) -> Self {
+        if msg_id.is_empty() {
+            return Self(None);
+        }
+        let key = (name.to_string(), msg_id.to_string());
+        if let Ok(mut set) = send_in_flight().lock() {
+            set.insert(key.clone());
+        }
+        Self(Some(key))
+    }
+}
+
+impl Drop for InFlightSend {
+    fn drop(&mut self) {
+        if let Some(key) = self.0.take() {
+            if let Ok(mut set) = send_in_flight().lock() {
+                set.remove(&key);
+            }
+        }
+    }
+}
+
+/// A poisoned registry answers "in flight", so it can never release anything.
+fn send_is_in_flight(name: &str, msg_id: &str) -> bool {
+    send_in_flight()
+        .lock()
+        .map(|set| set.contains(&(name.to_string(), msg_id.to_string())))
+        .unwrap_or(true)
+}
+
 /// A send runs in its own task, so a client that gives up mid-send cannot drop
 /// it between reserving the message ID and settling it (AMUX-4589).
 ///
@@ -16543,7 +16773,14 @@ async fn send_post_detached(state: &AppState, name: &str, headers: &HeaderMap, b
     }
     let mut watch = ClientLeft { session: name.to_string(), answered: false };
     let (st, n, h, b) = (state.clone(), name.to_string(), headers.clone(), body.clone());
-    let joined = tokio::spawn(async move { send_post(&st, &n, &h, &b).await }).await;
+    // Same identity send_post reserves: trimmed, first 64 chars.
+    let flight_id: String = body_str(body, "msg_id").trim().chars().take(64).collect();
+    let flight = InFlightSend::enter(name, &flight_id);
+    let joined = tokio::spawn(async move {
+        let _flight = flight;
+        send_post(&st, &n, &h, &b).await
+    })
+    .await;
     watch.answered = true;
     match joined {
         Ok(response) => response,
@@ -16676,6 +16913,7 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     }
     let msg_id: String = body_str(body, "msg_id").trim().chars().take(64).collect();
     if let Some(response)=send_dedup_gate(state,name,&msg_id).await {return response;}
+    send_dedup_note_text(state, name, &msg_id, &body_str(body, "text")).await;
     if text.trim().starts_with("/compact") {
         let n = name.to_string();
         crate::db::interactions::spawn_blocking(move || backup_session_jsonl(&n, "pre_compact"));
@@ -25242,6 +25480,69 @@ CLAUDE-POSTFIX-COMPLETE
         let conn = state.store.read().unwrap();
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM send_dedup",[],|r|r.get::<_,i64>(0)).unwrap(),1);
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM cmd_history",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    }
+
+    /// AMUX-4594. A reservation no live send owns resolves from the transcript:
+    /// a receipt when the text landed, a release when it did not, "unknown" when
+    /// amux cannot tell, and nothing at all while a live send still holds it.
+    #[tokio::test]
+    async fn a_stranded_reservation_resolves_from_the_lane_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        // claude_home() reads HOME; the guard restores the whole environment.
+        std::env::set_var("HOME", dir.path());
+        std::fs::create_dir_all(sessions_dir()).unwrap();
+        let wd = dir.path().join("work");
+        std::fs::create_dir_all(&wd).unwrap();
+        let name = "stranded-fixture";
+        std::fs::write(env_path(name), format!("CC_DIR={}\n", wd.display())).unwrap();
+        let project = claude_home().join("projects").join(project_name(&wd.to_string_lossy()));
+        std::fs::create_dir_all(&project).unwrap();
+        let (state, _store_dir) = state();
+        let old = now_i64() - 3600;
+        let stamp = |secs: i64| chrono::DateTime::from_timestamp(secs, 0).unwrap().to_rfc3339();
+        std::fs::write(
+            project.join("conv.jsonl"),
+            format!(
+                "{}\n{}\n",
+                json!({"type":"user","message":{"role":"user","content":"[02:00 PM] earlier"},"timestamp": stamp(old - 600)}),
+                json!({"type":"user","message":{"role":"user","content":"[03:17 PM] landed"},"timestamp": stamp(old + 5)}),
+            ),
+        )
+        .unwrap();
+        for id in ["landed-id", "lost-id", "unchecked-id", "hashed-id"] {
+            assert!(send_dedup_gate(&state, name, id).await.is_none());
+        }
+        send_dedup_note_text(&state, name, "hashed-id", "[03:17 PM] what was reserved").await;
+        state
+            .store
+            .write_async(move |conn| {
+                conn.execute("UPDATE send_dedup SET ts=?1", [old])?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
+        async fn read(r: Response) -> (StatusCode, Value) {
+            let status = r.status();
+            (status, serde_json::from_slice(&axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap()).unwrap())
+        }
+        let (_, v) = read(send_receipt_resolving(&state, name, "landed-id", "[03:17 PM] landed").await).await;
+        assert_eq!((v["accepted"].clone(), v["reconciled"].clone()), (json!(true), json!(true)), "{v}");
+        let (_, v) = read(send_receipt_resolving(&state, name, "lost-id", "[03:17 PM] never typed").await).await;
+        assert_eq!(v["released"], true, "{v}");
+        assert!(send_dedup_gate(&state, name, "lost-id").await.is_none(), "released: the same ID can be sent once");
+        let (_, v) = read(send_receipt_resolving(&state, name, "unchecked-id", "").await).await;
+        assert_eq!(v["delivered"], "unknown", "no text, no verdict: {v}");
+        let (_, v) = read(send_receipt_resolving(&state, name, "hashed-id", "[03:17 PM] never typed").await).await;
+        assert_eq!(v["delivered"], "unknown", "a text that is not what was reserved cannot release it: {v}");
+        let still: i64 = state.store.read().unwrap()
+            .query_row("SELECT COUNT(*) FROM send_dedup WHERE session=?1 AND msg_id='hashed-id'", [name], |r| r.get(0))
+            .unwrap();
+        assert_eq!(still, 1);
+        let _flight = InFlightSend::enter(name, "unchecked-id");
+        let (status, v) = read(send_receipt_resolving(&state, name, "unchecked-id", "[03:17 PM] never typed").await).await;
+        assert_eq!((status, v["accepted"].clone()), (StatusCode::ACCEPTED, json!(false)), "a live send owns it: {v}");
+        assert!(v.get("released").is_none() && v.get("stranded").is_none(), "{v}");
     }
 
     /// AMUX-4589. The client leaves while the send is parked on the lane lock,

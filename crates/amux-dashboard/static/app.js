@@ -2654,11 +2654,11 @@ async function _runSyncBanner(quiet = false) {
   const blockedResources = new Set();
   const queue = offlineQueue.filter(q => {
     if (q.state === 'blocked' && !_outboxUncertainMessage(q)) blockedResources.add(q.url);
-    // Uncertain/checking items are surfaced by the connection badge and modal,
-    // not the sync banner. Including them here means every new send pops the
-    // full checklist showing the stuck item alongside the just-sent one
-    // (Ethan 2026-09-14: "this shouldn't be appearing when I send, too invasive").
-    if (_outboxUncertainMessage(q)) return false;
+    // Uncertain sends STAY IN REPLAY (AMUX-4594). This list is what the loop
+    // below re-checks, so filtering them here (d69efdef) meant a stuck send
+    // was never re-read and never timed out. Ethan's point about that change
+    // still holds ("this shouldn't be appearing when I send, too invasive"),
+    // so they are left out of the decision to SHOW the checklist instead.
     return !blockedResources.has(q.url) && !_outboxActive.has(q.id);
   });
   let skipped = 0;
@@ -2692,7 +2692,7 @@ async function _runSyncBanner(quiet = false) {
   }
 
   renderBanner();
-  const show = !quiet || items.length >= 2;
+  const show = !quiet || items.filter(i => !(i.type === 'queue' && _outboxUncertainMessage(i.item))).length >= 2;
   if (show) {
     // The checklist replaces transient queue feedback, including a toast from
     // an offline write immediately before reconnect. Keep failure toasts intact.
@@ -2780,7 +2780,7 @@ async function _runSyncBanner(quiet = false) {
         ...(q.delivery_uncertain ? {measured:false, why_unmeasured:'Server has not confirmed message acceptance'} : {}), feedback:{message:q.error}});
       q.attempts = (q.attempts || 0) + 1;
       _writeError = q.error;
-      await _mutateQueue(current => { const saved = current.find(entry => entry.id === q.id); if (saved) Object.assign(saved, {state: q.state, error: q.error, attempts: q.attempts, delivery_uncertain:!!q.delivery_uncertain}); });
+      await _mutateQueue(current => { const saved = current.find(entry => entry.id === q.id); if (saved) Object.assign(saved, {state: q.state, error: q.error, attempts: q.attempts, delivery_uncertain:!!q.delivery_uncertain, checking_since:q.checking_since || 0}); });
       failedResources.add(q.url);
       item.status = q.delivery_uncertain ? 'checking' : 'failed';
       item.label += ' — ' + q.error;
@@ -2898,11 +2898,43 @@ function _outboxUncertainMessage(q) {
 const _OUTBOX_CONFIRM_TIMEOUT_MS = 10 * 60 * 1000;
 async function _outboxConfirmMessage(q, opts) {
   q.delivery_uncertain = true;
-  // If we have been checking for longer than the timeout, give up and mark
-  // the item as blocked so the user can dismiss or force-retry. The infinite
-  // loop was costing screen real estate and sync capacity for 50+ minutes
-  // (Ethan 2026-09-14 incident).
-  const checkingSince = q.attempted_at || q.timestamp || Date.now();
+  // Counted from when THIS entry began being re-checked, not from when it was
+  // queued: an entry restored after days offline has not been checked for
+  // days, and its first read may well confirm it.
+  q.checking_since ||= Date.now();
+  const checkingSince = q.checking_since;
+  // AMUX-4594: the text lets the server settle a reservation no live send owns
+  // from the lane transcript. A steering row has no typed prompt to match.
+  let text = '';
+  try { text = /\/steer$/.test(q.url) ? '' : String(JSON.parse(q.options?.body || '{}').text || ''); } catch (_) {}
+  const msgId = (/\/steer$/.test(q.url) ? 'steer:' : '') + _outboxMessageId(q);
+  const url = q.url.replace(/\/(send|steer)$/, '/send') + '?msg_id=' + encodeURIComponent(msgId)
+    + (text && text.length <= 2000 ? '&text=' + encodeURIComponent(text) : '');
+  const response = await _boundedMutationFetch(url, {method:'GET', headers:opts.headers, cache:'no-store'});
+  const receipt = response.ok ? await response.json() : null;
+  const confirmed = receipt?.accepted === true && receipt.msg_id === msgId && typeof receipt.id === 'string' && !!receipt.id;
+  _outboxDiagnostic('acceptance_recheck', {id:q.id, measured:response.ok, n_considered:1, confirmed, status:response.status});
+  if (confirmed) {
+    _outboxDiagnostic('acceptance_recovered', {id:q.id, measured:true, n_considered:1});
+    return new Response(JSON.stringify({ok:true,deduped:true,id:receipt.id}), {status:200,headers:{'Content-Type':'application/json'}});
+  }
+  if (receipt?.released === true && receipt.msg_id === msgId) {
+    // The server showed the text never reached the worker and released the
+    // identity (AMUX-4594). Send it once with the SAME msg_id, so a repeat
+    // still dedups.
+    Object.assign(q, {delivery_uncertain:false, state:'pending', error:'', checking_since:0});
+    _outboxDiagnostic('acceptance_released', {id:q.id, measured:true, n_considered:1});
+    return _boundedMutationFetch(q.url, opts);
+  }
+  if (receipt?.stranded === true && receipt.delivered === 'unknown' && receipt.msg_id === msgId) {
+    // Nothing owns the reservation and amux has no evidence either way, so the
+    // person decides instead of the tab checking forever (AMUX-4594).
+    Object.assign(q, {delivery_uncertain:false, error:''});
+    _outboxDiagnostic('acceptance_unknown', {id:q.id, measured:false, n_considered:1});
+    throw Object.assign(new Error('Not confirmed and amux cannot check: look at the worker, then resend or dismiss'), {outboxBlocked:true});
+  }
+  // Still pending. The fallback from ba203699 stands: past the timeout, stop
+  // auto-checking and let the person decide (Ethan 2026-09-14 incident).
   if (Date.now() - checkingSince > _OUTBOX_CONFIRM_TIMEOUT_MS) {
     _outboxDiagnostic('acceptance_timed_out', {id:q.id, measured:true, n_considered:1,
       age_min:Math.round((Date.now() - checkingSince) / 60000)});
@@ -2911,15 +2943,7 @@ async function _outboxConfirmMessage(q, opts) {
       new Error('Confirmation timed out after ' + Math.round((Date.now() - checkingSince) / 60000) + 'm. Dismiss or retry.'),
       {outboxBlocked:true});
   }
-  const msgId = (/\/steer$/.test(q.url) ? 'steer:' : '') + _outboxMessageId(q);
-  const url = q.url.replace(/\/(send|steer)$/, '/send') + '?msg_id=' + encodeURIComponent(msgId);
-  const response = await _boundedMutationFetch(url, {method:'GET', headers:opts.headers, cache:'no-store'});
-  const receipt = response.ok ? await response.json() : null;
-  const confirmed = receipt?.accepted === true && receipt.msg_id === msgId && typeof receipt.id === 'string' && !!receipt.id;
-  _outboxDiagnostic('acceptance_recheck', {id:q.id, measured:response.ok, n_considered:1, confirmed, status:response.status});
-  if (!confirmed) throw Object.assign(new Error('Awaiting confirmation — checking automatically'), {outboxUncertain:true});
-  _outboxDiagnostic('acceptance_recovered', {id:q.id, measured:true, n_considered:1});
-  return new Response(JSON.stringify({ok:true,deduped:true,id:receipt.id}), {status:200,headers:{'Content-Type':'application/json'}});
+  throw Object.assign(new Error('Awaiting confirmation — checking automatically'), {outboxUncertain:true});
 }
 
 // Queue modal
@@ -10797,7 +10821,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.947';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.948';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.

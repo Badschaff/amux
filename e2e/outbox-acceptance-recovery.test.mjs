@@ -26,7 +26,7 @@ test('legacy uncertain send resumes automatic confirmation after reload, without
  assert.equal(h.queue.length,1);assert.equal(h.patches.at(-1).phase,'unknown');assert.equal(h.patches.at(-1).measured,false);
  const restored=harness(JSON.parse(JSON.stringify(h.queue)),[accepted]);await restored.drain();
  assert.equal(restored.queue.length,0);assert(h.requests.concat(restored.requests).every(r=>r.opts.method==='GET'));
- assert.equal(restored.requests[0].url,'/api/sessions/test-worker/send?msg_id=same-identity');
+ assert.equal(restored.requests[0].url,'/api/sessions/test-worker/send?msg_id=same-identity&text=continue');
  assert(restored.signals.some(s=>s.kind==='acceptance_recovered'&&s.measured===true));
 });
 test('fresh uncertain response retries reads, preserving identity and later queued sends',async()=>{
@@ -48,4 +48,33 @@ test('unkeyed uncertain message and unrelated refused edits stay blocked',async(
 test('steering confirmations use the server transport namespace',async()=>{
  const h=harness([pending({url:'/api/sessions/test-worker/steer',delivery_uncertain:true})],[{status:200,body:{accepted:true,msg_id:'steer:same-identity',id:'steering-row'}}]);
  await h.drain();assert.equal(h.queue.length,0);assert.equal(h.requests[0].url,'/api/sessions/test-worker/send?msg_id=steer%3Asame-identity');assert.equal(h.requests[0].opts.method,'GET');
+});
+test('a released reservation is sent once with the same identity (AMUX-4594)',async()=>{
+ const h=harness([pending({delivery_uncertain:true})],[{status:200,body:{accepted:false,released:true,delivered:false,msg_id:'same-identity'}},{status:200,body:{ok:true,deduped:true,id:'sent-1'}}]);
+ await h.drain();
+ assert.equal(h.queue.length,0);
+ assert.deepEqual(h.requests.map(r=>r.opts.method),['GET','POST']);
+ assert.equal(JSON.parse(h.requests[1].opts.body).msg_id,'same-identity');
+ assert(h.signals.some(s=>s.kind==='acceptance_released'&&s.measured===true));
+});
+test('an unknown stranded reservation asks the person instead of checking forever (AMUX-4594)',async()=>{
+ const h=harness([pending({state:'blocked',error:'409: previous message acceptance is uncertain'})],[{status:200,body:{accepted:false,stranded:true,delivered:'unknown',msg_id:'same-identity'}}]);
+ await h.drain();
+ assert.equal(h.queue.length,1);assert.equal(h.queue[0].state,'blocked');assert.match(h.queue[0].error,/cannot check/);
+ await h.drain();assert.equal(h.requests.length,1,'no further reads or sends once it is the person\'s call');
+ assert(h.signals.some(s=>s.kind==='acceptance_unknown'));
+});
+test('an uncertain send is still re-checked when a quiet sync runs beside it (d69efdef, AMUX-4594)',async()=>{
+ const h=harness([pending({delivery_uncertain:true})],[waiting]);
+ await h.drain();
+ assert.equal(h.requests.length,1,'the stuck send was read again');
+ assert.equal(h.requests[0].opts.method,'GET');
+ assert.equal(h.queue.length,1);assert.equal(h.patches.at(-1).phase,'unknown');
+});
+test('a send still pending after ten minutes of checking goes to the person (ba203699)',async()=>{
+ const h=harness([pending({delivery_uncertain:true,checking_since:Date.now()-11*60000})],[waiting]);
+ await h.drain();
+ assert.equal(h.requests.length,1,'the verdict is read before giving up');
+ assert.equal(h.queue.length,1);assert.equal(h.queue[0].state,'blocked');assert.match(h.queue[0].error,/timed out/);
+ assert(h.signals.some(s=>s.kind==='acceptance_timed_out'));
 });
