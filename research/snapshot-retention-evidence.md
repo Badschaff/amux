@@ -102,3 +102,104 @@ changed. These limits must remain on AF-790 before any full-card closure claim.
 This is bounded source/evidence work. Full CI, final production behavior, and
 originating-session agreement remain separate gates. AF-790's ledger entry
 must not be retired solely on this correction or independent review.
+
+
+## Reclaim probe follow-up to 263f0bad
+
+The remaining reader gap is corrected in the follow-up: reclaim and autofix use
+one native listing parser/probe. The deadline covers process lifetime and stdout
+consumption, including a descendant retaining the pipe after its parent exits.
+Reads are nonblocking with a 1 MiB ceiling; failure paths kill/reap the owned
+child. Async reclaim handlers dispatch the bounded call off the executor.
+
+Unknown is preserved as a nullable count/list, with measurement metadata in the
+snapshot response and nullable persisted scan count. Scan completion records the
+final probe (rather than retaining the potentially different initial count).
+Purge responses retain unknown and explain it. No purge is invoked by these tests.
+The Disk Cleanup view shows unavailable snapshot status at desktop/phone widths.
+APP_VER and CACHE advance together to 0.9.940.
+
+`storage_snapshot_probe` logs measured/n_considered for every completed native
+attempt, with WARN and why_unmeasured for unavailable results. Deadline and output
+ceiling failures have separate diagnostic names. Historical stored zero counts
+cannot be retrospectively distinguished from the old reader's failures; these
+are not re-certified by the new reader. Backup age and destination absence
+remain unmeasured; this change does not infer either from snapshot count.
+
+Evidence is retained in scratch/af790-evidence/probe-*; final commands/results
+are recorded below once checks finish. This is a bounded instrumentation change,
+not originating storage-audit agreement, full CI, or permission to retire the
+original ledger entry.
+
+
+Follow-up failing controls and browser results:
+- `scripts/mutate.sh run` replacing the shared helper with exact263f's prior
+  helper, then `safe-cargo.sh test -p amux-server --lib
+  snapshot_probe_bounds_running_child_and_inherited_stdout -- --nocapture`:
+  compiled, 0 passed/1 failed on the inherited stdout operand. Exit101;
+  byte-scoped trap restored the source hash.
+- Mutation adding `.or(Some(0))` to the actual snapshot payload's count:
+  `safe-cargo.sh test -p amux-server --lib
+  snapshot_response_never_turns_failed_measurement_into_zero -- --nocapture`:
+  compiled, 0 passed/1 failed (unknown mislabeled measured). Exit101;
+  byte-scoped trap restored source hash.
+- `playwright test --config=scratch/af790-browser.config.ts
+  reclaim-snapshot-context.spec.ts`: 6 passed on desktop/mobile/WebKit,
+  positive and unavailable listings. Actual app SHA256
+  3a9335151eb71564283a07c9c2a8a960eb63be21439240f87fef3b7c808892d9.
+  Three unavailable-state screenshots opened: note readable and in viewport.
+  The exact263f app fails the same mobile unavailable case because no warning
+  is rendered. The private API binary remains5af; all reclaim API requests
+  are stubbed GET-only. This is neither native Simulator nor new Rust API proof.
+- JS syntax and state bundle freshness exit0; SPA lint0errors/48existingwarnings.
+- Read-only production bracket after publishing263f still reads5af2526fb60d,
+  build8b5f92f8f904ecee,25snapshots. No adoption proof inferred from that result.
+
+
+The first expanded storage group returned20passed/1failed: the new log assertion
+captured an empty buffer under concurrent process-wide tracing callsite changes.
+The assertion now runs in an exact-name child of the test binary, retaining both
+unknown/WARN and measured/INFO controls; the parent requires a successful
+nonempty one-test result. This avoids mutating process environment/subscribers
+shared with other test cases. That isolated log control passed in the next
+four-thread storage run. That run instead failed a timing assertion in the size
+fixture: a long shell echo loop was an unsuitable way to require a byte ceiling
+before a deadline. The final fixture uses finite `/bin/dd` streams (128 KiB
+succeeds, 2 MiB must be rejected by the 1 MiB ceiling), so without the ceiling
+the second stream can finish and return bytes. The probe drains available data
+without sleeping between successful reads; it sleeps only when no data progressed.
+
+
+A final caller search also found the same blanket "until they are thinned"
+claim in disk_watch's critical-pressure WARN. Its text is now qualified in the
+same way; thresholds, severity and dispatch remain unchanged. This is a log-text
+correction, not a new pressure detector or proof of backup destination absence.
+The autofix source-scan control was updated for its actual remaining local
+subprocess (du_one); shared snapshot helper behavior stays covered by the native
+runtime tests. Its prior expectation of two local helper call sites failed
+135passed/1failed/1ignored after the helper moved, before the control was updated.
+
+
+Final author checks for the follow-up:
+- `scripts/safe-cargo.sh test -p amux-server --lib runtime_jobs::storage::tests -- --test-threads=4`:21passed/0failed.
+- Same command, `runtime_jobs::autofix::tests`:136passed/0failed/1ignored.
+- Same command, `api::reclaim::tests`:17passed/0failed.
+- Same command, `runtime_jobs::disk_watch::tests`:22passed/0failed.
+- `scripts/safe-cargo.sh check --workspace`:exit0; workspace/all-target Clippy with `-D warnings`:exit0.
+These are focused groups, not a full-server or CI claim. The final commit hook
+and clean snapshot gates are recorded on AF-790 separately.
+
+
+Integration: source14342f70 is applied over published9e7582f8, which is a direct
+child of263f0bad. The upstream MDAI path fix is preserved. Both branches had
+selected940, so integration advances APP_VER/CACHE to941. No other manual
+semantic resolution. A fresh authenticated health/disk identity bracket showed
+live9e7582f8/build9db97c9cec77471c, matching its installed binary and receipt.
+The earlier suspected receipt mismatch was disproved; no publication-seam defect
+is inferred from comparing that image with an older5af health sample.
+
+Integration self-tests: storage21/0,reclaim17/0,upstream MDAI dashboard asset
+guard1/0, browser6/0 desktop/mobile/WebKit, state freshness exit0 and SPA lint
+0errors/48existingwarnings. Latest integrated mobile/desktop unavailable-state
+screenshots opened and legible. Eight strict Git-blob comparisons preserve the
+authored Rust/test files and upstream API/static-file/asset-guard files.

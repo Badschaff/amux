@@ -4807,95 +4807,18 @@ fn disk_candidates(home: &std::path::Path) -> Vec<std::path::PathBuf> {
     v
 }
 
-/// Count APFS local snapshots. **This is the instrument that was missing.**
-/// On 2026-08-10 roughly 450GB was deleted and free space moved by 8GB, because
-/// 24 hourly Time Machine snapshots were pinning every deleted block. Without
-/// this number in the evidence, the only available conclusion is "we deleted
-/// the wrong things" and the next action is deleting more of the right ones,
-/// which also does nothing. Snapshots are purgeable by macOS under pressure and
-/// thinnable with `tmutil`, so this line turns an unexplainable non-recovery
-/// into a one-command fix.
-/// Run a short subprocess with a wall-clock ceiling, killing AND reaping it on
-/// overrun.
-///
-/// Exists because `du_one` was the only bounded subprocess in this file and the
-/// bound was written into its body, so the next subprocess added here inherited
-/// nothing (AF-97). `tmutil` was that next one. Reaping matters for the same
-/// reason it does in `du_one`: an unreaped child is a zombie holding the very
-/// FDs the neighbouring `detect_fd` detector counts, so an unbounded probe here
-/// makes the detector beside it report pressure that the probe itself caused.
-fn bounded_output(program: &str, args: &[&str], budget: std::time::Duration) -> Option<Vec<u8>> {
-    let deadline = std::time::Instant::now() + budget;
-    let mut child = std::process::Command::new(program)
-        .args(args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    loop {
-        match child.try_wait() {
-            Ok(Some(st)) => {
-                let out = child.wait_with_output().ok()?;
-                return st.success().then_some(out.stdout);
-            }
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    // WARN, not debug: unlike du's per-path skips this is one
-                    // line per tick at most, and a `tmutil` that stops answering
-                    // is a real machine fault worth seeing in a log sweep.
-                    tracing::warn!(
-                        program,
-                        budget_s = budget.as_secs_f64(),
-                        "autofix: subprocess exceeded its budget and was killed — \
-                         the value it would have produced is reported as absent, not as zero"
-                    );
-                    return None;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(_) => return None,
-        }
-    }
-}
+// Keep the original deadline/parser regressions on the shared implementation
+// used by both the detector and reclaim; count alone does not prove causality.
+#[cfg(test)]
+use super::storage::bounded_output;
 
+#[cfg(test)]
 fn parse_local_snapshot_count(stdout: &[u8]) -> Option<usize> {
-    let mut lines = std::str::from_utf8(stdout)
-        .ok()?
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty());
-    let header = lines.next()?;
-    if !header.starts_with("Snapshots for ") || !header.ends_with(':') {
-        return None;
-    }
-    // A recognized empty listing is zero. Empty stdout, localized/changed
-    // formats and unexpected diagnostics are unmeasured, even after exit 0.
-    let mut count = 0;
-    for line in lines {
-        if line
-            .strip_prefix("com.apple.TimeMachine.")
-            .is_none_or(str::is_empty)
-        {
-            return None;
-        }
-        count += 1;
-    }
-    Some(count)
+    super::storage::parse_local_snapshots(stdout).map(|v| v.len())
 }
 
 fn local_snapshot_count() -> Option<usize> {
-    // 5s: `tmutil listlocalsnapshots /` answers in well under a second on a
-    // healthy machine. It talks to backupd, so a wedged Time Machine can hang it
-    // indefinitely — and before AF-97 that hang had no ceiling at all, on a
-    // thread that was also holding the SQLite store lock.
-    let stdout = bounded_output(
-        "/usr/bin/tmutil",
-        &["listlocalsnapshots", "/"],
-        std::time::Duration::from_secs(5),
-    )?;
-    parse_local_snapshot_count(&stdout)
+    super::storage::local_snapshots().map(|v| v.len())
 }
 
 fn disk_snapshot_evidence(snaps: Option<usize>) -> Vec<(String, String)> {
@@ -8726,7 +8649,7 @@ mod tests {
     fn every_blocking_subprocess_here_goes_through_a_bounded_helper() {
         let src = include_str!("autofix.rs");
         let prod = src.split("\nmod tests").next().unwrap_or(src);
-        const ALLOWED: [&str; 2] = ["du_one", "bounded_output"];
+        const ALLOWED: [&str; 1] = ["du_one"];
 
         let mut current = "<file scope>";
         let mut offenders: Vec<(usize, &str)> = Vec::new();
@@ -8762,7 +8685,9 @@ mod tests {
         let src = include_str!("autofix.rs");
         let prod = src.split("\nmod tests").next().unwrap_or(src);
         let n = prod.matches("std::process::Command::new").count();
-        assert!(n >= 2, "scan found {n} blocking subprocess call sites, expected at least the two bounded helpers — the pattern has drifted from the code");
+        // The native snapshot probe moved to storage.rs; its shared helper
+        // is exercised by the deadline/output tests below and storage's tests.
+        assert!(n >= 1, "scan found {n} blocking subprocess call sites, expected at least du_one — the pattern has drifted from the code");
     }
 
     /// AF-97. `bounded_output` must return on ITS deadline, not the command's.

@@ -10631,7 +10631,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.940';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.941';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -37507,7 +37507,15 @@ function _reclaimRender() {
 
   // Snapshot warning: the thing that makes cleanup look broken.
   const snapFinding = findings.find(f => f.category === 'snapshot');
-  if (snapFinding) {
+  if (scan.snapshot_count == null) {
+    html += `<div class="reclaim-warn">
+      <div style="font-weight:600;margin-bottom:4px;">Local snapshot status unavailable</div>
+      <div style="font-size:0.78rem;line-height:1.55;">
+        The scan could not measure local snapshots. This does not mean there are none.
+        Remeasure backup status and free space before deciding on further deletion.
+      </div>
+    </div>`;
+  } else if (snapFinding) {
     html += `<div class="reclaim-warn">
       <div style="font-weight:600;margin-bottom:4px;">${scan.snapshot_count} local snapshots observed</div>
       <div style="font-size:0.78rem;line-height:1.55;">

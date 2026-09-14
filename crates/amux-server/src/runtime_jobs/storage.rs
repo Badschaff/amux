@@ -118,6 +118,113 @@ pub(crate) fn apfs_snapshot_note(n: usize) -> String {
     )
 }
 
+
+/// Bound both child lifetime and stdout consumption. A child can exit while a
+/// descendant still holds its stdout open, so wait_with_output after try_wait
+/// is not a deadline. Nonblocking reads also prevent a full pipe deadlock.
+pub(crate) fn bounded_output(program: &str, args: &[&str], budget: std::time::Duration) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::process::{Command, Stdio};
+    let deadline = std::time::Instant::now() + budget;
+    let mut child = Command::new(program).args(args).stdout(Stdio::piped())
+        .stderr(Stdio::null()).spawn().ok()?;
+    let result = (|| {
+        let mut stdout = child.stdout.take()?;
+        let fd = stdout.as_raw_fd();
+        // The owned pipe remains alive throughout these calls.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return None;
+        }
+        let mut output = Vec::new();
+        let mut eof = false;
+        let mut status = None;
+        loop {
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!(program, budget_s = budget.as_secs_f64(),
+                    "storage_probe_timeout: subprocess or stdout exceeded its budget; measurement unknown");
+                return None;
+            }
+            let mut progressed = false;
+            if !eof {
+                let mut buf = [0; 8192];
+                match stdout.read(&mut buf) {
+                    Ok(0) => eof = true,
+                    Ok(n) => {
+                        progressed = true;
+                        output.extend_from_slice(&buf[..n]);
+                        if output.len() > 1024 * 1024 {
+                            tracing::warn!(program, "storage_probe_output_limit: measurement unknown");
+                            return None;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {},
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => return None,
+                }
+            }
+            if status.is_none() { status = child.try_wait().ok()?; }
+            if let Some(status) = status {
+                if !status.success() { return None; }
+                if eof { return Some(output); }
+            }
+            if !progressed {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    })();
+    // Reap on every exit, including I/O errors and deadline/size failures.
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+pub(crate) fn parse_local_snapshots(stdout: &[u8]) -> Option<Vec<String>> {
+    let mut lines = std::str::from_utf8(stdout)
+        .ok()?
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty());
+    let header = lines.next()?;
+    if !header.starts_with("Snapshots for ") || !header.ends_with(':') {
+        return None;
+    }
+    // A recognized empty listing is zero. Empty stdout, localized/changed
+    // formats and unexpected diagnostics are unmeasured, even after exit 0.
+    let mut snapshots = Vec::new();
+    for line in lines {
+        if line
+            .strip_prefix("com.apple.TimeMachine.")
+            .is_none_or(str::is_empty)
+        {
+            return None;
+        }
+        snapshots.push(line.to_owned());
+    }
+    Some(snapshots)
+}
+
+
+pub(crate) const SNAPSHOT_UNMEASURED: &str = "Local snapshot retention is unmeasured: the probe did not return a successful recognized listing (unsupported platform/output, command failure, or timeout). Do not infer that snapshots are absent or that deleting them is necessary.";
+
+pub(crate) fn local_snapshots() -> Option<Vec<String>> {
+    probe_local_snapshots("/usr/bin/tmutil", &["listlocalsnapshots", "/"], std::time::Duration::from_secs(5))
+}
+
+fn probe_local_snapshots(program: &str, args: &[&str], budget: std::time::Duration) -> Option<Vec<String>> {
+    let snapshots = bounded_output(program, args, budget)
+        .and_then(|stdout| parse_local_snapshots(&stdout));
+    let measured = snapshots.is_some();
+    let n_considered = snapshots.as_ref().map_or(0, Vec::len);
+    if measured {
+        tracing::info!(measured, n_considered, "storage_snapshot_probe");
+    } else {
+        tracing::warn!(measured, n_considered, why_unmeasured = SNAPSHOT_UNMEASURED, "storage_snapshot_probe");
+    }
+    snapshots
+}
+
 /// Default tick: hourly. Retention is not time-critical; the only thing that
 /// matters is that it happens without traffic.
 pub const STORAGE_TICK_SECS: u64 = 3600;
@@ -1258,6 +1365,77 @@ pub fn routes() -> axum::Router<AppState> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failed_snapshot_probe_logs_unknown_and_positive_control_logs_measured() {
+        // Tracing callsite interest is process-wide. Other tests concurrently
+        // installing subscribers must not decide whether this control logs.
+        if std::env::var_os("AMUX_TEST_SNAPSHOT_LOG_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "runtime_jobs::storage::tests::failed_snapshot_probe_logs_unknown_and_positive_control_logs_measured", "--nocapture"])
+                .env("AMUX_TEST_SNAPSHOT_LOG_CHILD", "1")
+                .output().unwrap();
+            assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        for (script, measured) in [("exit 0", false), ("echo 'Snapshots for disk /:'", true)] {
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            let writer = Writer(bytes.clone());
+            let subscriber = tracing_subscriber::fmt().with_ansi(false).without_time()
+                .with_writer(move || writer.clone()).finish();
+            let result = tracing::subscriber::with_default(subscriber, ||
+                super::probe_local_snapshots("/bin/sh", &["-c", script], std::time::Duration::from_secs(1)));
+            assert_eq!(result.is_some(), measured);
+            let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+            assert!(logs.contains("storage_snapshot_probe"), "{logs}");
+            assert!(logs.contains(&format!("measured={measured}")), "{logs}");
+            assert!(logs.contains("n_considered=0"), "{logs}");
+            if !measured {
+                assert!(logs.contains("WARN") && logs.contains("why_unmeasured="), "{logs}");
+            }
+        }
+    }
+
+    #[test]
+    fn native_snapshot_probe_preserves_zero_unknown_and_positive() {
+        let budget = std::time::Duration::from_secs(2);
+        assert_eq!(super::probe_local_snapshots("/bin/echo", &["Snapshots for disk /:"], budget), Some(vec![]));
+        assert_eq!(super::probe_local_snapshots("/bin/echo", &["Snapshots for disk /:\ncom.apple.TimeMachine.example.local"], budget), Some(vec!["com.apple.TimeMachine.example.local".into()]));
+        for script in ["exit 0", "echo 'Snapshots for disk /:'; exit 1", "echo diagnostic"] {
+            assert_eq!(super::probe_local_snapshots("/bin/sh", &["-c", script], budget), None, "{script}");
+        }
+        assert_eq!(super::probe_local_snapshots("/no/such/amux-probe", &[], budget), None);
+    }
+
+    #[test]
+    fn snapshot_probe_bounds_running_child_and_inherited_stdout() {
+        for script in ["exec /bin/sleep 5", "/bin/sleep 1 & exit 0"] {
+            let start = std::time::Instant::now();
+            assert_eq!(super::probe_local_snapshots("/bin/sh", &["-c", script], std::time::Duration::from_millis(150)), None);
+            assert!(start.elapsed() < std::time::Duration::from_millis(900), "probe outlived its own deadline: {script}");
+        }
+    }
+
+    #[test]
+    fn bounded_probe_drains_more_than_a_pipe_buffer_and_limits_output() {
+        let budget = std::time::Duration::from_secs(5);
+        // Finite deterministic byte streams. Without the ceiling the second
+        // command succeeds with 2 MiB, rather than hitting a separate timeout.
+        let bytes = super::bounded_output("/bin/dd", &["if=/dev/zero", "bs=65536", "count=2"], budget).unwrap();
+        assert_eq!(bytes.len(), 131072);
+        assert_eq!(super::bounded_output("/bin/dd", &["if=/dev/zero", "bs=65536", "count=32"], budget), None);
+    }
+
     use super::*;
 
     fn mem() -> Connection {
