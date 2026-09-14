@@ -216,17 +216,21 @@
 
   /* Archived sessions */
   #archived-section { padding: 0 12px 12px; }
+  /* Paused sits directly above Archived, below the worker cards (Ethan,
+     2026-09-14), so it takes Archived's side padding and spaces itself from the
+     cards above rather than below. */
+  #paused-section { padding: 0 12px; }
   .paused-footer {
     display: flex; align-items: center; gap: 8px;
     padding: 9px 12px; border-radius: 8px; cursor: pointer;
     border: 1px solid #d29922; color: #d29922;
-    font-size: 0.82rem; font-weight: 600; user-select: none; margin-bottom: 8px;
+    font-size: 0.82rem; font-weight: 600; user-select: none; margin-top: 8px;
     background: var(--card);
   }
   .paused-footer:hover { border-color: #e5a825; }
   .paused-chevron { font-size: 0.65rem; transition: transform 0.15s; color: #d29922; }
   .paused-chevron.open { transform: rotate(90deg); }
-  .paused-body { margin-bottom: 6px; display: flex; flex-direction: column; gap: 5px; }
+  .paused-body { margin-top: 6px; display: flex; flex-direction: column; gap: 5px; }
   .paused-card {
     display: flex; flex-direction: column; gap: 4px;
     padding: 8px 11px; border-radius: 8px; border: 1px solid color-mix(in srgb, #d29922 40%, var(--border));
