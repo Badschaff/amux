@@ -445,7 +445,7 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
 
     tm.mark(&out, "9. fire-alarm reachability");
 
-    // -- N. Nonterminal cards have a disposition (next_action).
+    // -- N. Nonterminal cards record what moves them, per status (AMUX-4540).
     match state.store.read() {
         Err(_) => {
             out.push(InvariantResult::unknown(
@@ -456,7 +456,12 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
         Ok(conn) => {
             let rows: Vec<checks::DispositionRow> = conn
                 .prepare(
-                    "SELECT id, status, next_action, session, COALESCE(type,'code') \
+                    "SELECT id, status, next_action, session, COALESCE(type,'code'), \
+                            COALESCE(NULLIF(TRIM(ask_question),''), NULLIF(TRIM(decision_question),'')), \
+                            reviewer, \
+                            COALESCE(NULLIF(TRIM(blocked_on),''), NULLIF(TRIM(waiting_on),'')), \
+                            COALESCE(TRIM(depends_on),'') NOT IN ('', '[]'), \
+                            callback_session \
                      FROM issues WHERE deleted IS NULL AND COALESCE(archived,0) = 0",
                 )
                 .and_then(|mut stmt| {
@@ -467,6 +472,11 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
                             next_action: r.get(2)?,
                             session: r.get(3)?,
                             item_type: r.get(4)?,
+                            ask: r.get(5)?,
+                            reviewer: r.get(6)?,
+                            waiting_on: r.get(7)?,
+                            has_dependency: r.get(8)?,
+                            callback_session: r.get(9)?,
                         })
                     })
                     .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
