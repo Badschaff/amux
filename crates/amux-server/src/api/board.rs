@@ -2172,6 +2172,27 @@ fn actor_from_headers(headers: &HeaderMap) -> (Actor, String) {
 /// Rides through slim on purpose: it is NOT in `SLIM_OMITS`, because a
 /// liveness verdict that disappears from the list payload is worse than one
 /// that was never there — `row.get("live")` returning None reads as an answer.
+/// RR-0052: who holds this card and how fresh the holding is, as one object on
+/// every row that carries a lease (absent otherwise, so "no lease" and "lease
+/// with a null field" never read the same). Kept OUT of `snapshot_fields` on
+/// purpose: that is the replay/journal snapshot, and a heartbeat moving every
+/// minute is not a card change the journal should see.
+fn designate_lease(obj: &mut serde_json::Map<String, Value>, row: &IssueRow) {
+    let Some(holder) = row.lease_owner.as_deref().filter(|h| !h.is_empty()) else {
+        return;
+    };
+    obj.insert(
+        "lease".into(),
+        json!({
+            "holder": holder,
+            "acquired_at": row.lease_acquired_at,
+            "heartbeat_at": row.lease_heartbeat_at,
+            "expires_at": row.lease_expires_at,
+            "generation": row.lease_generation,
+        }),
+    );
+}
+
 fn designate_live_state(obj: &mut serde_json::Map<String, Value>, row: &IssueRow) {
     let (live, reason) = live_state(row);
     obj.insert("live".into(), json!(live));
@@ -2230,6 +2251,7 @@ fn detail_body(row: &IssueRow) -> Value {
         // liveness verdict too, or a consumer that fetches one card gets a
         // different contract from one that lists.
         designate_live_state(obj, row);
+        designate_lease(obj, row);
     }
     v
 }
@@ -2824,6 +2846,7 @@ pub fn list_body(row: &IssueRow, slim: bool, stale: bool) -> Value {
     // `detail_body` above, which is also the function the single-card GET calls.
     if slim {
         designate_owner_reach(obj, row);
+        designate_lease(obj, row);
     }
     // BOTH paths, unlike designate_owner_reach above: the full branch gets its
     // owner-reach fields inside detail_body, but liveness is inserted here so
@@ -3622,10 +3645,17 @@ pub async fn list_board(
         } else {
             Default::default()
         };
-        Ok((kept, term_total, term_kept, working))
+        // RR-0052: the running attempt number for leased rows, one query over
+        // the running set, only when a leased row is in the page at all.
+        let attempt_nums = if kept.iter().any(|r| r.lease_owner.is_some()) {
+            crate::db::attempts::running_attempt_numbers(&conn).unwrap_or_default()
+        } else {
+            Default::default()
+        };
+        Ok((kept, term_total, term_kept, working, attempt_nums))
     })
     .await;
-    let (kept, term_total, term_kept, working) = match joined {
+    let (kept, term_total, term_kept, working, attempt_nums) = match joined {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => return internal(e),
         Err(e) => return internal(e),
@@ -3721,7 +3751,13 @@ pub async fn list_board(
 
     let items: Vec<Value> = page
         .iter()
-        .map(|r| list_body(r, slim, is_stale(r, now, &working)))
+        .map(|r| {
+            let mut v = list_body(r, slim, is_stale(r, now, &working));
+            if let (Some(n), Some(lease)) = (attempt_nums.get(&r.id), v.get_mut("lease")) {
+                lease["attempt"] = json!(n);
+            }
+            v
+        })
         .collect();
 
     let mut headers = HeaderMap::new();
@@ -5024,11 +5060,12 @@ pub async fn get_item(
         }).collect::<Vec<_>>();
         let verified_gate = bs::effective_gate_trail(&conn, &row, TaskStatus::Verified, &groups);
         let verification = crate::db::verification_store::coverage(&conn, &row, &verified_gate.criteria)?;
-        Ok(Some((row, children, messages, artifacts, asset_links, gate_requirements, verification)))
+        let attempts = crate::db::attempts::list_for_card(&conn, &row.id)?;
+        Ok(Some((row, children, messages, artifacts, asset_links, gate_requirements, verification, attempts)))
     })
     .await;
     match joined {
-        Ok(Ok(Some((row, children, messages, artifacts, asset_links, gate_requirements, verification)))) => {
+        Ok(Ok(Some((row, children, messages, artifacts, asset_links, gate_requirements, verification, attempts)))) => {
             // Weak ETag for read-modify-write callers (AMUX-1711 parity).
             let mut headers = HeaderMap::new();
             if let Ok(v) = format!("W/\"{}-{}\"", row.id, row.rev).parse() {
@@ -5041,6 +5078,13 @@ pub async fn get_item(
             body["asset_links"] = json!(asset_links);
             body["gate_requirements"] = json!(gate_requirements);
             body["verification"] = verification;
+            // RR-0052 Invariant 1: every holding of this card, oldest first.
+            if let Some(n) = attempts.iter().rev().find(|a| a.ended_at.is_none()).map(|a| a.attempt) {
+                if let Some(lease) = body.get_mut("lease") {
+                    lease["attempt"] = json!(n);
+                }
+            }
+            body["attempts"] = json!(attempts);
             (StatusCode::OK, headers, Json(body)).into_response()
         }
         Ok(Ok(None)) => not_found(&id),
@@ -11044,6 +11088,19 @@ pub async fn patch_item(
             }
             next.updated = now_secs();
             bs::save_patched(conn, &mut next)?;
+            // RR-0052 Invariant 1: the PATCH door is the other lease choke point.
+            // After the save, so a refusal above can never leave an attempt behind.
+            crate::db::attempts::record_lease_change(
+                conn,
+                &next.id,
+                row.lease_owner.as_deref(),
+                next.lease_owner.as_deref(),
+                next.lease_generation,
+                &next.status,
+                &actor_name,
+                body_str(&map, "reason").as_deref(),
+                now_secs(),
+            )?;
             if next.status == "verified" && (row.status != "verified" || map.get("reverify").and_then(Value::as_bool) == Some(true)) && !map.get("force").and_then(Value::as_bool).unwrap_or(false) {
                 let groups = next.session.as_deref().map(crate::api::session_verbs::lane_groups).unwrap_or_default();
                 let trail = bs::effective_gate_trail(conn, &next, TaskStatus::Verified, &groups);

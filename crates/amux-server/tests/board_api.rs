@@ -6097,3 +6097,67 @@ async fn capture_shell_frontier_and_status_claim_agree_with_patch() {
     assert_eq!(claim["claimed"], json!(true), "status update must agree with the frontier: {claim}");
     assert_eq!(claim["status"], json!("doing"));
 }
+
+// ---- RR-0052 Invariant 1: every holding of a card is a recorded attempt ----
+
+/// PATCH a status as `lane`, acking whatever gate the board names. The gate is
+/// not under test here; the lease and attempt bookkeeping around it is.
+async fn move_as(app: &axum::Router, id: &str, status: &str, lane: &str) -> Value {
+    let path = format!("/api/board/{id}");
+    // The continuation contract gates `doing`; supply it rather than let a host
+    // pref decide this test.
+    let body = if status == "doing" {
+        json!({ "status": status, "next_action": "Do the scoped work now" })
+    } else {
+        json!({ "status": status })
+    };
+    let (st, _, v) = send_with(app, "PATCH", &path, Some(body.clone()), &[("X-Amux-Session", lane)]).await;
+    if st == StatusCode::OK {
+        return v;
+    }
+    assert_eq!(st, StatusCode::CONFLICT, "unexpected refusal moving {id} to {status}: {v}");
+    let gate = v["gate"].clone();
+    assert!(gate.is_array(), "only a gate refusal is expected here: {v}");
+    let mut acked = body;
+    acked["gate_checked"] = gate;
+    let (st, _, v) = send_with(app, "PATCH", &path, Some(acked), &[("X-Amux-Session", lane)]).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    v
+}
+
+#[tokio::test]
+async fn each_claim_opens_an_attempt_and_each_exit_closes_it_with_an_outcome() {
+    let (app, _dir) = app();
+    let card = create(&app, json!({ "title": "attempted", "session": "lane-a",
+        "desc": "artifact: crates/amux-server/src/db/attempts.rs" })).await;
+    let id = card["id"].as_str().unwrap().to_string();
+
+    // Claim: a lease and a running attempt #1, on the list row and the detail.
+    move_as(&app, &id, "doing", "lane-a").await;
+    let (_, _, d) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert_eq!(d["lease"]["holder"], json!("lane-a"), "{d}");
+    assert_eq!(d["lease"]["attempt"], json!(1), "{d}");
+    assert_eq!(d["attempts"].as_array().unwrap().len(), 1);
+    assert!(d["attempts"][0]["outcome"].is_null(), "a running attempt has no outcome yet");
+    let (_, _, list) = send(&app, "GET", "/api/board", None).await;
+    let row = list.as_array().unwrap().iter().find(|r| r["id"] == json!(id)).unwrap().clone();
+    assert_eq!(row["lease"]["attempt"], json!(1), "the list row carries the same attempt: {row}");
+
+    // Released back to todo: attempt 1 closes as `released`, the lease is gone.
+    move_as(&app, &id, "todo", "lane-a").await;
+    // Claimed again and submitted: attempt 2 closes as `review`.
+    move_as(&app, &id, "doing", "lane-a").await;
+    move_as(&app, &id, "review", "lane-a").await;
+
+    let (_, _, d) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert!(d.get("lease").is_none(), "a card in review holds no lease: {d}");
+    let got: Vec<(i64, String, String)> = d["attempts"].as_array().unwrap().iter().map(|a| (
+        a["attempt"].as_i64().unwrap(),
+        a["worker"].as_str().unwrap().to_string(),
+        a["outcome"].as_str().unwrap_or("RUNNING").to_string(),
+    )).collect();
+    assert_eq!(got, vec![
+        (1, "lane-a".to_string(), "released".to_string()),
+        (2, "lane-a".to_string(), "review".to_string()),
+    ], "{d}");
+}

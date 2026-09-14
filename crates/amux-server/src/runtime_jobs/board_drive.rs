@@ -5723,6 +5723,10 @@ pub struct LeaseReaperReport {
     /// Process-lifetime heartbeat renewals from worker self-reports. Leases
     /// being granted while this stays 0 means the heartbeat path is broken.
     pub heartbeats_total: u64,
+    /// Running attempts closed as `orphaned` this tick: their card left its
+    /// lease through a path that bypassed both lease choke points. A steady
+    /// nonzero count names a bypass worth routing through `advance`.
+    pub attempts_orphaned: usize,
 }
 
 /// Why an expired lease is renewed or reclaimed. Pure so the rule has tests;
@@ -5794,6 +5798,34 @@ pub(crate) async fn reclaim_expired_leases<F: Fleet>(state: &AppState, fleet: &F
     };
     report.measured = true;
     report.n_considered = expired.len();
+    // Invariant 1 bookkeeping rides the reaper's tick: close running attempts
+    // whose card no longer holds a lease (raw-UPDATE hygiene discards, etc.).
+    let orphaned = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let orphaned_w = orphaned.clone();
+    match state
+        .store
+        .write_async(move |conn| {
+            let n = crate::db::attempts::reconcile_orphans(conn, now)?;
+            orphaned_w.store(n, std::sync::atomic::Ordering::Relaxed);
+            Ok(crate::db::WriteOutcome { applied: n > 0, events: vec![] })
+        })
+        .await
+    {
+        Ok(_) => {
+            report.attempts_orphaned = orphaned.load(std::sync::atomic::Ordering::Relaxed);
+            if report.attempts_orphaned > 0 {
+                tracing::warn!(
+                    target: "amux::board_drive", orphaned = report.attempts_orphaned,
+                    measured = true, verdict = "attempts_orphaned",
+                    "board_drive: running attempt(s) closed as orphaned; a card left its lease without passing a lease choke point (RR-0052)"
+                );
+            }
+        }
+        Err(error) => tracing::warn!(
+            target: "amux::board_drive", %error, measured = false, verdict = "attempt_reconcile_unmeasured",
+            "board_drive: could not reconcile orphaned attempts (RR-0052)"
+        ),
+    }
     for (card, owner, generation) in expired {
         let running = fleet.is_running(&owner).await;
         let at_boundary = if running { fleet.at_boundary(&owner).await } else { true };
@@ -5835,7 +5867,7 @@ pub(crate) async fn reclaim_expired_leases<F: Fleet>(state: &AppState, fleet: &F
                     )),
                     ..Default::default()
                 };
-                match crate::db::advance::advance(conn, &card_w, "todo", "amux:lease-reaper", &opts)? {
+                match crate::db::advance::advance(conn, &card_w, "todo", crate::db::attempts::LEASE_REAPER_ACTOR, &opts)? {
                     Ok(outcome) => {
                         // The audit row travels in the same transaction as the
                         // reclaim, so "why did my card leave doing" is answerable

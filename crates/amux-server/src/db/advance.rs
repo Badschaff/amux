@@ -96,6 +96,7 @@ pub fn advance(
     }
 
     let from_raw = row.status.clone();
+    let prev_holder = row.lease_owner.clone();
     let workflow = workflow_store::load_workflow(conn);
     let target_typed = bs::parse_status(destination);
 
@@ -107,6 +108,20 @@ pub fn advance(
     if let Err(refusal) = inner {
         return Ok(Err(refusal));
     }
+    // RR-0052 Invariant 1: the card is saved, so its lease change is real.
+    // Recorded in the same transaction, so an attempt and the lease it
+    // describes commit or roll back together.
+    crate::db::attempts::record_lease_change(
+        conn,
+        &row.id,
+        prev_holder.as_deref(),
+        row.lease_owner.as_deref(),
+        row.lease_generation,
+        &row.status,
+        actor,
+        opts.reason.as_deref().or(opts.log_line.as_deref()),
+        chrono::Utc::now().timestamp(),
+    )?;
 
     let to_raw = row.status.clone();
     let event = PendingEvent {
