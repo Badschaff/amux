@@ -289,6 +289,16 @@ pub const SPECS: &[SweepSpec] = &[
         env: "AMUX_SESSION_EVENTS_RETAIN_DAYS",
         default_days: 90.0,
     },
+    // ~1.8 KB per sample at a 300 s default interval: ~520 KB/day, ~15 MB at
+    // 30 days. Kept longer than the interaction log because a row is small and
+    // the question it answers ("when did the disk fill?") is asked weeks late.
+    SweepSpec {
+        table: "host_metrics",
+        ts_col: "ts",
+        unit: TsUnit::Secs,
+        env: "AMUX_HOST_METRICS_RETAIN_DAYS",
+        default_days: 30.0,
+    },
     // MILLISECONDS. The expensive one: 1,893 B/row (it stores `before`/`detail`/
     // `result` blobs), 3,236 rows/day. At 90d this single table would reach 524MB —
     // larger than the entire DB today — which is why it gets 14d and not the 90d

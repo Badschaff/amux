@@ -1362,6 +1362,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // -- metrics / usage / alerts / stats
     RouteEntry { path: "/api/metrics", methods: &["GET"] },
     RouteEntry { path: "/api/metrics/host", methods: &["GET"] },
+    RouteEntry { path: "/api/metrics/host/history", methods: &["GET"] },
     RouteEntry { path: "/api/metrics/fleet", methods: &["GET"] },
     RouteEntry { path: "/api/metrics/replay", methods: &["GET"] },
     RouteEntry { path: "/api/reclaim/scan", methods: &["GET", "POST"] },

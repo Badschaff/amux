@@ -17,6 +17,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", axum::routing::get(metrics))
         .route("/host", axum::routing::get(host))
+        .route("/host/history", axum::routing::get(host_history))
         .route("/fleet", axum::routing::get(fleet))
         .route("/replay", axum::routing::get(replay))
 }
@@ -63,7 +64,7 @@ async fn host() -> Response {
 /// to truncate mid-read), and no on-disk script at all. The script is ~10 KB —
 /// well under the OS pipe buffer — so writing it in full before reading stdout
 /// cannot deadlock.
-fn run_host_analysis() -> Result<serde_json::Value, String> {
+pub(crate) fn run_host_analysis() -> Result<serde_json::Value, String> {
     use std::io::Write;
     use std::process::{Command, Stdio};
     let bash = if std::path::Path::new("/bin/bash").exists() {
@@ -99,6 +100,109 @@ fn run_host_analysis() -> Result<serde_json::Value, String> {
     }
     serde_json::from_slice(&out.stdout)
         .map_err(|e| format!("host-analysis.sh output was not valid JSON: {e}"))
+}
+
+#[derive(serde::Deserialize)]
+pub struct HistoryQuery {
+    since_h: Option<f64>,
+    limit: Option<usize>,
+}
+
+/// GET /api/metrics/host/history — the recorded series behind
+/// /api/metrics/host: one row per sample of the same analysis, written by
+/// `runtime_jobs::host_metrics`.
+///
+/// Every host instrument amux had was a spot read, so "free disk fell 151 GB
+/// overnight, when?" had no answer (DESKT-39, 2026-09-15). This is that
+/// answer's source.
+///
+/// `unmeasured_samples` counts rows whose probe FAILED, and those rows are in
+/// `samples` with `measured: false` and `why_unmeasured`. A reader must be able
+/// to tell a quiet machine from a probe that never ran, which is the same
+/// contract the live endpoint carries (ethos rule 4). `interval_secs` travels
+/// with the answer so an empty window reads as "nothing sampled yet, samples
+/// land every N seconds" rather than as a flat zero.
+async fn host_history(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<HistoryQuery>,
+) -> Response {
+    let since_h = q.since_h.unwrap_or(24.0).clamp(0.0, 24.0 * 90.0);
+    let limit = q.limit.unwrap_or(500).clamp(1, 5000);
+    let cutoff = chrono::Utc::now().timestamp() - (since_h * 3600.0) as i64;
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(e) => {
+            return Json(crate::api::measured::unmeasured(
+                json!({}),
+                &format!("store unavailable: {e}"),
+            ))
+            .into_response()
+        }
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT ts, measured, why_unmeasured, cpu_count, load1, load_per_core, mem_total_mb, \
+         mem_used_mb, mem_percent, mem_pressure, swap_used_mb, swap_total_mb, disk_free_gb, \
+         disk_total_gb, proc_total FROM host_metrics WHERE ts >= ?1 ORDER BY ts DESC LIMIT ?2",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            return Json(crate::api::measured::unmeasured(
+                json!({}),
+                &format!("host_metrics unreadable: {e}"),
+            ))
+            .into_response()
+        }
+    };
+    let rows = stmt.query_map(rusqlite::params![cutoff, limit as i64], |r| {
+        Ok(json!({
+            "ts": r.get::<_, i64>(0)?,
+            "measured": r.get::<_, i64>(1)? != 0,
+            "why_unmeasured": r.get::<_, Option<String>>(2)?,
+            "cpu_count": r.get::<_, Option<i64>>(3)?,
+            "load1": r.get::<_, Option<f64>>(4)?,
+            "load_per_core": r.get::<_, Option<f64>>(5)?,
+            "mem_total_mb": r.get::<_, Option<f64>>(6)?,
+            "mem_used_mb": r.get::<_, Option<f64>>(7)?,
+            "mem_percent": r.get::<_, Option<f64>>(8)?,
+            "mem_pressure": r.get::<_, Option<String>>(9)?,
+            "swap_used_mb": r.get::<_, Option<f64>>(10)?,
+            "swap_total_mb": r.get::<_, Option<f64>>(11)?,
+            "disk_free_gb": r.get::<_, Option<f64>>(12)?,
+            "disk_total_gb": r.get::<_, Option<f64>>(13)?,
+            "proc_total": r.get::<_, Option<i64>>(14)?,
+        }))
+    });
+    let samples: Vec<serde_json::Value> = match rows {
+        Ok(it) => it.filter_map(|r| r.ok()).collect(),
+        Err(e) => {
+            return Json(crate::api::measured::unmeasured(
+                json!({}),
+                &format!("host_metrics query failed: {e}"),
+            ))
+            .into_response()
+        }
+    };
+    let unmeasured = samples
+        .iter()
+        .filter(|s| s.get("measured").and_then(|m| m.as_bool()) == Some(false))
+        .count();
+    let newest = samples.first().and_then(|s| s.get("ts").and_then(|t| t.as_i64()));
+    let oldest = samples.last().and_then(|s| s.get("ts").and_then(|t| t.as_i64()));
+    let n = samples.len();
+    Json(crate::api::measured::measured(
+        json!({
+            "since_h": since_h,
+            "limit": limit,
+            "interval_secs": crate::runtime_jobs::host_metrics::tick_secs(),
+            "sample_count": n,
+            "unmeasured_samples": unmeasured,
+            "newest_ts": newest,
+            "oldest_ts": oldest,
+            "samples": samples,
+        }),
+        n,
+    ))
+    .into_response()
 }
 
 /// GET /api/metrics/replay — audit replay (RR-0111a): fold the event journal

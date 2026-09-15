@@ -415,8 +415,13 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 72,
-        name: "0072_command_intake",
-        sql: include_str!("../../migrations/0072_command_intake.sql"),
+        name: "0072_host_metrics",
+        sql: include_str!("../../migrations/0072_host_metrics.sql"),
+    },
+    Migration {
+        version: 73,
+        name: "0073_command_intake",
+        sql: include_str!("../../migrations/0073_command_intake.sql"),
     },
 ];
 

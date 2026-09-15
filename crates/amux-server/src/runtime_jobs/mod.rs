@@ -62,6 +62,7 @@ pub mod disk_watch;
 pub(crate) mod executor;
 pub mod ghost_rescue;
 pub mod heartbeat;
+pub mod host_metrics;
 pub mod mac_health;
 mod memory_consumers;
 pub mod pane_size;

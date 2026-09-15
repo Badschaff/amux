@@ -365,9 +365,85 @@ async fn resolve_rel(method: Method, RawQuery(q): RawQuery) -> Response {
     // Containment rides the SAME deny sets as every other fs verb: a denied
     // candidate is treated as absent, so this endpoint cannot be used to
     // probe existence inside paths the Files surface refuses to serve.
-    let (resolved, exists, tried) =
-        resolve_rel_candidates(&cwd, &rel, &|p| is_path_allowed(p) && p.exists());
+    let allowed_exists = |p: &Path| is_path_allowed(p) && p.exists();
+    let (resolved, exists, mut tried) = resolve_rel_candidates(&cwd, &rel, &allowed_exists);
+    // AMUX-4661 (Ethan's screenshots, jobs.py "does not exist here"): the
+    // ancestor walk above only ever climbs — it cannot find a session
+    // registered at a SCAFFOLD directory one level above where the worker
+    // actually works (dir=ai-for-smbs, real repo at
+    // ai-for-smbs/smb-workspace), so a path printed from inside the nested
+    // repo (backend/connectors/jobs.py) never resolved. Try downward too,
+    // once the ascent has already failed.
+    if !exists && !rel.trim().starts_with('/') {
+        let root = PathBuf::from(cwd.trim_end_matches('/'));
+        let rel_clean = rel.trim().trim_start_matches("./");
+        if let Some(found) = resolve_rel_descend(&root, rel_clean, &allowed_exists, &real_list_dirs) {
+            let s = found.display().to_string();
+            tried.push(s.clone());
+            return Json(json!({ "resolved": s, "exists": true, "tried": tried })).into_response();
+        }
+    }
     Json(json!({ "resolved": resolved, "exists": exists, "tried": tried })).into_response()
+}
+
+/// The descent counterpart to `resolve_rel_candidates`'s ancestor walk —
+/// breadth-first from `root` for a directory `d` where `d.join(rel)` exists.
+/// BFS order means a SHALLOWER match always wins when more than one exists,
+/// the same "closest plausible spelling wins" rule the ascent uses.
+///
+/// Depth- and visit-capped so a large repo cannot turn one dead link into a
+/// slow one, and skips the usual noise directories so the cap is not spent
+/// walking into node_modules/.git/target before reaching a real subtree.
+/// `is_path_allowed` gates every directory entered, not just the final
+/// candidate file — the same posture `resolve_rel`'s own `exists` closure
+/// already applies, extended to the listing itself so this cannot be used to
+/// enumerate what is inside a denied directory either.
+const DESCEND_MAX_DEPTH: usize = 3;
+const DESCEND_MAX_DIRS: usize = 500;
+const DESCEND_SKIP: &[&str] = &[
+    "node_modules", ".git", "target", "__pycache__", ".venv", "venv", ".next", "dist", "build",
+];
+
+fn resolve_rel_descend(
+    root: &Path,
+    rel: &str,
+    exists: &dyn Fn(&Path) -> bool,
+    list_dirs: &dyn Fn(&Path) -> Vec<PathBuf>,
+) -> Option<PathBuf> {
+    let mut frontier = vec![root.to_path_buf()];
+    let mut visited = 0usize;
+    for _ in 0..DESCEND_MAX_DEPTH {
+        let mut next = Vec::new();
+        for dir in frontier {
+            for child in list_dirs(&dir) {
+                let name = child.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if DESCEND_SKIP.contains(&name) || !is_path_allowed(&child) {
+                    continue;
+                }
+                if visited >= DESCEND_MAX_DIRS {
+                    return None;
+                }
+                visited += 1;
+                let cand = child.join(rel);
+                if exists(&cand) {
+                    return Some(cand);
+                }
+                next.push(child);
+            }
+        }
+        frontier = next;
+    }
+    None
+}
+
+/// Real directory listing for `resolve_rel_descend`'s production call site.
+/// Kept separate from the pure walk above so every cell of the walk itself
+/// is testable with an injected in-memory fake, the same split
+/// `resolve_rel_candidates` uses for `exists`.
+fn real_list_dirs(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|entries| entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect())
+        .unwrap_or_default()
 }
 
 /// The candidate walk, pure over an injected existence probe so every cell —
@@ -2346,6 +2422,83 @@ mod tests {
         assert!(ok);
         assert_eq!(r, "/etc/hosts");
         assert_eq!(tried.len(), 1);
+    }
+
+    /// AMUX-4661: the mirror-image case the ancestor walk cannot reach by
+    /// construction — a session registered at a SCAFFOLD directory
+    /// (ai-for-smbs) one level above where the worker actually works
+    /// (ai-for-smbs/smb-workspace). Rebuilt from Ethan's screenshots: the
+    /// file overlay said jobs.py "does not exist here" for a file the same
+    /// terminal pane had just shown being edited.
+    #[test]
+    fn descend_finds_a_nested_workspace_the_ascent_cannot_reach() {
+        let root = Path::new("/Users/ethan/Dev/ai-for-smbs");
+        let real = root.join("smb-workspace/backend/connectors/jobs.py");
+        let exists = |p: &Path| p == real;
+        let list_dirs = |d: &Path| -> Vec<PathBuf> {
+            if d == root {
+                vec![
+                    root.join("node_modules"), // must be skipped, not walked into
+                    root.join("smb-workspace"),
+                ]
+            } else if d == root.join("node_modules") {
+                // If the skip list did not work, this decoy would also match.
+                vec![]
+            } else {
+                vec![]
+            }
+        };
+        let found = resolve_rel_descend(root, "backend/connectors/jobs.py", &exists, &list_dirs);
+        assert_eq!(found, Some(real));
+    }
+
+    /// The skip list is load-bearing, not decorative: a same-shaped file
+    /// sitting inside node_modules must never win, even breadth-first-first.
+    #[test]
+    fn descend_never_walks_into_a_skip_listed_directory() {
+        let root = Path::new("/repo");
+        let decoy = root.join("node_modules/pkg/x.py");
+        let exists = |p: &Path| p == decoy;
+        let list_dirs = |d: &Path| -> Vec<PathBuf> {
+            if d == root {
+                vec![root.join("node_modules")]
+            } else if d == root.join("node_modules") {
+                vec![root.join("node_modules/pkg")]
+            } else {
+                vec![]
+            }
+        };
+        let found = resolve_rel_descend(root, "x.py", &exists, &list_dirs);
+        assert_eq!(found, None, "node_modules must never be entered");
+    }
+
+    /// Depth is capped, and BFS means a SHALLOWER match wins over a deeper
+    /// one when both exist — the same "closest spelling wins" rule the
+    /// ancestor walk documents for its own direction.
+    #[test]
+    fn descend_prefers_the_shallowest_match_and_respects_the_depth_cap() {
+        let root = Path::new("/repo");
+        let shallow = root.join("a/x.py");
+        let deep = root.join("a/b/c/x.py"); // depth 3, at the cap boundary
+        let too_deep = root.join("a/b/c/d/x.py"); // depth 4, past the cap
+        let exists = |p: &Path| p == shallow || p == deep || p == too_deep;
+        let list_dirs = |d: &Path| -> Vec<PathBuf> {
+            match d.to_str().unwrap() {
+                "/repo" => vec![root.join("a")],
+                "/repo/a" => vec![root.join("a/b")],
+                "/repo/a/b" => vec![root.join("a/b/c")],
+                "/repo/a/b/c" => vec![root.join("a/b/c/d")],
+                _ => vec![],
+            }
+        };
+        // Both shallow and deep exist: BFS must return the shallow one.
+        let found = resolve_rel_descend(root, "x.py", &exists, &list_dirs);
+        assert_eq!(found, Some(shallow));
+
+        // With only the past-cap file present, the walk must not reach it.
+        let only_too_deep = |p: &Path| p == too_deep;
+        let found = resolve_rel_descend(root, "x.py", &only_too_deep, &list_dirs);
+        assert_eq!(found, None, "a match past DESCEND_MAX_DEPTH must not be found");
     }
 
     // ---- path guards ----

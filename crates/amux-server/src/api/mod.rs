@@ -41,6 +41,7 @@ pub mod gmail;
 pub mod graph;
 pub mod harness;
 pub mod history;
+pub mod history_ask;
 pub mod reports;
 pub mod terminal;
 pub mod invariants_api;

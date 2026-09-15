@@ -10821,7 +10821,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.950';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.953';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -19575,12 +19575,15 @@ async function openFilePreview(path) {
       return;
     }
     _fileData = data;
-    // Markdown opens to Raw by default (Ethan, 2026-09-14): rendered Preview
-    // hides exact formatting/links/frontmatter, which is what you want first
-    // when opening a note to read or edit. Preview is one tap away. The tabs
-    // were set to Preview-active synchronously above, before is_markdown was
-    // known, so re-sync them now that it is.
-    if (data.is_markdown) _fileViewMode = 'raw';
+    // Preview is the default for every file type, markdown included (Ethan,
+    // 2026-09-15, reversing the 2026-09-14 markdown-opens-to-Raw decision
+    // below this comment's old text). _fileViewMode is already 'preview'
+    // from the general default set synchronously above; nothing to override
+    // here now. Left the history rather than deleting it silently: the
+    // prior reasoning was "rendered Preview hides exact formatting/links/
+    // frontmatter, which is what you want first when opening a note to read
+    // or edit" — if that resurfaces as a complaint, Raw is one tap away via
+    // file-tab-raw either way.
     document.getElementById('file-tab-preview').classList.toggle('active', _fileViewMode === 'preview');
     document.getElementById('file-tab-raw').classList.toggle('active', _fileViewMode === 'raw');
     // Show tabs only for text files
@@ -19628,7 +19631,8 @@ async function openFilePreview(path) {
       if (cachedIsText) {
         document.getElementById('file-view-tabs').style.display = '';
       }
-      if (cached.data.is_markdown) _fileViewMode = 'raw';
+      // Same preview-by-default rule as the online path above — no markdown
+      // override here either.
       document.getElementById('file-tab-preview').classList.toggle('active', _fileViewMode === 'preview');
       document.getElementById('file-tab-raw').classList.toggle('active', _fileViewMode === 'raw');
       _renderFileBody(cached.data, _fileViewMode);
@@ -36691,11 +36695,123 @@ function _msgSetMode(mode) {
   _msgMode = mode;
   document.getElementById('msgmode-messages')?.classList.toggle('active', mode === 'messages');
   document.getElementById('msgmode-trends')?.classList.toggle('active', mode === 'trends');
+  document.getElementById('msgmode-ask')?.classList.toggle('active', mode === 'ask');
   const isT = mode === 'trends';
-  ['msgs-controls','msgs-kind-filter','msgs-list'].forEach(id => { const e=document.getElementById(id); if(e) e.style.display = isT ? 'none' : ''; });
+  const isA = mode === 'ask';
+  // The list and its controls belong to the Messages mode only; both of the
+  // other modes replace the whole pane rather than sitting under it.
+  ['msgs-controls','msgs-kind-filter','msgs-list'].forEach(id => { const e=document.getElementById(id); if(e) e.style.display = (isT || isA) ? 'none' : ''; });
   const tv = document.getElementById('trends-view'); if (tv) tv.style.display = isT ? '' : 'none';
   const td = document.getElementById('trends-days'); if (td) td.style.display = isT ? '' : 'none';
+  const av = document.getElementById('ask-view'); if (av) av.style.display = isA ? '' : 'none';
+  const more = document.getElementById('msgs-more-btn'); if (more && (isT || isA)) more.style.display = 'none';
   if (isT) _trendsLoad();
+  if (isA) { _askSuggestions(false); document.getElementById('ask-q')?.focus(); }
+}
+
+// ---- Ask: open-ended questions about the messages (AMUX-4664) -------------
+// Trends answers the questions its theme list already names. This one sends the
+// question to the model with the messages as data, and shows what it was
+// answered OVER: how many messages of how many, the window, and the ids the
+// answer cited, so a claim can be checked rather than believed.
+const _ASK_SUGGESTIONS = [
+  'What themes came up most?',
+  'What did Ethan ask for that is still not done?',
+  'Where did two lanes disagree?',
+  'What keeps getting repeated?',
+];
+function _askSuggestions(peek) {
+  const el = document.getElementById(peek ? 'peek-ask-suggestions' : 'ask-suggestions');
+  if (!el || el.dataset.filled) return;
+  el.dataset.filled = '1';
+  el.innerHTML = _ASK_SUGGESTIONS.map(q =>
+    '<button class="btn" style="font-size:0.72rem;padding:3px 9px;" onclick="_askPick(' + (peek ? 'true' : 'false')
+    + ',this.textContent)">' + esc(q) + '</button>').join('');
+}
+function _askPick(peek, q) {
+  const inp = document.getElementById(peek ? 'peek-ask-q' : 'ask-q');
+  if (inp) inp.value = q;
+  _askRun(peek);
+}
+function _peekAskToggle() {
+  const p = document.getElementById('peek-ask-panel');
+  if (!p) return;
+  const open = p.style.display === 'none';
+  p.style.display = open ? '' : 'none';
+  if (open) { _askSuggestions(true); document.getElementById('peek-ask-q')?.focus(); }
+}
+async function _askRun(peek) {
+  const qEl = document.getElementById(peek ? 'peek-ask-q' : 'ask-q');
+  const metaEl = document.getElementById(peek ? 'peek-ask-meta' : 'ask-meta');
+  const ansEl = document.getElementById(peek ? 'peek-ask-answer' : 'ask-answer');
+  const question = (qEl?.value || '').trim();
+  if (!question) { if (qEl) qEl.focus(); return; }
+  const days = +(document.getElementById(peek ? 'peek-ask-days' : 'ask-days')?.value || 14);
+  const session = peek ? peekSession : null;
+  if (metaEl) metaEl.textContent = 'Asking' + (session ? ' about ' + session : '') + '\u2026';
+  if (ansEl) ansEl.innerHTML = '';
+  let r, d;
+  try {
+    // _origFetch, NOT the patched window.fetch: this is a READ that takes tens
+    // of seconds (the model call), and the outbox treats a slow /api/ POST as
+    // an unreachable server, queues it for replay and hands back a synthetic
+    // 202 {ok:true,queued:true}. The panel then rendered "0 of 0 messages ...
+    // last undefined days" while the server was answering the question fine
+    // (found in the browser, 2026-09-15). Replaying a question later is also
+    // meaningless: there is nobody to show the answer to.
+    r = await _origFetch(API + '/api/history/ask', {
+      method: 'POST', headers: _authHeaders({'Content-Type':'application/json'}),
+      body: JSON.stringify({ question, session, days }),
+      _skipOutbox: true, signal: AbortSignal.timeout(300000),
+    });
+    d = await r.json();
+  } catch (e) {
+    if (metaEl) metaEl.textContent = 'Could not reach the server: ' + String(e && e.message || e);
+    return;
+  }
+  // A locally queued 202 never left the browser, so it is not an answer.
+  if (_isLocallyQueued(r)) {
+    if (metaEl) metaEl.textContent = 'Not sent: this client queued the request offline. Reconnect and ask again.';
+    return;
+  }
+  // A refusal and an unmeasured answer both say WHY, and neither is rendered
+  // as an empty answer: an empty answer reads as "there is nothing about that".
+  if (!r.ok || d.measured === false) {
+    if (metaEl) metaEl.textContent = d.why_unmeasured || d.error || ('error ' + r.status);
+    if (ansEl) ansEl.innerHTML = '';
+    return;
+  }
+  // measured true with no window means this is not the payload this panel
+  // renders. Saying so beats printing "0 of 0 ... undefined days", which reads
+  // as a measured emptiness.
+  if (d.window_days === undefined || d.n_available === undefined) {
+    if (metaEl) metaEl.textContent = 'The server answered in a shape this view does not recognise (HTTP ' + r.status + ').';
+    if (ansEl) ansEl.innerHTML = '';
+    return;
+  }
+  const scope = d.session ? esc(d.session) : 'all workers';
+  const considered = (d.n_considered || 0).toLocaleString();
+  const available = (d.n_available || 0).toLocaleString();
+  const secs = d.elapsed_ms ? ' \u00b7 ' + (d.elapsed_ms / 1000).toFixed(1) + 's' : '';
+  if (metaEl) metaEl.textContent = 'answered over ' + considered + ' of ' + available
+    + ' message' + (d.n_available === 1 ? '' : 's') + ' from ' + scope
+    + ', last ' + d.window_days + ' day' + (d.window_days === 1 ? '' : 's')
+    + (d.truncated ? ' (oldest dropped to fit)' : '') + secs;
+  const cites = Array.isArray(d.cited) && d.cited.length
+    ? '<div style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap;align-items:center;">'
+      + '<span style="font-size:0.72rem;color:var(--dim);">cited:</span>'
+      + d.cited.map(id => '<button class="btn" style="font-size:0.7rem;padding:2px 8px;" onclick="_askOpenCitation('
+        + JSON.stringify(id) + ')">MSG-' + esc(id) + '</button>').join('') + '</div>'
+    : '';
+  if (ansEl) ansEl.innerHTML = '<div>' + esc(d.answer || '') + '</div>' + cites;
+}
+/// Open the message an answer cited, so a claim can be checked against the row.
+async function _askOpenCitation(id) {
+  try {
+    const m = await (await fetch(API + '/api/history/' + encodeURIComponent(id))).json();
+    if (m && m.text) { _msgLocate(m.session || '', encodeURIComponent(m.text)); return; }
+  } catch (e) {}
+  showToast('Could not open MSG-' + id);
 }
 async function _trendsLoad() {
   const days = document.getElementById('trends-days')?.value || '7';

@@ -53,6 +53,9 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", get(list_history).post(append_history).delete(clear_history))
         .route("/import", axum::routing::post(import_history))
+        // AMUX-4664: ask a question of these messages. A literal POST, like
+        // `/import`, so the `/{id}` capture below does not take it.
+        .route("/ask", axum::routing::post(super::history_ask::ask))
         // Look up ONE message by its id. `/import` is a literal POST above, so
         // this GET capture never swallows it.
         .route("/{id}", get(get_history_item))
