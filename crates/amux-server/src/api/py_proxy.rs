@@ -124,6 +124,7 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/criteria", "gate criteria"),
     ("/api/metrics", "metrics"),
     ("/api/reclaim", "disk scan, reclaim findings, treemap, quarantine"),
+    ("/api/recordings", "audio recorder: upload, list, folder config, local transcription (api/recordings.rs)"),
     ("/api/usage", "token usage"),
     ("/api/alert", "owner alerts"),
     ("/api/stats", "daily stats"),
