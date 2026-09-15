@@ -3469,6 +3469,20 @@ function _outboxBoardAcknowledged(card) {
     _boardDraftsPersist();
   }
 }
+// AMUX-4661 (Ethan's screenshot, "Send to self ... [Stopped]"): this used to
+// throw `new DOMException('Stopped', 'AbortError')` on both exits below. That
+// name is what `_STATUS_LABELS`/several `e.name === 'AbortError'` checks
+// elsewhere in this file rely on, so it stays — but the MESSAGE ("Stopped")
+// is what the offline-op row shows verbatim (`describeOp` + `[` + item.error
+// + `]`), and it told the reader nothing. Both exits here fire the same way:
+// `_boundedMutationFetch`'s 15s outer timeout aborted `signal` before a
+// receipt confirmed — the send itself may have landed on the server with no
+// receipt yet echoed back (this loop polls at 1s intervals and gives up at
+// 15s), which is exactly the "unconfirmed, not failed" shape
+// `_validateMessageAcknowledgement` already names in its own error a few
+// lines up. Same wording here so the two paths that can leave a message
+// ambiguous read as one fact, not two.
+const _RECEIPT_TIMEOUT_MSG = 'No delivery confirmation within 15s — the message may still have gone through; review the worker before retrying';
 async function _waitForMessageReceipt(input, init, signal) {
   let msgId;
   try { msgId = JSON.parse(init?.body || '{}').msg_id; } catch (_) {}
@@ -3477,7 +3491,7 @@ async function _waitForMessageReceipt(input, init, signal) {
   const url = input.replace(/\/(send|steer)$/, '/send') + '?msg_id=' + encodeURIComponent(msgId);
   while (!signal.aborted) {
     await new Promise((resolve, reject) => {
-      const stop = () => { clearTimeout(timer); reject(new DOMException('Stopped', 'AbortError')); };
+      const stop = () => { clearTimeout(timer); reject(new DOMException(_RECEIPT_TIMEOUT_MSG, 'AbortError')); };
       const timer = setTimeout(() => { signal.removeEventListener('abort', stop); resolve(); }, 1000);
       signal.addEventListener('abort', stop, {once:true});
     });
@@ -3490,7 +3504,7 @@ async function _waitForMessageReceipt(input, init, signal) {
       }
     } catch (e) { if (signal.aborted) throw e; }
   }
-  throw new DOMException('Stopped', 'AbortError');
+  throw new DOMException(_RECEIPT_TIMEOUT_MSG, 'AbortError');
 }
 async function _boundedMutationFetch(input, init) {
   const controller = new AbortController();
@@ -10979,7 +10993,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.964';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.965';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -17834,7 +17848,21 @@ async function _peekMessagesLoad(more) {
   try {
     const rows = await _peekMsgFetch({ level: 'worker', name: sess }, _peekMsgOffset);
     if (peekSession !== sess) { _peekMsgLoading = false; return; }
-    if (_peekMsgCountsFor !== sess) {
+    // AMUX-4661 (Ethan's screenshot, mixpeek-cicd: the filter chips read "2"
+    // beside a freshly-loaded list of 3). `_peekMsgCountsFor !== sess` only
+    // catches a SESSION SWITCH. The SSE `messages` invalidation handler
+    // (search this file for `key === 'messages'`) calls this exact function
+    // with `more` undefined to refresh page 1 of the CURRENT session when a
+    // new message lands fleet-wide — same session, so that gate alone never
+    // fires, and `_peekMsgCounts` (the source of every "All N / Human N /
+    // ..." chip) sits at whatever it was when the peek was first opened,
+    // silently behind the row list and tab badge that DID just refresh.
+    // Page 1 is cheap and infrequent enough (user-driven opens/retries, or
+    // this debounced SSE handler) that refetching counts every time this is
+    // page 1 costs nothing worth trading correctness for; a deeper page
+    // (`_peekMsgPage > 1`) skips it, matching that counts do not change what
+    // is already on screen there.
+    if (_peekMsgCountsFor !== sess || _peekMsgPage === 1) {
       fetch(API + '/api/history?counts=1&session=' + encodeURIComponent(sess), { headers: _authHeaders() })
         .then(x => x.json())
         .then(c => { if (peekSession === sess) { _peekMsgCounts = c; _peekMsgCountsFor = sess; _peekMessagesRender(); } })
