@@ -413,6 +413,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0071_issues_epic_index",
         sql: include_str!("../../migrations/0071_issues_epic_index.sql"),
     },
+    Migration {
+        version: 72,
+        name: "0072_command_intake",
+        sql: include_str!("../../migrations/0072_command_intake.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.

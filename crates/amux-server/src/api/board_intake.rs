@@ -21,6 +21,8 @@ pub fn initialize() {
     let _ = MODEL.set(Arc::new(super::mdai::ReadOnlyCliModel));
 }
 
+pub(crate) fn model_client() -> Option<Arc<dyn ModelClient>> { MODEL.get().cloned() }
+
 pub async fn lock(session: &str, owner: &str) -> tokio::sync::OwnedMutexGuard<()> {
     let lane = {
         let mut locks = LOCKS.get_or_init(Mutex::default).lock().expect("intake locks");
@@ -109,7 +111,7 @@ where
 /// markdown fences, leading label, or trailing prose the model wraps around it.
 /// String-aware so a `}` inside a quoted value (a reason mentioning a brace) does
 /// not close the object early. `None` if no balanced object is present.
-fn extract_json_object(s: &str) -> Option<&str> {
+pub(crate) fn extract_json_object(s: &str) -> Option<&str> {
     let bytes = s.as_bytes();
     let start = s.find('{')?;
     let mut depth = 0i32;

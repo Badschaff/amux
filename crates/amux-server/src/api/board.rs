@@ -1322,7 +1322,7 @@ async fn get_contract(
             "idempotency": "the normalized plan SHA-256 is durable on the root epic; an identical retry returns idempotent=true and a different retry returns 409 decomposition_plan_conflict",
             "dependency_execution": "todo/backlog claims are refused until every dependency is resolved: runtime-changing types require verified; other types may finish at done; missing or discarded dependencies remain blocking, and a committed successor is not stranded by unrelated todo queue depth",
             "graph": "GET /api/graph/board: versioned snapshot of tasks, workers, artifacts and recorded messages, typed provenance, cycle/missing-reference verification, and deterministic prerequisite-first layers. GET /api/graph/board/verify or amux board graph --check: lightweight structural preflight using the same verifier, without task prose. Structural order is not a workflow readiness or artifact-existence claim. Mutate through board/decompose/artifacts APIs; periodic board.graph_integrity detects legacy corruption.",
-            "completion": "when every child is done, verified, discarded, or quarantined, board-drive closes the root epic and records the child-status summary as evidence",
+            "completion": "when every required child and linked canonical outcome meets the dependency completion gate (verified for runtime changes; done for other types), board-drive closes the root epic; discarded and quarantined required outcomes do not count as success",
         },
         // AMUX-2933 (ts-gke). The list filters WORK and were documented
         // NOWHERE — "discoverable only by guessing", and the cap was worse than
@@ -4407,6 +4407,11 @@ pub async fn create_item(
                 return needsyou_ask_refusal(verdict, "(new card)", session_for_gate.as_deref());
             }
         }
+    }
+    if bs::parse_status(&status_in) == Some(TaskStatus::NeedsYou)
+        && !bs::approval_type_allowed(Some(&session), body_str(&map,"ask_type").as_deref().unwrap_or("")) {
+        tracing::warn!(session, verdict="approval_category_refused", "needsyou is outside the standing authorization policy");
+        return err(StatusCode::CONFLICT,json!({"error":"needsyou is reserved for the configured authorization categories","code":"needsyou_outside_approval_policy","allowed":bs::approval_types(Some(&session)),"how_to_fix":"Proceed with ordinary decisions. For a capability failure, record the concrete blocker and attempt an authorized remedy; do not invent an approval request."}));
     }
     // AMUX-2609: a status outside the typed vocabulary may still be a real
     // user-created column. The `statuses` table is the vocabulary for those —
@@ -10959,6 +10964,11 @@ pub async fn patch_item(
                                 );
                             }
                         }
+                    }
+
+                    if target == TaskStatus::NeedsYou && !bs::approval_type_allowed(next.session.as_deref(), next.ask_type.as_deref().unwrap_or("")) {
+                        tracing::warn!(card=%next.id,verdict="approval_category_refused","needsyou is outside the standing authorization policy");
+                        return finish(&slot_w,PatchOut::Refused(StatusCode::CONFLICT,json!({"error":"needsyou is reserved for the configured authorization categories","code":"needsyou_outside_approval_policy","allowed":bs::approval_types(next.session.as_deref()),"how_to_fix":"Continue ordinary decisions; record capability failures as operational blockers with an attempted remedy."})),no_write());
                     }
 
                     // A GATE THAT SAYS "NAME THEM" MUST COLLECT THE NAME (AF-160).

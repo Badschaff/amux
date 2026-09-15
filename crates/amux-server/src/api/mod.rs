@@ -13,6 +13,7 @@ pub mod aliases;
 pub mod auth;
 pub mod board;
 pub mod board_intake;
+pub mod board_lifecycle;
 pub mod criteria;
 pub mod browser;
 pub mod browser_import;
@@ -205,6 +206,7 @@ pub fn router(state: AppState) -> Router {
         // LAST python-proxied family; its cutover emptied PROXIED_FAMILIES).
         .nest("/api/scope", scope::routes())
         .nest("/api/orchestrate", orchestrate::routes())
+        .nest("/api/board-lifecycle", board_lifecycle::routes())
         // Nothing proxies. py_proxy::PROXIED_FAMILIES is EMPTY post-AMUX-2608
         // and the forwarder it fed was deleted in AMUX-2906, so the merge that
         // used to sit here (already a no-op) is gone too — the registry, the

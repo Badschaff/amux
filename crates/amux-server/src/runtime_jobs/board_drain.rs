@@ -171,8 +171,8 @@ pub fn drain_state(conn: &Connection, lane: &str, now: i64) -> DrainState {
                 heartbeat_age_s: row.lease_heartbeat_at.map(|h| now - h),
                 lease_expires_in_s: row.lease_expires_at.map(|e| e - now),
             }),
-            "todo" if blockers.is_empty() => st.ready += 1,
-            "backlog" if blockers.is_empty() => st.parked += 1,
+            "todo" if blockers.is_empty() && blocked_on.is_none() => st.ready += 1,
+            "backlog" if blockers.is_empty() && blocked_on.is_none() => st.parked += 1,
             "todo" | "backlog" => st.blocked.push(as_blocked(blockers)),
             "blocked" => {
                 if blockers.is_empty() && blocked_on.is_none() {

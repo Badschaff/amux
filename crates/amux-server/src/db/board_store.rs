@@ -342,11 +342,13 @@ pub const NEEDSYOU_ASK_REQUIRED_KEY: &str = "AMUX_NEEDSYOU_ASK_REQUIRED";
 /// means a call only the owner's taste can settle, which is a real category
 /// (ethos rule 3 wants a truthful path for it) and NOT "I would like a second
 /// opinion".
-pub const ASK_TYPES: [&str; 5] = ["decision", "access", "credential", "external", "judgment"];
+pub const ASK_TYPES: [&str; 7] = ["budget", "customer_outbound", "decision", "access", "credential", "external", "judgment"];
 
 /// What each type means, printed in the refusal so the reader picks correctly
 /// on the first try rather than by guessing at five bare words.
-pub const ASK_TYPE_HELP: [(&str, &str); 5] = [
+pub const ASK_TYPE_HELP: [(&str, &str); 7] = [
+    ("budget", "increase spend or exceed an authorized budget"),
+    ("customer_outbound", "send customer communication without existing authorization"),
     ("decision", "a choice only the owner can make — direction, priority, or a trade-off with no right answer"),
     ("access", "you cannot reach something: a repo, a console, an environment, a person"),
     ("credential", "a secret, token, key or sign-in only the owner can supply"),
@@ -379,6 +381,21 @@ pub fn needsyou_ask_required(session: Option<&str>) -> bool {
         Some(v) => !is_off(&v),
         None => true,
     }
+}
+
+/// Scoped authorization categories, independent of whether the question is well
+/// formed. `*` is the explicit legacy policy. Existing deployments keep it until
+/// the owner selects a global/group/worker policy; no worker can silently infer
+/// a budget grant from the absence of a typed question.
+pub fn approval_types(session: Option<&str>) -> Vec<String> {
+    let configured = std::env::var("AMUX_APPROVAL_TYPES").ok().filter(|v|!v.trim().is_empty())
+        .or_else(||session.and_then(|s|crate::api::session_verbs::scoped_setting_in(&crate::api::session_verbs::home(),s,"AMUX_APPROVAL_TYPES")))
+        .unwrap_or_else(||"*".into());
+    configured.split(',').map(|s|s.trim().to_ascii_lowercase()).filter(|s|!s.is_empty()).collect()
+}
+pub fn approval_type_allowed(session: Option<&str>, kind: &str) -> bool {
+    let allowed=approval_types(session);
+    allowed.iter().any(|s|s=="*" || s==&kind.trim().to_ascii_lowercase())
 }
 
 /// Why a typed ask was refused, or that it was accepted.

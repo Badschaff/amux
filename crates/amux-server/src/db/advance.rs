@@ -150,6 +150,10 @@ fn advance_typed(
     opts: &AdvanceOpts,
     workflow: &Option<BoardWorkflow>,
 ) -> Result<Result<(), AdvanceRefusal>, rusqlite::Error> {
+    if target == TaskStatus::NeedsYou && !bs::approval_type_allowed(row.session.as_deref(),row.ask_type.as_deref().unwrap_or("")) {
+        tracing::warn!(card=%row.id,verdict="approval_category_refused","transition refused by standing approval policy");
+        return Ok(Err(AdvanceRefusal::InvalidTransition{from:row.status.clone(),to:"needsyou".into(),reason:format!("approval category outside policy; allowed: {}",bs::approval_types(row.session.as_deref()).join(","))}));
+    }
     // Gate check: workflow gates are the authority when present, otherwise
     // the five-tier precedence trail.
     if !opts.force && !opts.gate_ack {

@@ -2468,11 +2468,10 @@ pub(crate) async fn promote_ready_backlog(state: &AppState) -> (usize, usize) {
     (promoted, held_on_trigger)
 }
 
-fn child_terminal_for_epic(status: &str) -> bool {
-    matches!(
-        status.trim().to_ascii_lowercase().as_str(),
-        "done" | "verified" | "discarded" | "quarantined"
-    )
+/// Completion uses the same output requirement as a dependent task. Failed or
+/// discarded children never manufacture success for a still-required outcome.
+fn child_terminal_for_epic(conn: &Connection, id: &str) -> bool {
+    bs::dependency_resolved(conn, id).unwrap_or(false)
 }
 
 fn epic_completion_candidates(conn: &Connection) -> Vec<(String, Vec<(String, String)>)> {
@@ -2490,7 +2489,7 @@ fn epic_completion_candidates(conn: &Connection) -> Vec<(String, Vec<(String, St
     epic_ids
         .into_iter()
         .filter_map(|epic| {
-            let children = conn
+            let mut children = conn
                 .prepare(
                     "SELECT id,status FROM issues WHERE epic=?1 AND deleted IS NULL \
                      AND COALESCE(archived,0)=0 ORDER BY created,id",
@@ -2502,10 +2501,19 @@ fn epic_completion_candidates(conn: &Connection) -> Vec<(String, Vec<(String, St
                     .map(|rows| rows.flatten().collect::<Vec<_>>())
                 })
                 .unwrap_or_default();
+            if let Ok(Some(root))=bs::get_issue(conn,&epic) {
+                for id in root.depends_on {
+                    if !children.iter().any(|(child,_)|child==&id) {
+                        let status=bs::get_issue(conn,&id).ok().flatten().map(|c|c.status).unwrap_or_else(||"missing".into());
+                        children.push((id,status));
+                    }
+                }
+            }
             (!children.is_empty()
                 && children
                     .iter()
-                    .all(|(_, status)| child_terminal_for_epic(status)))
+                    .all(|(id, _)| child_terminal_for_epic(conn, id))
+                && bs::get_issue(conn, &epic).ok().flatten().is_some_and(|root| deps_blocking(conn, &root).is_empty()))
             .then_some((epic, children))
         })
         .collect()
@@ -2627,6 +2635,8 @@ mod epic_completion_unit_tests {
         assert!(epic_completion_candidates(&conn).is_empty());
         conn.execute("UPDATE issues SET status='verified' WHERE id='C-2'", [])
             .unwrap();
+        assert!(epic_completion_candidates(&conn).is_empty(), "code done is not verified output");
+        conn.execute("UPDATE issues SET status='verified' WHERE id='C-1'", []).unwrap();
         let got = epic_completion_candidates(&conn);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].0, "E-1");

@@ -4981,6 +4981,11 @@ pub(crate) async fn capture_recorded_message(state: &AppState, row_id: i64) {
         }
     };
     let _intake_guard = super::board_intake::lock(&cap_session, "agent").await;
+    // One durable interpretation/decomposition replaces the old create-first
+    // classifier. A failed interpretation stays pending on the message.
+    if super::board_lifecycle::capture(state, row_id, &cap_session).await {
+        return;
+    }
     let loaded = (|| -> anyhow::Result<Option<(String, String, String, i64)>> {
         let conn = state.store.read()?;
         Ok(conn.query_row("SELECT text,type,origin,ts FROM cmd_history WHERE id=?1 AND capture_pending!=0 AND card_id IS NULL",
