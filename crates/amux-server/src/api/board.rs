@@ -7885,6 +7885,24 @@ mod af413_discarded_tests {
             .expect("the block ends at the delivery guard")
             + start;
         let block = &src[start..end];
+        // COMMENTS ARE NOT SENTENCES. `split('"')` cannot tell a literal from a
+        // quoted phrase inside a `//` comment, so a comment that QUOTES the
+        // wording it is explaining reads as a literal whose newline and leading
+        // `//` become the run of spaces this guards against. That is exactly
+        // what happened: AMUX-4558 deleted a callback branch and left a comment
+        // saying its old text ("owed you nothing") used to live there, and this
+        // test failed over prose no reader will ever see.
+        //
+        // Whole-line comments only, and the same rule
+        // `tests/nudge_commands_exist.rs` already applies for the same reason: a
+        // trailing comment cannot be cut without risking a `//` inside a real
+        // literal, which would corrupt the thing being measured.
+        let block: String = block
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let block = block.as_str();
 
         // APPLY RUST'S OWN CONTINUATION RULE FIRST. A backslash at end of line
         // eats the newline AND the next line's leading whitespace, so the raw
