@@ -1,6 +1,6 @@
 {
   "measured": true,
-  "n_considered": 2002,
+  "n_considered": 2006,
   "command_handlers": {
     "_applyEmbedView": {
       "kind": "command._applyEmbedView",
@@ -2146,6 +2146,12 @@
     },
     "_recorderUpload": {
       "kind": "command._recorderUpload",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_refreshBoardActivityOnSessions": {
+      "kind": "command._refreshBoardActivityOnSessions",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"

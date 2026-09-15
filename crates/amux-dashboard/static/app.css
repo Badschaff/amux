@@ -3918,6 +3918,18 @@
   .board-card-live-label .board-live-dot { flex:0 0 auto; }
   @keyframes boardLivePulse { 0%,100% { opacity:1; } 50% { opacity:0.35; } }
   .board-card-live .board-card-session { color: var(--green,#3fb950); border-color: rgba(63,185,80,0.4); }
+  .board-activity { display:flex; gap:8px; overflow-x:auto; max-width:100%; padding:8px 2px; margin-bottom:8px; }
+  .board-activity[hidden] { display:none; }
+  .board-activity-item { display:flex; align-items:flex-start; gap:10px; flex:0 0 min(420px,92%); padding:10px 12px; border:1px solid rgba(63,185,80,0.45); border-radius:10px; background:var(--surface,var(--bg)); font-size:0.8rem; }
+  .board-activity-copy { min-width:0; flex:1; }
+  .board-activity-copy > span { color:var(--green,#3fb950); }
+  .board-activity-task { display:block; max-width:100%; padding:4px 0 0; border:0; background:none; color:var(--accent); text-align:left; cursor:pointer; font:inherit; overflow-wrap:anywhere; }
+  .board-activity-note { margin-top:4px; color:var(--dim); font-size:0.74rem; }
+  .board-activity-unlinked, .board-card-observed { border-color:var(--yellow,#d29922); box-shadow:0 0 0 1px rgba(210,153,34,0.2); }
+  .board-activity-unlinked .board-activity-copy > span, .board-card-observed .board-card-live-label { color:var(--yellow,#d29922); }
+  .board-card-observed .board-card-live-label { background:rgba(210,153,34,0.1); border-color:rgba(210,153,34,0.35); }
+  .peek-issue-item.board-card-live, .peek-issue-item.board-card-observed { border-radius:6px; }
+  @media (max-width:600px) { .board-activity-item { flex-direction:column; gap:6px; } }
   .board-pin-btn {
     position: absolute; top: 6px; right: 30px;
     width: 22px; height: 22px; padding: 0; border: none; background: none;

@@ -4241,15 +4241,7 @@ async function _fetchSessionsOnce() {
       if (typeof _idb !== 'undefined') _idb.set('sessions_cache', data);
       render();
       _refreshOpenPeekOnSessions();   // list AND details update from the one event
-      // Board live-emphasis tracks session activity: re-render the board when the
-      // ACTIVE set changes (signature-guarded so this is rare; never mid-drag).
-      try {
-        const _liveSig = data.filter(s => s.status === 'active').map(s => s.name).sort().join(',');
-        if (window._boardLiveSig !== _liveSig) {
-          window._boardLiveSig = _liveSig;
-          if (activeView === 'board' && !document.body.classList.contains('board-dragging')) renderBoard();
-        }
-      } catch(e) {}
+      _refreshBoardActivityOnSessions();
       if (!window._peekEmbed) _fetchGitBranches(sessions);
     }
   } catch(e) {
@@ -4679,6 +4671,70 @@ function _cardDoingItem(name) {
   return (boardItems || []).find(c =>
     !c.deleted && !c.archived && c.session === name && c.status === 'doing' && c.id === claimed
   ) || null;
+}
+
+// Runtime activity remains visible even when its task is filtered out, the
+// board has not loaded, or the last claim no longer matches a Doing card.
+// An observed stale claim is a navigation aid, never promoted to a live claim.
+function _boardActivityEntries(workerName) {
+  return (sessions || []).filter(s => {
+    if (workerName && s.name !== workerName) return false;
+    if (!s.running || s.archived || s.lifecycle === 'paused' || s.lifecycle === 'archived') return false;
+    const truth = s.runtime_board || {};
+    return truth.measured === true ? truth.runtime_status === 'active' : s.status === 'active';
+  }).map(s => {
+    const truth = s.runtime_board || {};
+    const cardId = _runtimeBoardCardId(s);
+    const observedId = truth.measured === true ? String(truth.observed_card_id || '') : '';
+    const id = cardId || observedId;
+    const card = (boardItems || []).find(c => c.id === id && !c.deleted);
+    return { name: s.name, cardId, observedId, linked: !!cardId,
+      cardless: truth.status === 'cardless-allowed',
+      title: card ? card.title : (cardId && s.task_source === 'board' ? s.task_name : ''),
+      status: card ? card.status : '', verdict: truth.verdict || truth.status || 'unmeasured' };
+  });
+}
+
+function _boardActivityForCard(item) {
+  const session = (sessions || []).find(s => s.name === item.session);
+  const id = _runtimeBoardCardId(session) || String(session?.runtime_board?.observed_card_id || '');
+  if (!id || id !== item.id) return null;
+  return _boardActivityEntries(item.session).find(a => (a.cardId || a.observedId) === item.id) || null;
+}
+
+function _renderBoardActivity(host, workerName) {
+  if (!host || !host.parentNode) return;
+  const id = host.id + '-activity';
+  let strip = document.getElementById(id);
+  if (!strip) {
+    strip = document.createElement('div');
+    strip.id = id;
+    strip.className = 'board-activity';
+    strip.setAttribute('aria-label', 'Current worker activity');
+    host.parentNode.insertBefore(strip, host);
+  }
+  const entries = _boardActivityEntries(workerName);
+  strip.hidden = !entries.length;
+  strip.innerHTML = entries.map(a => {
+    const id = a.cardId || a.observedId;
+    const state = a.linked ? 'Working now' : a.cardless ? 'Working · conversation' : 'Working · task link missing or out of date';
+    const label = id ? (a.linked ? '' : 'Last linked: ') + id + (a.title ? ' · ' + a.title : '') : '';
+    return '<div class="board-activity-item' + (!a.linked && !a.cardless ? ' board-activity-unlinked' : '') + '" data-worker="' + esc(a.name) + '" data-card-id="' + esc(id) + '">'
+      + '<div class="board-activity-copy"><strong>' + esc(a.name) + '</strong> <span>' + state + '</span>'
+      + (id ? '<button class="board-activity-task" onclick="openBoardDetail(\'' + escJs(id) + '\')">' + esc(label) + '</button>' : '')
+      + (!a.linked && !a.cardless ? '<div class="board-activity-note">No current board task is confirmed. Open the terminal to see the running work.</div>' : '') + '</div>'
+      + '<button class="btn btn-sm" onclick="openPeek(\'' + escJs(a.name) + '\')">Open terminal</button></div>';
+  }).join('');
+}
+
+function _refreshBoardActivityOnSessions() {
+  const signature = JSON.stringify(_boardActivityEntries());
+  if (window._boardLiveSig === signature) return;
+  window._boardLiveSig = signature;
+  if (document.body.classList.contains('board-dragging')) { _boardRenderPending = true; return; }
+  if (activeView === 'board') renderBoard();
+  const pane = document.getElementById('peek-issues-panel');
+  if (pane && pane.classList.contains('active')) renderPeekIssues();
 }
 
 // A card's runtime badge, text and link make one statement. The server owns
@@ -10178,6 +10234,7 @@ function renderPeekIssues() {
       .finally(() => { _peekIssuesFetching = false; renderPeekIssues(); });
   }
   const list = document.getElementById('peek-issues-list');
+  _renderBoardActivity(list, _peekIssuesAllSessions ? '' : peekSession);
   const count = document.getElementById('peek-issues-count');
   const allScope = _peekIssuesAllSessions;
   // The per-session panel shows the lane's FULL record including archived, so
@@ -29049,6 +29106,7 @@ function _boardWorkerGroupCollapsed(name, items) {
 // drift (Ethan 07:17: same UX on both).
 function _issueRowHTML(item, opts) {
   opts = opts || {};
+  const activity = _boardActivityForCard(item);
   const sty = statusStyle(item.status || 'todo');
   const due = item.due ? '<span class="peek-issue-due">' + esc(item.due) + '</span>' : '';
   const owner = (opts.showOwner && item.session)
@@ -29059,7 +29117,7 @@ function _issueRowHTML(item, opts) {
   const _rq = (typeof _peekIssuesQuery !== 'undefined' && _peekIssuesQuery)
     ? _peekIssuesQuery
     : (typeof boardSearchQuery !== 'undefined' ? boardSearchQuery : '');
-  return '<div class="peek-issue-item" style="min-height:44px;" onclick="openBoardDetail(\'' + esc(item.id) + '\')" oncontextmenu="return _boardCtxMenu(event,\'' + escJs(item.id) + '\')">' +
+  return '<div class="peek-issue-item' + (activity ? (activity.linked ? ' board-card-live' : ' board-card-observed') : '') + '" data-id="' + esc(item.id) + '" style="min-height:44px;" onclick="openBoardDetail(\'' + esc(item.id) + '\')" oncontextmenu="return _boardCtxMenu(event,\'' + escJs(item.id) + '\')">' +
     dot +
     '<span class="peek-issue-key">' + _hlSearch(esc(item.id), _rq) + '</span>' +
     // The PEEK query, not the global board query. This read boardSearchQuery,
@@ -29067,7 +29125,7 @@ function _issueRowHTML(item, opts) {
     // filtered correctly and looked broken, which is the failure Ethan
     // reported for messages, sitting one tab over.
     '<span class="peek-issue-title">' + owner + _hlSearch(esc(item.title), _rq) + '</span>' +
-    '<span class="peek-issue-meta">' + badge + due + '</span>' +
+    '<span class="peek-issue-meta">' + (activity ? '<span class="board-card-live-label">' + (activity.linked ? 'Working now' : 'Last linked') + '</span>' : '') + badge + due + '</span>' +
     '</div>';
 }
 
@@ -29080,25 +29138,20 @@ function _renderBoardCard(item) {
   const firstLine = (item.desc !== undefined ? item.desc : (item.desc_head || ''))
                       .split('\n')[0].slice(0, 80);
   const pinned = item.pinned ? 1 : 0;
-  // LIVE emphasis: this card is what its owning session explicitly claims it is
-  // working on right now. `active + doing` is not enough: a lane can contain
-  // several doing cards, but only one is the current parent task.
-  // `sessions`, not the pre-rename `workers` (b009f6e's FOURTH casualty —
-  // the typeof guard made the dead global read as false instead of throwing,
-  // so the LIVE emphasis just silently never lit).
-  const _liveSession = item.session && (typeof sessions !== 'undefined')
-    ? (sessions || []).find(s => s.name === item.session && s.status === 'active')
-    : null;
-  const _liveCard = _liveSession ? _cardDoingItem(item.session) : null;
-  const _liveNow = !!(_liveCard && _liveCard.id === item.id);
+  // The server's exact runtime link drives live emphasis. A stale observed
+  // claim is shown separately in amber, including cards outside Doing.
+  const _activity = _boardActivityForCard(item);
+  const _liveNow = !!(_activity && _activity.linked);
+  const _observedNow = !!(_activity && !_activity.linked);
   // item.session, not the pre-rename item.worker — the dead field rendered
   // 'undefined is working on this right now' in the LIVE tooltip.
-  let h = '<div class="board-card' + (pinned ? ' board-card-pinned' : '') + (_liveNow ? ' board-card-live' : '') + '" data-id="' + item.id + '"' + (_liveNow ? ' title="' + esc(item.session) + ' is working on this right now"' : '') + ' onclick="openBoardDetail(\'' + item.id + '\')" oncontextmenu="return _boardCtxMenu(event,\'' + escJs(item.id) + '\')">';
+  let h = '<div class="board-card' + (pinned ? ' board-card-pinned' : '') + (_liveNow ? ' board-card-live' : _observedNow ? ' board-card-observed' : '') + '" data-id="' + item.id + '"' + (_liveNow ? ' title="' + esc(item.session) + ' is working on this right now"' : '') + ' onclick="openBoardDetail(\'' + item.id + '\')" oncontextmenu="return _boardCtxMenu(event,\'' + escJs(item.id) + '\')">';
   h += '<div class="board-drag-handle" onclick="event.stopPropagation()" title="Drag to move"><svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><circle cx="3.5" cy="2.5" r="1.25"/><circle cx="8.5" cy="2.5" r="1.25"/><circle cx="3.5" cy="6" r="1.25"/><circle cx="8.5" cy="6" r="1.25"/><circle cx="3.5" cy="9.5" r="1.25"/><circle cx="8.5" cy="9.5" r="1.25"/></svg></div>';
   h += '<button class="board-pin-btn' + (pinned ? ' active' : '') + '" onclick="event.stopPropagation();_togglePin(\'' + item.id + '\')" title="' + (pinned ? 'Unpin' : 'Pin to top') + '">&#x1F4CC;</button>';
   const _bq = typeof boardSearchQuery !== 'undefined' ? boardSearchQuery : '';
   h += '<div class="board-card-key">' + _hlSearch(esc(item.id), _bq)
     + (_liveNow ? '<span class="board-card-live-label"><span class="board-live-dot"></span>Working now</span>' : '')
+    + (_observedNow ? '<span class="board-card-live-label">Last linked · out of date</span>' : '')
     + '</div>';
   if (item.doing_rot) h += '<div class="board-card-rot" title="Rotting: ' + item.doing_rot_days + 'd in doing with no board update and no commit/PR evidence. Evidence it forward or demote it.">&#x26A0; ' + Math.round(item.doing_rot_days) + 'd no evidence</div>';
   if (item.no_executor) h += '<div class="board-card-noexec" title="In doing, but nobody is executing it: ' + esc(item.no_executor) + '. Shepherding is not ownership.">&#x1F6A8; no executor</div>';
@@ -29697,6 +29750,7 @@ function renderBoard() {
   if (document.body.classList.contains('board-dragging')) { _boardRenderPending = true; return; }
   renderBoardFilters();
   const container = document.getElementById('board-columns');
+  _renderBoardActivity(container, '');
   // Update view toggle buttons
   var bvS = document.getElementById('bv-session');
   var bvC = document.getElementById('bv-status');
@@ -33362,6 +33416,7 @@ function connectSSE() {
           // peeked frame is unchanged; the while-open poll still carries the
           // continuous mid-turn stream that SSE-on-change alone would miss.
           _refreshOpenPeekOnSessions();
+          _refreshBoardActivityOnSessions();
           // If workspace is open but no panes were restored yet (e.g. sessions
           // cache was empty on startup), retry restoration now that we have data.
           if (firstLoad && _grid && Object.keys(_gridPanes).length === 0) {
