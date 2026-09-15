@@ -8,7 +8,8 @@ use tower::ServiceExt;
 
 async fn call(app: &axum::Router, method: &str, path: &str, data: Value) -> (StatusCode,Value) {
     let r=app.clone().oneshot(Request::builder().method(method).uri(path)
-        .header("content-type","application/json").body(Body::from(data.to_string())).unwrap()).await.unwrap();
+        .header("content-type","application/json").header("X-Amux-Session","approval-fixture")
+        .body(Body::from(data.to_string())).unwrap()).await.unwrap();
     let status=r.status();
     let bytes=axum::body::to_bytes(r.into_body(),usize::MAX).await.unwrap();
     (status,serde_json::from_slice(&bytes).unwrap())
@@ -38,10 +39,11 @@ async fn needs_you_requires_budget_or_customer_outbound_at_every_write_boundary(
     assert!(status.is_success(),"{created}");
     let id=created["id"].as_str().unwrap();
     let (status,result)=call(&app,"PATCH",&format!("/api/board/{id}"),json!({"status":"needsyou",
-        "force":true,"force_reason":"test force cannot override standing authority","gate_ack":true,
+        "force":true,"reason":"test force cannot override standing authority","gate_ack":true,
         "ask_type":"decision","ask_actor":"Ethan","ask_question":"Which report formatting should be used?",
         "ask_unblocks":"Choosing a report format"})).await;
     assert_eq!(status,StatusCode::CONFLICT,"{result}");
+    assert_eq!(result["code"],"needsyou_outside_approval_policy","{result}");
     let c=store.read().unwrap();
     assert_eq!(amux_server::db::board_store::get_issue(&c,id).unwrap().unwrap().status,"todo");
     let opts=amux_server::db::advance::AdvanceOpts{force:true,gate_ack:true,..Default::default()};
