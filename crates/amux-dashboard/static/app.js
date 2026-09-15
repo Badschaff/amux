@@ -10821,7 +10821,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.958';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.959';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -36790,6 +36790,42 @@ function _msgSetMode(mode) {
 // question to the model with the messages as data, and shows what it was
 // answered OVER: how many messages of how many, the window, and the ids the
 // answer cited, so a claim can be checked rather than believed.
+// AMUX-4681: the conversation, held here rather than on the server. A thread
+// belongs to ONE population: the global tab and each worker have their own, and
+// switching worker starts a new one, because a follow-up interpreted against a
+// different lane's messages is a wrong answer that reads as a right one.
+const _ASK_MAX_THREAD = 6;
+let _askThread = [];          // [{q, a}] for the global tab
+let _peekAskThread = [];      // [{q, a}] for the worker tab
+let _peekAskThreadFor = '';   // which worker _peekAskThread belongs to
+function _askThreadFor(peek) {
+  if (!peek) return _askThread;
+  if (_peekAskThreadFor !== peekSession) { _peekAskThread = []; _peekAskThreadFor = peekSession; }
+  return _peekAskThread;
+}
+function _askNewThread(peek) {
+  if (peek) { _peekAskThread = []; _peekAskThreadFor = peekSession; } else { _askThread = []; }
+  const ansEl = document.getElementById(peek ? 'peek-ask-answer' : 'ask-answer');
+  const metaEl = document.getElementById(peek ? 'peek-ask-meta' : 'ask-meta');
+  if (ansEl) ansEl.innerHTML = '';
+  if (metaEl) metaEl.textContent = '';
+  document.getElementById(peek ? 'peek-ask-q' : 'ask-q')?.focus();
+}
+// The thread, oldest first, newest answer last. Earlier turns collapse: the
+// reader needs to see what was asked, not re-read every answer.
+function _askRenderThread(peek, latestHTML) {
+  const ansEl = document.getElementById(peek ? 'peek-ask-answer' : 'ask-answer');
+  if (!ansEl) return;
+  const thread = _askThreadFor(peek);
+  const earlier = thread.slice(0, -1).map(t =>
+    '<details style="margin-bottom:8px;border-left:2px solid var(--border);padding-left:8px;">'
+    + '<summary style="cursor:pointer;color:var(--dim);font-size:0.8rem;">' + esc(t.q) + '</summary>'
+    + '<div style="margin-top:6px;font-size:0.82rem;">' + _askFormat(t.a) + '</div></details>').join('');
+  const current = thread.length
+    ? '<div style="font-size:0.8rem;color:var(--dim);margin-bottom:4px;">' + esc(thread[thread.length - 1].q) + '</div>'
+    : '';
+  ansEl.innerHTML = earlier + current + latestHTML;
+}
 const _ASK_SUGGESTIONS = [
   'What themes came up most?',
   'What did Ethan ask for that is still not done?',
@@ -36847,7 +36883,10 @@ async function _askRun(peek) {
     // meaningless: there is nobody to show the answer to.
     r = await _origFetch(API + '/api/history/ask', {
       method: 'POST', headers: _authHeaders({'Content-Type':'application/json'}),
-      body: JSON.stringify({ question, session, days }),
+      // The thread goes with the question so a follow-up ("why?", "which of
+      // those...") is interpreted against what was already asked.
+      body: JSON.stringify({ question, session, days,
+        history: _askThreadFor(peek).slice(-_ASK_MAX_THREAD).map(t => ({ question: t.q, answer: t.a })) }),
       _skipOutbox: true, signal: AbortSignal.timeout(300000),
     });
     d = await r.json();
@@ -36882,14 +36921,19 @@ async function _askRun(peek) {
   if (metaEl) metaEl.textContent = 'answered over ' + considered + ' of ' + available
     + ' message' + (d.n_available === 1 ? '' : 's') + ' from ' + scope
     + ', last ' + d.window_days + ' day' + (d.window_days === 1 ? '' : 's')
-    + (d.truncated ? ' (oldest dropped to fit)' : '') + secs;
+    + (d.truncated ? ' (oldest dropped to fit)' : '')
+    + (d.history_turns ? ' \u00b7 follow-up with ' + d.history_turns + ' earlier exchange' + (d.history_turns === 1 ? '' : 's') : '')
+    + secs;
+  const thread = _askThreadFor(peek);
+  thread.push({ q: question, a: d.answer || '' });
+  if (qEl) qEl.value = '';   // the box is ready for the follow-up
   const cites = Array.isArray(d.cited) && d.cited.length
     ? '<div style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap;align-items:center;">'
       + '<span style="font-size:0.72rem;color:var(--dim);">cited:</span>'
       + d.cited.map(id => '<button class="btn" style="font-size:0.7rem;padding:2px 8px;" onclick="_askOpenCitation('
         + JSON.stringify(id) + ')">MSG-' + esc(id) + '</button>').join('') + '</div>'
     : '';
-  if (ansEl) ansEl.innerHTML = '<div>' + _askFormat(d.answer || '') + '</div>' + cites;
+  _askRenderThread(peek, '<div>' + _askFormat(d.answer || '') + '</div>' + cites);
 }
 /// Open the message an answer cited, so a claim can be checked against the row.
 async function _askOpenCitation(id) {

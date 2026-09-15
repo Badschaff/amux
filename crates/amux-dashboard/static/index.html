@@ -1418,6 +1418,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <option value="90">Last 90 days</option>
       </select>
       <button class="btn primary" id="ask-go" onclick="_askRun()">Ask</button>
+      <button class="btn" id="ask-new" onclick="_askNewThread(false)" title="Start a new thread: follow-ups will not see the earlier questions">New</button>
     </div>
     <div id="ask-suggestions" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;"></div>
     <div id="ask-meta" style="font-size:0.72rem;color:var(--dim);margin-bottom:8px;"></div>
@@ -2528,6 +2529,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
           <option value="90">90 days</option>
         </select>
         <button class="btn primary" onclick="_askRun(true)">Ask</button>
+        <button class="btn" onclick="_askNewThread(true)" title="Start a new thread: follow-ups will not see the earlier questions">New</button>
       </div>
       <div id="peek-ask-suggestions" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;"></div>
       <div id="peek-ask-meta" style="font-size:0.7rem;color:var(--dim);margin-top:8px;"></div>
