@@ -867,12 +867,11 @@ async fn get_attribution(
         )?;
 
         let mut stmt = conn.prepare(
-            "WITH lg AS (SELECT ts, session, cost_usd, input, output FROM token_ledger WHERE ts > ?1) \
-             SELECT COALESCE((SELECT h.type FROM cmd_history h \
-                                WHERE h.session = lg.session AND h.ts/1000 <= lg.ts \
-                                ORDER BY h.ts DESC LIMIT 1), '') AS trig, \
-                    SUM(cost_usd), COUNT(*), SUM(input), SUM(output) \
-             FROM lg GROUP BY 1 ORDER BY 2 DESC",
+            &format!(
+                "WITH lg AS (SELECT ts, session, cost_usd, input, output FROM token_ledger WHERE ts > ?1), {PROMPT_SOURCE_SRC} \
+                 SELECT {PROMPT_SOURCE_TRIG} AS trig, SUM(cost_usd), COUNT(*), SUM(input), SUM(output) \
+                 FROM src GROUP BY 1 ORDER BY 2 DESC"
+            ),
         )?;
         let rows = stmt.query_map([cutoff], |r| {
             Ok((
@@ -1074,20 +1073,20 @@ pub(crate) fn render_usage_report(conn: &rusqlite::Connection, days: i64, limit:
         total_cost,
     ));
 
-    // Prompt source: the same join /api/usage/attribution uses. It sees
-    // cmd_history only; steering-delivered nudges are credited to the prompt
-    // before them until AMUX-4582 lands, and the report says so.
+    // Prompt source: the same definition /api/usage/attribution uses, now
+    // including steering deliveries (AMUX-4582).
     let mut st = conn.prepare(
-        "WITH lg AS (SELECT ts, session, cost_usd, input, cache_read, cache_write, output FROM token_ledger WHERE ts > ?1) \
-         SELECT COALESCE((SELECT h.type FROM cmd_history h WHERE h.session = lg.session AND h.ts/1000 <= lg.ts \
-                          ORDER BY h.ts DESC LIMIT 1), '') AS trig, \
-                SUM(cost_usd), SUM(input + cache_read + cache_write + output), COUNT(*) \
-         FROM lg GROUP BY 1 ORDER BY 2 DESC",
+        &format!(
+            "WITH lg AS (SELECT ts, session, cost_usd, input, cache_read, cache_write, output FROM token_ledger WHERE ts > ?1), {PROMPT_SOURCE_SRC} \
+             SELECT {PROMPT_SOURCE_TRIG} AS trig, \
+                    SUM(cost_usd), SUM(input + cache_read + cache_write + output), COUNT(*) \
+             FROM src GROUP BY 1 ORDER BY 2 DESC"
+        ),
     )?;
     let sources: Vec<(String, f64, i64, i64)> = st
         .query_map([cutoff], |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    md.push_str(&md_table("By what triggered the turn", "Source (cmd_history.type)", &sources, total_cost));
+    md.push_str(&md_table("By what triggered the turn", "Source (prompt or steering guard)", &sources, total_cost));
 
     // By card: attributed rows only; the stale task_windows problem is named.
     md.push_str(&md_table(
@@ -1172,6 +1171,49 @@ struct AttributionQuery {
 
 /// Plain English, because the audience is a person wondering where their
 /// credits went, not someone who knows what `cmd_history.type` is.
+/// Which prompt a turn is credited to: the LATEST one the lane received at or
+/// before it, from EITHER history table.
+///
+/// AMUX-4582. This used to read `cmd_history` alone. Steering deliveries write
+/// only `steering_history` (board-drive nudges, board-progress, `sched:` fires,
+/// the commit nudge, auto-compact, the browser reaper, the staged guard), so
+/// every turn they started was credited to the prompt BEFORE them, which is
+/// frequently the human's. That is the exact inversion this view exists to
+/// prevent: it answers "did amux hand me this, or did I ask for it?".
+///
+/// Written once and interpolated into all three readers (by_source, top
+/// origins, the markdown report) rather than restated in each: a view must
+/// share the predicate of the mechanism it describes, and three copies of a
+/// join is how two of them end up disagreeing.
+const PROMPT_SOURCE_SRC: &str = "\
+ src AS (SELECT lg.*, \
+   (SELECT h.ts/1000 FROM cmd_history h \
+      WHERE h.session = lg.session AND h.ts/1000 <= lg.ts ORDER BY h.ts DESC LIMIT 1) AS c_ts, \
+   (SELECT COALESCE(h.type,'') FROM cmd_history h \
+      WHERE h.session = lg.session AND h.ts/1000 <= lg.ts ORDER BY h.ts DESC LIMIT 1) AS c_type, \
+   (SELECT COALESCE(h.origin,'') FROM cmd_history h \
+      WHERE h.session = lg.session AND h.ts/1000 <= lg.ts ORDER BY h.ts DESC LIMIT 1) AS c_origin, \
+   (SELECT s.delivered_at FROM steering_history s \
+      WHERE s.session = lg.session AND s.delivered_at <= lg.ts ORDER BY s.delivered_at DESC LIMIT 1) AS s_ts, \
+   (SELECT COALESCE(NULLIF(s.guard,''),'steering') FROM steering_history s \
+      WHERE s.session = lg.session AND s.delivered_at <= lg.ts ORDER BY s.delivered_at DESC LIMIT 1) AS s_guard, \
+   (SELECT COALESCE(s.sender,'') FROM steering_history s \
+      WHERE s.session = lg.session AND s.delivered_at <= lg.ts ORDER BY s.delivered_at DESC LIMIT 1) AS s_sender \
+   FROM lg)";
+
+/// The source key. A steering guard becomes `steer:<family>`, the part before
+/// its first colon, so `sched:SCHED-456` and `task-callback:TUBES-2790` group
+/// as `steer:sched` and `steer:task-callback` instead of one bucket per id.
+const PROMPT_SOURCE_TRIG: &str = "CASE WHEN src.s_ts IS NOT NULL AND (src.c_ts IS NULL OR src.s_ts > src.c_ts) \
+   THEN 'steer:' || CASE WHEN instr(src.s_guard, ':') > 0 \
+                         THEN substr(src.s_guard, 1, instr(src.s_guard, ':') - 1) ELSE src.s_guard END \
+   ELSE COALESCE(src.c_type, '') END";
+
+/// Who or what sent it, for the named-offenders list: the steering sender when
+/// steering won, the cmd_history origin otherwise.
+const PROMPT_SOURCE_ORIGIN: &str = "CASE WHEN src.s_ts IS NOT NULL AND (src.c_ts IS NULL OR src.s_ts > src.c_ts) \
+   THEN src.s_sender ELSE COALESCE(src.c_origin, '') END";
+
 fn trigger_label(t: &str) -> &'static str {
     match t {
         "user" => "you typed it",
@@ -1185,6 +1227,19 @@ fn trigger_label(t: &str) -> &'static str {
         "system" => "an amux nudge",
         "direct" | "steering" => "a steering message",
         "" => "no prompt matched; the turn predates this lane's history",
+        // AMUX-4582: steering deliveries, named by what sent them. Each of
+        // these was previously credited to the prompt before it.
+        "steer:board-drive" => "amux nudged this lane about a card",
+        "steer:board-progress" => "a board progress note",
+        "steer:sched" => "a schedule fired",
+        "steer:commit-nudge" => "the commit nudge",
+        "steer:auto-compact" | "steer:compact" => "an auto-compact",
+        "steer:task-callback" => "a task callback from a peer",
+        "steer:browser-reaper" => "the browser reaper",
+        "steer:staged-guard" => "the staged guard",
+        "steer:deferred-automation" => "deferred automation",
+        "steer:steering" => "a steering message with no guard",
+        other if other.starts_with("steer:") => "an amux nudge",
         _ => "other",
     }
 }
@@ -1192,15 +1247,11 @@ fn trigger_label(t: &str) -> &'static str {
 /// The named offenders inside the background bucket.
 fn stmt_top(conn: &rusqlite::Connection, cutoff: i64) -> anyhow::Result<Vec<Value>> {
     let mut stmt = conn.prepare(
-        "WITH lg AS (SELECT ts, session, cost_usd FROM token_ledger WHERE ts > ?1) \
-         SELECT COALESCE((SELECT h.type FROM cmd_history h \
-                            WHERE h.session = lg.session AND h.ts/1000 <= lg.ts \
-                            ORDER BY h.ts DESC LIMIT 1), ''), \
-                COALESCE((SELECT h.origin FROM cmd_history h \
-                            WHERE h.session = lg.session AND h.ts/1000 <= lg.ts \
-                            ORDER BY h.ts DESC LIMIT 1), ''), \
-                lg.session, SUM(cost_usd), COUNT(*) \
-         FROM lg GROUP BY 1,2,3 ORDER BY 4 DESC LIMIT 10",
+        &format!(
+            "WITH lg AS (SELECT ts, session, cost_usd FROM token_ledger WHERE ts > ?1), {PROMPT_SOURCE_SRC} \
+             SELECT {PROMPT_SOURCE_TRIG}, {PROMPT_SOURCE_ORIGIN}, src.session, SUM(cost_usd), COUNT(*) \
+             FROM src GROUP BY 1,2,3 ORDER BY 4 DESC LIMIT 10"
+        ),
     )?;
     let rows = stmt.query_map([cutoff], |r| {
         Ok((
@@ -1983,6 +2034,116 @@ mod tests {
 #[cfg(test)]
 mod usage_report_tests {
     use super::render_usage_report;
+
+    use super::trigger_label;
+
+    fn ledger_row(conn: &rusqlite::Connection, session: &str, ts: i64, cost: f64) {
+        conn.execute(
+            "INSERT INTO token_ledger (ts, session, conversation, model, input, cache_read, cache_write, output, cost_usd, task) \
+             VALUES (?1, ?2, 'conv', 'claude-opus-5', 10, 0, 0, 5, ?3, '')",
+            rusqlite::params![ts, session, cost],
+        )
+        .unwrap();
+    }
+
+    fn typed_prompt(conn: &rusqlite::Connection, session: &str, ts_secs: i64, kind: &str) {
+        conn.execute(
+            "INSERT INTO cmd_history (text, type, session, ts, origin) VALUES ('do the thing', ?1, ?2, ?3, 'ethan')",
+            rusqlite::params![kind, session, ts_secs * 1000],
+        )
+        .unwrap();
+    }
+
+    fn steering_delivery(conn: &rusqlite::Connection, id: &str, session: &str, ts_secs: i64, guard: &str, sender: &str) {
+        conn.execute(
+            "INSERT INTO steering_history (id, session, text, queued_at, delivered_at, guard, sender) \
+             VALUES (?1, ?2, 'nudge text', ?3, ?4, ?5, ?6)",
+            rusqlite::params![id, session, ts_secs as f64, ts_secs as f64, guard, sender],
+        )
+        .unwrap();
+    }
+
+    fn source_keys(md: &str) -> Vec<String> {
+        // Stop at the next heading: the report has more tables below this one,
+        // and reading past it collected their rows as sources.
+        let section = md.split("## By what triggered the turn").nth(1).unwrap();
+        let section = section.split("\n## ").next().unwrap_or(section);
+        section
+            .lines()
+            .filter(|l| l.starts_with("| ") && !l.contains("---"))
+            .skip(1)   // the table's own header row is not a source
+            .map(|l| l.trim_start_matches("| ").split(" |").next().unwrap_or("").to_string())
+            .collect()
+    }
+
+    /// AMUX-4582: a turn a NUDGE started is credited to the nudge.
+    ///
+    /// Before this, the nudge wrote only `steering_history`, the join saw only
+    /// `cmd_history`, and the turn was charged to the human prompt that
+    /// happened to precede it. That inverts the one question this view exists
+    /// to answer, and it inflates what looks like human-requested spend.
+    #[test]
+    fn a_steering_delivered_turn_is_credited_to_the_steering_guard() {
+        let conn = crate::db::migrate::test_memdb();
+        let now = 1_789_400_000i64;
+
+        // The human typed something an hour before; then amux nudged; then the
+        // lane spent tokens. The spend belongs to the nudge.
+        typed_prompt(&conn, "amux", now - 3600, "user");
+        steering_delivery(&conn, "s1", "amux", now - 120, "board-drive", "");
+        ledger_row(&conn, "amux", now - 60, 4.0);
+
+        // A lane whose newest prompt really is the human's keeps it: the CONTROL
+        // that separates "reads steering" from "always says steering".
+        typed_prompt(&conn, "solo", now - 300, "user");
+        ledger_row(&conn, "solo", now - 60, 1.0);
+
+        // A schedule fire groups by family, not one bucket per schedule id.
+        steering_delivery(&conn, "s2", "cron", now - 200, "sched:SCHED-456", "");
+        ledger_row(&conn, "cron", now - 60, 2.0);
+
+        let md = render_usage_report(&conn, 1, 25, now).unwrap();
+        let keys = source_keys(&md);
+        assert!(keys.contains(&"steer:board-drive".to_string()), "the nudge is its own source: {keys:?}");
+        assert!(keys.contains(&"steer:sched".to_string()), "sched:SCHED-456 groups as its family: {keys:?}");
+        assert!(keys.contains(&"user".to_string()), "a genuinely human-prompted turn still reads user: {keys:?}");
+        assert!(!keys.iter().any(|k| k.contains("SCHED-456")), "not one bucket per schedule id: {keys:?}");
+
+        // And the money moved with it: $4 of nudge-driven spend that used to be
+        // filed under the human prompt.
+        let section = md.split("## By what triggered the turn").nth(1).unwrap();
+        let section = section.split("\n## ").next().unwrap_or(section);
+        let nudge_line = section.lines().find(|l| l.starts_with("| steer:board-drive")).unwrap();
+        assert!(nudge_line.contains("$4.00"), "{nudge_line}");
+        let human_line = section.lines().find(|l| l.starts_with("| user")).unwrap();
+        assert!(human_line.contains("$1.00"), "only the lane that really typed it: {human_line}");
+    }
+
+    /// A steering row OLDER than the lane's newest prompt must not win: the rule
+    /// is "the latest prompt", not "steering beats everything".
+    #[test]
+    fn the_newest_prompt_wins_whichever_table_it_came_from() {
+        let conn = crate::db::migrate::test_memdb();
+        let now = 1_789_400_000i64;
+        steering_delivery(&conn, "s1", "amux", now - 600, "board-drive", "");
+        typed_prompt(&conn, "amux", now - 120, "user");
+        ledger_row(&conn, "amux", now - 60, 3.0);
+        let keys = source_keys(&render_usage_report(&conn, 1, 25, now).unwrap());
+        assert_eq!(keys, vec!["user".to_string()], "the human typed after the nudge: {keys:?}");
+    }
+
+    #[test]
+    fn every_steering_family_reads_as_itself_and_an_unknown_one_still_reads_as_a_nudge() {
+        assert_eq!(trigger_label("steer:board-drive"), "amux nudged this lane about a card");
+        assert_eq!(trigger_label("steer:sched"), "a schedule fired");
+        assert_eq!(trigger_label("steer:commit-nudge"), "the commit nudge");
+        assert_eq!(trigger_label("steer:auto-compact"), "an auto-compact");
+        assert_eq!(trigger_label("steer:task-callback"), "a task callback from a peer");
+        // A guard nobody has taught this table still reads as amux, not "other":
+        // the question is "did amux hand me this", and the answer is yes.
+        assert_eq!(trigger_label("steer:some-future-job"), "an amux nudge");
+        assert_eq!(trigger_label("user"), "you typed it");
+    }
 
     #[test]
     fn the_markdown_report_is_sorted_by_cost_and_states_its_population() {
