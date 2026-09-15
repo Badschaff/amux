@@ -455,26 +455,114 @@ pub async fn index_once_at(
     Ok(inserted)
 }
 
-/// py:18219 — fill `token_ledger.task` for turns that fall inside a card's
-/// doing-window for the SAME session. Only touches unattributed rows.
+/// A claim window may not run longer than this, however it ended.
+///
+/// The open-ended window is what made the old attribution wrong, so the
+/// replacement refuses to express one. `task_attempts` closes an abandoned
+/// attempt through the lease reaper and `reconcile_orphans`, but "the writer
+/// will close it" is the same assumption `task_windows` was built on, and it
+/// held until the writer went away. A genuinely long claim loses attribution
+/// for its tail, which is a bounded error; an unclosed one silently absorbs
+/// every later turn on that lane, which is not.
+const MAX_CLAIM_WINDOW_S: i64 = 24 * 3600;
+
+/// Fill `token_ledger.task` for turns that fall inside a card's claim window on
+/// the SAME lane. Only touches unattributed rows.
+///
+/// WHY NOT `task_windows` (AMUX-4581). It has had no writer since the Python
+/// cutover: 484 rows, newest `entered_doing` 2026-08-09, measured 37 days
+/// stale. Four of those windows never closed, and the old query read
+/// `COALESCE(left_doing, now)`, so each one stretched from last July to the
+/// present and swallowed everything after it. Measured over 7 days before this
+/// change: AMUX-1808 took $2,680 of ownerless conversations and AMUX-2598 took
+/// $1,618 of every `amux` turn. The Cost tab's by-task bars were reporting
+/// which stale row won a race, not where the money went.
+///
+/// TWO causes, both fixed here, because swapping the table alone would have
+/// rebuilt the same trap on fresher data:
+///
+/// 1. THE UNBOUNDED WINDOW. `task_attempts` is the live record (written at both
+///    lease choke points), but an attempt that never closes would extend to now
+///    exactly as those four windows did. Capped at `MAX_CLAIM_WINDOW_S`.
+///
+/// 2. THE EMPTY SESSION MATCHING ITSELF. Three of the four absorbing windows
+///    had `session = ''`, and the old `WHERE session=?2` matched them against
+///    ledger rows whose session is also `''` — every ownerless conversation on
+///    the box. An empty lane is not an identity, so a blank on EITHER side now
+///    attributes nothing. This is the clause that actually drained AMUX-1808,
+///    and it is independent of which table the windows come from.
+///
+/// `task.claimed` covers the era before attempts existed: it is the only record
+/// of a claim for ledger rows older than the first attempt row. Its interval
+/// runs to the lane's next claim, capped the same way, so it cannot become an
+/// open window either.
 pub async fn attribute_tasks(store: &SharedStore) -> anyhow::Result<()> {
     store
         .write_async(move |conn| {
             let now = chrono::Utc::now().timestamp();
-            let wins: Vec<(String, String, i64, i64)> = {
-                let mut stmt = conn.prepare(
-                    "SELECT task, session, entered_doing, COALESCE(left_doing, ?1) lo
-                     FROM task_windows ORDER BY entered_doing",
-                )?;
-                let rows = stmt.query_map([now], |r| {
+            let mut wins: Vec<(String, String, i64, i64)> = Vec::new();
+
+            // The live source. `min(a, b)` is SQLite's two-argument scalar min.
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT card, worker, started_at, \
+                        min(COALESCE(ended_at, ?1), started_at + ?2) \
+                 FROM task_attempts \
+                 WHERE COALESCE(worker,'') <> '' AND COALESCE(card,'') <> '' \
+                 ORDER BY started_at",
+            ) {
+                if let Ok(rows) = stmt.query_map([now, MAX_CLAIM_WINDOW_S], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                }) {
+                    wins.extend(rows.flatten());
+                }
+            }
+
+            // The historical source: one interval per claim, ending at that
+            // lane's next claim. `data` carries {"issue": "<id>", ...}.
+            let claims: Vec<(String, String, i64)> = {
+                let mut stmt = conn.prepare(
+                    "SELECT session, data, CAST(ts AS INTEGER) FROM session_events \
+                     WHERE type='task.claimed' AND COALESCE(session,'') <> '' \
+                     ORDER BY session, ts",
+                )?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                        r.get::<_, i64>(2)?,
+                    ))
                 })?;
                 rows.flatten().collect()
             };
+            for (i, (session, data, ts)) in claims.iter().enumerate() {
+                let Some(card) = serde_json::from_str::<serde_json::Value>(data)
+                    .ok()
+                    .and_then(|v| v.get("issue").and_then(|c| c.as_str()).map(str::to_string))
+                    .filter(|c| !c.is_empty())
+                else {
+                    continue;
+                };
+                // The next claim BY THE SAME LANE ends this one. A later claim
+                // by another lane says nothing about when this one stopped.
+                let next = claims[i + 1..]
+                    .iter()
+                    .find(|(s, _, _)| s == session)
+                    .map(|(_, _, t)| *t)
+                    .unwrap_or(now);
+                wins.push((card, session.clone(), *ts, next.min(ts + MAX_CLAIM_WINDOW_S)));
+            }
+
+            // Oldest first, so the earliest claim covering a turn wins it; the
+            // UPDATE only touches rows still unattributed.
+            wins.sort_by_key(|(_, _, from, _)| *from);
             for (task, session, from, to) in wins {
+                if session.trim().is_empty() || task.trim().is_empty() || to < from {
+                    continue;
+                }
                 conn.execute(
-                    "UPDATE token_ledger SET task=?1
-                     WHERE task='' AND session=?2 AND ts>=?3 AND ts<=?4",
+                    "UPDATE token_ledger SET task=?1 \
+                     WHERE task='' AND session=?2 AND COALESCE(session,'') <> '' \
+                       AND ts>=?3 AND ts<=?4",
                     rusqlite::params![task, session, from, to],
                 )?;
             }
@@ -660,6 +748,131 @@ mod tests {
         let st = crate::db::Store::open(&dir.path().join("ledger-test.db")).unwrap();
         std::mem::forget(dir);
         std::sync::Arc::new(st)
+    }
+
+    /// AMUX-4581: the two misattributions the token audit measured, reproduced
+    /// as fixtures and then required NOT to happen.
+    ///
+    /// Both were caused by a window that never closed being read as
+    /// `COALESCE(left_doing, now)`: AMUX-1808 (entered_doing 2026-07-21, no
+    /// session) absorbed $2,680 of ownerless conversations in 7 days, and
+    /// AMUX-2598 (session `amux`) absorbed $1,618 of every amux turn. Both
+    /// stale rows are seeded here in the shape the live DB actually holds.
+    #[tokio::test]
+    async fn a_stale_open_window_stops_absorbing_every_later_turn() {
+        let st = store();
+        let now = chrono::Utc::now().timestamp();
+        let july = now - 56 * 86400;
+        st.write(move |conn| {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS task_windows (id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 task TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', session TEXT NOT NULL DEFAULT '', \
+                 entered_doing INTEGER NOT NULL, left_doing INTEGER);",
+            )?;
+            crate::db::attempts::ensure_table(conn)?;
+            // The two absorbing windows, never closed, exactly as measured.
+            conn.execute(
+                "INSERT INTO task_windows (task, session, entered_doing, left_doing) \
+                 VALUES ('AMUX-1808','',?1,NULL), ('AMUX-2598','amux',?1,NULL)",
+                [july],
+            )?;
+            // THE SAME SHAPE ON THE NEW SOURCE. Without these two rows the
+            // empty-lane rule is untestable: dropping it stays green purely
+            // because the dead table is no longer read, so the fixture would be
+            // proving the table swap and nothing else. An attempt and a claim
+            // that carry no lane are the way AMUX-1808 could come back.
+            conn.execute(
+                "INSERT INTO task_attempts (card, attempt, worker, generation, started_at, ended_at) \
+                 VALUES ('AMUX-1808', 1, '', 1, ?1, NULL)",
+                [now - 3600],
+            )?;
+            conn.execute(
+                "INSERT INTO session_events (ts, session, type, data, source) \
+                 VALUES (?1,'','task.claimed','{\"issue\":\"AMUX-1808\"}','test')",
+                [now - 3600],
+            )?;
+            // Turns from today: one ownerless, one on the amux lane.
+            conn.execute(
+                "INSERT INTO token_ledger (ts, session, conversation, model, input, cache_read, \
+                 cache_write, output, cost_usd, task) VALUES \
+                 (?1,'','conv-ownerless','m',10,0,0,1,0.5,''), \
+                 (?1,'amux','conv-amux','m',10,0,0,1,0.5,'')",
+                [now - 60],
+            )?;
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        })
+        .unwrap();
+
+        attribute_tasks(&st).await.unwrap();
+
+        let task_of = |conv: &str| -> String {
+            st.read()
+                .unwrap()
+                .query_row("SELECT task FROM token_ledger WHERE conversation=?1", [conv], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            task_of("conv-ownerless"),
+            "",
+            "an ownerless conversation must not land on AMUX-1808: an empty lane is not an identity"
+        );
+        assert_eq!(
+            task_of("conv-amux"),
+            "",
+            "a 56-day-old unclosed window must not claim today's amux turn (AMUX-2598)"
+        );
+    }
+
+    /// The other half: with the dead table gone, a REAL claim still attributes.
+    /// Without this the fix above would be indistinguishable from attributing
+    /// nothing at all, which would also make both assertions pass.
+    #[tokio::test]
+    async fn a_live_attempt_and_a_historical_claim_still_attribute() {
+        let st = store();
+        let now = chrono::Utc::now().timestamp();
+        st.write(move |conn| {
+            crate::db::attempts::ensure_table(conn)?;
+            conn.execute(
+                "INSERT INTO task_attempts (card, attempt, worker, generation, started_at, ended_at) \
+                 VALUES ('AMUX-9001', 1, 'lane-a', 1, ?1, NULL)",
+                [now - 600],
+            )?;
+            conn.execute(
+                "INSERT INTO session_events (ts, session, type, data, source) \
+                 VALUES (?1,'lane-b','task.claimed','{\"issue\":\"AMUX-9002\"}','test')",
+                [now - 500],
+            )?;
+            conn.execute(
+                "INSERT INTO token_ledger (ts, session, conversation, model, input, cache_read, \
+                 cache_write, output, cost_usd, task) VALUES \
+                 (?1,'lane-a','conv-a','m',10,0,0,1,0.5,''), \
+                 (?1,'lane-b','conv-b','m',10,0,0,1,0.5,''), \
+                 (?2,'lane-a','conv-old','m',10,0,0,1,0.5,'')",
+                [now - 300, now - 40 * 3600],
+            )?;
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        })
+        .unwrap();
+
+        attribute_tasks(&st).await.unwrap();
+
+        let task_of = |conv: &str| -> String {
+            st.read()
+                .unwrap()
+                .query_row("SELECT task FROM token_ledger WHERE conversation=?1", [conv], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(task_of("conv-a"), "AMUX-9001", "a running attempt attributes its lane's turn");
+        assert_eq!(task_of("conv-b"), "AMUX-9002", "a task.claimed event still attributes historical turns");
+        assert_eq!(
+            task_of("conv-old"),
+            "",
+            "a turn 40h BEFORE the claim is outside the window and must stay unattributed"
+        );
     }
 
     async fn ledger(store: &SharedStore) -> Vec<(String, String, i64)> {
