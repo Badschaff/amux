@@ -8272,7 +8272,12 @@ fn reassign_exit(card: &str, owner: Option<&str>, caller: &str) -> Value {
             // where you stand, and this server refuses it 403
             // cross_board_reassignment_forbidden. Only the STATUS moves here,
             // which is all that is needed: the card is already theirs.
-            "how": format!("amux board todo {card}"),
+            // The lane is named IN the command line, not only in `effect`:
+            // board_api.rs requires the exit to name the owner it could see, so
+            // a reader can judge the advice without another call. Moving that
+            // name out while removing the assign broke it, and the test was
+            // right to fail.
+            "how": format!("amux board todo {card} (it is already {o}'s card, this returns it to their queue)"),
             "effect": format!("returns it to {o}'s queue. Do NOT try `amux board assign {card} {o}` — a worker may set an owner only to its own lane, and that is refused."),
             "not_a_bypass": "this does not skip the gate; it puts the card back in front of the lane the gate is asking about, and they satisfy it honestly",
         });
@@ -8308,7 +8313,8 @@ mod reassign_exit_tests {
         // own lane). The advice a gate refusal gives has to be runnable by the
         // lane reading it, so only the STATUS moves; the card is already theirs.
         assert!(
-            v["how"].as_str().unwrap() == "amux board todo MI-4155",
+            v["how"].as_str().unwrap().starts_with("amux board todo MI-4155")
+                && v["how"].as_str().unwrap().contains("mvs-infra"),
             "{v:#}"
         );
         assert!(v["effect"].as_str().unwrap().contains("mvs-infra's queue"), "{v:#}");
