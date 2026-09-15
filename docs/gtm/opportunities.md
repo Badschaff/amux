@@ -4,4 +4,4 @@ This file is the rolling backlog for opportunities found by the daily Amux GTM s
 
 | Date | Priority | Type | Source | Opportunity | Owner/Artifact | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| 2026-09-15 | P1 | Setup | User request | Create a durable daily Amux GTM distribution schedule and logging workflow. | `SCHED-462` + `docs/gtm/daily-schedule.md` | Live |
+| 2026-09-15 | P1 | Setup | User request | Create a durable daily Amux GTM distribution schedule and logging workflow in this worker. | `SCHED-462` -> `amux-gtm-auto` + `docs/gtm/daily-schedule.md` | Live |
