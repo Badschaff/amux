@@ -6202,7 +6202,16 @@ fn fault_identity(signature: &str) -> Option<&str> {
             .and_then(|rest| rest.find('|'))
             .map(|i| &signature[..("invariant|".len() + i)]);
     }
-    if !(signature.starts_with("5xx|") || signature.starts_with("latency|outlier|")) {
+    // AMUX-4648: the p95 rollup (`latency|p95|ROLLUP|<families>`) is keyed on its
+    // family set exactly like the outlier rollup, and was left out of this list
+    // when AMUX-3673 fixed the outlier one, so every new family subset filed
+    // another card: 121 p95 rollup cards by 2026-09-15, eight hand-folded into
+    // AMUX-4620 in one day. A single-family `latency|p95|<family>` signature has
+    // no trailing epoch, so it still gets no identity below and behaves as before.
+    if !(signature.starts_with("5xx|")
+        || signature.starts_with("latency|outlier|")
+        || signature.starts_with("latency|p95|"))
+    {
         return None;
     }
     // A ROLLUP'S IDENTITY IS "THE SERVER WAS SLOW", NOT WHICH ENDPOINTS IT
@@ -9160,6 +9169,26 @@ mod tests {
             fault_identity("latency|outlier|GET|/api/board|1787585028"),
             "a rollup and a single-endpoint outlier are different faults"
         );
+
+        // AMUX-4648: the p95 rollup gets the same treatment. These are the real
+        // signatures of AMUX-4640 and AMUX-4646, filed 33 minutes apart during
+        // one loaded stretch, differing only in which families were over.
+        let p1 = "latency|p95|ROLLUP|/api/email,/api/logs,/api/sessions,/api/sessions-git";
+        let p2 = "latency|p95|ROLLUP|/api/email,/api/logs,/api/sessions-git";
+        assert_eq!(fault_identity(p1), Some("latency|p95|ROLLUP"));
+        assert_eq!(
+            fault_identity(p1),
+            fault_identity(p2),
+            "two p95 rollups differing by one family are one fault, not two cards"
+        );
+        // CONTROLS: a p95 rollup does not suppress an outlier rollup, and a
+        // single-family p95 finding still has no identity, as before this change.
+        assert_ne!(
+            fault_identity(p1),
+            fault_identity(r1),
+            "a p95 rollup and an outlier rollup are different detectors"
+        );
+        assert_eq!(fault_identity("latency|p95|/api/board"), None);
 
         // Invariant signatures dedup by invariant name: all violations of the
         // same invariant (different entities, different episodes) are one fault.
