@@ -73,6 +73,7 @@ pub mod review;
 pub mod saved_messages;
 pub mod schedules;
 pub mod scope;
+pub mod screen;
 pub mod search;
 pub mod self_update;
 pub mod session_verbs;
@@ -215,6 +216,11 @@ pub fn router(state: AppState) -> Router {
         // standing proof of the cutover. Matrix:
         // docs/rust-migration/server-boundary.md.
         .nest("/api/browser", browser::routes())
+        // Server-machine screen capture (AMUX-4661): a real macOS Screen
+        // Recording permission grant needs the OS's own native prompt, not a
+        // manually-added System Settings entry — see screen.rs header for why.
+        // Loopback-only; the fleet's remote/tunnel-facing paths don't reach it.
+        .nest("/api/screen", screen::routes())
         // File VIEWER family — NATIVE (AMUX-2598): payload + raw range
         // streaming + vtt + ffmpeg prepare/transcode with durable job state
         // (api/file_viewer.rs; was PROXIED_FAMILIES' /api/file namespace row).
