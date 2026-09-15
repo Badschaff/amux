@@ -3045,3 +3045,14 @@ CARD: AF-904
 SYMPTOM: MSG-63706 exhausted two interpretation attempts: verify with no existing ID, then invented canonical IDs. The duplicate MSG-63707 waited without another call. No command graph was committed; the subsequent execution fixtures were introduced directly and do not prove automatic intake.
 COST: 10,346 measured input/cache tokens, 1,630 output tokens and a five-minute retry delay; the third trial could not demonstrate unattended command completion.
 FIX: fac6452b supplies explicit identity repair instructions and retains raw attempts; deterministic regressions pass, but successful live recovery is unproven. Enforce structured output without hiding extra calls. All three authorized Haiku workers are paused; do not claim a fourth trial ran.
+
+## The browser reaper closes a profile that CDP is actively driving
+AREA: browser
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-15
+SESSION: amux
+CARD: AMUX-4685
+SYMPTOM: "[amux] I closed your browser on profile 'default': nothing had driven it for 6min (the activity window is 5min)" arrived three times while I was driving that exact tab over raw CDP, once mid-sweep. Activity is counted as an amux browser API verb; /chrome-cdp and skills/chrome-cdp/scripts/cdp.mjs send none, so continuous use reads as idle.
+COST: Three browser restarts and one overlay sweep lost half-collected, roughly 15 minutes across an AMUX-4684 session. The kill notice names only AMUX_BROWSER_ACTIVITY_REAP_S in ~/.amux/server.env as the remedy, which needs a server restart, so a lane on a ten-minute browser task chooses between restarting the fleet's server and being interrupted.
+FIX: Let the reaper see CDP: the server already stores the profile's cdp_port, so a read of /json/version on it answers "is a debugger attached" without touching the page. Or add a keepalive verb and name it in the notice, so the remedy reaches the lane at the moment it is being killed.
