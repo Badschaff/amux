@@ -10821,7 +10821,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.955';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.957';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -17476,12 +17476,10 @@ function _peekMessagesRender() {
       pbar.style.display = 'flex';
     } else { pbar.innerHTML = ''; pbar.style.display = 'none'; }
   }
-  // Load-older affordance at the BOTTOM (rows are newest-first, so older loads
-  // below). Shown whenever the server has more pages, even when the current
-  // kind/search filter leaves the visible set small — that is exactly when you
-  // need to page back to find more of it.
-  const moreHTML = _peekMsgDone ? '' :
-    '<button class="btn" id="peek-msgs-more-btn" style="align-self:center;margin:8px auto;font-size:0.78rem;min-height:36px;" onclick="_peekMessagesLoad(true)">Load older</button>';
+  // Pager at the BOTTOM (rows are newest-first, so older pages sit below).
+  // Always rendered, not only when older pages exist: the page number and the
+  // size control are how the reader navigates, not a hint that there is more.
+  const moreHTML = _peekMsgPagerHTML();
   const _body = pendingHTML + histHTML;
   // NOTHING LOADED YET IS NOT NOTHING THERE.
   //
@@ -17512,6 +17510,56 @@ function _peekMessagesRender() {
 // pure scroll: land on the day's header, or the nearest one on/before it, and
 // flash it. If the day predates the loaded window there is nothing to page in, so
 // say so rather than silently scrolling to the oldest row.
+/// Pages for this worker under the active filter, or null when the server did
+/// not report a total (an old build): then only next/previous are offered,
+/// rather than a last page nobody measured.
+function _peekMsgPageCount() {
+  if (_peekMsgTotal === null) return null;
+  return Math.max(1, Math.ceil(_peekMsgTotal / (_msgsPageSize || _PEEK_MSG_PAGE)));
+}
+function _peekMsgPagerHTML() {
+  const pages = _peekMsgPageCount();
+  const atFirst = _peekMsgPage <= 1;
+  const atLast = pages === null ? _peekMsgDone : _peekMsgPage >= pages;
+  const btn = (label, page, disabled, title) =>
+    '<button class="btn" style="font-size:0.75rem;padding:3px 9px;min-height:44px;"'
+    + (disabled ? ' disabled' : ' onclick="_peekMsgGoToPage(' + page + ')"')
+    + ' title="' + title + '">' + label + '</button>';
+  const sizes = _MSGS_PAGE_SIZES.map(n =>
+    '<option value="' + n + '"' + (n === (_msgsPageSize || _PEEK_MSG_PAGE) ? ' selected' : '') + '>' + n + '/page</option>').join('');
+  return '<div style="display:flex;gap:5px;justify-content:center;align-items:center;flex-wrap:wrap;margin:10px auto 4px;">'
+    + btn('&laquo;', 1, atFirst, 'First page')
+    + btn('&lsaquo;', _peekMsgPage - 1, atFirst, 'Previous page')
+    + '<span style="font-size:0.72rem;color:var(--dim);display:inline-flex;align-items:center;gap:5px;">page'
+    + '<input class="input" type="number" min="1"' + (pages ? ' max="' + pages + '"' : '')
+    + ' value="' + _peekMsgPage + '" onchange="_peekMsgGoToPage(+this.value)"'
+    + ' onkeydown="if(event.key===\'Enter\')_peekMsgGoToPage(+this.value)"'
+    + ' style="width:60px;text-align:center;" aria-label="Page number">'
+    + (pages ? 'of ' + pages.toLocaleString() : '') + '</span>'
+    + btn('&rsaquo;', _peekMsgPage + 1, atLast, 'Next page')
+    + (pages ? btn('&raquo;', pages, atLast, 'Last page') : '')
+    + '<select class="input" style="max-width:110px;font-size:0.72rem;" aria-label="Messages per page"'
+    + ' onchange="_peekMsgSetPageSize(+this.value)">' + sizes + '</select>'
+    + '</div>';
+}
+function _peekMsgGoToPage(page) {
+  const pages = _peekMsgPageCount();
+  let next = Math.max(1, Math.floor(page) || 1);
+  if (pages !== null) next = Math.min(next, pages);
+  if (next === _peekMsgPage) { _peekMessagesRender(); return; }
+  _peekMsgPage = next;
+  _peekMessagesLoad();                          // refresh THIS (new) page
+  const list = document.getElementById('peek-messages-list');
+  if (list) list.scrollTop = 0;
+}
+function _peekMsgSetPageSize(size) {
+  if (!_MSGS_PAGE_SIZES.includes(size)) return;
+  const anchor = (_peekMsgPage - 1) * (_msgsPageSize || _PEEK_MSG_PAGE);
+  _msgsPageSize = size;                         // one size for both message lists
+  try { localStorage.setItem('amux.msgs.pageSize', String(size)); } catch (e) {}
+  _peekMsgPage = Math.floor(anchor / size) + 1;
+  _peekMessagesLoad();
+}
 async function _peekMsgsJumpToDate(dateStr) {
   if (!dateStr) return;
   const target = new Date(dateStr + 'T00:00:00').getTime();  // local start-of-day, ms
@@ -17519,12 +17567,13 @@ async function _peekMsgsJumpToDate(dateStr) {
   // pages until the target day is in range (or the store is exhausted), then
   // scroll to it — the same behaviour the global timeline's date-jump has.
   let guard = 0;
+  if (_peekMsgPage !== 1) { _peekMsgPage = 1; await _peekMessagesLoad(); }
   while (!_peekMsgDone && guard < 80) {
     const items = _peekMessagesFor();          // newest-first
-    const last = items[items.length - 1];      // oldest loaded row
+    const last = items[items.length - 1];      // oldest row on this page
     const oldest = last ? (last.time || last.ts || Infinity) : Infinity;
-    if (oldest <= target + 86400000) break;    // loaded into (or past) that day
-    await _peekMessagesLoad(true);
+    if (oldest <= target + 86400000) break;    // this page reaches that day
+    await _peekMessagesLoad(true);             // next page
     guard++;
   }
   const list = document.getElementById('peek-messages-list');
@@ -17554,8 +17603,12 @@ let _peekMsgError = '';       // last load failure, '' when the last load succee
 let _peekMsgServerRows = [];  // raw server rows accumulated across pages, current session
 let _peekMsgOffset = 0;       // server offset = count of raw server rows fetched so far
 let _peekMsgDone = false;     // no older server page remains
+// AMUX-4666: pages here too. The size is the same preference the global tab
+// stores, so choosing 100 per page once means 100 in both.
+let _peekMsgPage = 1;         // 1-based
+let _peekMsgTotal = null;     // x-amux-total for this worker; null = not reported
 let _peekMsgLoading = false;  // true while the session-scoped fetch is in flight
-const _PEEK_MSG_PAGE = 60;    // first-paint page size; 'Load older' pages the rest (AMUX-4476: 200 rows was 40-120s under fleet load)
+const _PEEK_MSG_PAGE = 60;    // fallback page size only; the reader's choice lives in _msgsPageSize (AMUX-4666). 200 rows was 40-120s under fleet load (AMUX-4476)
 
 // Local entries that the server has not echoed yet (no id) must survive the
 // swap to server-scoped rows, or a message you just sent vanishes until the
@@ -17576,12 +17629,14 @@ function _mergeUnechoed(serverRows, session) {
 // Configurations tab's second caller a one-liner instead of a second renderer.
 async function _peekMsgFetch(scope, offset, pageSize) {
   const sc = (typeof scope === 'string') ? { level: 'worker', name: scope } : (scope || {});
-  const page = pageSize || _PEEK_MSG_PAGE;
+  const page = pageSize || _msgsPageSize || _PEEK_MSG_PAGE;
   const q = sc.level === 'group'  ? '&group=' + encodeURIComponent(sc.name)
           : sc.level === 'global' ? ''
           : '&session=' + encodeURIComponent(sc.name);
   const r = await fetch(API + '/api/history?limit=' + page + '&offset=' + (offset || 0) + q, { headers: _authHeaders() });
   if (!r.ok) throw new Error('history ' + r.status);
+  const _t = r.headers && r.headers.get('x-amux-total');
+  _peekMsgTotal = _t === null || _t === undefined || _t === '' ? null : +_t;
   // Raw server page (newest-first). The pending-unechoed merge and the time sort
   // happen ONCE in _peekMessagesLoad, on the full accumulated set — merging
   // per-page would prepend the same locally-queued sends to every page.
@@ -17590,27 +17645,28 @@ async function _peekMsgFetch(scope, offset, pageSize) {
 
 async function _peekMessagesLoad(more) {
   const sess = peekSession;
-  if (_peekMsgRowsFor !== sess) {              // session changed -> full reset, treat as first page
+  if (_peekMsgRowsFor !== sess) {              // session changed -> back to page 1
     _peekMsgRows = null; _peekMsgServerRows = []; _peekMsgOffset = 0; _peekMsgDone = false;
-    _peekMsgRowsFor = sess; more = false;
+    _peekMsgRowsFor = sess; _peekMsgPage = 1; _peekMsgTotal = null; more = false;
   }
-  if (more && _peekMsgDone) return;            // nothing older to load
-  const prevCount = _peekMsgServerRows.length;
-  const prevDone = _peekMsgDone;
-  if (!more) { _peekMsgServerRows = []; _peekMsgOffset = 0; _peekMsgDone = false; }
+  if (more === true) {                          // the older-page affordance
+    if (_peekMsgDone) return;
+    _peekMsgPage += 1;
+  } else if (more === false) {                  // an explicit reset (retry, worker switch)
+    _peekMsgPage = 1;
+  }                                             // undefined = refresh THIS page
+  _peekMsgOffset = (_peekMsgPage - 1) * (_msgsPageSize || _PEEK_MSG_PAGE);
   _peekMsgLoading = true;
   _peekMsgError = '';
   _peekMessagesRender();                        // paint what we have instantly (with loading indicator)
   try {
     const rows = await _peekMsgFetch({ level: 'worker', name: sess }, _peekMsgOffset);
     if (peekSession !== sess) { _peekMsgLoading = false; return; }
-    _peekMsgServerRows = _peekMsgServerRows.concat(rows);
-    _peekMsgOffset += rows.length;
-    // A short page is the last page. When refreshing the same page size
-    // (SSE tick, not "Load older"), preserve a previous exhaustion so the
-    // button does not reappear every tick on boundary-sized stores.
-    if (!more && rows.length === prevCount && prevDone) _peekMsgDone = true;
-    else _peekMsgDone = rows.length < _PEEK_MSG_PAGE;
+    _peekMsgServerRows = rows;                  // a page REPLACES, it does not accumulate
+    const size = _msgsPageSize || _PEEK_MSG_PAGE;
+    _peekMsgDone = _peekMsgTotal === null
+      ? rows.length < size
+      : _peekMsgPage >= Math.max(1, Math.ceil(_peekMsgTotal / size));
     _peekMsgRows = _mergeUnechoed(_peekMsgServerRows, sess); // pending merge + time sort, once, on the full set
   } catch(e) {
     // A FAILED LOAD IS ITS OWN STATE. Without this the view can only say
@@ -36704,7 +36760,7 @@ function _msgSetMode(mode) {
   const tv = document.getElementById('trends-view'); if (tv) tv.style.display = isT ? '' : 'none';
   const td = document.getElementById('trends-days'); if (td) td.style.display = isT ? '' : 'none';
   const av = document.getElementById('ask-view'); if (av) av.style.display = isA ? '' : 'none';
-  const more = document.getElementById('msgs-more-btn'); if (more && (isT || isA)) more.style.display = 'none';
+  const pager = document.getElementById('msgs-pager'); if (pager) pager.style.display = (isT || isA) ? 'none' : '';
   if (isT) _trendsLoad();
   if (isA) { _askSuggestions(false); document.getElementById('ask-q')?.focus(); }
 }
@@ -38689,6 +38745,16 @@ function _msgsRenderGroupChip() {
 }
 let _msgsOffset = 0;
 const _MSGS_PAGE = 60;   // AMUX-4476: smaller first page for a fast click-to-display; page older on demand
+// AMUX-4666: the reader chooses the page size, and the footer says which page
+// of how many. The size persists because it is a preference about this reader's
+// screen, not about this session.
+const _MSGS_PAGE_SIZES = [25, 50, 100, 200];
+let _msgsPageSize = (() => {
+  const saved = +(localStorage.getItem('amux.msgs.pageSize') || 0);
+  return _MSGS_PAGE_SIZES.includes(saved) ? saved : _MSGS_PAGE;
+})();
+let _msgsPage = 1;        // 1-based, what the footer shows
+let _msgsTotal = null;    // x-amux-total for the ACTIVE filter; null = not reported
 let _msgsDone = false;
 // A reset (tab switch, group/kind change) and the debounced SSE 'messages'
 // refresh can both be in flight at once — nothing cancelled either fetch.
@@ -38700,7 +38766,7 @@ let _msgsDone = false;
 let _msgsGen = 0;
 
 async function _messagesLoad(reset, presetSession) {
-  if (reset !== false) { _msgsData = []; _msgsOffset = 0; _msgsDone = false; _msgsGen++; }
+  if (reset !== false) { _msgsData = []; _msgsOffset = 0; _msgsDone = false; _msgsGen++; _msgsPage = 1; }
   const _gen = _msgsGen;
   try {
     // Kind-scoped at the SERVER. Filtering a mixed page client-side is what
@@ -38708,7 +38774,9 @@ async function _messagesLoad(reset, presetSession) {
     // the window. ?counts=1 supplies true per-kind totals for the chips, which
     // a tally of the fetched page cannot (every unselected chip would read 0).
     const _sf = document.getElementById('msgs-session-filter')?.value || '';
-    let _u = API + '/api/history?limit=' + _MSGS_PAGE + '&offset=' + _msgsOffset;
+    // The page is the unit now: offset is derived from it, never accumulated.
+    _msgsOffset = (_msgsPage - 1) * _msgsPageSize;
+    let _u = API + '/api/history?limit=' + _msgsPageSize + '&offset=' + _msgsOffset;
     if (_msgsKind !== 'all') _u += '&kind=' + encodeURIComponent(_msgsKind);
     if (_sf) _u += '&session=' + encodeURIComponent(_sf);
     // Deep search (Enter in the box): the SERVER scans all history, so hits
@@ -38718,6 +38786,12 @@ async function _messagesLoad(reset, presetSession) {
     if (_msgsGroup) _u += '&group=' + encodeURIComponent(_msgsGroup);
     const r = await fetch(_u);
     const rows = await r.json();
+    // The count for THIS filter, from the same request that served the page.
+    // Guessing it from a short page would misreport the number of pages on
+    // every filter, and a pager that lies about its own last page is worse
+    // than no pager.
+    const _t = r.headers && r.headers.get('x-amux-total');
+    _msgsTotal = _t === null || _t === undefined || _t === '' ? null : +_t;
     fetch(API + '/api/history?counts=1' + (_sf ? '&session=' + encodeURIComponent(_sf) : ''))
       .then(x => x.json()).then(c => { _msgsCounts = c; _msgsRenderChips(); }).catch(() => {});
     if (!Array.isArray(rows)) return;
@@ -38730,9 +38804,10 @@ async function _messagesLoad(reset, presetSession) {
       }
       return;
     }
-    _msgsData = _msgsData.concat(rows.map(_msgNorm));
-    _msgsOffset += rows.length;
-    _msgsDone = rows.length < _MSGS_PAGE;
+    _msgsData = rows.map(_msgNorm);
+    _msgsDone = _msgsTotal === null
+      ? rows.length < _msgsPageSize
+      : _msgsPage >= Math.max(1, Math.ceil(_msgsTotal / _msgsPageSize));
     // Session filter options — FROM THE STORE, not the loaded page (AMUX-2548).
     // Deriving names from _msgsData meant the dropdown listed only workers with
     // a message in the newest 200 rows — ~7 hours of a 46-lane fleet — so 90 of
@@ -38963,9 +39038,15 @@ function _messagesRender() {
     }
   }
   const count = document.getElementById('msgs-count');
-  if (count) count.textContent = rows.length + ' message' + (rows.length === 1 ? '' : 's') + (_msgsDone ? '' : ' (more available)');
-  const more = document.getElementById('msgs-more-btn');
-  if (more) more.style.display = _msgsDone ? 'none' : '';
+  if (count) {
+    const from = _msgsData.length ? (_msgsPage - 1) * _msgsPageSize + 1 : 0;
+    const to = (_msgsPage - 1) * _msgsPageSize + _msgsData.length;
+    count.textContent = _msgsTotal === null
+      ? rows.length + ' message' + (rows.length === 1 ? '' : 's') + (_msgsDone ? '' : ' (more available)')
+      : from + '\u2013' + to + ' of ' + _msgsTotal.toLocaleString()
+        + (rows.length !== _msgsData.length ? ' (' + rows.length + ' shown by this filter)' : '');
+  }
+  _msgsRenderPager();
   if (!rows.length) {
     const kl = (_MSG_KIND[_msgsKind] || {}).label;
     list.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:24px;text-align:center;">'
@@ -39038,14 +39119,72 @@ function _msgDayLabel(ts) {
 // is older than what's loaded, keep loading older pages until it's in range (or
 // the store is exhausted), then scroll its header into view. The date-review
 // jump (Ethan): easily land on any past day without hand-scrolling.
+/// How many pages the ACTIVE filter has. null total means the server did not
+/// report one (an old build): the pager then offers next/previous only, rather
+/// than inventing a last page.
+function _msgsPageCount() {
+  if (_msgsTotal === null) return null;
+  return Math.max(1, Math.ceil(_msgsTotal / _msgsPageSize));
+}
+function _msgsRenderPager() {
+  const el = document.getElementById('msgs-pager');
+  if (!el) return;
+  const pages = _msgsPageCount();
+  const atFirst = _msgsPage <= 1;
+  const atLast = pages === null ? _msgsDone : _msgsPage >= pages;
+  const btn = (label, page, disabled, title) =>
+    '<button class="btn" style="font-size:0.78rem;padding:4px 10px;min-height:44px;"'
+    + (disabled ? ' disabled' : ' onclick="_msgsGoToPage(' + page + ')"')
+    + ' title="' + title + '">' + label + '</button>';
+  const sizes = _MSGS_PAGE_SIZES.map(n =>
+    '<option value="' + n + '"' + (n === _msgsPageSize ? ' selected' : '') + '>' + n + ' per page</option>').join('');
+  el.innerHTML =
+      btn('&laquo;', 1, atFirst, 'First page')
+    + btn('&lsaquo;', _msgsPage - 1, atFirst, 'Previous page')
+    + '<span style="font-size:0.78rem;color:var(--dim);display:inline-flex;align-items:center;gap:6px;">page'
+    + '<input class="input" id="msgs-page-input" type="number" min="1"' + (pages ? ' max="' + pages + '"' : '')
+    + ' value="' + _msgsPage + '" onchange="_msgsGoToPage(+this.value)"'
+    + ' onkeydown="if(event.key===\'Enter\')_msgsGoToPage(+this.value)"'
+    + ' style="width:68px;text-align:center;" aria-label="Page number">'
+    + (pages ? 'of ' + pages.toLocaleString() : '') + '</span>'
+    + btn('&rsaquo;', _msgsPage + 1, atLast, 'Next page')
+    + (pages ? btn('&raquo;', pages, atLast, 'Last page') : '')
+    + '<select class="input" style="max-width:130px;font-size:0.78rem;" aria-label="Messages per page"'
+    + ' onchange="_msgsSetPageSize(+this.value)">' + sizes + '</select>';
+}
+function _msgsGoToPage(page) {
+  const pages = _msgsPageCount();
+  let next = Math.max(1, Math.floor(page) || 1);
+  if (pages !== null) next = Math.min(next, pages);
+  if (next === _msgsPage) { _msgsRenderPager(); return; }
+  _msgsPage = next;
+  _messagesLoad(false);
+  const list = document.getElementById('msgs-list');
+  if (list) list.scrollTop = 0;   // a new page starts at its own top
+}
+function _msgsSetPageSize(size) {
+  if (!_MSGS_PAGE_SIZES.includes(size) || size === _msgsPageSize) return;
+  // Keep the reader near the same messages rather than at the same page
+  // number: page 7 of 25-per-page and page 7 of 200-per-page are different
+  // places, and only the position in the list is what they were looking at.
+  const anchor = (_msgsPage - 1) * _msgsPageSize;
+  _msgsPageSize = size;
+  try { localStorage.setItem('amux.msgs.pageSize', String(size)); } catch (e) {}
+  _msgsPage = Math.floor(anchor / size) + 1;
+  _messagesLoad(false);
+}
 async function _msgsJumpToDate(dateStr) {
   if (!dateStr) return;
   const target = new Date(dateStr + 'T00:00:00').getTime();  // local start-of-day, ms
   let guard = 0;
+  // Walk pages from the current one until the page holding that day is on
+  // screen. Rows are newest-first, so the oldest row of a page is its floor.
+  if (_msgsPage !== 1) { _msgsPage = 1; await _messagesLoad(false); }
   while (!_msgsDone && guard < 80) {
     const last = _msgsData[_msgsData.length - 1];
     const oldest = last ? (last.time || last.ts) : Infinity;
-    if (oldest <= target + 86400000) break;   // loaded into (or past) that day
+    if (oldest <= target + 86400000) break;   // this page reaches that day
+    _msgsPage += 1;
     await _messagesLoad(false);
     guard++;
   }

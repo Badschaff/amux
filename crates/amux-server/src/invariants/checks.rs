@@ -684,6 +684,8 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     ("dictation_history", "ts", true),
     ("guard_verdicts", "outcome_ts", false),
     ("guard_verdicts", "ts", false),
+    // 28cdee7b added the table; `record` stamps chrono::Utc::now().timestamp(), which is seconds.
+    ("host_metrics", "ts", false),
     ("interaction_log", "ts", true),
     ("issue_files", "added_at", false),
     ("issue_tags", "added_at", false),

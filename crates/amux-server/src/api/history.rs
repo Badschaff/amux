@@ -528,7 +528,7 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
              page with &offset= instead"
         );
     }
-    let joined = crate::db::interactions::spawn_blocking(move || -> anyhow::Result<Value> {
+    let joined = crate::db::interactions::spawn_blocking(move || -> anyhow::Result<(Value, Option<i64>)> {
         let conn = store.read()?;
         let offset: i64 = p.offset.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0);
         let session = p.session.clone().unwrap_or_default();
@@ -543,7 +543,7 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
             let rows = stmt.query_map([], |r| {
                 Ok(json!({ "session": r.get::<_, String>(0)?, "count": r.get::<_, i64>(1)? }))
             })?;
-            return Ok(Value::Array(rows.flatten().collect()));
+            return Ok((Value::Array(rows.flatten().collect()), None));
         }
 
         // ?counts=1 — true totals per kind (respecting ?session=), ignoring
@@ -576,7 +576,7 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
             }
             let all: i64 = MSG_KINDS.iter().map(|k| out[*k].as_i64().unwrap_or(0)).sum();
             out.insert("all".into(), json!(all));
-            return Ok(Value::Object(out));
+            return Ok((Value::Object(out), None));
         }
 
         // The list window. Every predicate lands in SQL, before the LIMIT.
@@ -683,6 +683,21 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
             sql.push_str(" WHERE ");
             sql.push_str(&where_cl.join(" AND "));
         }
+        // AMUX-4666: the size of the population this page came from, counted
+        // with the same WHERE and the same params the rows use. Counting with
+        // anything else is the trap this codebase already records: a number
+        // that measures the query rather than the thing.
+        let mut count_sql = String::from("SELECT COUNT(*) FROM cmd_history");
+        if !where_cl.is_empty() {
+            count_sql.push_str(" WHERE ");
+            count_sql.push_str(&where_cl.join(" AND "));
+        }
+        let total: i64 = {
+            let refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+            conn.query_row(&count_sql, refs.as_slice(), |r| r.get(0))?
+        };
+
         sql.push_str(" ORDER BY ts DESC LIMIT ? OFFSET ?");
         params.push(rusqlite::types::Value::Integer(limit));
         params.push(rusqlite::types::Value::Integer(offset));
@@ -707,12 +722,20 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
             }
         }
         attach_linked_cards(&conn, &mut rows)?;
-        Ok(Value::Array(rows))
+        Ok((Value::Array(rows), Some(total)))
     })
     .await;
     match joined {
-        Ok(Ok(v)) => {
+        Ok(Ok((v, total))) => {
             let mut resp = Json(v).into_response();
+            // The body is a bare array, so the total rides beside it. A pager
+            // that guessed the count from a short page would show the wrong
+            // number of pages on every filter.
+            if let Some(total) = total {
+                if let Ok(hv) = HeaderValue::from_str(&total.to_string()) {
+                    resp.headers_mut().insert("x-amux-total", hv);
+                }
+            }
             if was_clamped {
                 if let Ok(hv) = HeaderValue::from_str(&limit.to_string()) {
                     resp.headers_mut().insert("x-amux-limit-clamped", hv);
@@ -1605,6 +1628,38 @@ mod tests {
         assert_eq!(one["card_status"], json!("done"));
         assert_eq!(one["card_archived"], json!(0));
         assert_eq!(one["linked_cards"], row["linked_cards"]);
+    }
+
+    /// AMUX-4666: paging by PAGE NUMBER needs a page count, and a page count is
+    /// only right if it counts the population the page came from. A total that
+    /// ignored the active filter would show pages that do not exist, and the
+    /// last page would come back empty.
+    #[tokio::test]
+    async fn the_page_total_counts_the_same_population_the_page_came_from() {
+        let (app, _dir) = app();
+        seed(&app).await;
+
+        let total_for = |app: axum::Router, uri: &'static str| async move {
+            let req = axum::http::Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            res.headers().get("x-amux-total").and_then(|v| v.to_str().ok()).map(str::to_string)
+        };
+
+        // A short page still reports the whole population.
+        assert_eq!(total_for(app.clone(), "/api/history?limit=2").await, Some("5".into()));
+        // ...and every filter moves it, because it is the SAME predicate.
+        assert_eq!(total_for(app.clone(), "/api/history?kind=human&limit=1").await, Some("2".into()));
+        assert_eq!(total_for(app.clone(), "/api/history?session=alpha&limit=1").await, Some("3".into()));
+        assert_eq!(total_for(app.clone(), "/api/history?q=steer&limit=1").await, Some("1".into()));
+        // A page past the end is empty and still says how many exist, so a
+        // pager can send the reader back rather than showing a blank list.
+        let (_, past) = send(&app, "GET", "/api/history?limit=2&offset=99", None).await;
+        assert_eq!(past.as_array().unwrap().len(), 0);
+        assert_eq!(total_for(app.clone(), "/api/history?limit=2&offset=99").await, Some("5".into()));
+
+        // CONTROL: the answers that are not pages do not claim a page total.
+        assert_eq!(total_for(app.clone(), "/api/history?counts=1").await, None);
+        assert_eq!(total_for(app.clone(), "/api/history?sessions=1").await, None);
     }
 
     #[tokio::test]

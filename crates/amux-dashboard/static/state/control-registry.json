@@ -1,6 +1,6 @@
 {
   "measured": true,
-  "n_considered": 1994,
+  "n_considered": 2002,
   "command_handlers": {
     "_applyEmbedView": {
       "kind": "command._applyEmbedView",
@@ -1832,6 +1832,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_peekMsgGoToPage": {
+      "kind": "command._peekMsgGoToPage",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_peekMsgMove": {
       "kind": "command._peekMsgMove",
       "feedback_required": true,
@@ -1840,6 +1846,12 @@
     },
     "_peekMsgNavSelect": {
       "kind": "command._peekMsgNavSelect",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekMsgSetPageSize": {
+      "kind": "command._peekMsgSetPageSize",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
