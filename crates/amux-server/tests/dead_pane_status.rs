@@ -135,11 +135,23 @@ async fn retained_dead_pane_cannot_remain_idle_in_worker_api() {
             let before = body(&app, &worker).await;
             assert_eq!(before["running"], true);
             assert_eq!(before["state"]["state"], "idle");
-            std::fs::write(flag, b"exit").unwrap();
+            std::fs::write(&flag, b"exit").unwrap();
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
-                if backend.status(&proc).await.unwrap() == (BackendStatus::Completed { exit_code: 1 }) { break; }
-                assert!(Instant::now() < deadline, "controlled process never exited");
+                let seen = backend.status(&proc).await.unwrap();
+                if seen == (BackendStatus::Completed { exit_code: 1 }) { break; }
+                if Instant::now() >= deadline {
+                    // AMUX-4636. "never exited" alone could not tell a command that
+                    // never ran (the typed line lost, or the flag variable missing
+                    // in the pane) from one that exited and was reported as
+                    // something else. Name the last status and the pane's text so a
+                    // CI-only failure can be diagnosed from its log.
+                    let pane = backend.capture(&proc, 40).await.unwrap_or_else(|e| format!("<capture failed: {e}>"));
+                    panic!(
+                        "controlled process never exited: last status {seen:?} after 10 s; flag written={}; pane:\n{pane}",
+                        flag.exists()
+                    );
+                }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             assert!(std::process::Command::new("tmux").args(["has-session", "-t", &format!("={}", proc.backend_ref)]).status().unwrap().success(), "positive control: dead pane's session must still exist");
