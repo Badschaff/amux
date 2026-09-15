@@ -73,7 +73,7 @@ run_needsyou() {  # run_needsyou <refuse_status true|false> -> sets RC, OUT, ORD
   python3 -c "import json,sys; json.dump({'status':'blocked','refuse_status':sys.argv[1]=='true'}, open(sys.argv[2],'w'))" "$1" "$TMPD/state.json"
   : > "$TMPD/patches.log"
   if OUT=$(timeout 30 env AMUX_API="http://127.0.0.1:$PORT" AMUX_SESSION=needsyou-order-test CC_HOME="$TMPD" \
-      bash "$AMUX_BIN" board needsyou TEST-1 --actor Ethan --ask decision \
+      bash "$AMUX_BIN" board needsyou TEST-1 --actor Ethan --ask "${2:-decision}" \
       --question "Should this ship?" --unblocks "The lane ships it." 2>&1); then RC=0; else RC=$?; fi
   ORDER=$(tr '\n' ' ' < "$TMPD/patches.log" | sed 's/ $//')
 }
@@ -92,5 +92,11 @@ run_needsyou true
 case "$OUT" in *"typed ask was recorded"*"STATUS MOVE was refused"*) ok "a refused move says the ask was recorded and the move was not" ;;
   *) bad "a refused move says the ask was recorded and the move was not" "output: $OUT" ;; esac
 
+for kind in budget customer_outbound; do
+  run_needsyou false "$kind"
+  [ "$RC" -eq 0 ] && [ "$ORDER" = "ask status tag" ] && ok "$kind reaches the server through the normal CLI" || bad "$kind reaches the server through the normal CLI" "$RC: $OUT; $ORDER"
+done
+run_needsyou false blocked
+[ "$RC" -ne 0 ] && [ -z "$ORDER" ] && ok "unknown category is refused before any write" || bad "unknown category is refused before any write" "$RC: $OUT; $ORDER"
 echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]

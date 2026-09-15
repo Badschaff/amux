@@ -1970,7 +1970,7 @@ _board_id_guard() {
 }
 
 
-# AF-318: the five kinds of human act, printed on an untyped park.
+# Typed approval categories, narrowed by the effective server-side scope policy.
 #
 # Refused HERE and not only server-side, because the point of the refusal is
 # that the reader sees the vocabulary. A 409 teaches it too, but only after a
@@ -1978,12 +1978,14 @@ _board_id_guard() {
 _needsyou_types_or_die() {
   local t="$1" id="$2"
   case "$(printf '%s' "$t" | tr '[:upper:]' '[:lower:]')" in
-    decision|access|credential|external|judgment) return 0 ;;
+    budget|customer_outbound|decision|access|credential|external|judgment) return 0 ;;
   esac
   local head="amux board needsyou: --ask is required."
-  [[ -n "$t" ]] && head="amux board needsyou: '$t' is not one of the five kinds of human act."
+  [[ -n "$t" ]] && head="amux board needsyou: '$t' is not an accepted approval category."
   die "$head
 
+  budget      increased spend or an increase beyond the authorized budget
+  customer_outbound  customer communication without existing authorization
   decision    a choice only the owner can make: direction, priority, a trade-off
               with no right answer
   access      you cannot reach something: a repo, a console, an environment, a person
@@ -1993,10 +1995,8 @@ _needsyou_types_or_die() {
   judgment    a call only the owner's taste settles: is this good enough, does
               this read right
 
-The vocabulary is closed on purpose. 445 cards were parked in needsyou at a median
-age of 15 days and 51% of them were not blocked on a human at all — this status was
-the only one that cost nothing and stopped the idle nudge. If your block fits none
-of the five, it is not a block on a person:
+The effective global/group/worker policy may allow only budget and customer_outbound.
+Ordinary choices should proceed. If no human act is required, work the blocker:
 
   amux board backlog $id --trigger \"<the condition that re-arms it>\"   external wait
   amux board doing $id                                                work the blocker
@@ -4192,7 +4192,7 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
                                    (the anti-livelock end state) with the reason.
   amux board needsyou <ID> --actor <name> --ask <type> --question "...?" --unblocks "..."
                                    Park a card on the human. The ask is TYPED:
-                                   decision | access | credential | external | judgment
+                                   budget | customer_outbound | decision | access | credential | external | judgment
                                    --actor     specific person/external actor (required)
                                    --question  one sentence, what you are asking
                                    --unblocks  one sentence, what ENDS the block

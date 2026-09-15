@@ -25777,8 +25777,12 @@ CLAUDE-POSTFIX-COMPLETE
             let events: i64 = state.store.read().unwrap().query_row("SELECT COUNT(*) FROM session_events", [], |r| r.get(0)).unwrap();
             assert_eq!(events, 1, "a refused live swap cannot stop, start, or enqueue recovery");
         }
-        // Positive control: a valid preflight persists the exact directory
-        // before the changed config can become durable.
+        // Positive control: an actual retained request needs recovery context.
+        // An empty worker now correctly restarts without buying a model turn.
+        state.store.write(move |conn| {
+            conn.execute("INSERT INTO cmd_history(session,text,type,ts,capture_pending) VALUES(?1,'Finish the retained report','user',1,1)",[name])?;
+            Ok(crate::db::WriteOutcome {applied:true,events:vec![]})
+        }).unwrap();
         let mut valid = original_meta.as_object().unwrap().clone();
         valid.insert("cc_cwd".into(), json!(dir.path()));
         save_resume_meta(name, &valid).unwrap();
