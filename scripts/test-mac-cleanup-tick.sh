@@ -83,6 +83,28 @@ check "a tight disk thins"                     "yes" "$(should_thin 40 100 && ec
 # window on every tick of a machine whose probe is broken.
 check "an unmeasured disk never thins"         "no"  "$(should_thin -1 100 && echo yes || echo no)"
 
+echo "6c. the family rule sees what per-process ranking cannot"
+check "hours:minutes:seconds" "144753" "$(etime_secs 40:12:33)"
+check "days-hours"            "183845" "$(etime_secs 2-03:04:05)"
+check "minutes:seconds"       "449"    "$(etime_secs 07:29)"
+# Fixture: pid ppid rss_kb oldest_secs. Parent 999 holds three children summing
+# 31 GB; parent 888 holds one 20 GB child. Per-process ranking picks 888's child
+# and misses the bigger family, which is the DESKT-31 failure exactly.
+FAM=$(printf '%s\n' "101 999 10485760 01:00:00" "102 999 10485760 1-16:00:00" "103 999 11534336 01:00" "201 888 20971520 00:30" "301 1 99999999 00:10" | top_family)
+check "the largest FAMILY is picked, not the largest process" "999" "$(echo "$FAM" | awk '{print $1}')"
+check "children are counted"                                   "3"   "$(echo "$FAM" | awk '{print $3}')"
+check "the oldest child's age is carried"                      "144000" "$(echo "$FAM" | awk '{print $4}')"
+check "descendants of launchd are not one giant family"        "999" "$(echo "$FAM" | awk '{print $1}')"
+check "a family over the share fires"      "yes" "$(family_exceeds 46514176 100663296 15 && echo yes || echo no)"
+check "a small family does not"            "no"  "$(family_exceeds 1048576 100663296 15 && echo yes || echo no)"
+check "unknown physical RAM never fires"   "no"  "$(family_exceeds 46514176 0 15 && echo yes || echo no)"
+# The return value alone cannot see this guard: without it awk dies on a
+# division by zero, which also returns non-zero and reads as "did not fire".
+# The observable difference is the error on stderr, so assert THAT.
+check "unknown physical RAM produces no awk error" "" "$(family_exceeds 46514176 0 15 2>&1 >/dev/null)"
+check "a 40h family is past a 12h ceiling" "yes" "$(family_too_old 144000 12 && echo yes || echo no)"
+check "a young family is not"              "no"  "$(family_too_old 600 12 && echo yes || echo no)"
+
 echo "7. end to end: the action runs when triggered, and dry run performs none"
 REC="$FIX/purge-calls"
 cat > "$FIX/fake-purge.sh" <<EOF
@@ -129,6 +151,18 @@ AMUX_CLEANUP_THIN_CMD="$FIX/fake-thin.sh BYTES URGENCY" AMUX_CLEANUP_SNAPSHOT_FL
   AMUX_CLEANUP_PURGE_CMD=true AMUX_CLEANUP_FREE_FLOOR_GB=0 AMUX_CLEANUP_PRESSURE_PURGE=99 \
   AMUX_CLEANUP_AGENTS="" AMUX_CLEANUP_REPORT_GB=99999 "$TICK" >/dev/null 2>&1
 check "no thin when the disk has room" "0" "$(wc -l < "$TREC" | tr -d ' ')"
+
+echo "7c. end to end: the family line names a parent and its child count"
+out=$(AMUX_CLEANUP_PURGE_CMD=true AMUX_CLEANUP_FREE_FLOOR_GB=0 AMUX_CLEANUP_PRESSURE_PURGE=99 \
+      AMUX_CLEANUP_SNAPSHOT_FLOOR_GB=0 AMUX_CLEANUP_AGENTS="" AMUX_CLEANUP_REPORT_GB=99999 \
+      AMUX_CLEANUP_FAMILY_SHARE_PCT=0.0001 "$TICK" 2>&1)
+case "$out" in *"FAMILY "*"children of pid "*) echo "  ok   a family over the share is named with its parent" ;;
+  *) echo "  FAIL no family line when the share threshold is effectively zero: $(printf '%s' "$out" | tail -3)"; fails=$((fails+1)) ;; esac
+out=$(AMUX_CLEANUP_PURGE_CMD=true AMUX_CLEANUP_FREE_FLOOR_GB=0 AMUX_CLEANUP_PRESSURE_PURGE=99 \
+      AMUX_CLEANUP_SNAPSHOT_FLOOR_GB=0 AMUX_CLEANUP_AGENTS="" AMUX_CLEANUP_REPORT_GB=99999 \
+      AMUX_CLEANUP_FAMILY_SHARE_PCT=99.9 AMUX_CLEANUP_FAMILY_AGE_H=99999 "$TICK" 2>&1)
+case "$out" in *"largest family"*"under the"*) echo "  ok   under both thresholds it reports without firing" ;;
+  *) echo "  FAIL no under-threshold family line: $(printf '%s' "$out" | tail -3)"; fails=$((fails+1)) ;; esac
 
 echo "8. end to end: an agent restart goes through the knob, and only past the floor"
 AREC="$FIX/restart-calls"

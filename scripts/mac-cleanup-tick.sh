@@ -61,6 +61,13 @@ FSEVENTSD_REBOOT_GB=${AMUX_CLEANUP_FSEVENTSD_REBOOT_GB:-20}
 SNAPSHOT_FLOOR_GB=${AMUX_CLEANUP_SNAPSHOT_FLOOR_GB:-100}
 SNAPSHOT_RECLAIM_GB=${AMUX_CLEANUP_SNAPSHOT_RECLAIM_GB:-50}
 SNAPSHOT_URGENCY=${AMUX_CLEANUP_SNAPSHOT_URGENCY:-2}
+# A process FAMILY is what actually took this box down: on 2026-08-29 local Ray
+# held 194 worker processes and 44.35 GB under one parent for 40 hours, and the
+# watcher of the day only had a rule for zombies, so it reported 79 harmless
+# reaped-parent entries and never once mentioned Ray (DESKT-31). Per-process
+# ranking misses it too, because no single child is large.
+FAMILY_SHARE_PCT=${AMUX_CLEANUP_FAMILY_SHARE_PCT:-15}
+FAMILY_AGE_H=${AMUX_CLEANUP_FAMILY_AGE_H:-12}
 # Seams: the tests point these at a recorder so an action can be observed
 # without running it. Defaults are what the scheduler actually runs.
 PURGE_CMD=${AMUX_CLEANUP_PURGE_CMD:-sudo -n /usr/sbin/purge}
@@ -116,6 +123,45 @@ classify_owner() { # <user> <command>
 # tick of a machine whose probe is broken.
 should_thin() { # <free_disk_gb> <floor_gb>
   awk -v f="$1" -v t="$2" 'BEGIN{ exit !(f+0 >= 0 && f+0 < t+0) }'
+}
+
+# `ps` elapsed time ("40:12:33", "2-03:04:05", "07:29") into seconds.
+etime_secs() { # <etime>
+  awk -v v="$1" 'BEGIN{
+    d=0; if (index(v,"-")) { split(v,a,"-"); d=a[1]+0; v=a[2] }
+    n=split(v,t,":");
+    if (n==3) s=t[1]*3600+t[2]*60+t[3]; else if (n==2) s=t[1]*60+t[2]; else s=t[1]+0;
+    printf "%d", d*86400+s
+  }'
+}
+
+# Sum resident memory by PARENT pid over `ps -Ao pid=,ppid=,rss=,etime=` on
+# stdin, printing "<ppid> <total_kb> <children> <oldest_secs>" for the largest
+# family. Parents 0 and 1 are excluded: everything on the machine descends from
+# launchd, so including them would always report one enormous family and name
+# nobody (the instrument would be unable to express the failure again).
+top_family() {
+  # ONE awk over every row, including the elapsed-time parse. A shell loop
+  # calling etime_secs per process forks ~950 awks and takes minutes, which on a
+  # 30-minute tick is a cleanup job that becomes its own load problem.
+  awk '
+    function secs(v,   d,n,t,s) {
+      d=0; if (index(v,"-")) { split(v,a,"-"); d=a[1]+0; v=a[2] }
+      n=split(v,t,":");
+      if (n==3) s=t[1]*3600+t[2]*60+t[3]; else if (n==2) s=t[1]*60+t[2]; else s=t[1]+0;
+      return d*86400+s
+    }
+    { ppid=$2+0; if (ppid<=1) next; age=secs($4); kb[ppid]+=$3+0; n[ppid]++; if (age>old[ppid]) old[ppid]=age }
+    END { best=0; for (p in kb) if (kb[p]>kb[best]) best=p;
+          if (best) printf "%d %d %d %d", best, kb[best], n[best], old[best] }'
+}
+
+family_exceeds() { # <family_kb> <phys_kb> <share_pct>
+  awk -v f="$1" -v p="$2" -v s="$3" 'BEGIN{ exit !(p+0 > 0 && f+0 > 0 && (f+0)/(p+0)*100 >= s+0) }'
+}
+
+family_too_old() { # <oldest_secs> <ceiling_hours>
+  awk -v s="$1" -v h="$2" 'BEGIN{ exit !(h+0 > 0 && s+0 >= (h+0) * 3600) }'
 }
 
 needs_reboot() { # <fseventsd_gb> <threshold>
@@ -243,6 +289,28 @@ if should_thin "$disk_free_gb" "$SNAPSHOT_FLOOR_GB"; then
   fi
 else
   echo "mac-cleanup: snapshots ${snaps_before}, free ${disk_free_gb}G at or above the ${SNAPSHOT_FLOOR_GB}G floor — not thinned"
+fi
+
+# ── report: the largest process FAMILY, which per-process ranking cannot see ──
+phys_kb=$(awk -v b="$(sysctl -n hw.memsize 2>/dev/null || echo 0)" 'BEGIN{ printf "%d", b/1024 }')
+fam=$(ps -Ao pid=,ppid=,rss=,etime= 2>/dev/null | top_family)
+if [ -n "$fam" ]; then
+  set -- $fam
+  fam_ppid=$1; fam_kb=$2; fam_n=$3; fam_age=$4
+  fam_gb=$(awk -v k="$fam_kb" 'BEGIN{ printf "%.1f", k/1048576 }')
+  fam_pct=$(awk -v f="$fam_kb" -v p="$phys_kb" 'BEGIN{ printf "%.1f", (p>0)? f/p*100 : -1 }')
+  fam_hours=$(awk -v s="$fam_age" 'BEGIN{ printf "%.1f", s/3600 }')
+  fam_cmd=$(ps -o command= -p "$fam_ppid" 2>/dev/null | cut -c1-70)
+  fam_user=$(ps -o user= -p "$fam_ppid" 2>/dev/null | tr -d ' ')
+  if family_exceeds "$fam_kb" "$phys_kb" "$FAMILY_SHARE_PCT"; then
+    echo "mac-cleanup: FAMILY ${fam_gb}G (${fam_pct}% of RAM) in ${fam_n} children of pid ${fam_ppid}, oldest ${fam_hours}h — $(classify_owner "${fam_user:-?}" "${fam_cmd:-unknown}") — reported, never killed"
+  elif family_too_old "$fam_age" "$FAMILY_AGE_H"; then
+    echo "mac-cleanup: FAMILY ${fam_gb}G (${fam_pct}% of RAM) in ${fam_n} children of pid ${fam_ppid} has run ${fam_hours}h, past the ${FAMILY_AGE_H}h ceiling — $(classify_owner "${fam_user:-?}" "${fam_cmd:-unknown}")"
+  else
+    echo "mac-cleanup: largest family ${fam_gb}G (${fam_pct}% of RAM) in ${fam_n} children of pid ${fam_ppid}, under the ${FAMILY_SHARE_PCT}% share and ${FAMILY_AGE_H}h ceiling"
+  fi
+else
+  echo "mac-cleanup: family scan produced no rows (ps unavailable?)"
 fi
 
 fse_pid=$(pgrep -x fseventsd 2>/dev/null | head -1)
