@@ -583,7 +583,7 @@ mod tests {
 
     #[test]
     fn bootstrap_injects_auth_and_derived_ui_token() {
-        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->old<!-- AMUX-BOOTSTRAP-END --></head>";
+        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->STALE-BOOTSTRAP-PLACEHOLDER<!-- AMUX-BOOTSTRAP-END --></head>";
         let out = inject_bootstrap(html, &state(Some("tok123")), None, true);
         assert!(out.contains("window._AMUX_AUTH_TOKEN=\"tok123\""));
         // Python-parity UI token: sha256("amux-ui-guard:tok123")[..40]
@@ -591,12 +591,15 @@ mod tests {
         h.update("amux-ui-guard:tok123");
         let expect = &hex::encode(h.finalize())[..40];
         assert!(out.contains(expect), "{out}");
-        assert!(!out.contains("old"), "placeholder block replaced");
+        // AMUX-4658: the placeholder used to be the word `old`, and `out` embeds
+        // $HOME. A parallel test points HOME at a macOS tempdir under
+        // /var/folders, which contains "old", so this failed on local runs.
+        assert!(!out.contains("STALE-BOOTSTRAP-PLACEHOLDER"), "placeholder block replaced: {out}");
     }
 
     #[test]
     fn invited_member_bootstrap_withholds_owner_bearer_but_keeps_ui_guard() {
-        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->old<!-- AMUX-BOOTSTRAP-END --></head>";
+        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->STALE-BOOTSTRAP-PLACEHOLDER<!-- AMUX-BOOTSTRAP-END --></head>";
         let owner = inject_bootstrap(html, &state(Some("tok123")), None, true);
         let member = inject_bootstrap(html, &state(Some("tok123")), None, false);
         assert!(member.contains("window._AMUX_AUTH_TOKEN=\"\""), "{member}");
@@ -664,7 +667,7 @@ mod tests {
 
         // And the shell built from that decision really is tokenless, so the
         // record describes a window that will 401 rather than a hypothesis.
-        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->old<!-- AMUX-BOOTSTRAP-END --></head>";
+        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->STALE-BOOTSTRAP-PLACEHOLDER<!-- AMUX-BOOTSTRAP-END --></head>";
         let shell = inject_bootstrap(html, &state(Some("tok123")), None, allowed);
         assert!(shell.contains("window._AMUX_AUTH_TOKEN=\"\""), "{shell}");
         assert!(shell.contains("window._AMUX_AUTH_WITHHELD=true;"), "{shell}");
@@ -675,7 +678,7 @@ mod tests {
     /// empty string.
     #[test]
     fn the_shell_says_whether_an_empty_token_means_withheld_or_auth_disabled() {
-        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->old<!-- AMUX-BOOTSTRAP-END --></head>";
+        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->STALE-BOOTSTRAP-PLACEHOLDER<!-- AMUX-BOOTSTRAP-END --></head>";
         let owner = inject_bootstrap(html, &state(Some("tok123")), None, true);
         let withheld = inject_bootstrap(html, &state(Some("tok123")), None, false);
         let no_auth = inject_bootstrap(html, &state(None), None, false);
@@ -697,7 +700,7 @@ mod tests {
     /// covers the whole script rather than the line just added to it.
     #[test]
     fn the_injected_script_carries_no_run_of_spaces_from_a_dropped_continuation() {
-        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->old<!-- AMUX-BOOTSTRAP-END --></head>";
+        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->STALE-BOOTSTRAP-PLACEHOLDER<!-- AMUX-BOOTSTRAP-END --></head>";
         let out = inject_bootstrap(html, &state(Some("tok123")), None, true);
         let script = out
             .split("<script>")
@@ -718,7 +721,7 @@ mod tests {
         // Client adoption rides the SSE ping's `v` (sse.rs::ping_payload,
         // Python parity) — the old /health-polling banner must stay gone,
         // or a backend-only deploy shows UI Python never showed.
-        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->old<!-- AMUX-BOOTSTRAP-END --></head><body></body>";
+        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->STALE-BOOTSTRAP-PLACEHOLDER<!-- AMUX-BOOTSTRAP-END --></head><body></body>";
         let s = state(Some("tok"));
         let out = inject_bootstrap(html, &s, None, true);
         assert!(!out.contains("AMUX-UPDATE-WATCH"));
@@ -740,7 +743,7 @@ mod tests {
     /// SOCKET the request arrived on.
     #[test]
     fn legacy_marker_is_injected_only_when_served_on_the_retired_port() {
-        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->old<!-- AMUX-BOOTSTRAP-END --></head><body></body>";
+        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->STALE-BOOTSTRAP-PLACEHOLDER<!-- AMUX-BOOTSTRAP-END --></head><body></body>";
         let s = state(Some("tok"));
 
         let canonical = inject_bootstrap(html, &s, None, true);
