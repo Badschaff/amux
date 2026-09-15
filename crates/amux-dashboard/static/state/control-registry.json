@@ -1850,6 +1850,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_peekMsgSetFilter": {
+      "kind": "command._peekMsgSetFilter",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_peekMsgSetPageSize": {
       "kind": "command._peekMsgSetPageSize",
       "feedback_required": true,
