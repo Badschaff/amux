@@ -244,7 +244,9 @@ pub async fn dictate(
         if let Some(raw) = raw {
             let (t, e) = whisper_transcribe(&raw, &mime).await;
             werr = e;
-            if !t.is_empty() {
+            let outcome = read_local_result(&t, &werr);
+            let outcome_was_no_speech = outcome == LocalResult::NoSpeech;
+            if let LocalResult::Text(t) = outcome {
                 let store = state.store.clone();
                 let fixed = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
                     let conn = store.read()?;
@@ -257,14 +259,55 @@ pub async fn dictate(
                     Err(e) => return internal(e),
                 }
                 engine = "whisper";
+            } else if outcome_was_no_speech {
+                // THE ENGINE RAN AND HEARD NO SPEECH. That is a RESULT, not a
+                // failure, and escalating it is how silence became a sentence
+                // (AMUX-4675).
+                //
+                // Measured on the live server 2026-09-15: a synthesised 1s
+                // 440Hz tone came back from the paid engine as 68 words reading
+                // fleet lane names; a 0.13s clip came back as "I need to open up
+                // a new session for ai-for-smbs". Neither sentence is in the
+                // audio. This text is what the dictation UI hands the user to
+                // SEND, so a silent clip did not produce silence, it produced a
+                // confident fleet-specific instruction someone could send to a
+                // worker believing they had said it. The invented content looks
+                // like the custom dictionary echoed back, which is exactly what
+                // makes it plausible enough to send.
+                //
+                // The old branch could not tell the two apart: it keyed on
+                // `!t.is_empty()` alone, so an empty result with no error read
+                // as failure and logged "local transcribe failed ()" — naming
+                // no cause, because there was none.
+                //
+                // The local engine was never broken: its own worker returns
+                // {"text": "Testing 123"} on a real speech clip (AMUX-4627).
+                engine = "whisper";
+                tracing::info!(
+                    measured = true, n_considered = 1,
+                    verdict = "dictation_local_empty_is_a_result",
+                    "[dictation] local engine heard no speech; returning an empty transcription \
+                     rather than escalating to the paid engine"
+                );
             } else {
-                tracing::warn!("[dictation] local transcribe failed ({werr}) — trying Gemini");
+                tracing::warn!(
+                    measured = true, n_considered = 1,
+                    verdict = "dictation_local_failed",
+                    error = %werr,
+                    "[dictation] local transcribe FAILED — trying Gemini"
+                );
             }
         }
     }
     // Gemini is the FALLBACK (py:72120-72135), not the single point of
     // failure it used to be.
-    if text.is_empty() {
+    //
+    // `engine` is the gate, not `text` (AMUX-4675). An empty string is the
+    // right answer for a clip with no speech, and reaching the paid engine on
+    // it is what turned silence into invented instructions. Once the local
+    // engine has ANSWERED — even with nothing — the question is settled and
+    // there is nothing left to fall back from.
+    if text.is_empty() && engine.is_empty() {
         let store = state.store.clone();
         let sess = session.clone();
         let keyed = tokio::task::spawn_blocking(move || -> anyhow::Result<(String, &'static str, String)> {
@@ -1131,7 +1174,13 @@ async fn whisper_start(st: &mut WhisperState) {
         .env("PYTHONUNBUFFERED", "1")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        // KEEP STDERR (AMUX-4675). It was Stdio::null(), so a worker that
+        // failed for a real reason — a missing model, a bad weights dir, an
+        // import error — could not explain itself, and the caller's only
+        // evidence was an empty string. That is what made "local transcribe
+        // failed ()" possible: an escalation naming no cause, because the cause
+        // had been sent to /dev/null at spawn time. Piped and drained below.
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn();
     let mut child = match spawned {
@@ -1146,6 +1195,21 @@ async fn whisper_start(st: &mut WhisperState) {
         st.failed = true;
         return;
     };
+    // Drain stderr into the log on its own task. It must be DRAINED whatever
+    // happens: a piped stream nobody reads fills its pipe buffer and blocks the
+    // worker mid-write, which would turn a diagnostic improvement into a hang.
+    if let Some(errs) = child.stderr.take() {
+        tokio::spawn(async move {
+            let mut lines = tokio::io::BufReader::new(errs).lines();
+            while let Ok(Some(l)) = lines.next_line().await {
+                let l = l.trim();
+                if !l.is_empty() {
+                    tracing::warn!(verdict = "dictation_whisper_stderr", "[dictation] whisper worker: {}",
+                                   truncate_chars(l, 300));
+                }
+            }
+        });
+    }
     let mut stdout = tokio::io::BufReader::new(stdout);
     let mut line = String::new();
     // Python blocks on readline forever here; bound it so a wedged model
@@ -1167,6 +1231,38 @@ async fn whisper_start(st: &mut WhisperState) {
 }
 
 /// py:27400 `_whisper_transcribe` — (text, err) from the warm local worker.
+/// What the local engine's `(text, error)` pair actually MEANS (AMUX-4675).
+///
+/// Three outcomes, not two. The handler used to key on `!text.is_empty()`
+/// alone, which folded "heard no speech" into "failed" and escalated silence to
+/// the paid engine. Measured on the live server: a 1s 440Hz tone came back as
+/// 68 words of fleet lane names, and a 0.13s clip came back as "I need to open
+/// up a new session for ai-for-smbs". Neither is in the audio, and this text is
+/// what the UI hands the user to SEND.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LocalResult {
+    /// Speech, transcribed.
+    Text(String),
+    /// The engine ran and there was nothing to hear. A RESULT: the honest
+    /// answer is an empty transcription, and no paid call is owed.
+    NoSpeech,
+    /// The engine could not answer, and says why. The only case that escalates.
+    Failed(String),
+}
+
+/// Read the local engine's answer. Pure, so the rule can be tested without a
+/// model, a worker process, or a network call — the defect was entirely in this
+/// reading, and a test that needed Whisper installed is a test nobody runs.
+pub(crate) fn read_local_result(text: &str, err: &str) -> LocalResult {
+    if !text.trim().is_empty() {
+        return LocalResult::Text(text.to_string());
+    }
+    if err.trim().is_empty() {
+        return LocalResult::NoSpeech;
+    }
+    LocalResult::Failed(err.trim().to_string())
+}
+
 async fn whisper_transcribe(raw: &[u8], mime: &str) -> (String, String) {
     let ext = match mime.to_lowercase().as_str() {
         "audio/ogg" => ".ogg",
@@ -2112,6 +2208,47 @@ pub(crate) mod tests {
         assert_eq!(st, StatusCode::NOT_FOUND);
         assert_eq!(e["error"], json!("dictation route not found"));
         set_overrides(None, None, None);
+    }
+
+    /// AMUX-4675: silence must not become a sentence.
+    ///
+    /// The live specimens this pins, measured 2026-09-15 before the fix: a 1s
+    /// 440Hz tone escalated to the paid engine and came back as 68 words of
+    /// fleet lane names; a 0.13s clip came back as "I need to open up a new
+    /// session for ai-for-smbs". Neither is in the audio, and this text is what
+    /// the dictation UI hands the user to SEND — so the failure mode was a
+    /// person sending a worker an instruction they never spoke.
+    #[test]
+    fn an_empty_local_result_with_no_error_is_silence_not_failure() {
+        // THE BUG. No error, no text: the engine ran and heard nothing.
+        assert_eq!(read_local_result("", ""), LocalResult::NoSpeech);
+        // Whitespace is not speech either; the old check was `!t.is_empty()`,
+        // which would have called a single newline a successful transcription.
+        assert_eq!(read_local_result("   \n ", ""), LocalResult::NoSpeech);
+        assert_eq!(read_local_result("", "   "), LocalResult::NoSpeech,
+            "a blank error is no error; it must not read as a failure to escalate");
+
+        // A REAL failure still escalates, and carries its cause. "local
+        // transcribe failed ()" naming nothing is what this replaces.
+        assert_eq!(
+            read_local_result("", "model weights missing"),
+            LocalResult::Failed("model weights missing".into())
+        );
+
+        // CONTROL: real speech is unaffected. Without this, a "fix" that
+        // returned NoSpeech for everything would pass every assertion above and
+        // silently disable dictation.
+        assert_eq!(
+            read_local_result("Testing 123", ""),
+            LocalResult::Text("Testing 123".into()),
+            "the local engine is not broken: its worker returns this on a real clip (AMUX-4627)"
+        );
+        // Text WITH a stderr warning is still text. Whisper chatters on stderr
+        // routinely, and treating that as failure would escalate good results.
+        assert_eq!(
+            read_local_result("Testing 123", "some warning"),
+            LocalResult::Text("Testing 123".into())
+        );
     }
 
     #[tokio::test]
