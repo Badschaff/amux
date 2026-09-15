@@ -10821,7 +10821,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.953';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.954';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -36740,6 +36740,16 @@ function _peekAskToggle() {
   p.style.display = open ? '' : 'none';
   if (open) { _askSuggestions(true); document.getElementById('peek-ask-q')?.focus(); }
 }
+/// Light markdown, applied AFTER escaping: **bold**, `code`, and leading
+/// bullet markers. The answer is model output about untrusted message text, so
+/// it is never inserted as HTML; only this fixed set of markers becomes tags.
+function _askFormat(answer) {
+  let out = esc(String(answer).replace(/^\s+/, ''));
+  out = out.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+  out = out.replace(/`([^`\n]+)`/g, '<code style="background:var(--bg);padding:1px 4px;border-radius:4px;">$1</code>');
+  out = out.replace(/^[ \t]*[-*][ \t]+/gm, '\u2022 ');
+  return out;
+}
 async function _askRun(peek) {
   const qEl = document.getElementById(peek ? 'peek-ask-q' : 'ask-q');
   const metaEl = document.getElementById(peek ? 'peek-ask-meta' : 'ask-meta');
@@ -36803,7 +36813,7 @@ async function _askRun(peek) {
       + d.cited.map(id => '<button class="btn" style="font-size:0.7rem;padding:2px 8px;" onclick="_askOpenCitation('
         + JSON.stringify(id) + ')">MSG-' + esc(id) + '</button>').join('') + '</div>'
     : '';
-  if (ansEl) ansEl.innerHTML = '<div>' + esc(d.answer || '') + '</div>' + cites;
+  if (ansEl) ansEl.innerHTML = '<div>' + _askFormat(d.answer || '') + '</div>' + cites;
 }
 /// Open the message an answer cited, so a claim can be checked against the row.
 async function _askOpenCitation(id) {
