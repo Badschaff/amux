@@ -16554,9 +16554,11 @@ pub(crate) fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static
          approves from the dashboard. A human send is never \
          restricted — this applies only to sends carrying a worker origin. For a \
          cross-group HANDOFF with a NEW finding, create the card in YOUR OWN lane and \
-         hand it over: `amux board add` then `amux board assign <ID> {target}`. That is \
-         the path that works when no card exists yet, and it is the one this refusal used \
-         to omit (GMA-123) — a lane with a new cross-group finding read the two verbs \
+         link them: `amux board add` then `amux board reviewer <ID> {target}` (or \
+         shepherd). NOT `board assign {target}`, which this server refuses with 403 \
+         cross_board_reassignment_forbidden — a worker may assign only to its own board, \
+         measured 2026-09-15 (AMUX-4678). The card stays yours; the link is what names \
+         them. This refusal used to omit any path at all (GMA-123) — a lane with a new cross-group finding read the two verbs \
          below, found both need a card the target ALREADY owns, and concluded there was \
          no path at all. On an EXISTING card owned by {target}: `amux board progress \
          <CARD> --stdin` notifies the owner at their next turn, and `amux board ask \

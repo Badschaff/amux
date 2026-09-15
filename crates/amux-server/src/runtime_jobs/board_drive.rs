@@ -4601,10 +4601,31 @@ fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String
         //
         // Both real cases are named instead, because they have different exits
         // and conflating them is what produced the loop.
+        // NO HANDOVER IS PROMISED HERE ANY MORE (AMUX-4678). This said
+        // "hand it over: `amux board assign <ID> <lane>`", and the server
+        // REFUSES that for a worker: board.rs answers 403
+        // `cross_board_reassignment_forbidden` whenever the requested owner is
+        // not the caller's own lane. Measured live 2026-09-15 by running the
+        // printed command against a card this lane owned.
+        //
+        // A nudge every lane receives, naming the one action for someone
+        // else's work, has to be true. What replaces it is the server's OWN
+        // how_to_fix from that refusal, so the instruction and the refusal
+        // cannot drift apart: keep the card, link the peer.
+        //
+        // Deliberately NOT naming `board request` or a direct message: on the
+        // same day, `request` was measured filing on the SENDER's board
+        // (AMUX-4653) and a direct ASK was captured and triaged away as junk
+        // (AMUX-4677). Three handover paths, none of which dispatch. Promising
+        // a fourth before AMUX-4653 settles where a delegated card lives would
+        // repeat exactly this bug.
         "{PICKUP_ANCHOR}{} — work it now. Card text below is historical, \
-         not a live message. If this card's WORK belongs to another lane, hand it over: \
-         `amux board assign <ID> <lane> && amux board todo <ID>` — it dispatches to THEM, \
-         not back to you. Needs You must satisfy the scoped approval policy below. \
+         not a live message. If this card's WORK belongs to another lane, the card STAYS ON \
+         YOUR BOARD — a worker cannot move one to another lane, and \
+         `amux board assign` to a lane that is not yours is refused. Link them instead: \
+         `amux board reviewer <ID> <lane>`, `amux board shepherd <ID> <lane>`, or a \
+         `depends_on` edge, and say on the card what you need from them. \
+         Needs You must satisfy the scoped approval policy below. \
          Do NOT move it to review to park it: the review gate asks \
          you to attest work you have not done, and will refuse.{}\n{}{}",
         row.id,

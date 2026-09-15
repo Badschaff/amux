@@ -8267,16 +8267,27 @@ fn reassign_exit(card: &str, owner: Option<&str>, caller: &str) -> Value {
             "when": format!(
                 "This card is owned by {o:?}, not by you. If the work is theirs, you do not need to satisfy this gate at all — hand it back."
             ),
-            "how": format!("amux board assign {card} {o} && amux board todo {card}"),
-            "effect": format!("dispatches to {o}, not to you"),
-            "not_a_bypass": "this does not skip the gate; it moves the card to the lane the gate is asking about, and they satisfy it honestly",
+            // NOT `board assign {o}` (AMUX-4678). The card already belongs to
+            // {o}; re-stating that owner is still a cross-board write from
+            // where you stand, and this server refuses it 403
+            // cross_board_reassignment_forbidden. Only the STATUS moves here,
+            // which is all that is needed: the card is already theirs.
+            "how": format!("amux board todo {card}"),
+            "effect": format!("returns it to {o}'s queue. Do NOT try `amux board assign {card} {o}` — a worker may set an owner only to its own lane, and that is refused."),
+            "not_a_bypass": "this does not skip the gate; it puts the card back in front of the lane the gate is asking about, and they satisfy it honestly",
         });
     }
+    // Same false promise as the auto-pickup nudge carried, fixed for the same
+    // reason (AMUX-4678): a worker running `amux board assign <ID> <other-lane>`
+    // gets 403 cross_board_reassignment_forbidden from this very file. A gate
+    // refusal that offers an escape the same server refuses is ethos rule 3 —
+    // a constraint with no truthful path — and this is the moment a lane is
+    // most likely to try it.
     json!({
         "when": "If this card's WORK belongs to another lane, hand it over instead of acking a criterion you cannot truthfully claim. You own it right now, so nothing here can tell whether that is the case — only you can.",
-        "how": format!("amux board assign {card} <owning-lane> && amux board todo {card}"),
-        "effect": "dispatches to THEM, not back to you. Moving it to `backlog` or `todo` while you still own it re-feeds your own auto-pickup and it returns.",
-        "not_a_bypass": "this does not skip the gate; it moves the card to the lane the gate is asking about, and they satisfy it honestly",
+        "how": format!("amux board reviewer {card} <owning-lane> (or shepherd, or a depends_on edge)"),
+        "effect": "the card STAYS on your board — a worker cannot assign one to another lane, and trying it is refused 403 cross_board_reassignment_forbidden. Linking names who the gate is really asking about without claiming the work moved. Moving it to `backlog` or `todo` while you still own it re-feeds your own auto-pickup and it returns.",
+        "not_a_bypass": "this does not skip the gate; it records that the criterion belongs to another lane, and the card is still yours until they act",
     })
 }
 
@@ -8291,11 +8302,37 @@ mod reassign_exit_tests {
     fn a_card_owned_by_a_peer_names_that_peer_in_the_command() {
         let v = reassign_exit("MI-4155", Some("mvs-infra"), "backend");
         assert!(v["when"].as_str().unwrap().contains("\"mvs-infra\""), "{v:#}");
+        // AMUX-4678: it used to print `amux board assign MI-4155 mvs-infra`,
+        // which this server refuses for a worker (403
+        // cross_board_reassignment_forbidden — an owner may only ever be your
+        // own lane). The advice a gate refusal gives has to be runnable by the
+        // lane reading it, so only the STATUS moves; the card is already theirs.
         assert!(
-            v["how"].as_str().unwrap() == "amux board assign MI-4155 mvs-infra && amux board todo MI-4155",
+            v["how"].as_str().unwrap() == "amux board todo MI-4155",
             "{v:#}"
         );
-        assert!(v["effect"].as_str().unwrap().contains("dispatches to mvs-infra"), "{v:#}");
+        assert!(v["effect"].as_str().unwrap().contains("mvs-infra's queue"), "{v:#}");
+        assert!(
+            !v["how"].as_str().unwrap().contains("assign"),
+            "a gate refusal must not hand a worker a cross-board assign: {v:#}"
+        );
+    }
+
+    /// THE WHOLE POINT, as a rule rather than one string: nothing this function
+    /// prints may tell a worker to run `board assign` at a lane that is not its
+    /// own, because the server answers that 403. Checked across BOTH arms, since
+    /// each carried the same promise in a different shape and fixing one is the
+    /// obvious way to leave the other.
+    #[test]
+    fn no_arm_tells_a_worker_to_assign_across_boards() {
+        for (owner, caller) in [(Some("mvs-infra"), "backend"), (None, "backend"), (Some("backend"), "backend")] {
+            let v = reassign_exit("MI-4155", owner, caller);
+            let how = v["how"].as_str().unwrap_or_default().to_string();
+            assert!(
+                !how.contains("board assign"),
+                "arm owner={owner:?} caller={caller} still prints a cross-board assign: {how}"
+            );
+        }
     }
 
     /// THE REPORTED CASE. The pickup had already assigned MI-4155 to backend, so
