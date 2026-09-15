@@ -1579,17 +1579,17 @@ cmd_server() {
   case "${1:-}" in
     start)
       echo "Starting amux server..."
-      launchctl kickstart gui/$(id -u)/com.amux.server-rs
+      launchctl kickstart "gui/$(id -u)/com.amux.server-rs"
       echo "${GREEN}server started${RESET}"
       ;;
     stop)
       echo "Stopping amux server..."
-      launchctl kill SIGTERM gui/$(id -u)/com.amux.server-rs
+      launchctl kill SIGTERM "gui/$(id -u)/com.amux.server-rs"
       echo "${RED}server stopped${RESET}"
       ;;
     restart)
       echo "Restarting amux server..."
-      launchctl kickstart -k gui/$(id -u)/com.amux.server-rs
+      launchctl kickstart -k "gui/$(id -u)/com.amux.server-rs"
       echo "${GREEN}server restarted${RESET}"
       ;;
     status)
@@ -2934,6 +2934,11 @@ deps.append(b) if b not in deps else None; print(json.dumps(deps))') || die "cre
       linkresp=$(_curl -sk -X PATCH -H 'Content-Type: application/json' -H "X-Amux-Worker: $worker" \
         -d "$(D="$newdeps" python3 -c 'import json,os;print(json.dumps({"depends_on":json.loads(os.environ["D"])}))')" \
         "$api/api/board/$id") || die "created blocker $bid but could not link it to $id"
+      # AMUX-4652: the link is a board write like any other, so read its answer.
+      # It used to be captured and dropped, and this line reported the link even
+      # when the board refused it or ignored depends_on.
+      printf '%s' "$linkresp" | _board_outcome "$id" "depends on $bid" >/dev/null \
+        || die "created blocker $bid but the board did not link it to $id (its answer is above)"
       echo "reported blocker: $id now depends on new task $bid (\"$title\"); it resumes when $bid completes."
       return 0
       ;;

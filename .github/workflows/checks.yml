@@ -489,6 +489,9 @@ jobs:
       # script (AMUX-4651).
       - name: CLI refusal remedies (board doing)
         run: ./scripts/test-board-continuation-hint.sh
+      # AMUX-4652: board needs reports a refused blocker link instead of claiming it.
+      - name: CLI board needs checks its link write
+        run: ./scripts/test-board-needs-link-refusal.sh
       # AMUX-3891. The CLI is symlinked straight into the working tree and ~50
       # lanes invoke it while it is being edited, so it MUST be parseable in one
       # read: bash holds a byte offset, and a rewrite mid-invocation resumes it
