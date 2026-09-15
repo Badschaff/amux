@@ -350,6 +350,21 @@ if [ -d "$(dirname "$SHARED_GUARD_DEST")" ]; then
   install -m 0755 "$ROOT/scripts/git-hooks/git-shared-guard.py" "$SHARED_GUARD_DEST"
 fi
 
+# THE READ ROUTER, the same shape as the guard above (AMUX-4544). settings.json
+# runs `python3 ~/.amux/hooks/large-read-guard.py` on every Read and Bash call,
+# and only install.sh ever placed it, so a commit to the router reached no lane.
+# Measured 2026-09-14: the running copy was byte-identical to its first commit,
+# 6bce0158, eight days after 4c068e80 (GMA-123) stopped it recommending the text
+# summarizer for images. Same existence rule as the guard: no ~/.amux/hooks, no
+# amux host, nothing invented.
+READ_ROUTER_DEST="${AMUX_READ_ROUTER_DEST:-$HOME/.amux/hooks/large-read-guard.py}"
+READ_ROUTER_SRC="$ROOT/scripts/hooks/large-read-guard.py"
+# Source-exists too: a checkout without the router (an older branch, a trimmed
+# fixture) must skip it, not fail the whole install.
+if [ -d "$(dirname "$READ_ROUTER_DEST")" ] && [ -f "$READ_ROUTER_SRC" ]; then
+  install -m 0755 "$READ_ROUTER_SRC" "$READ_ROUTER_DEST"
+fi
+
 # Verify rather than announce (ethos #7): compare what landed against its source,
 # so a stale installed copy cannot hide behind a success message. That drift was
 # real and security-relevant — the AC-239 secret patterns (Clerk, R2, Slack,
@@ -380,6 +395,18 @@ if [ -d "$(dirname "$SHARED_GUARD_DEST")" ]; then
   fi
 else
   echo "  SKIP $SHARED_GUARD_DEST — no ~/.amux/hooks on this machine (not an amux host)"
+fi
+if [ ! -f "$READ_ROUTER_SRC" ]; then
+  echo "  SKIP $READ_ROUTER_DEST — this checkout has no scripts/hooks/large-read-guard.py"
+elif [ -d "$(dirname "$READ_ROUTER_DEST")" ]; then
+  if cmp -s "$READ_ROUTER_SRC" "$READ_ROUTER_DEST"; then
+    echo "  ok   $READ_ROUTER_DEST matches scripts/hooks/large-read-guard.py"
+  else
+    echo "  FAIL $READ_ROUTER_DEST differs from scripts/hooks/large-read-guard.py" >&2
+    fail=1
+  fi
+else
+  echo "  SKIP $READ_ROUTER_DEST — no ~/.amux/hooks on this machine (not an amux host)"
 fi
 
 # The shim is the whole chain: an installed guard that pre-commit never calls is

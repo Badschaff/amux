@@ -451,6 +451,16 @@ if [ -n "${hooks_dir:-}" ] && [ -d "$REPO/scripts/git-hooks" ]; then
     out+=$'    a repo edit reaches nobody until someone installs it (AF-409)\n'
     out+=$'    ./scripts/install-hooks.sh   installs and verifies it now\n'
   fi
+  # The read router has the same blind spot and cost eight days (AMUX-4544):
+  # every lane ran 6bce0158's copy after 4c068e80 changed the committed one.
+  _rrd="${AMUX_READ_ROUTER_DEST:-$HOME/.amux/hooks/large-read-guard.py}"
+  _rrs="$REPO/scripts/hooks/large-read-guard.py"
+  if [ -f "$_rrs" ] && [ -f "$_rrd" ] && ! cmp -s "$_rrs" "$_rrd"; then
+    out+="  - the PreToolUse large-read router differs from this checkout"$'\n'
+    out+="    running: ${_rrd}"$'\n'
+    out+=$'    every Read and Bash call on this box runs it; a repo edit reaches nobody until it is installed (AMUX-4544)\n'
+    out+=$'    ./scripts/install-hooks.sh   installs and verifies it now\n'
+  fi
 
   if [ -n "$stale_hooks" ]; then
     out+="  - installed git hooks differ from this checkout: ${stale_hooks}"$'

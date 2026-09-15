@@ -458,6 +458,44 @@ out=$(cd "$w"; AMUX_SESSION="" AMUX_OBSERVED_EDITS_LOG="" \
       bash .claude/session-freshness.sh 2>&1)
 lacks "$PGMARK" "$out"
 
+# ── AMUX-4544: the large-read router, same blind spot, same three states ─────
+# Every lane ran 6bce0158's router for eight days after 4c068e80 changed the
+# committed copy, because nothing compared the running file to the checkout.
+RRMARK="the PreToolUse large-read router differs from this checkout"
+
+# (r1) DRIFT: say so, and name the installer.
+w=$(hooks_repo rr_drift)
+mkdir -p "$w/scripts/hooks" "$TMP/rr_drift/dest"
+printf 'repo version\n'    > "$w/scripts/hooks/large-read-guard.py"
+printf 'running version\n' > "$TMP/rr_drift/dest/large-read-guard.py"
+out=$(cd "$w"; AMUX_SESSION="" AMUX_OBSERVED_EDITS_LOG="" \
+      AMUX_READ_ROUTER_DEST="$TMP/rr_drift/dest/large-read-guard.py" \
+      AMUX_RS_BUILD_PROVENANCE="$TMP/no-such-provenance.json" \
+      bash .claude/session-freshness.sh 2>&1)
+says "$RRMARK" "$out"
+says "install-hooks.sh" "$out"
+
+# (r2) IDENTICAL: silent.
+w=$(hooks_repo rr_same)
+mkdir -p "$w/scripts/hooks" "$TMP/rr_same/dest"
+printf 'same bytes\n' > "$w/scripts/hooks/large-read-guard.py"
+printf 'same bytes\n' > "$TMP/rr_same/dest/large-read-guard.py"
+out=$(cd "$w"; AMUX_SESSION="" AMUX_OBSERVED_EDITS_LOG="" \
+      AMUX_READ_ROUTER_DEST="$TMP/rr_same/dest/large-read-guard.py" \
+      AMUX_RS_BUILD_PROVENANCE="$TMP/no-such-provenance.json" \
+      bash .claude/session-freshness.sh 2>&1)
+lacks "$RRMARK" "$out"
+
+# (r3) DESTINATION ABSENT: not an amux host, not drift.
+w=$(hooks_repo rr_nodest)
+mkdir -p "$w/scripts/hooks"
+printf 'repo version\n' > "$w/scripts/hooks/large-read-guard.py"
+out=$(cd "$w"; AMUX_SESSION="" AMUX_OBSERVED_EDITS_LOG="" \
+      AMUX_READ_ROUTER_DEST="$TMP/rr_nodest/definitely/not/here.py" \
+      AMUX_RS_BUILD_PROVENANCE="$TMP/no-such-provenance.json" \
+      bash .claude/session-freshness.sh 2>&1)
+lacks "$RRMARK" "$out"
+
 # ── AF-375: is one of the drifting hooks a file THIS session edited? ─────────
 #
 # The block above was already correct, already specific, and already printed at
