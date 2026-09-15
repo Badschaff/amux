@@ -1950,11 +1950,23 @@ function _dialogReachCheck(root) {
     if (!saved) issues.push('content-unreachable');
   }
   // The lowest visible line, by position rather than by DOM order.
-  let last = null, lowest = -Infinity;
+  //
+  // Cheap pass first. `shown` walks ancestors calling getComputedStyle, so
+  // running it over every text leaf costs 6ms on a 704-element card detail and
+  // scales with the dialog; the peek overlay is an order of magnitude bigger,
+  // and this runs on every mutation. Rank by rectangle, which needs one layout
+  // for the whole set, then pay for visibility only from the bottom up and
+  // stop at the first element that is really on screen.
+  const candidates = [];
   for (const el of all) {
-    if (el.children.length || !(el.textContent || '').trim() || !shown(el)) continue;
-    const b = el.getBoundingClientRect().bottom;
-    if (b > lowest) { lowest = b; last = el; }
+    if (el.children.length || !(el.textContent || '').trim()) continue;
+    const b = el.getBoundingClientRect();
+    if (b.height > 0 && b.width > 0) candidates.push([b.bottom, el]);
+  }
+  candidates.sort((a, b) => b[0] - a[0]);
+  let last = null;
+  for (let i = 0; i < candidates.length && i < 200; i++) {
+    if (shown(candidates[i][1])) { last = candidates[i][1]; break; }
   }
   if (last) {
     const holder = scrollers.find(s => s.contains(last));
@@ -10967,7 +10979,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.963';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.964';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
