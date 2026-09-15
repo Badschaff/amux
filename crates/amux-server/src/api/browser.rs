@@ -1892,6 +1892,42 @@ async fn identify(headers: HeaderMap, body: Option<Json<IdentifyBody>>) -> Respo
     .into_response()
 }
 
+/// Which running browser a `/stop` request names (MHC-816).
+///
+/// Returns `(profile, started_by, pid)`, or None when the request does not
+/// resolve to exactly one — in which case the caller must stop NOTHING.
+///
+/// A pure function over the registry snapshot so the selection can be tested
+/// without killing a process: the defect was entirely in the selection, and a
+/// test that had to spawn browsers to reach it would never have been written.
+///
+/// Order is most-specific first. `session` resolves only when that lane owns
+/// exactly ONE browser; two browsers on one lane is the ambiguity this bug fed
+/// on, so it is left unresolved rather than settled by picking either.
+fn resolve_stop_target(
+    running: &[(String, String, i64, u32, u16, i64)],
+    want_profile: Option<&str>,
+    want_pid: Option<u32>,
+    want_session: Option<&str>,
+) -> Option<(String, String, u32)> {
+    let hit = running
+        .iter()
+        .find(|(p, _, _, _, _, _)| want_profile.is_some() && Some(p.as_str()) == want_profile)
+        .or_else(|| running.iter().find(|(_, _, _, pid, _, _)| want_pid.is_some() && Some(*pid) == want_pid))
+        .or_else(|| {
+            let mut owned = running
+                .iter()
+                .filter(|(_, by, _, _, _, _)| want_session.is_some() && Some(by.as_str()) == want_session);
+            match (owned.next(), owned.next()) {
+                (Some(one), None) => Some(one),
+                _ => None,
+            }
+        })
+        // A bare stop is unambiguous only when there is exactly one browser.
+        .or_else(|| if running.len() == 1 { running.first() } else { None })?;
+    Some((hit.0.clone(), hit.1.clone(), hit.3))
+}
+
 async fn stop(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1904,20 +1940,73 @@ async fn stop(
     let attrib = explicit_session(body.get("session").and_then(Value::as_str), &headers);
     let actor = attrib.as_deref().unwrap_or("(unattributed)");
     let home = chrome::amux_home();
+    // RESOLVE THE TARGET FROM THE REQUEST (MHC-816).
+    //
+    // This handler used to read `running_all().into_iter().next()` purely to
+    // LABEL the response, then call `stop_as`, which stops the OLDEST browser.
+    // `running_all` is sorted NEWEST first. So the label and the kill were
+    // sorted in opposite directions and, with more than one browser running,
+    // were guaranteed to name different ones. The body's `pid`, `profile` and
+    // `session` were never read at all.
+    //
+    // mixpeek-homepage-claude measured it twice on 2026-09-14: it stopped
+    // another lane's browser while the caller's stayed alive, and the second
+    // time the body named the caller's own pid and profile and it still killed
+    // the other one. Victims were tubescience and ai-for-smbs.
+    //
+    // `stop_as`'s own doc says "The API layer always names one; this arm exists
+    // for internal callers and tests". That was not true of this caller, which
+    // is why the fallback arm was doing the fleet's stopping.
+    let running = chrome::running_all();
+    let want_profile = body.get("profile").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+    let want_pid = body.get("pid").and_then(Value::as_u64).map(|p| p as u32);
+    let want_session = body.get("session").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+    let target = resolve_stop_target(&running, want_profile, want_pid, want_session);
+
+    let Some((profile, owner_of_target, target_pid)) = target else {
+        // NOTHING IS STOPPED HERE, deliberately. Guessing is what killed two
+        // lanes' browsers; an unresolvable stop names the candidates and lets
+        // the caller say which. A bare stop with exactly one browser running is
+        // still unambiguous and handled above.
+        let candidates: Vec<Value> = running
+            .iter()
+            .map(|(p, by, _, pid, _, _)| json!({"profile": p, "started_by": by, "pid": pid}))
+            .collect();
+        tracing::warn!(
+            stopped_by = %actor, n_running = running.len(),
+            measured = true, n_considered = running.len(),
+            verdict = "browser_stop_target_unresolved",
+            "browser: stop names no resolvable target; stopping nothing (MHC-816)"
+        );
+        return err(
+            StatusCode::CONFLICT,
+            json!({
+                "ok": false,
+                "error": if running.is_empty() { "no browser is running" }
+                         else { "several browsers are running and the request names none of them" },
+                "code": "browser_stop_target_unresolved",
+                "stopped": false,
+                "candidates": candidates,
+                "how_to_fix": "name one: {\"profile\": \"<profile>\"} or {\"pid\": <pid>}",
+            }),
+        );
+    };
+
     // Cross-session stop stays PERMITTED (a wedged browser must be cleanable
     // by whoever notices) but LOUD: the log and the response both name owner
     // and actor, so an anonymous stop can no longer read as a mystery death
-    // (AMUX-3063's other half — the 09:05 stop had no actor on record).
-    let owner = chrome::running_all().into_iter().next().map(|(_, o, _, _, _, _)| o);
+    // (AMUX-3063's other half — the 09:05 stop had no actor on record). The
+    // owner named here is now the owner of the browser actually being stopped.
+    let owner = Some(owner_of_target);
     if let Some(o) = owner.as_deref() {
         if attrib.as_deref() != Some(o) {
             tracing::warn!(
-                stopped_by = %actor, owner = %o,
+                stopped_by = %actor, owner = %o, profile = %profile, pid = target_pid,
                 "browser: cross-session STOP of another session's browser"
             );
         }
     }
-    let report = chrome::stop_as(&home, attrib.as_deref().unwrap_or("")).await;
+    let report = chrome::stop_profile_as(&home, &profile, attrib.as_deref().unwrap_or("")).await;
     let mut v = serde_json::to_value(&report).unwrap_or_else(|_| json!({}));
     v["ok"] = json!(true);
     v["stopped_by"] = json!(actor);
@@ -3523,6 +3612,75 @@ fn catalog_body(path: &str) -> Response {
 
 #[cfg(test)]
 mod tests {
+    /// MHC-816, reported by mixpeek-homepage-claude with two measured incidents
+    /// on 2026-09-14: `/api/browser/stop` killed another lane's browser while
+    /// the caller's stayed alive, and the second time the body named the
+    /// caller's OWN pid and profile and it still killed the other one.
+    ///
+    /// The mechanism: the handler labelled the response from
+    /// `running_all().into_iter().next()` (sorted NEWEST first) and then called
+    /// `stop_as`, which stops the OLDEST. Two orderings in opposite directions,
+    /// so with more than one browser running they could not agree. The body's
+    /// pid/profile/session reached neither.
+    ///
+    /// The fixture is two browsers on two lanes, which is the smallest shape
+    /// that can expose it — with one running, every wrong policy looks right.
+    #[test]
+    fn a_stop_targets_the_browser_the_request_names_and_refuses_to_guess() {
+        // (profile, started_by, started_at, pid, cdp_port, last_verb_at).
+        // beta is NEWER than alpha, so "newest" and "oldest" disagree here.
+        let running = vec![
+            ("alpha".to_string(), "tubescience".to_string(), 100i64, 111u32, 9001u16, 0i64),
+            ("beta".to_string(), "mixpeek-homepage-claude".to_string(), 200i64, 222u32, 9002u16, 0i64),
+        ];
+
+        // BY PROFILE: the caller's own, not the other lane's.
+        let got = super::resolve_stop_target(&running, Some("beta"), None, None);
+        assert_eq!(got, Some(("beta".into(), "mixpeek-homepage-claude".into(), 222)),
+            "a named profile must select that browser");
+
+        // BY PID: the exact failure reported — body named the caller's own pid.
+        let got = super::resolve_stop_target(&running, None, Some(222), None);
+        assert_eq!(got, Some(("beta".into(), "mixpeek-homepage-claude".into(), 222)),
+            "a named pid must select that browser, not the oldest");
+
+        // The other lane is still reachable ON PURPOSE: a wedged browser must
+        // be cleanable by whoever notices. What changed is that it happens only
+        // when asked for by name.
+        let got = super::resolve_stop_target(&running, Some("alpha"), None, None);
+        assert_eq!(got, Some(("alpha".into(), "tubescience".into(), 111)));
+
+        // BY SESSION, when that lane owns exactly one.
+        let got = super::resolve_stop_target(&running, None, None, Some("tubescience"));
+        assert_eq!(got, Some(("alpha".into(), "tubescience".into(), 111)));
+
+        // AMBIGUOUS: two running, nothing named. Stopping nothing is the whole
+        // fix; the old code stopped the oldest and told the caller it had
+        // stopped the newest's owner.
+        assert_eq!(super::resolve_stop_target(&running, None, None, None), None,
+            "a bare stop with two browsers running must resolve to nothing");
+
+        // AMBIGUOUS: one lane owns both. Picking either is what the bug did.
+        let two_on_one = vec![
+            ("alpha".to_string(), "same-lane".to_string(), 100i64, 111u32, 9001u16, 0i64),
+            ("beta".to_string(), "same-lane".to_string(), 200i64, 222u32, 9002u16, 0i64),
+        ];
+        assert_eq!(super::resolve_stop_target(&two_on_one, None, None, Some("same-lane")), None,
+            "a lane owning two browsers does not name one of them");
+
+        // A name that matches nothing resolves to nothing, rather than falling
+        // through to some other browser.
+        assert_eq!(super::resolve_stop_target(&running, Some("ghost"), None, None), None);
+        assert_eq!(super::resolve_stop_target(&running, None, Some(999), None), None);
+
+        // A BARE stop with exactly one running is still unambiguous.
+        let one = vec![("solo".to_string(), "lane".to_string(), 1i64, 7u32, 9000u16, 0i64)];
+        assert_eq!(super::resolve_stop_target(&one, None, None, None),
+            Some(("solo".into(), "lane".into(), 7)));
+        assert_eq!(super::resolve_stop_target(&[], None, None, None), None,
+            "nothing running resolves to nothing");
+    }
+
     use super::*;
     use std::sync::Arc;
     use tower::ServiceExt;
