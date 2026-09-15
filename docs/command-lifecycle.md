@@ -49,9 +49,14 @@ approve an external action; the existing capability and sending adapters remain
 responsible for actual side-effect authorization.
 
 Validation evidence is recorded per fresh Haiku worker against a fixed 10-point
-scorecard. Unit tests use deterministic model fakes; only the live rounds spend
-provider tokens. Do not claim full lifecycle effectiveness from compilation or
+scorecard. Unit tests use deterministic model fakes; provider integration tests
+and live rounds can spend provider tokens. Do not claim full lifecycle effectiveness from compilation or
 from a worker saying it finished: inspect the resulting board and artifacts.
+
+The [three-round validation](command-lifecycle-validation-2026-09-15.md) scored
+2, 3 and 5 out of 10. Automatic intake failed the final live trial, so this
+controller remains opt-in. The separately tested global approval policy is
+enabled; the old fleet backlog has not been bulk migrated.
 
 ## Conservative execution and recovery
 
