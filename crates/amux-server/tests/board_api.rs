@@ -1874,7 +1874,7 @@ async fn needsyou_refuses_a_park_that_names_no_human_act() {
     .await;
     let id = c["id"].as_str().unwrap().to_string();
 
-    // Untyped: refused, and the five types are IN the refusal so the reader
+    // Untyped: refused, and the accepted types are IN the refusal so the reader
     // does not have to go and find them (AF-112).
     let (st, _, v) = send(
         &app,
@@ -1887,7 +1887,7 @@ async fn needsyou_refuses_a_park_that_names_no_human_act() {
     assert_eq!(v["code"], json!("needsyou_requires_ask_type"), "{v}");
     let types: Vec<&str> =
         v["ask_types"].as_array().unwrap().iter().map(|t| t["type"].as_str().unwrap()).collect();
-    assert_eq!(types, vec!["decision", "access", "credential", "external", "judgment"], "{v}");
+    assert_eq!(types, vec!["budget", "customer_outbound", "decision", "access", "credential", "external", "judgment"], "{v}");
 
     // A type outside the closed vocabulary is refused too, or the vocabulary
     // is decorative.
