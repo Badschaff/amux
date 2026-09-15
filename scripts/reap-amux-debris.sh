@@ -39,12 +39,17 @@
 set -uo pipefail
 
 AGE_HOURS=6
+# A per-worktree CARGO_TARGET_DIR is only debris once nothing is building into
+# it. 24h because a lane's build touches its target constantly, so a full idle
+# day is a strong signal, and the cost of being wrong is a rebuild.
+TARGET_IDLE_HOURS=24
 APPLY=0
 REPO="${AMUX_REPO_DIR:-$HOME/Dev/amux}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --apply) APPLY=1 ;;
     --age-hours) AGE_HOURS="${2:?--age-hours needs a value}"; shift ;;
+    --target-idle-hours) TARGET_IDLE_HOURS="${2:?--target-idle-hours needs a value}"; shift ;;
     --repo) REPO="${2:?--repo needs a value}"; shift ;;
     -h|--help) sed -n '2,36p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -182,6 +187,47 @@ if [ -d "$REPO/.git" ] || [ -f "$REPO/.git" ]; then
   [ "$APPLY" = "1" ] && git -C "$REPO" worktree prune >/dev/null 2>&1
 fi
 
+# ── stale side cargo target dirs ─────────────────────────────────────────────
+# A per-worktree CARGO_TARGET_DIR outlives the worktree that made it. Measured
+# 2026-09-15: 76.6 GB across four of them, and rust-build-target-rr0052-wt was
+# back at 19.9 GB hours after 45 GB of it was deleted by hand, which is why this
+# is an arm and not a cleanup someone runs when they notice (AMUX-4614).
+#
+# THE SHARED TARGET IS NEVER A CANDIDATE. CLAUDE.md mandates one shared
+# CARGO_TARGET_DIR for the whole fleet; reaping it would make every lane rebuild
+# at once. Two layers protect it, and they cover different cases: the glob below
+# never matches the default name (~/.amux/rust-build-target has no suffix), and
+# the explicit guard covers a shared target CONFIGURED to a matching sibling
+# name. Only siblings are eligible, and only when nothing has written to them
+# for --target-idle-hours and no live process is inside or names them.
+targets_removed=0; targets_kb=0; targets_kept=0
+shared_target="${AMUX_SHARED_TARGET:-$HOME/.amux/rust-build-target}"
+target_root="${AMUX_DEBRIS_TARGET_ROOT:-$HOME/.amux}"
+for t in "$target_root"/rust-build-target-*; do
+  [ -d "$t" ] || continue
+  [ "$t" = "$shared_target" ] && continue
+  # Written inside the idle window? A build in flight touches its target
+  # constantly, so this is the cheap half of "is anyone using it".
+  if [ -n "$(find "$t" -newermt "-${TARGET_IDLE_HOURS} hours" -print -quit 2>/dev/null)" ]; then
+    targets_kept=$((targets_kept+1)); continue
+  fi
+  # Named by a live process (cargo/rustc read it from argv or the environment),
+  # or someone is standing in it. Same fail-closed rule as the worktree arm:
+  # an empty cwd listing means the probe failed, so nothing is removed.
+  if ps -Ao command= 2>/dev/null | grep -v grep | grep -qF -- "$t"; then
+    targets_kept=$((targets_kept+1)); continue
+  fi
+  if [ -z "$cwds" ] || printf '%s\n' "$cwds" | grep -qF -- "$t"; then
+    targets_kept=$((targets_kept+1)); continue
+  fi
+  kb=$(du -sk "$t" 2>/dev/null | cut -f1); kb=${kb:-0}
+  if [ "$APPLY" = "1" ]; then
+    rm -rf -- "$t" 2>/dev/null && { targets_removed=$((targets_removed+1)); targets_kb=$((targets_kb+kb)); }
+  else
+    targets_removed=$((targets_removed+1)); targets_kb=$((targets_kb+kb))
+  fi
+done
+
 # Every number below is COMPUTED (CLAUDE.md: a summary line you hardcode cannot
 # disagree with the run, so it reads as measured to every reader including you).
 mode=$([ "$APPLY" = "1" ] && echo applied || echo "dry-run (pass --apply to reclaim)")
@@ -189,6 +235,7 @@ mb=$((dirs_bytes / 1024))
 echo "amux-debris: mode=$mode age_floor=${AGE_HOURS}h"
 echo "amux-debris: temp dirs ${dirs_removed} (${mb} MB), kept ${dirs_kept_fresh} younger than the floor"
 echo "amux-debris: worktrees ${wt_removed} of ${wt_considered} considered, ${wt_dirty} left alone as dirty, ${wt_local_only} kept because HEAD is on no remote, ${wt_in_use} kept in use"
+echo "amux-debris: side cargo targets ${targets_removed} ($((targets_kb / 1024)) MB), ${targets_kept} kept as busy or fresh (idle floor ${TARGET_IDLE_HOURS}h; the shared target is never a candidate)"
 [ -n "$cwds" ] || echo "amux-debris: cwd probe unavailable (lsof missing or empty), so ${wt_unprobed} worktree(s) were not removed"
 # Non-zero only on a real failure, so a scheduler run that reclaims nothing is
 # still a success. Reclaiming nothing is the healthy steady state.
