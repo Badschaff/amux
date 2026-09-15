@@ -4104,6 +4104,8 @@ pub(crate) enum Delivery {
     Direct,
     /// Parked on the steering queue, delivered at a later turn boundary.
     Queued,
+    /// Accepted by the board controller; the raw command is not a pane send.
+    Board,
 }
 
 impl Delivery {
@@ -4111,6 +4113,7 @@ impl Delivery {
         match self {
             Delivery::Direct => "direct",
             Delivery::Queued => "queued",
+            Delivery::Board => "board",
         }
     }
 }
@@ -4167,6 +4170,9 @@ pub(crate) struct DeliveryMeta<'a> {
 }
 
 impl DeliveryMeta<'_> {
+    pub(crate) fn board(at_ms: i64) -> Self {
+        Self { delivery: Some(Delivery::Board), queued_at_ms: Some(at_ms), submit_verdict: Some("accepted") }
+    }
     /// A send handed straight to a live lane, with nothing to verify.
     pub(crate) fn direct() -> Self {
         DeliveryMeta {
@@ -4714,6 +4720,7 @@ async fn cmd_hist_record_with_id(
     let ctype = ctype.to_string();
     let origin: String = origin.chars().take(80).collect();
     let delivery = meta.delivery.map(|d| d.as_str().to_string());
+    let board_delivery = delivery.as_deref() == Some("board");
     let submit_verdict = meta.submit_verdict.map(|v| v.to_string());
     let queued_at_ms = meta.queued_at_ms;
     let now_ms = now_i64() * 1000;
@@ -4809,7 +4816,7 @@ async fn cmd_hist_record_with_id(
     // the text landed, so it decides this column too.
     let landed = !matches!(submit_verdict.as_deref(), Some("stuck"));
     let delivered_at_ms = match meta.delivery {
-        Some(Delivery::Queued) => None,
+        Some(Delivery::Queued | Delivery::Board) => None,
         _ if !landed => None,
         _ => Some(now_ms),
     };
@@ -4925,7 +4932,14 @@ async fn cmd_hist_record_with_id(
         && !amux_core::board::is_informational_query(&cap_text);
     if capture_pending {
         let row_id = msg_row_id.load(std::sync::atomic::Ordering::SeqCst);
-        if row_id > 0 { capture_recorded_message(state, row_id).await; }
+        if row_id > 0 {
+            if board_delivery {
+                let state = state.clone();
+                tokio::spawn(async move { capture_recorded_message(&state, row_id).await; });
+            } else {
+                capture_recorded_message(state, row_id).await;
+            }
+        }
     }
     if task_bearing && landed {
         let cardless_reason = if amux_core::board::is_informational_query(&cap_text) {
@@ -5402,6 +5416,13 @@ pub(crate) async fn steer_enqueue_idempotent_report(
         Some(message_id),
     )
     .await
+}
+
+/// A semantically conversational board receipt uses the existing durable outbox.
+/// Stable identity survives a crash between enqueue and receipt finalization.
+pub(crate) async fn enqueue_board_conversation(state: &AppState, name: &str, id: i64, text: &str) -> Result<(), String> {
+    steer_enqueue_precond_with_id(&state.store, name, text, "", "", None,
+        Some(&format!("board-conversation-{id}"))).await.map(|_| ()).map_err(str::to_string)
 }
 
 async fn steer_enqueue_precond_with_id(
@@ -17011,7 +17032,7 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     {
         let actor = member_actor.as_deref().unwrap_or("");
         let id = cmd_hist_record_with_id(state, name, &orig_text, "user", actor,
-            skip_board, DeliveryMeta::queued(now_i64()*1000)).await;
+            skip_board, DeliveryMeta::board(now_i64()*1000)).await;
         let receipt = state.store.read().ok().and_then(|c| c.query_row(
             "SELECT intake_result FROM cmd_history WHERE id=?1", [id],
             |r|r.get::<_,Option<String>>(0)).ok());
@@ -17020,23 +17041,6 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
             return jresp(StatusCode::SERVICE_UNAVAILABLE,json!({"ok":false,"error":"request could not be retained; retry is safe"}));
         };
         let result: Value = saved.and_then(|v|serde_json::from_str(&v).ok()).unwrap_or(Value::Null);
-        let kind = result["decision"]["kind"].as_str().unwrap_or("");
-        // Interpretation can establish that this is conversation, not work.
-        // Preserve one receipt, and deliver such a message normally.
-        if matches!(kind, "information" | "question" | "policy") {
-            let (ok, message) = send_text(state,name,&text,defer_busy,send_origin).await;
-            let (submitted, submission) = submission_verdict(ok,&message);
-            let landed = submitted == Some(true);
-            let verdict = submission.to_string();
-            let _ = state.store.write_async(move |c| {
-                c.execute("UPDATE cmd_history SET submit_verdict=?2,delivered_at=CASE WHEN ?3 THEN ?4 ELSE delivered_at END WHERE id=?1",
-                    rusqlite::params![id,verdict,landed,now_i64()*1000])?;
-                Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
-            }).await;
-            if ok { send_dedup_accept(state,name,&msg_id,&format!("MSG-{id}")).await; }
-            else { send_dedup_forget(state,name,&msg_id).await; }
-            return jresp(if ok {StatusCode::OK} else {StatusCode::CONFLICT},json!({"ok":ok,"message":message,"id":format!("MSG-{id}"),"submitted":submitted,"submission":submission}));
-        }
         send_dedup_accept(state,name,&msg_id,&format!("MSG-{id}")).await;
         tracing::info!(session=name,message_id=id,root=?result.get("root"),measured=true,n_considered=1,
             verdict="command_retained_before_dispatch","request accepted; existing board dispatcher owns execution, no duplicate raw prompt sent");

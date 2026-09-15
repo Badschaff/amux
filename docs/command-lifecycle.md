@@ -28,12 +28,12 @@ workers. Disabling it preserves the existing capture path.
 `AMUX_HELPER_MODEL` and the configured fast default. Deterministic scheduling,
 readiness, completion and unchanged-receipt recovery make zero model calls.
 
-`AMUX_INTAKE_CANDIDATES` defaults to 24 compact candidates (maximum 200).
+`AMUX_INTAKE_CANDIDATES` defaults to 8 compact candidates (maximum 200).
 `AMUX_INTAKE_CALLS_PER_HOUR` defaults to a conservative shared 60-call ceiling.
 At most two interpretations run concurrently and a receipt has at most two
 attempts. A failed/uncertain interpretation remains visible on the receipt.
 No generic endless retry or repeated capture-disposal prompt is produced by this
-controller. `/api/board-lifecycle/?session=<worker>` exposes decisions, pending
+controller. `/api/board-lifecycle?session=<worker>` exposes decisions, pending
 requests and durable call counts. Character counts are explicitly not presented
 as measured token usage.
 
@@ -75,3 +75,24 @@ paid helper. Provider-reported input, output and cache usage is retained where
 available, with explicit coverage of measured receipts. Worker execution costs
 remain separate in the existing token ledger. Empty new-worker configuration
 restarts do not generate a continuation turn.
+
+## Live validation fixes
+
+The second Haiku trial exposed a quiet-start deadlock: a new Claude process had
+no current-life hook and its idle prompt aged out after the last repaint. Such
+workers now keep a bounded terminal probe until structured reports exist. Empty
+captures and busy prompts still do not authorize dispatch.
+
+Board acceptance is a distinct delivery mode. The API acknowledges the durable
+receipt before planning; repeated pending requests wait on the original receipt.
+Conversational interpretations enter the existing durable outbox with a stable
+identity. Rejected model output retains its usage and response for one informed
+repair. Task handoffs include current criteria, next action and effective gates.
+
+Read-only helpers disable memory-file loading and default to zero extended
+thinking tokens through the documented Claude environment settings
+([reference](https://code.claude.com/docs/en/env-vars)). These settings apply to
+data-only helper processes; working agents retain their normal project context.
+`AMUX_HELPER_THINKING_TOKENS` can override the helper thinking budget. Diagnostics
+count measured calls, including rejected interpretations, and say when coverage
+is incomplete.

@@ -4584,8 +4584,8 @@ fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String
         "{PICKUP_ANCHOR}{} — work it now. Card text below is historical, \
          not a live message. If this card's WORK belongs to another lane, hand it over: \
          `amux board assign <ID> <lane> && amux board todo <ID>` — it dispatches to THEM, \
-         not back to you. If it needs a decision only Ethan can make, `amux board needsyou \
-         <ID>` with the question. Do NOT move it to review to park it: the review gate asks \
+         not back to you. Needs You must satisfy the scoped approval policy below. \
+         Do NOT move it to review to park it: the review gate asks \
          you to attest work you have not done, and will refuse.{}\n{}{}",
         row.id,
         decline_exit(session),
@@ -4599,6 +4599,15 @@ fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String
          todo/backlog work until no non-terminal task remains actionable.",
         row.id, row.id
     ));
+    prompt.push_str(&format!("\n\n[approval policy] Allowed Needs You categories: {}. Make ordinary implementation choices. Resolve operational prerequisites yourself within existing authority.", bs::approval_types(Some(session)).join(", ")));
+    if let Some(next) = row.next_action.as_deref().filter(|v| !v.is_empty()) {
+        prompt.push_str(&format!("\nNext action: {}", quoted_card_text(next, &row.id)));
+    }
+    if let Some(criteria) = row.acceptance_criteria.as_deref().filter(|v| !v.is_empty()) {
+        prompt.push_str(&format!("\nAcceptance criteria: {}", quoted_card_text(criteria, &row.id)));
+    }
+    let completion_gate = bs::effective_gate_configured(conn, row, TaskStatus::Done);
+    prompt.push_str(&format!("\nDone gate: {}. Verify the actual outputs before acknowledging criteria. Submit with `amux board done {} --checked \"<true criterion>\" ... --evidence-stdin` (evidence on stdin). Gate acknowledgements use --checked or API gate_checked; never change the gate to bypass a refusal.", completion_gate.join("; "), row.id));
     let full = format!("{}\n{}", row.desc, row.log.clone().unwrap_or_default());
     let full = full.trim();
     let cap = pickup_excerpt_chars();
@@ -5457,6 +5466,7 @@ pub fn select_advance_with(
         ball_with_author: &ball_with_author,
         item_type: &row.item_type,
         has_evidence: board_has_evidence(&row.desc),
+        approval_types: &bs::approval_types(Some(session)).join(", "),
     });
     Advance::Nudge {
         target: session.to_string(),
@@ -5492,6 +5502,7 @@ struct AdvanceMsg<'a> {
     ball_with_author: &'a str,
     item_type: &'a str,
     has_evidence: bool,
+    approval_types: &'a str,
 }
 
 /// The advance nudge body. Compressed to reduce token waste (AMUX-3767):
@@ -5534,7 +5545,7 @@ fn advance_text(m: AdvanceMsg<'_>) -> String {
          {}{}\n\
          2) Finished? Close to {} with evidence.\n\
          3) Blocked? Work the blocker. External block: `amux board backlog {} --trigger \"<condition>\"`.\n\
-         4) Needs human? Record it, pick up next card.\n\
+         4) Needs You only under scoped categories: {}. Ordinary choices are yours.\n\
          5) Mis-shaped (not done-able)? Discard or retype to watch.\n\n\
          {} more queued. Update the card desc with current state before moving on.",
         m.card,
@@ -5545,6 +5556,7 @@ fn advance_text(m: AdvanceMsg<'_>) -> String {
         retype,
         m.term,
         m.card,
+        m.approval_types,
         m.queued,
     )
 }
@@ -11915,6 +11927,21 @@ mod tests {
     ///
     /// A test that mints its own input can only ever pin ITSELF. This one runs
     /// the real producer into the real parser.
+    #[test]
+    fn pickup_delivers_current_criteria_and_effective_gate_without_a_lookup_turn() {
+        let conn=board_db();
+        add_card(&conn,"BRIEF-1","lane","doing","Report","Generate the report");
+        conn.execute("UPDATE issues SET type='chore',next_action='Read the existing seed first',acceptance_criteria='[\"names.txt contains alpha and beta\"]' WHERE id='BRIEF-1'",[]).unwrap();
+        let row=bs::get_issue(&conn,"BRIEF-1").unwrap().unwrap();
+        let prompt=pickup_prompt(&conn,"lane",&row);
+        assert!(prompt.contains("Read the existing seed first"));
+        assert!(prompt.contains("names.txt contains alpha and beta"));
+        for gate in bs::effective_gate_configured(&conn,&row,TaskStatus::Done) { assert!(prompt.contains(&gate)); }
+        assert!(prompt.contains("--checked"));
+        assert!(!prompt.contains("decision only Ethan can make"));
+        assert_eq!(crate::api::session_verbs::pickup_card_id(&prompt).as_deref(),Some("BRIEF-1"));
+    }
+
     #[test]
     fn pickup_prompt_round_trips_through_the_stale_guard() {
         let conn = board_db();

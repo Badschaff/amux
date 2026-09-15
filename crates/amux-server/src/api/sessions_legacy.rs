@@ -853,6 +853,11 @@ pub struct FleetSignals {
     pub now: f64,
 }
 
+fn no_current_hook_report(report: Option<&Value>, started: f64) -> bool {
+    let ts=report.and_then(|r|r.get("ts")).and_then(Value::as_f64).unwrap_or(0.0);
+    ts <= 0.0 || ts < started
+}
+
 impl FleetSignals {
     pub fn load(conn: &rusqlite::Connection) -> Self {
         Self::load_scoped(conn, None)
@@ -1211,8 +1216,13 @@ impl FleetSignals {
             })
             .collect();
         let hookless_workers = running.iter().filter_map(|tmux| tmux.strip_prefix("amux-"))
-            .filter(|name| crate::config::parse_env_file(&amux_home().join("sessions").join(format!("{name}.env")))
-                .get("CC_PROVIDER").is_some_and(|provider| provider == "gemini"))
+            .filter(|name| {
+                let no_current_report = no_current_hook_report(reports.get(*name), started.get(*name).copied().unwrap_or(0.0));
+                // A fresh Claude worker has no Stop hook yet. Its recognized idle
+                // composer must stay observable after its last repaint ages out.
+                no_current_report || crate::config::parse_env_file(&amux_home().join("sessions").join(format!("{name}.env")))
+                    .get("CC_PROVIDER").is_some_and(|provider| provider == "gemini")
+            })
             .map(str::to_string).collect();
         FleetSignals {
             hookless_workers,
@@ -5638,6 +5648,23 @@ Claude usage limit reached. Your limit will reset at 3pm.
         s.panes.insert(lane.into(), String::new());
         assert!(s.turn_boundary_status(lane).is_none());
         s.panes.clear();
+        assert!(s.turn_boundary_status(lane).is_none());
+    }
+
+    #[test]
+    fn fresh_claude_without_a_hook_keeps_its_quiet_composer_observable() {
+        let mut s=signals(); let lane="fresh-claude";
+        s.running.insert(format!("amux-{lane}"));
+        s.activity.insert(format!("amux-{lane}"),(s.now-7200.0) as i64);
+        assert!(no_current_hook_report(None,s.now-100.0));
+        assert!(no_current_hook_report(Some(&json!({"state":"idle","ts":s.now-200.0})),s.now-100.0));
+        assert!(!no_current_hook_report(Some(&json!({"state":"idle","ts":s.now-50.0})),s.now-100.0));
+        if no_current_hook_report(None,s.now-100.0) { s.hookless_workers.insert(lane.into()); }
+        s.panes.insert(lane.into(),"Claude Code\n❯ \n────────────────────\n⏵⏵ bypass permissions on (shift+tab to cycle) · ← 5 agents".into());
+        assert_eq!(s.turn_boundary_status(lane).as_deref(),Some("idle"));
+        s.panes.insert(lane.into(),WORKING_BAR.into());
+        assert_ne!(s.turn_boundary_status(lane).as_deref(),Some("idle"));
+        s.panes.insert(lane.into(),String::new());
         assert!(s.turn_boundary_status(lane).is_none());
     }
 

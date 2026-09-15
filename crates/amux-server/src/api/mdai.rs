@@ -908,6 +908,11 @@ fn read_only_helper_options(cmd: &mut std::process::Command) {
         .and_then(|s|s.parse::<f64>().ok()).filter(|n|n.is_finite() && *n > 0.0).unwrap_or(0.10);
     cmd.arg("--max-budget-usd").arg(budget.to_string());
     cmd.env_remove("CLAUDECODE").env_remove("CLAUDE_CODE_ENTRYPOINT");
+    // These helpers interpret supplied data; worker memory and extended thinking
+    // were adding unrelated context and thousands of thinking tokens to small receipts.
+    cmd.env("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1")
+        .env("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1")
+        .env("MAX_THINKING_TOKENS", std::env::var("AMUX_HELPER_THINKING_TOKENS").unwrap_or_else(|_| "0".into()));
     cmd.current_dir(std::env::temp_dir());
     cmd.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
 }
@@ -932,12 +937,8 @@ fn complete_cli(model: &str, prompt: &str, read_only: bool) -> Result<String, St
         // argv clean in `ps` output. `claude --print` with no prompt arg reads
         // stdin, which is how this works.
         cmd.arg("--print");
-        if read_only {
-            cmd.args(["--tools", "", "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}",
-                "--disable-slash-commands", "--no-session-persistence", "--settings", "{\"disableAllHooks\":true}"]);
-            cmd.env_remove("CLAUDECODE").env_remove("CLAUDE_CODE_ENTRYPOINT");
-            cmd.current_dir(std::env::temp_dir());
-        }
+        if read_only { read_only_helper_options(&mut cmd); }
+
         if !model.trim().is_empty() {
             cmd.arg("--model").arg(model.trim());
         }
