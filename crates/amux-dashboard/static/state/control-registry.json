@@ -1,6 +1,6 @@
 {
   "measured": true,
-  "n_considered": 1988,
+  "n_considered": 1994,
   "command_handlers": {
     "_applyEmbedView": {
       "kind": "command._applyEmbedView",
@@ -28,6 +28,24 @@
     },
     "_askCardStatus": {
       "kind": "command._askCardStatus",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_askOpenCitation": {
+      "kind": "command._askOpenCitation",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_askPick": {
+      "kind": "command._askPick",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_askRun": {
+      "kind": "command._askRun",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
