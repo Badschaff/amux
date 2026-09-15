@@ -514,6 +514,7 @@ async fn async_main() {
     drop(runtime_jobs::heartbeat::spawn(store.clone()));
     drop(runtime_jobs::storage::spawn(state.clone()));
     drop(runtime_jobs::disk_watch::spawn(state.clone()));
+    drop(runtime_jobs::host_metrics::spawn(state.clone()));
     drop(runtime_jobs::queue_disposition::spawn(state.clone()));
     // Record tab transcripts (AMUX-4624): the folder is the work list, so a
     // restart or a late model install resolves on the next tick.

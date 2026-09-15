@@ -92,6 +92,7 @@ pub mod ids {
     pub const PIPE_RECONCILE: &str = "pipe-reconcile";
     pub const INVARIANTS: &str = "invariants-monitor";
     pub const SCHEDULER: &str = "scheduler";
+    pub const HOST_METRICS: &str = "host-metrics";
     pub const ORCH_RUNTIME: &str = "orchestrator-runtime";
     pub const EVENT_PROCESSORS: &str = "event-processors";
     pub const SCAN: &str = "terminal-scan";
@@ -166,6 +167,7 @@ pub const ALL_IDS: &[&str] = &[
     ids::ACCOUNTABILITY_NUDGE,
     ids::CONTEXT_HEALTH,
     ids::DISK_WATCH,
+    ids::HOST_METRICS,
     ids::STATUS_HISTORY,
     ids::TOKEN_LEDGER,
     ids::BOARD_HYGIENE,
@@ -641,6 +643,18 @@ pub const CATALOG: &[Doc] = &[
         ],
         pref: None,
         detail: Some("/api/reclaim/scan"),
+    },
+    Doc {
+        id: ids::HOST_METRICS,
+        name: "Host metrics history",
+        purpose: "Samples the host analysis /api/metrics/host serves (CPU, load, memory, swap, disk, process counts) into host_metrics, so utilization over time is answerable rather than only right now. A failed probe is recorded as an unmeasured row, never as a gap.",
+        env: &[EnvControl {
+            var: "AMUX_HOST_METRICS_EVERY_SECS",
+            effect: "seconds between samples (default 300, floored at 60; spawn_periodic clamps 0 to 1s, so this knob has no off value)",
+            off: None,
+        }],
+        pref: None,
+        detail: Some("/api/metrics/host/history"),
     },
     Doc {
         id: ids::STATUS_HISTORY,
