@@ -36,8 +36,13 @@ test('the header toolbar is decluttered and fits the viewport', async ({ page },
     () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
   )).toBeLessThanOrEqual(1);
 
-  // Every header action button is on-screen (x within the viewport).
-  for (const id of ['brand-header', 'notif-btn', 'rate-limit-pill', 'add-btn', 'settings-btn', 'active-btn']) {
+  // The active-workers button is deliberately hidden since 9af1c88b, which
+  // integrated the user-authored lifecycle toolbar and made
+  // mobile-header-visibility.spec.ts assert it hidden. This spec kept requiring
+  // it on screen, so the two contradicted each other (AMUX-4633).
+  await expect(page.locator('#active-btn')).toBeHidden();
+  // Every visible header action button is on-screen (x within the viewport).
+  for (const id of ['brand-header', 'notif-btn', 'rate-limit-pill', 'add-btn', 'settings-btn']) {
     const box = await page.locator('#' + id).boundingBox();
     expect(box, id).not.toBeNull();
     expect(box!.x, id).toBeGreaterThanOrEqual(-0.5);

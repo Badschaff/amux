@@ -93,7 +93,8 @@ test('worker card and peek share all worker actions, plus both peek-only actions
     };
   }, SAMPLE);
 
-  expect(state.card).toHaveLength(27);
+  // 28 since 9af1c88b added Pause/Resume to the shared worker menu (AMUX-4632).
+  expect(state.card).toHaveLength(28);
   expect(state.card).toContain('task-queue');
   expect(state.card).toContain('copy-directory-link');
   expect(state.peek).toEqual(state.card);
