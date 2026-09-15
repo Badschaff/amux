@@ -47,7 +47,7 @@ fn model_is_skipped(model: &str) -> bool {
     model.is_empty() || model == "<synthetic>"
 }
 
-fn prices(home: &Path) -> Vec<(String, [f64; 4])> {
+pub(crate) fn prices(home: &Path) -> Vec<(String, [f64; 4])> {
     let mut table: Vec<(String, [f64; 4])> = MODEL_PRICES_DEFAULT
         .iter()
         .map(|(k, v)| ((*k).to_string(), *v))
@@ -98,7 +98,7 @@ fn price_for_model(table: &[(String, [f64; 4])], model: &str) -> [f64; 4] {
         .unwrap_or(PRICE_DEFAULT)
 }
 
-fn turn_cost_usd(table: &[(String, [f64; 4])], model: &str, t: [i64; 4]) -> f64 {
+pub(crate) fn turn_cost_usd(table: &[(String, [f64; 4])], model: &str, t: [i64; 4]) -> f64 {
     let p = price_for_model(table, model);
     (t[0] as f64 * p[0] + t[1] as f64 * p[1] + t[2] as f64 * p[2] + t[3] as f64 * p[3])
         / 1_000_000.0
@@ -496,6 +496,14 @@ pub fn spawn(state: crate::api::AppState) -> Option<super::PeriodicTask> {
                 // between writer and readers served a confident zero for
                 // 36 hours; a failing indexer must not reproduce that quietly.
                 Err(e) => tracing::warn!(error = %e, "token-ledger index failed"),
+            }
+            // AMUX-4583: codex lanes spend through a different file tree, and
+            // their turns were in no ledger at all. Same tick, same table,
+            // counted separately so "0 codex rows" is readable as a state.
+            match super::codex_ledger::index_once(&store, &home).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(rows = n, provider = "codex", "token-ledger indexed"),
+                Err(e) => tracing::warn!(error = %e, provider = "codex", "token-ledger index failed"),
             }
         }
     }))
