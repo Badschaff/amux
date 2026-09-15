@@ -160,6 +160,55 @@ AMUX_DEBRIS_ROOTS="$FIX" "$REAPER" --apply --repo "$WTREPO" >/dev/null 2>&1
 check "worktree with symlinked node_modules removed" "no" "$([ -d "$WTY" ] && echo yes || echo no)"
 check "shared node_modules canary survives" "yes" "$([ -f "$SHARED/pkg/canary.js" ] && echo yes || echo no)"
 
+echo "10. stale side cargo targets go; the shared target and a fresh one stay"
+# 76.6 GB sat in four side targets on 2026-09-15, and one came back hours after
+# a manual delete. Reaping the SHARED target instead would make every lane in
+# the fleet rebuild at once, so that one is never a candidate.
+TR="$FIX/amuxhome"
+# The shared target is named as a SIBLING here on purpose: the default
+# ~/.amux/rust-build-target is already outside the rust-build-target-* glob, so
+# a fixture using that name cannot fail when the guard is deleted. The guard is
+# what protects a shared target someone CONFIGURED to a matching name.
+mkdir -p "$TR/rust-build-target-shared/debug" "$TR/rust-build-target-stale/debug" "$TR/rust-build-target-fresh/debug"
+echo x > "$TR/rust-build-target-shared/debug/a"; echo x > "$TR/rust-build-target-stale/debug/a"; echo x > "$TR/rust-build-target-fresh/debug/a"
+touch -t 202501010000 "$TR/rust-build-target-shared/debug/a" "$TR/rust-build-target-shared/debug" "$TR/rust-build-target-shared" 2>/dev/null
+touch -t 202501010000 "$TR/rust-build-target-stale/debug/a" "$TR/rust-build-target-stale/debug" "$TR/rust-build-target-stale" 2>/dev/null
+out=$(AMUX_DEBRIS_TARGET_ROOT="$TR" AMUX_SHARED_TARGET="$TR/rust-build-target-shared" \
+      AMUX_DEBRIS_ROOTS="$FIX/none" "$REAPER" --apply --repo /nonexistent 2>&1)
+check "stale side target removed"        "no"  "$([ -d "$TR/rust-build-target-stale" ] && echo yes || echo no)"
+check "configured shared target untouched" "yes" "$([ -d "$TR/rust-build-target-shared" ] && echo yes || echo no)"
+check "freshly written side target kept" "yes" "$([ -d "$TR/rust-build-target-fresh" ] && echo yes || echo no)"
+case "$out" in *"side cargo targets 1 ("*) echo "  ok   report counts exactly one reclaimed target" ;;
+  *) echo "  FAIL report does not count exactly one reclaimed target: $out"; fails=$((fails+1)) ;; esac
+
+echo "11. a side target a live process is standing in is kept"
+TR2="$FIX/amuxhome2"
+mkdir -p "$TR2/rust-build-target-busy/debug"
+echo x > "$TR2/rust-build-target-busy/debug/a"
+touch -t 202501010000 "$TR2/rust-build-target-busy/debug/a" "$TR2/rust-build-target-busy/debug" "$TR2/rust-build-target-busy" 2>/dev/null
+( cd "$TR2/rust-build-target-busy" && exec sleep 60 ) &
+THOLDER=$!
+sleep 1
+out=$(AMUX_DEBRIS_TARGET_ROOT="$TR2" AMUX_SHARED_TARGET="$TR2/rust-build-target" \
+      AMUX_DEBRIS_ROOTS="$FIX/none" "$REAPER" --apply --repo /nonexistent 2>&1)
+kill "$THOLDER" 2>/dev/null || true; wait "$THOLDER" 2>/dev/null || true
+check "busy side target still present" "yes" "$([ -d "$TR2/rust-build-target-busy" ] && echo yes || echo no)"
+case "$out" in *"side cargo targets 0 ("*) echo "  ok   report counts nothing reclaimed while it is busy" ;;
+  *) echo "  FAIL report claims a reclaim while the target was busy: $out"; fails=$((fails+1)) ;; esac
+
+echo "12. a side-target root that does not exist says so instead of reading as clean"
+# The first scheduled run printed "0 (0 MB), 0 kept" because $HOME resolved
+# elsewhere under the scheduler. A wrong root must not render like a machine
+# with nothing to reclaim.
+out=$(AMUX_DEBRIS_TARGET_ROOT="$FIX/no-such-root" AMUX_DEBRIS_ROOTS="$FIX/none" \
+      "$REAPER" --apply --repo /nonexistent 2>&1)
+case "$out" in *"side-target root $FIX/no-such-root MISSING"*) echo "  ok   the missing root is named" ;;
+  *) echo "  FAIL a missing side-target root is not reported: $out"; fails=$((fails+1)) ;; esac
+out=$(AMUX_DEBRIS_TARGET_ROOT="$TR" AMUX_SHARED_TARGET="$TR/rust-build-target-shared" \
+      AMUX_DEBRIS_ROOTS="$FIX/none" "$REAPER" --repo /nonexistent 2>&1)
+case "$out" in *"side-target root $TR present"*) echo "  ok   control: a real root reports present" ;;
+  *) echo "  FAIL a real root did not report present: $out"; fails=$((fails+1)) ;; esac
+
 echo
 if [ "$fails" -eq 0 ]; then echo "PASS: reap-amux-debris — all checks passed"; exit 0; fi
 echo "reap-amux-debris: $fails check(s) FAILED"; exit 1
