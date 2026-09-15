@@ -1427,9 +1427,8 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <div id="trends-totals" class="review-totals"></div>
     <div id="trends-body"><div style="color:var(--dim);padding:20px;">Loading…</div></div>
   </div>
-  <div style="flex-shrink:0;padding-top:8px;text-align:center;">
-    <button class="btn" id="msgs-more-btn" style="display:none;font-size:0.78rem;" onclick="_messagesLoad(false)">Load older</button>
-  </div>
+  <!-- AMUX-4666: pages, not an endless "Load older". -->
+  <div id="msgs-pager" style="flex-shrink:0;padding-top:8px;display:flex;gap:6px;justify-content:center;align-items:center;flex-wrap:wrap;"></div>
 </div>
 
 <div id="terminal-view" style="display:none;flex-direction:column;flex:1;min-height:0;">
