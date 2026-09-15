@@ -10821,7 +10821,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.952';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.953';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -19575,12 +19575,15 @@ async function openFilePreview(path) {
       return;
     }
     _fileData = data;
-    // Markdown opens to Raw by default (Ethan, 2026-09-14): rendered Preview
-    // hides exact formatting/links/frontmatter, which is what you want first
-    // when opening a note to read or edit. Preview is one tap away. The tabs
-    // were set to Preview-active synchronously above, before is_markdown was
-    // known, so re-sync them now that it is.
-    if (data.is_markdown) _fileViewMode = 'raw';
+    // Preview is the default for every file type, markdown included (Ethan,
+    // 2026-09-15, reversing the 2026-09-14 markdown-opens-to-Raw decision
+    // below this comment's old text). _fileViewMode is already 'preview'
+    // from the general default set synchronously above; nothing to override
+    // here now. Left the history rather than deleting it silently: the
+    // prior reasoning was "rendered Preview hides exact formatting/links/
+    // frontmatter, which is what you want first when opening a note to read
+    // or edit" — if that resurfaces as a complaint, Raw is one tap away via
+    // file-tab-raw either way.
     document.getElementById('file-tab-preview').classList.toggle('active', _fileViewMode === 'preview');
     document.getElementById('file-tab-raw').classList.toggle('active', _fileViewMode === 'raw');
     // Show tabs only for text files
@@ -19628,7 +19631,8 @@ async function openFilePreview(path) {
       if (cachedIsText) {
         document.getElementById('file-view-tabs').style.display = '';
       }
-      if (cached.data.is_markdown) _fileViewMode = 'raw';
+      // Same preview-by-default rule as the online path above — no markdown
+      // override here either.
       document.getElementById('file-tab-preview').classList.toggle('active', _fileViewMode === 'preview');
       document.getElementById('file-tab-raw').classList.toggle('active', _fileViewMode === 'raw');
       _renderFileBody(cached.data, _fileViewMode);
