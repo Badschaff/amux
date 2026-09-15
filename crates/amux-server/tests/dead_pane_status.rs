@@ -35,6 +35,60 @@ async fn body(app: &axum::Router, worker: &WorkerId) -> Value {
     serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap()).unwrap()
 }
 
+/// AMUX-4636: what tmux and the OS know about a pane tmux calls dead with no
+/// exit status. The first CI diagnostic showed the command ran (its text is in
+/// the pane) and exited, yet tmux reported neither pane_dead_status nor
+/// pane_dead_signal. Whether tmux reaped the process, and whether its server
+/// can receive SIGCHLD at all, separates the candidate causes. Each probe
+/// reports its own failure inline, so a missing tool reads as a failure rather
+/// than as an empty answer.
+fn dead_pane_host_evidence(backend_ref: &str) -> String {
+    fn run(args: &[&str]) -> String {
+        match std::process::Command::new(args[0]).args(&args[1..]).output() {
+            Ok(o) => format!(
+                "{}{}(exit {:?})",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr),
+                o.status.code()
+            ),
+            Err(e) => format!("<{} failed: {e}>", args[0]),
+        }
+    }
+    let target = format!("={backend_ref}:");
+    let panes = run(&[
+        "tmux", "list-panes", "-t", &target, "-F",
+        "dead=#{pane_dead} status=#{pane_dead_status} signal=#{pane_dead_signal} time=#{pane_dead_time} pane_pid=#{pane_pid} server_pid=#{pid} version=#{version}",
+    ]);
+    let mut out = format!("tmux -V: {}\nlist-panes: {}\n", run(&["tmux", "-V"]).trim(), panes.trim());
+    let field = |key: &str| {
+        panes.split_whitespace().find_map(|w| w.strip_prefix(key)).unwrap_or("").to_string()
+    };
+    let pane_pid = field("pane_pid=");
+    let server_pid = field("server_pid=");
+    if !pane_pid.is_empty() {
+        let ps = run(&["ps", "-o", "pid,ppid,stat,args", "-p", &pane_pid]);
+        out.push_str(&format!("ps pane_pid (a Z row means tmux never reaped it): {}\n", ps.trim()));
+    }
+    if !server_pid.is_empty() {
+        let ps = run(&["ps", "-o", "pid,ppid,stat,args", "-p", &server_pid]);
+        out.push_str(&format!("ps server: {}\n", ps.trim()));
+        match std::fs::read_to_string(format!("/proc/{server_pid}/status")) {
+            Ok(status) => {
+                // SigBlk/SigIgn/SigCgt are hex masks; SIGCHLD is signal 17 on
+                // Linux, bit 0x10000.
+                for line in status.lines().filter(|l| l.starts_with("Sig") || l.starts_with("Shd")) {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+            Err(e) => out.push_str(&format!("/proc/{server_pid}/status: <unreadable: {e}>\n")),
+        }
+        let children = run(&["ps", "-o", "pid,ppid,stat,args", "--ppid", &server_pid]);
+        out.push_str(&format!("children of server: {}\n", children.trim()));
+    }
+    out
+}
+
 #[tokio::test]
 async fn retained_dead_pane_cannot_remain_idle_in_worker_api() {
     let tmux = std::process::Command::new("tmux").arg("-V").output();
@@ -147,8 +201,9 @@ async fn retained_dead_pane_cannot_remain_idle_in_worker_api() {
                     // something else. Name the last status and the pane's text so a
                     // CI-only failure can be diagnosed from its log.
                     let pane = backend.capture(&proc, 40).await.unwrap_or_else(|e| format!("<capture failed: {e}>"));
+                    let host = dead_pane_host_evidence(&proc.backend_ref);
                     panic!(
-                        "controlled process never exited: last status {seen:?} after 10 s; flag written={}; pane:\n{pane}",
+                        "controlled process never exited: last status {seen:?} after 10 s; flag written={}; pane:\n{pane}\nhost evidence:\n{host}",
                         flag.exists()
                     );
                 }
