@@ -136,7 +136,34 @@ impl TmuxBackend {
             return Ok(BackendStatus::NotFound);
         }
         let stdout = String::from_utf8_lossy(&out.stdout);
-        Ok(parse_pane_dead(stdout.lines().next().unwrap_or("")))
+        let status = parse_pane_dead(stdout.lines().next().unwrap_or(""));
+        if status != (BackendStatus::Crashed { signal: None }) {
+            return Ok(status);
+        }
+        // AMUX-4636: tmux marked the pane dead but recorded neither status nor
+        // signal. Measured on tmux 3.4 (ubuntu CI): the pane's process sat as a
+        // zombie under the tmux server, never reaped, so tmux had nothing to
+        // report. The kernel still holds that zombie's exit status.
+        let pids = self
+            .run(&["list-panes", "-t", &pt, "-F", "#{pane_pid}:#{pid}"], OP_TIMEOUT)
+            .await?;
+        let line = String::from_utf8_lossy(&pids.stdout);
+        if let Some((pane_pid, server_pid)) = parse_pid_pair(line.lines().next().unwrap_or("")) {
+            if let Some(measured) =
+                zombie_exit_status(std::path::Path::new("/proc"), &pane_pid, &server_pid)
+            {
+                tracing::info!(
+                    target: "amux::tmux",
+                    verdict = "tmux_unreaped_exit_measured_from_proc",
+                    backend_ref,
+                    pane_pid = %pane_pid,
+                    status = ?measured,
+                    "tmux reported a dead pane with no exit status; read it from the zombie in /proc"
+                );
+                return Ok(measured);
+            }
+        }
+        Ok(status)
     }
 }
 
@@ -171,7 +198,53 @@ impl SessionBackend for TmuxBackend {
                 "tmux process-exit census: {error}"
             )));
         }
-        parse_process_exits(&String::from_utf8_lossy(&out.stdout))
+        let mut exits = parse_process_exits(&String::from_utf8_lossy(&out.stdout))?;
+        if !exits.values().any(|e| e.code.is_none() && e.signal.is_none()) {
+            return Ok(exits);
+        }
+        // AMUX-4636: see status_by_ref. Only a session with exactly one dead
+        // pane is filled in; several dead panes still prove cessation without
+        // one shared exit code, exactly as parse_process_exits decides.
+        let census = self
+            .run(
+                &["list-panes", "-a", "-F", "#{session_name}:#{pane_dead}:#{pane_pid}:#{pid}"],
+                OP_TIMEOUT,
+            )
+            .await?;
+        if !census.status.success() {
+            return Ok(exits);
+        }
+        let pids = dead_pane_pids(&String::from_utf8_lossy(&census.stdout));
+        for (name, exit) in exits.iter_mut() {
+            if exit.code.is_some() || exit.signal.is_some() {
+                continue;
+            }
+            let Some([(pane_pid, server_pid)]) = pids.get(name).map(Vec::as_slice) else {
+                continue;
+            };
+            let measured =
+                zombie_exit_status(std::path::Path::new("/proc"), pane_pid, server_pid);
+            let filled = match measured {
+                Some(BackendStatus::Completed { exit_code }) => {
+                    amux_core::protocol::ExitStatus { code: Some(exit_code), signal: None }
+                }
+                Some(BackendStatus::Crashed { signal: Some(sig) }) => {
+                    amux_core::protocol::ExitStatus { code: None, signal: Some(sig) }
+                }
+                _ => continue,
+            };
+            tracing::info!(
+                target: "amux::tmux",
+                verdict = "tmux_unreaped_exit_measured_from_proc",
+                session = %name,
+                pane_pid = %pane_pid,
+                code = ?filled.code,
+                signal = ?filled.signal,
+                "tmux census had a dead pane with no exit status; read it from the zombie in /proc"
+            );
+            *exit = filled;
+        }
+        Ok(exits)
     }
 
     fn name(&self) -> &'static str {
@@ -481,6 +554,54 @@ fn parse_process_exits(
     Ok(exits)
 }
 
+/// `#{pane_pid}:#{pid}` -> (pane pid, tmux server pid), both numeric.
+fn parse_pid_pair(line: &str) -> Option<(String, String)> {
+    let (pane, server) = line.trim().split_once(':')?;
+    (pane.parse::<u32>().is_ok() && server.parse::<u32>().is_ok())
+        .then(|| (pane.to_string(), server.to_string()))
+}
+
+/// Dead panes per session from a `#{session_name}:#{pane_dead}:#{pane_pid}:#{pid}`
+/// census. Live panes and malformed lines are left out.
+fn dead_pane_pids(census: &str) -> std::collections::BTreeMap<String, Vec<(String, String)>> {
+    let mut out: std::collections::BTreeMap<String, Vec<(String, String)>> = Default::default();
+    for line in census.lines() {
+        let fields: Vec<_> = line.rsplitn(4, ':').collect();
+        if fields.len() != 4 || fields[3].is_empty() || fields[2] != "1" {
+            continue;
+        }
+        if let Some(pair) = parse_pid_pair(&format!("{}:{}", fields[1], fields[0])) {
+            out.entry(fields[3].to_string()).or_default().push(pair);
+        }
+    }
+    out
+}
+
+/// The exit status the kernel holds for an unreaped child, or None.
+///
+/// AMUX-4636. `<proc_root>/<pid>/stat` field 3 is the state, field 4 the parent
+/// pid and field 52 `exit_code` (Linux 3.5+, in waitpid encoding). Accepted
+/// only for a zombie ('Z') whose parent is the tmux server, so a recycled pid
+/// or an unrelated process can never supply an exit. `comm` (field 2) may hold
+/// spaces and parentheses, so fields are counted after its LAST ')'. Anything
+/// unreadable is None, which keeps the honest Crashed { signal: None }.
+fn zombie_exit_status(proc_root: &std::path::Path, pid: &str, parent: &str) -> Option<BackendStatus> {
+    pid.parse::<u32>().ok()?;
+    let stat = std::fs::read_to_string(proc_root.join(pid).join("stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // fields[0] is field 3 (state), so field N is fields[N - 3].
+    if fields.first() != Some(&"Z") || fields.get(1) != Some(&parent) {
+        return None;
+    }
+    let raw: i32 = fields.get(52 - 3)?.parse().ok()?;
+    if raw & 0x7f == 0 {
+        Some(BackendStatus::Completed { exit_code: (raw >> 8) & 0xff })
+    } else {
+        Some(BackendStatus::Crashed { signal: Some(raw & 0x7f) })
+    }
+}
+
 /// POSIX single-quote escaping — the command line is typed into a login shell
 /// via send-keys, so quoting is ours (identical rationale to herdr.rs; the
 /// two backends deliberately do not share private helpers across modules).
@@ -558,6 +679,52 @@ mod tests {
         );
         // Defensive: garbage line from a future tmux — never invent an exit.
         assert_eq!(parse_pane_dead(""), BackendStatus::Running);
+    }
+
+    /// A /proc/<pid>/stat line with `comm`, state, parent and exit_code set
+    /// and every other field zero, 52 fields in all.
+    fn fake_stat(pid: &str, comm: &str, state: &str, parent: &str, exit_code: i32) -> String {
+        let mut rest = vec!["0".to_string(); 50];
+        rest[0] = state.into();
+        rest[1] = parent.into();
+        rest[52 - 3] = exit_code.to_string();
+        format!("{pid} ({comm}) {}\n", rest.join(" "))
+    }
+
+    fn write_stat(root: &std::path::Path, pid: &str, line: &str) {
+        std::fs::create_dir_all(root.join(pid)).unwrap();
+        std::fs::write(root.join(pid).join("stat"), line).unwrap();
+    }
+
+    /// AMUX-4636: the zombie record supplies the exit only for a zombie child
+    /// of the tmux server, and is decoded the way waitpid encodes it.
+    #[test]
+    fn zombie_exit_status_reads_only_a_zombie_child_of_the_server() {
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path();
+        write_stat(r, "100", &fake_stat("100", "sh", "Z", "50", 256));
+        assert_eq!(zombie_exit_status(r, "100", "50"), Some(BackendStatus::Completed { exit_code: 1 }));
+        write_stat(r, "101", &fake_stat("101", "sh", "Z", "50", 9));
+        assert_eq!(zombie_exit_status(r, "101", "50"), Some(BackendStatus::Crashed { signal: Some(9) }));
+        write_stat(r, "102", &fake_stat("102", "a b) (c", "Z", "50", 0));
+        assert_eq!(zombie_exit_status(r, "102", "50"), Some(BackendStatus::Completed { exit_code: 0 }));
+        // Controls: not a zombie, a foreign parent, no record, a non-numeric pid.
+        write_stat(r, "103", &fake_stat("103", "sh", "S", "50", 256));
+        assert_eq!(zombie_exit_status(r, "103", "50"), None);
+        assert_eq!(zombie_exit_status(r, "100", "51"), None);
+        assert_eq!(zombie_exit_status(r, "999", "50"), None);
+        assert_eq!(zombie_exit_status(r, "../100", "50"), None);
+    }
+
+    #[test]
+    fn dead_pane_pids_keeps_dead_panes_with_numeric_pids() {
+        let pids = dead_pane_pids("amux-a:1:100:50\namux-b:0:101:50\namux-c:1:x:50\nweird:name:1:102:50\n");
+        assert_eq!(pids["amux-a"], vec![("100".to_string(), "50".to_string())]);
+        assert!(!pids.contains_key("amux-b"));
+        assert!(!pids.contains_key("amux-c"));
+        assert_eq!(pids["weird:name"], vec![("102".to_string(), "50".to_string())]);
+        assert_eq!(parse_pid_pair("100:50"), Some(("100".into(), "50".into())));
+        assert_eq!(parse_pid_pair("100:"), None);
     }
 
     #[test]
