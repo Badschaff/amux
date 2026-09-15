@@ -507,8 +507,27 @@ fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state(
         app.contains("board-card-live-label\"><span class=\"board-live-dot\"></span>Working now"),
         "a live board card needs an explicit visible label, not only a border or tooltip"
     );
+    // The rule is that a card says "Working now" only when the runtime truth
+    // names THAT card. 6e34096d moved it out of an inline `_liveCard`
+    // expression into a named helper, and this assertion kept demanding the old
+    // spelling, so it failed on a refactor that preserved the rule exactly. A
+    // check pinning a spelling is red for the wrong reason; pin the helper and
+    // the identity test inside it, the way the `_workerExecutionBadge` block a
+    // few lines above already does.
+    let activity_start = app
+        .find("function _boardActivityForCard(item)")
+        .expect("the live-card decision must live in one named helper");
+    let activity_tail = &app[activity_start..];
+    let activity = &activity_tail[..activity_tail.find('\n').unwrap_or(0)
+        + activity_tail[activity_tail.find('\n').unwrap_or(0)..]
+            .find("\n}")
+            .expect("helper must be a complete function")];
     assert!(
-        app.contains("const _liveNow = !!(_liveCard && _liveCard.id === item.id)"),
+        activity.contains("id !== item.id") && activity.contains("return null"),
+        "the helper must refuse any card the runtime truth does not name"
+    );
+    assert!(
+        app.contains("const _liveNow = !!(_activity && _activity.linked)"),
         "only the explicitly claimed card may say Working now"
     );
     for needle in [
