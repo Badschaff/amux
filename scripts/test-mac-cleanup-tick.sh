@@ -76,6 +76,13 @@ if [ "$(uname)" != "Darwin" ]; then
   echo "mac-cleanup-tick: $fails check(s) FAILED"; exit 1
 fi
 
+echo "6b. snapshots are thinned only when the disk is actually tight"
+check "plenty of space leaves snapshots alone" "no"  "$(should_thin 500 100 && echo yes || echo no)"
+check "a tight disk thins"                     "yes" "$(should_thin 40 100 && echo yes || echo no)"
+# -1 is the "df failed" value. Thinning on it would delete the owner's restore
+# window on every tick of a machine whose probe is broken.
+check "an unmeasured disk never thins"         "no"  "$(should_thin -1 100 && echo yes || echo no)"
+
 echo "7. end to end: the action runs when triggered, and dry run performs none"
 REC="$FIX/purge-calls"
 cat > "$FIX/fake-purge.sh" <<EOF
@@ -97,6 +104,31 @@ check "dry run performed no purge" "0" "$(wc -l < "$REC" | tr -d ' ')"
 AMUX_CLEANUP_PURGE_CMD="$FIX/fake-purge.sh" AMUX_CLEANUP_FREE_FLOOR_GB=0 AMUX_CLEANUP_PRESSURE_PURGE=99 \
   AMUX_CLEANUP_AGENTS="" AMUX_CLEANUP_REPORT_GB=99999 "$TICK" >/dev/null 2>&1
 check "no purge when neither trigger fires" "0" "$(wc -l < "$REC" | tr -d ' ')"
+
+echo "7b. end to end: thinning goes through the knob, honours dry run, and stays bounded"
+TREC="$FIX/thin-calls"
+cat > "$FIX/fake-thin.sh" <<EOF
+#!/bin/bash
+echo "\$@" >> "$TREC"
+EOF
+chmod +x "$FIX/fake-thin.sh"
+: > "$TREC"
+AMUX_CLEANUP_THIN_CMD="$FIX/fake-thin.sh BYTES URGENCY" AMUX_CLEANUP_SNAPSHOT_FLOOR_GB=999999 \
+  AMUX_CLEANUP_SNAPSHOT_RECLAIM_GB=7 AMUX_CLEANUP_PURGE_CMD=true AMUX_CLEANUP_FREE_FLOOR_GB=0 \
+  AMUX_CLEANUP_PRESSURE_PURGE=99 AMUX_CLEANUP_AGENTS="" AMUX_CLEANUP_REPORT_GB=99999 "$TICK" >/dev/null 2>&1
+check "thin ran when the disk was under the floor" "1" "$(wc -l < "$TREC" | tr -d ' ')"
+case "$(cat "$TREC")" in *7516192768*) echo "  ok   the thin is bounded to the requested bytes" ;;
+  *) echo "  FAIL the thin did not carry a bounded byte target: $(cat "$TREC")"; fails=$((fails+1)) ;; esac
+: > "$TREC"
+AMUX_CLEANUP_THIN_CMD="$FIX/fake-thin.sh BYTES URGENCY" AMUX_CLEANUP_SNAPSHOT_FLOOR_GB=999999 \
+  AMUX_CLEANUP_PURGE_CMD=true AMUX_CLEANUP_FREE_FLOOR_GB=0 AMUX_CLEANUP_PRESSURE_PURGE=99 \
+  AMUX_CLEANUP_AGENTS="" AMUX_CLEANUP_REPORT_GB=99999 "$TICK" --dry-run >/dev/null 2>&1
+check "dry run thinned nothing" "0" "$(wc -l < "$TREC" | tr -d ' ')"
+: > "$TREC"
+AMUX_CLEANUP_THIN_CMD="$FIX/fake-thin.sh BYTES URGENCY" AMUX_CLEANUP_SNAPSHOT_FLOOR_GB=0 \
+  AMUX_CLEANUP_PURGE_CMD=true AMUX_CLEANUP_FREE_FLOOR_GB=0 AMUX_CLEANUP_PRESSURE_PURGE=99 \
+  AMUX_CLEANUP_AGENTS="" AMUX_CLEANUP_REPORT_GB=99999 "$TICK" >/dev/null 2>&1
+check "no thin when the disk has room" "0" "$(wc -l < "$TREC" | tr -d ' ')"
 
 echo "8. end to end: an agent restart goes through the knob, and only past the floor"
 AREC="$FIX/restart-calls"

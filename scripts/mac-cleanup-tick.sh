@@ -53,9 +53,18 @@ AGENT_LEAK_GB=${AMUX_CLEANUP_AGENT_LEAK_GB:-2}
 AGENTS=${AMUX_CLEANUP_AGENTS:-com.procwarden.menubar}
 REPORT_GB=${AMUX_CLEANUP_REPORT_GB:-10}
 FSEVENTSD_REBOOT_GB=${AMUX_CLEANUP_FSEVENTSD_REBOOT_GB:-20}
+# APFS local snapshots pin deleted blocks, so a reaper can delete 50 GB and free
+# nothing until they expire (DESKT-26 measured exactly that: a thin returned
+# 68.7 GB). Thinning is BOUNDED and disk-triggered because these snapshots are
+# the owner's short-window restore path: DESKT-13 thinned by hand and the space
+# was gone again within days, which is why this is an arm and not a one-shot.
+SNAPSHOT_FLOOR_GB=${AMUX_CLEANUP_SNAPSHOT_FLOOR_GB:-100}
+SNAPSHOT_RECLAIM_GB=${AMUX_CLEANUP_SNAPSHOT_RECLAIM_GB:-50}
+SNAPSHOT_URGENCY=${AMUX_CLEANUP_SNAPSHOT_URGENCY:-2}
 # Seams: the tests point these at a recorder so an action can be observed
 # without running it. Defaults are what the scheduler actually runs.
 PURGE_CMD=${AMUX_CLEANUP_PURGE_CMD:-sudo -n /usr/sbin/purge}
+THIN_CMD=${AMUX_CLEANUP_THIN_CMD:-tmutil thinlocalsnapshots / BYTES URGENCY}
 RESTART_CMD=${AMUX_CLEANUP_RESTART_CMD:-launchctl kickstart -k gui/UID/LABEL}
 
 # ── pure decisions (no side effects, so the tests can exercise them) ──────────
@@ -100,6 +109,13 @@ classify_owner() { # <user> <command>
     *)
       if [ "$1" = "root" ]; then echo "root process"; else echo "user process"; fi ;;
   esac
+}
+
+# Thin only when free disk is under the floor. Same unmeasured guard as the
+# purge decision: df failing must not read as "no space left" and thin on every
+# tick of a machine whose probe is broken.
+should_thin() { # <free_disk_gb> <floor_gb>
+  awk -v f="$1" -v t="$2" 'BEGIN{ exit !(f+0 >= 0 && f+0 < t+0) }'
 }
 
 needs_reboot() { # <fseventsd_gb> <threshold>
@@ -206,6 +222,28 @@ done <<EOF
 $(top -l 1 -o mem -n 12 -stats pid,mem 2>/dev/null | awk 'f{print} /^PID/{f=1}' | sed 's/\*//')
 EOF
 [ "$reported" = 0 ] && echo "mac-cleanup:   none"
+
+# ── act: thin APFS local snapshots when the disk is tight ────────────────────
+disk_free_gb=$(df -k /System/Volumes/Data 2>/dev/null | awk 'NR==2{ printf "%.1f", $4/1048576 }')
+case "$disk_free_gb" in ''|*[!0-9.]*) disk_free_gb=-1 ;; esac
+snaps_before=$(tmutil listlocalsnapshots / 2>/dev/null | tail -n +2 | grep -c . )
+if should_thin "$disk_free_gb" "$SNAPSHOT_FLOOR_GB"; then
+  if [ "$DRY" = "1" ]; then
+    echo "mac-cleanup: snapshots ${snaps_before}, free ${disk_free_gb}G under the ${SNAPSHOT_FLOOR_GB}G floor — would thin up to ${SNAPSHOT_RECLAIM_GB}G (dry run)"
+  else
+    bytes=$(awk -v g="$SNAPSHOT_RECLAIM_GB" 'BEGIN{ printf "%d", g*1073741824 }')
+    cmd=${THIN_CMD//BYTES/$bytes}; cmd=${cmd//URGENCY/$SNAPSHOT_URGENCY}
+    if $cmd >/dev/null 2>&1; then
+      snaps_after=$(tmutil listlocalsnapshots / 2>/dev/null | tail -n +2 | grep -c . )
+      free_after=$(df -k /System/Volumes/Data 2>/dev/null | awk 'NR==2{ printf "%.1f", $4/1048576 }')
+      echo "mac-cleanup: snapshots thinned ${snaps_before} -> ${snaps_after}, free ${disk_free_gb}G -> ${free_after}G (target ${SNAPSHOT_RECLAIM_GB}G, urgency ${SNAPSHOT_URGENCY})"
+    else
+      echo "mac-cleanup: snapshot thin FAILED with ${snaps_before} snapshots at ${disk_free_gb}G free"
+    fi
+  fi
+else
+  echo "mac-cleanup: snapshots ${snaps_before}, free ${disk_free_gb}G at or above the ${SNAPSHOT_FLOOR_GB}G floor — not thinned"
+fi
 
 fse_pid=$(pgrep -x fseventsd 2>/dev/null | head -1)
 if [ -n "$fse_pid" ]; then
