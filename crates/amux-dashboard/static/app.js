@@ -10821,7 +10821,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.951';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.952';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -36748,19 +36748,40 @@ async function _askRun(peek) {
   if (ansEl) ansEl.innerHTML = '';
   let r, d;
   try {
-    r = await fetch(API + '/api/history/ask', {
+    // _origFetch, NOT the patched window.fetch: this is a READ that takes tens
+    // of seconds (the model call), and the outbox treats a slow /api/ POST as
+    // an unreachable server, queues it for replay and hands back a synthetic
+    // 202 {ok:true,queued:true}. The panel then rendered "0 of 0 messages ...
+    // last undefined days" while the server was answering the question fine
+    // (found in the browser, 2026-09-15). Replaying a question later is also
+    // meaningless: there is nobody to show the answer to.
+    r = await _origFetch(API + '/api/history/ask', {
       method: 'POST', headers: _authHeaders({'Content-Type':'application/json'}),
       body: JSON.stringify({ question, session, days }),
+      _skipOutbox: true, signal: AbortSignal.timeout(300000),
     });
     d = await r.json();
   } catch (e) {
-    if (metaEl) metaEl.textContent = 'Could not reach the server.';
+    if (metaEl) metaEl.textContent = 'Could not reach the server: ' + String(e && e.message || e);
+    return;
+  }
+  // A locally queued 202 never left the browser, so it is not an answer.
+  if (_isLocallyQueued(r)) {
+    if (metaEl) metaEl.textContent = 'Not sent: this client queued the request offline. Reconnect and ask again.';
     return;
   }
   // A refusal and an unmeasured answer both say WHY, and neither is rendered
   // as an empty answer: an empty answer reads as "there is nothing about that".
   if (!r.ok || d.measured === false) {
     if (metaEl) metaEl.textContent = d.why_unmeasured || d.error || ('error ' + r.status);
+    if (ansEl) ansEl.innerHTML = '';
+    return;
+  }
+  // measured true with no window means this is not the payload this panel
+  // renders. Saying so beats printing "0 of 0 ... undefined days", which reads
+  // as a measured emptiness.
+  if (d.window_days === undefined || d.n_available === undefined) {
+    if (metaEl) metaEl.textContent = 'The server answered in a shape this view does not recognise (HTTP ' + r.status + ').';
     if (ansEl) ansEl.innerHTML = '';
     return;
   }
