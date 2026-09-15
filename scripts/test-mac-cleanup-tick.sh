@@ -5,7 +5,7 @@
 # properties worth pinning are the ones that keep it from acting when it should
 # not: the thresholds, the label guard, and dry run. Each cell fails if its
 # guard is removed — the point is that it CAN go red (ethos rule 7).
-set -uo pipefail
+set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 TICK="$HERE/mac-cleanup-tick.sh"
 FIX=$(mktemp -d)                      # never a fixed name: /tmp is shared
