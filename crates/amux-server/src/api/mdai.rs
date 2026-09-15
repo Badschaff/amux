@@ -831,15 +831,67 @@ impl ModelClient for CliModel {
 }
 
 /// Classification may return data only, with no tools, MCP servers or hooks.
+///
+/// AMUX-4659: it answers from a helper started before this call when one is
+/// waiting. Board intake makes this call on every card create, and the measured
+/// cost of starting the process is ~18s of a ~20s create. A failure on that
+/// path falls back to a cold call rather than failing the create, so the worst
+/// case is the latency this lane already had.
 pub struct ReadOnlyCliModel;
 impl ModelClient for ReadOnlyCliModel {
     fn complete(&self, model: &str, prompt: &str) -> Result<String, String> {
+        let cli = helper_cli();
+        if warm_helper::enabled() {
+            let ready = warm_helper::take(&cli, model);
+            let had_ready = ready.is_some();
+            let answer = ready.map(|child| {
+                let started = std::time::Instant::now();
+                let out = helper_io::exchange(child, warm_helper::message_line(prompt).as_bytes(),
+                    std::time::Duration::from_secs(MODEL_TIMEOUT_S), output_limit());
+                let answer = finish_cli_exchange(out, &cli, std::time::Duration::from_secs(MODEL_TIMEOUT_S))
+                    .and_then(|transcript| warm_helper::parse_result(&transcript));
+                (answer, started.elapsed().as_millis() as u64)
+            });
+            // Start the next one either way: this call consumed the ready
+            // helper, and a call that found none is evidence one is wanted.
+            warm_helper::prepare(cli.clone(), model.to_string());
+            match answer {
+                Some((Ok(text), exchange_ms)) => {
+                    tracing::info!(target: "amux::model_helper", verdict = "warm_helper_used",
+                        helper = %cli, exchange_ms, measured = true, n_considered = 1,
+                        "answered from a helper started before this call");
+                    return Ok(text);
+                }
+                Some((Err(e), exchange_ms)) => {
+                    tracing::warn!(target: "amux::model_helper", verdict = "warm_helper_failed",
+                        helper = %cli, exchange_ms, error = %e, measured = true, n_considered = 1,
+                        "the pre-started helper did not answer; running this call cold");
+                }
+                None => {
+                    tracing::info!(target: "amux::model_helper", verdict = "warm_helper_absent",
+                        helper = %cli, had_ready, measured = true, n_considered = 1,
+                        "no helper was waiting; running this call cold");
+                }
+            }
+        }
         complete_cli(model, prompt, true)
     }
 }
 
+/// The helper CLI both paths invoke.
+fn helper_cli() -> String {
+    std::env::var("AMUX_HELPER_CLI").unwrap_or_else(|_| "claude".into())
+}
+
+/// How much helper output is retained before the call is refused.
+fn output_limit() -> usize {
+    std::env::var("AMUX_HELPER_OUTPUT_MAX_BYTES").ok()
+        .and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0)
+        .unwrap_or(8 * 1024 * 1024)
+}
+
 fn complete_cli(model: &str, prompt: &str, read_only: bool) -> Result<String, String> {
-        let cli = std::env::var("AMUX_HELPER_CLI").unwrap_or_else(|_| "claude".into());
+        let cli = helper_cli();
         let mut cmd = std::process::Command::new(&cli);
         // Pipe the prompt via stdin instead of passing it as a CLI argument.
         // Avoids arg-length issues for large prompts and keeps the process's
@@ -862,12 +914,21 @@ fn complete_cli(model: &str, prompt: &str, read_only: bool) -> Result<String, St
 }
 
 mod helper_io;
+mod warm_helper;
 
 fn run_cli_command(cmd: std::process::Command, cli: &str, prompt: &str, budget: std::time::Duration) -> Result<String, String> {
-        let limit = std::env::var("AMUX_HELPER_OUTPUT_MAX_BYTES").ok()
-            .and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0)
-            .unwrap_or(8 * 1024 * 1024);
-        let out = match helper_io::run(cmd, prompt.as_bytes(), budget, limit) {
+        finish_cli_exchange(helper_io::run(cmd, prompt.as_bytes(), budget, output_limit()), cli, budget)
+}
+
+/// Turn one helper exchange into an answer or a named failure.
+///
+/// AMUX-4659: this was the body of `run_cli_command`. A pre-started helper
+/// produces the same `Output` through `helper_io::exchange`, and every failure
+/// here (timeout, output limit, incomplete stdin, non-zero exit, empty answer)
+/// means the same thing whichever way the process was started, so both paths
+/// diagnose through this one function rather than two drifting copies.
+fn finish_cli_exchange(exchange: Result<std::process::Output, helper_io::Error>, cli: &str, budget: std::time::Duration) -> Result<String, String> {
+        let out = match exchange {
             Ok(out) => out,
             Err(helper_io::Error::Spawn(e)) => {
                 tracing::warn!(target: "amux::model_helper", helper = cli, error = %e,

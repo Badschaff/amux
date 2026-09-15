@@ -92,13 +92,40 @@ fn drain(
     Ok(progressed)
 }
 
-pub(super) fn run(
-    mut cmd: Command,
-    prompt: &[u8],
-    budget: Duration,
-    limit: usize,
-) -> Result<Output, Error> {
-    let started = Instant::now();
+/// A spawned helper whose pipes are open and whose prompt has not been sent.
+///
+/// AMUX-4659: a helper CLI's startup is most of a call's wall time (measured
+/// 2026-09-15 on the amux Mac: ~20s cold against ~2s once the process was
+/// already up), so a caller that can start one AHEAD of the request pays that
+/// once, off the request path. Holding one of these keeps the child alive; drop
+/// stops it with the same group cleanup every other path gets.
+pub(super) struct Started {
+    owned: OwnedChild,
+    input: Option<std::process::ChildStdin>,
+    output: Option<std::process::ChildStdout>,
+    errors: Option<std::process::ChildStderr>,
+}
+
+impl Started {
+    /// Has this helper already exited, so it must not be handed a prompt?
+    ///
+    /// Reaps it when it has: the group cleanup in `Drop` signals `-pid`, and a
+    /// PID that is exited but unreaped can be recycled, so a later kill would
+    /// land on somebody else's group.
+    pub(super) fn exited(&mut self) -> bool {
+        match self.owned.child.try_wait() {
+            Ok(Some(_)) => {
+                self.owned.reaped = true;
+                true
+            }
+            Ok(None) => false,
+            Err(_) => true,
+        }
+    }
+}
+
+/// Spawn a helper and make its pipes non-blocking, without sending anything.
+pub(super) fn start(mut cmd: Command) -> Result<Started, Error> {
     cmd.process_group(0)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -107,9 +134,9 @@ pub(super) fn run(
         child: cmd.spawn().map_err(Error::Spawn)?,
         reaped: false,
     };
-    let mut input = owned.child.stdin.take();
-    let mut output = owned.child.stdout.take();
-    let mut errors = owned.child.stderr.take();
+    let input = owned.child.stdin.take();
+    let output = owned.child.stdout.take();
+    let errors = owned.child.stderr.take();
     if let Some(p) = &input {
         nonblocking(p)?;
     }
@@ -119,6 +146,41 @@ pub(super) fn run(
     if let Some(p) = &errors {
         nonblocking(p)?;
     }
+    Ok(Started {
+        owned,
+        input,
+        output,
+        errors,
+    })
+}
+
+pub(super) fn run(
+    cmd: Command,
+    prompt: &[u8],
+    budget: Duration,
+    limit: usize,
+) -> Result<Output, Error> {
+    exchange(start(cmd)?, prompt, budget, limit)
+}
+
+/// Send `prompt` to an already-started helper and read it out.
+///
+/// The budget covers THIS exchange, not the process's life: a pre-started
+/// helper may have been idle for minutes before the prompt arrived, and killing
+/// it for that would defeat the point of starting it early.
+pub(super) fn exchange(
+    started_child: Started,
+    prompt: &[u8],
+    budget: Duration,
+    limit: usize,
+) -> Result<Output, Error> {
+    let started = Instant::now();
+    let Started {
+        mut owned,
+        mut input,
+        mut output,
+        mut errors,
+    } = started_child;
     let mut written = 0;
     let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
     loop {
@@ -184,6 +246,30 @@ pub(super) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_child_started_earlier_still_answers_its_prompt() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "cat >/dev/null; printf answer"]);
+        let mut pre = start(cmd).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!pre.exited(), "the helper must still be up after idling");
+        let out = exchange(pre, b"request", Duration::from_secs(3), 1024).unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"answer");
+    }
+
+    #[test]
+    fn a_child_that_died_while_waiting_is_reported_exited() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "exit 3"]);
+        let mut pre = start(cmd).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pre.exited() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(pre.exited(), "a helper that exited while idle must be detectable");
+    }
 
     #[test]
     fn output_limit_fails_explicitly_without_retaining_the_full_stream() {
