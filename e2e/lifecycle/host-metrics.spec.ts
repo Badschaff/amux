@@ -72,6 +72,9 @@ test('LC-HOST: measured host analysis, refresh and related navigation work at ea
   await page.locator('#host-content [title="Open Disk Cleanup"]').click();
   await expect(page.locator('#reclaim-content')).toBeVisible();
   await expect(page.locator('#host-content')).toBeHidden();
+  // Disk Cleanup is its own tab since 1a2963c8, so the Metrics mode bar is
+  // hidden while it shows. Return through the Metrics tab first (AMUX-4634).
+  await tab.click();
   await page.locator('#metricsmode-system').click();
   await expect(page.locator('#metrics-content')).toBeVisible();
   await expect(page.locator('#reclaim-content')).toBeHidden();

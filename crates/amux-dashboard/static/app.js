@@ -10821,7 +10821,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.949';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.950';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -37257,10 +37257,12 @@ function _metricsSetMode(mode) {
   document.getElementById('metricsmode-host')?.classList.toggle('active', mode === 'host');
   document.getElementById('metricsmode-disk')?.classList.toggle('active', mode === 'disk');
   const mc = document.getElementById('metrics-content');
-  const rc = document.getElementById('reclaim-content');
   const hc = document.getElementById('host-content');
   if (mc) mc.style.display = mode === 'system' ? '' : 'none';
-  if (rc) rc.style.display = mode === 'disk' ? '' : 'none';
+  // #reclaim-content is NOT toggled here (AMUX-4634). It lives in #disk-view
+  // since Disk Cleanup became its own tab (1a2963c8), and switchView('disk')
+  // never resets it, so hiding it from the Host or System mode left Disk
+  // Cleanup blank when opened from the Host panel's card.
   if (hc) hc.style.display = mode === 'host' ? '' : 'none';
   // The worker sidebar only pairs with the System view; Host and Disk are host-wide.
   const sb = document.getElementById('metrics-sidebar');
