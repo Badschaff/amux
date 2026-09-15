@@ -3056,3 +3056,14 @@ CARD: AMUX-4685
 SYMPTOM: "[amux] I closed your browser on profile 'default': nothing had driven it for 6min (the activity window is 5min)" arrived three times while I was driving that exact tab over raw CDP, once mid-sweep. Activity is counted as an amux browser API verb; /chrome-cdp and skills/chrome-cdp/scripts/cdp.mjs send none, so continuous use reads as idle.
 COST: Three browser restarts and one overlay sweep lost half-collected, roughly 15 minutes across an AMUX-4684 session. The kill notice names only AMUX_BROWSER_ACTIVITY_REAP_S in ~/.amux/server.env as the remedy, which needs a server restart, so a lane on a ten-minute browser task chooses between restarting the fleet's server and being interrupted.
 FIX: Let the reaper see CDP: the server already stores the profile's cdp_port, so a read of /json/version on it answers "is a debugger attached" without touching the page. Or add a keepalive verb and name it in the notice, so the remedy reaches the lane at the moment it is being killed.
+
+## The test wrapper exits 0 when the cargo budget refuses to run anything
+AREA: instruments
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-15
+SESSION: amux
+CARD: AMUX-4689
+SYMPTOM: `scripts/test-contended.sh -p amux-server` printed 17 lines and exited 0 with NO TEST RUN. The budget guard had refused (`{"event": "cargo_budget_refused", "target_bytes": 48094199808, "free_bytes": 356396068864, "reason": "target_size"}`) and the wrapper reported that refusal as a successful run. The contention block still printed "A failure here is NOT build contention" and the worktree block still certified the tree was clean "in this build", both statements about a run that never happened.
+COST: I nearly cited it as the test evidence for AMUX-4527. The commit hook caught it instead, by a different route: "your last run EXITED 124 ... A red run vouches for nothing". Two instruments disagreed about the same run and only the incidental one was right. VERIFY.md's contract is to paste a command and its result line, and the result line here is an empty success.
+FIX: Exit non-zero on `cargo_budget_refused` — a refusal is not a pass, and every caller already handles a non-zero exit. And print the remedy in the same breath: the refusal names `target_bytes` and `reason` but not `scripts/cargo-target-guard.py clear --target <root> --path <candidate>`, which exists and is invisible from there. This is the wrapper's own principle (a green must carry "and nothing was building" beside it) applied to the cheaper half, since a run that did not happen is knowable with certainty rather than inferred.
