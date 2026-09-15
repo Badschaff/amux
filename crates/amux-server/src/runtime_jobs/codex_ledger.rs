@@ -232,6 +232,31 @@ pub async fn index_once_at(
     }
     let expected: usize = pending.iter().map(|(_, _, _, _, turns)| turns.len()).sum();
 
+    // How many of these rows take the default price because no table entry
+    // names their model. Reported beside the row count: a defaulted dollar
+    // figure that looks measured is worse than no figure at all.
+    let guessed: usize = pending
+        .iter()
+        .flat_map(|(_, _, _, _, turns)| turns.iter())
+        .filter(|t| !super::token_ledger::model_is_priced(&table, &t.model))
+        .count();
+    let models: std::collections::BTreeSet<String> = pending
+        .iter()
+        .flat_map(|(_, _, _, _, turns)| turns.iter())
+        .filter(|t| !super::token_ledger::model_is_priced(&table, &t.model))
+        .map(|t| t.model.clone())
+        .collect();
+    if guessed > 0 {
+        tracing::warn!(
+            verdict = "codex_rows_priced_by_default",
+            rows = guessed,
+            models = %models.into_iter().collect::<Vec<_>>().join(","),
+            measured = true,
+            n_considered = expected,
+            "codex turns carry the DEFAULT price: their token counts are measured, their cost is not. \
+             Set real rates for these models in ~/.amux/prices.json (config, no redeploy)."
+        );
+    }
     let inserted = store
         .write_async(move |conn| {
             let mut n = 0usize;

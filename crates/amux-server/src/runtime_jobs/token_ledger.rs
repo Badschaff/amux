@@ -98,6 +98,19 @@ fn price_for_model(table: &[(String, [f64; 4])], model: &str) -> [f64; 4] {
         .unwrap_or(PRICE_DEFAULT)
 }
 
+/// Does the price table actually name this model?
+///
+/// AMUX-4583: `price_for_model` falls back to PRICE_DEFAULT on purpose, because
+/// a zero reads as a free turn. That is right for a new Claude model and wrong
+/// for a different vendor: applying Claude rates to codex turns put $5,654 of
+/// cost in the ledger that nobody spent. The fallback stays; the COUNT of rows
+/// that took it is now reportable, so a guessed dollar figure cannot pass as a
+/// measured one.
+pub(crate) fn model_is_priced(table: &[(String, [f64; 4])], model: &str) -> bool {
+    let m = model.to_lowercase();
+    table.iter().any(|(k, _)| m.contains(k.as_str()))
+}
+
 pub(crate) fn turn_cost_usd(table: &[(String, [f64; 4])], model: &str, t: [i64; 4]) -> f64 {
     let p = price_for_model(table, model);
     (t[0] as f64 * p[0] + t[1] as f64 * p[1] + t[2] as f64 * p[2] + t[3] as f64 * p[3])
