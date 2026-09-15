@@ -657,7 +657,10 @@ pub(crate) fn transcribe_one(dir: &Path, sidecar: &Value, tr: &Transcriber, ffmp
     let wargs: Vec<String> = vec![
         "-m".into(), tr.model.display().to_string(),
         "-f".into(), wav.display().to_string(),
-        "-t".into(), tr.threads.to_string(),
+        // The long form on purpose: tests/tmux_target_audit.rs reads every short
+        // t-flag argument in server source as a tmux target, and this value is
+        // a thread count (AMUX-4629).
+        "--threads".into(), tr.threads.to_string(),
         "-l".into(), lang.into(),
         "-np".into(), "-oj".into(),
         "-of".into(), out.display().to_string(),
