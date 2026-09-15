@@ -10887,7 +10887,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.961';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.962';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -29177,6 +29177,8 @@ function _renderBoardCard(item) {
   // for and re-wording it here would be the second spelling the comment warns
   // against.
   if (item.owner_isolated) h += '<div class="board-card-isolated" title="' + esc(item.owner_reach || 'The owning session is an isolated raw agent.') + '">&#x1F512; isolated owner</div>';
+  h += _leaseChip(item);
+  h += _blockedByChip(item);
   h += '<div class="board-card-title">';
   if (boardViewMode === 'worker') { const _st = item.status || 'todo'; h += '<span class="board-status-dot" style="background:' + statusStyle(_st).dot + '"></span>'; }
   h += _hlSearch(esc(item.title), typeof boardSearchQuery !== 'undefined' ? boardSearchQuery : '') + '</div>';
@@ -29203,6 +29205,60 @@ function _renderBoardCard(item) {
   if (item.epic) h += '<div class="board-card-epic">↗ Epic ' + esc(item.epic) + '</div>';
   h += '</div>';
   return h;
+}
+
+// RR-0052 / AMUX-4529. The lease has been on every board row since 4970f038
+// and nothing rendered it, so "who is actually holding this card, and is that
+// hold still alive" was answerable only by reading the API by hand.
+//
+// Heartbeat age is the useful number, not the lease's existence: a held card
+// whose holder stopped beating looks identical to a healthy one in the column.
+function _leaseChip(item) {
+  const lease = item && item.lease;
+  if (!lease || !lease.holder) return '';
+  const now = Date.now() / 1000;
+  const beat = Number(lease.heartbeat_at || 0);
+  const expires = Number(lease.expires_at || 0);
+  const expired = expires > 0 && expires < now;
+  const attempt = Number(lease.attempt || 0);
+  const label = esc(lease.holder)
+    + (attempt > 1 ? ' &middot; attempt ' + attempt : '')
+    + (beat ? ' &middot; \u2665 ' + timeAgo(beat) : ' &middot; no heartbeat recorded');
+  const why = expired
+    ? 'Lease EXPIRED ' + timeAgo(expires) + '. ' + lease.holder + ' still holds the card on the board, but the hold is no longer alive, so another worker may claim it.'
+    : 'Held by ' + lease.holder + ' (attempt ' + (attempt || 1) + ', generation ' + (lease.generation || 1) + ')'
+      + (beat ? ', last heartbeat ' + timeAgo(beat) : ', no heartbeat recorded yet')
+      // timeAgo() has no future branch: a negative age falls into its `< 60`
+      // arm and a lease with half an hour left reads "expires just now". Live
+      // leases are ALWAYS in the future, so that arm is the common case here.
+      + (expires ? ', lease expires in ' + fmtDuration(Math.round(expires - now)) : '');
+  return '<div class="board-card-lease' + (expired ? ' board-card-lease-stale' : '') + '" title="' + esc(why) + '">'
+    + (expired ? '&#x23F1; expired &middot; ' : '&#x1F517; ') + label + '</div>';
+}
+
+// Which of this card's dependencies are not finished yet.
+//
+// Resolved against the LOADED board, which is a working set, so a dependency
+// that is not loaded is reported as unknown rather than counted as blocking:
+// asserting "blocked by X" from a row this client never saw would be a claim
+// about a card it cannot see (the same trap the capped board list already has).
+function _blockedByChip(item) {
+  const deps = Array.isArray(item && item.depends_on) ? item.depends_on : [];
+  if (!deps.length || ['done', 'verified', 'discarded'].includes(item.status)) return '';
+  const known = new Map((Array.isArray(boardItems) ? boardItems : []).map(i => [i.id, i.status]));
+  const blocking = [], unknown = [];
+  deps.forEach(id => {
+    const st = known.get(id);
+    if (st === undefined) unknown.push(id);
+    else if (!['done', 'verified', 'discarded'].includes(st)) blocking.push(id);
+  });
+  if (!blocking.length && !unknown.length) return '';
+  const shown = blocking.slice(0, 3).join(', ') + (blocking.length > 3 ? ' +' + (blocking.length - 3) : '');
+  const why = (blocking.length ? 'Waiting on ' + blocking.join(', ') + '. ' : '')
+    + (unknown.length ? unknown.length + ' dependency(ies) not in the loaded board, so their status is unknown here: ' + unknown.join(', ') + '. ' : '')
+    + 'This card cannot finish until they resolve.';
+  const label = blocking.length ? shown : unknown.length + ' unknown';
+  return '<div class="board-card-blocked" title="' + esc(why) + '">&#x26D4; blocked by ' + esc(label) + '</div>';
 }
 
 async function _togglePin(id) {
@@ -30551,6 +30607,31 @@ function _bdRenderMeta(item) {
   }
   let html = parts.length ? '<div class="bd-card-facts">'
     + parts.map(p => '<span>' + p + '</span>').join('') + '</div>' : '';
+
+  // RR-0052: every claim on this card, not just the one holding it now. A
+  // second attempt after a failed first is the thing worth seeing, and the
+  // detail GET has carried `attempts` since 4970f038 with nothing reading it.
+  const attempts = Array.isArray(item.attempts) ? item.attempts : [];
+  if (attempts.length) {
+    const lease = item.lease || {};
+    const rows = attempts.slice().sort((a, b) => (b.attempt || 0) - (a.attempt || 0)).map(a => {
+      const live = !a.ended_at && lease.holder && Number(lease.attempt || 0) === Number(a.attempt || 0);
+      const outcome = a.outcome ? esc(a.outcome) : (live ? 'holding now' : 'ended without a recorded outcome');
+      const ended = a.ended_at ? timeAgo(a.ended_at) : '';
+      return '<div class="board-detail-meta-row">'
+        + '<b>#' + Number(a.attempt || 0) + '</b> '
+        + '<button class="task-id-chip bd-link-chip" onclick="event.stopPropagation();openPeek(\'' + escJs(a.worker || '') + '\')" '
+        + 'title="Open ' + esc(a.worker || 'worker') + '">' + esc(a.worker || 'unknown worker') + '</button> '
+        + '<span>' + (a.started_at ? 'started ' + timeAgo(a.started_at) : 'start not recorded')
+        + (ended ? ' &middot; ended ' + ended : '')
+        + ' &middot; ' + outcome
+        + (a.to_status ? ' &middot; left it in ' + esc(a.to_status) : '')
+        + (a.ended_by ? ' &middot; ended by ' + esc(a.ended_by) : '')
+        + (a.reason ? ' &middot; ' + esc(String(a.reason).slice(0, 160)) : '')
+        + '</span></div>';
+    }).join('');
+    html += '<section class="bd-card-section"><h4>Attempts (' + attempts.length + ')</h4>' + rows + '</section>';
+  }
 
   const messages = Array.isArray(item.messages) ? item.messages : [];
   if (messages.length) {

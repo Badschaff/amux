@@ -3880,6 +3880,18 @@
     border-radius:4px; background:rgba(210,153,34,0.15); color:var(--warn,#d29922); border:1px solid rgba(210,153,34,0.45); }
   .board-card-shepherd { font-size:0.62rem; padding:1px 6px; border-radius:4px; background:rgba(137,87,229,0.15);
     color:var(--purple,#8957e5); border:1px dashed rgba(137,87,229,0.5); }
+  /* LEASE (RR-0052 / AMUX-4529). Same chip shape as its neighbours because it
+     is the same class of fact: something about this card that decides whether
+     the advice on it is followable. Neutral while the hold is alive, red once
+     the lease has expired, because an expired hold and a healthy one looked
+     identical in the column. */
+  .board-card-lease { display:inline-block; font-size:0.62rem; font-weight:600; padding:1px 6px; margin-bottom:4px;
+    border-radius:4px; background:rgba(88,166,255,0.12); color:var(--accent); border:1px solid rgba(88,166,255,0.35);
+    max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .board-card-lease-stale { background:rgba(224,85,91,0.15); color:#e0555b; border-color:rgba(224,85,91,0.45); }
+  .board-card-blocked { display:inline-block; font-size:0.62rem; font-weight:600; padding:1px 6px; margin-bottom:4px;
+    border-radius:4px; background:rgba(210,153,34,0.15); color:var(--warn,#d29922); border:1px solid rgba(210,153,34,0.45);
+    max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .board-card-rot { display:inline-block; font-size:0.62rem; font-weight:600; padding:1px 6px; margin-bottom:4px;
     border-radius:4px; background:rgba(240,160,32,0.16); color:#f0a020; border:1px solid rgba(240,160,32,0.35); }
   .board-card {
