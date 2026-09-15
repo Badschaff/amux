@@ -1889,8 +1889,88 @@ function _modalLayoutCheck() {
     const visibleTop = root.classList.contains('amux-dialog-viewport') ? root.getBoundingClientRect().top : top;
     if (r.top < visibleTop - 2 || r.bottom > visibleTop + height + 2 || r.left < -2 || r.right > innerWidth + 2)
       clipped.push(root.id || root.classList[0]);
+    for (const issue of _dialogReachCheck(root)) clipped.push((root.id || root.classList[0]) + ':' + issue);
   });
   return { measured: true, n_considered: n, clipped, viewport_height: height };
+}
+
+/// Can the reader get to the LAST LINE of this window?
+///
+/// Every check above this one measures the dialog's frame: is the box inside
+/// the viewport, is a footer covered, is the contrast readable. None of them
+/// looks at the content, and `box` is `root.firstElementChild`, which for
+/// `#file-overlay` is the 40px header. So a window could hold text nobody could
+/// reach and the only thing this diagnostic would report is the id.
+///
+/// Ethan, 2026-09-15, screenshotting a markdown file whose last table row was
+/// cut off: "make sure these windows can be scrolled down to the bottom test
+/// every window". This is that question, asked of every open dialog, on every
+/// mutation, in whatever browser the reader is actually using.
+///
+/// It is READ-ONLY. It never scrolls anything: moving a reader's scroll
+/// position to measure it would be the diagnostic changing what it measures.
+function _dialogReachCheck(root) {
+  const issues = [];
+  const cs = el => getComputedStyle(el);
+  // A box is not a view. A collapsed <details> is 80px tall with overflow
+  // hidden and a 1400px child inside it, and that child's rect runs a thousand
+  // pixels past the fold while being painted nowhere. Intersect with every
+  // clipping ancestor before believing an element is on screen.
+  const shown = el => {
+    const s = cs(el);
+    if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+    const r = el.getBoundingClientRect();
+    if (r.height <= 0 || r.width <= 0) return false;
+    let top = r.top, bottom = r.bottom, left = r.left, right = r.right;
+    for (let p = el.parentElement; p && p !== document.body; p = p.parentElement) {
+      const ps = cs(p);
+      if (ps.overflowY === 'visible' && ps.overflowX === 'visible') continue;
+      const pr = p.getBoundingClientRect();
+      top = Math.max(top, pr.top); bottom = Math.min(bottom, pr.bottom);
+      left = Math.max(left, pr.left); right = Math.min(right, pr.right);
+      if (bottom - top <= 0 || right - left <= 0) return false;
+    }
+    return true;
+  };
+  const all = [root, ...root.querySelectorAll('*')];
+  const scrollers = [];
+  for (const el of all) {
+    if (el.scrollHeight <= el.clientHeight + 4 || !shown(el)) continue;
+    const oy = cs(el).overflowY;
+    if (oy === 'auto' || oy === 'scroll') { scrollers.push(el); continue; }
+    if (oy !== 'hidden' && oy !== 'clip') continue;
+    // Clipped content is fine when an ancestor scrolls it into view, which is
+    // what a collapsed section is. With no such ancestor it is content that no
+    // gesture can reach.
+    let saved = false;
+    for (let p = el.parentElement; p && p !== document.body; p = p.parentElement) {
+      const po = cs(p).overflowY;
+      if ((po === 'auto' || po === 'scroll') && p.scrollHeight > p.clientHeight + 4) { saved = true; break; }
+    }
+    if (!saved) issues.push('content-unreachable');
+  }
+  // The lowest visible line, by position rather than by DOM order.
+  let last = null, lowest = -Infinity;
+  for (const el of all) {
+    if (el.children.length || !(el.textContent || '').trim() || !shown(el)) continue;
+    const b = el.getBoundingClientRect().bottom;
+    if (b > lowest) { lowest = b; last = el; }
+  }
+  if (last) {
+    const holder = scrollers.find(s => s.contains(last));
+    // Only meaningful once the reader HAS scrolled to the end: a footer below
+    // the scroll area (Clear all / Done) is not a defect, and neither is a
+    // window the reader simply has not scrolled yet.
+    if (holder && Math.abs(holder.scrollTop - (holder.scrollHeight - holder.clientHeight)) < 2) {
+      const lb = last.getBoundingClientRect(), hb = holder.getBoundingClientRect();
+      if (lb.bottom - hb.bottom > 1) issues.push('last-line-below-scroller');
+      const hit = document.elementFromPoint(
+        Math.round(lb.left + Math.min(lb.width / 2, 40)),
+        Math.round(lb.bottom - Math.min(lb.height / 2, 6)));
+      if (hit && hit !== last && !last.contains(hit) && !hit.contains(last)) issues.push('last-line-covered');
+    }
+  }
+  return issues;
 }
 (function observeDialogs() {
   let timer, previous = '', previousComponents = '';
@@ -10887,7 +10967,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.962';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.963';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
