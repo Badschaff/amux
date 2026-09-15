@@ -1893,9 +1893,13 @@ pub fn dispatch_backlog_when_idle(session: &str) -> bool {
 /// apart from "no backlog at all".
 fn backlog_by_type_count(conn: &Connection, session: &str) -> usize {
     conn.query_row(
-        "SELECT COUNT(*) FROM issues i WHERE i.session=?1 AND i.status='backlog' \
-           AND i.owner_type='agent' AND i.deleted IS NULL AND COALESCE(i.archived,0)=0 \
-           AND COALESCE(i.type,'') NOT IN ('tripwire','watch','epic')",
+        &format!(
+            "SELECT COUNT(*) FROM issues i WHERE i.session=?1 AND i.status='backlog' \
+               AND i.owner_type='agent' AND i.deleted IS NULL AND COALESCE(i.archived,0)=0 \
+               AND COALESCE(i.type,'') NOT IN ('tripwire','watch','epic') \
+               AND NOT {}",
+            bs::CAPTURE_SHELL_SQL
+        ),
         rusqlite::params![session],
         |r| r.get::<_, i64>(0),
     )
@@ -1916,9 +1920,10 @@ fn drainable_backlog_rows(conn: &Connection, session: &str, now: f64) -> rusqlit
     let verified_cut = (now as i64) - SOURCE_REF_STALE_S;
     let candidates = conn
         .prepare(
-            "SELECT i.id FROM issues i WHERE i.session=?1 AND i.status='backlog' \
+            &format!("SELECT i.id FROM issues i WHERE i.session=?1 AND i.status='backlog' \
            AND i.owner_type='agent' AND i.deleted IS NULL AND COALESCE(i.archived,0)=0 \
            AND COALESCE(i.type,'') NOT IN ('tripwire','watch','epic') \
+           AND NOT {CAPTURE} \
            AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=i.id \
                            AND lower(t.tag) LIKE 'needs:you%') \
            AND NOT EXISTS (SELECT 1 FROM session_events e WHERE e.type='task.claimed' \
@@ -1927,6 +1932,7 @@ fn drainable_backlog_rows(conn: &Connection, session: &str, now: f64) -> rusqlit
            AND COALESCE(i.blocked_on,'') = '' \
            AND NOT (COALESCE(i.source,'')='capture' AND COALESCE(i.source_ref,'') <> '') \
          ORDER BY COALESCE(i.pinned,0) DESC, COALESCE(i.created,0) ASC, i.id ASC",
+                CAPTURE = bs::CAPTURE_SHELL_SQL),
         )
         .and_then(|mut st| {
             st.query_map(rusqlite::params![session, reclaim_cut, verified_cut], |r| {

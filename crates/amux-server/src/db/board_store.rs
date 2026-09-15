@@ -3126,6 +3126,22 @@ pub fn is_capture_shell(row: &IssueRow) -> bool {
     row.creator == "amux" && row.desc.trim_start().starts_with("**Prompt:**")
 }
 
+/// [`is_capture_shell`] as a SQL predicate, for the queries that select or
+/// count board rows without loading them (AMUX-4697).
+///
+/// ONE definition, interpolated, rather than the same two clauses written into
+/// each query. Five call sites spelling a predicate by hand is how two of them
+/// come to disagree, and the disagreement is invisible until a count and a
+/// dispatch list differ by rows nobody can name.
+///
+/// Expects the `issues` row to be addressable as `i`. `ltrim` mirrors
+/// `trim_start`: SQLite's default `ltrim` strips spaces only, so the leading
+/// newline that `save_patched` can leave is handled explicitly. The test
+/// `the_sql_predicate_and_the_rust_one_select_the_same_rows` runs both over the
+/// same fixtures and fails if they ever part company.
+pub const CAPTURE_SHELL_SQL: &str =
+    "(i.creator = 'amux' AND ltrim(ltrim(i.desc, char(10) || char(13) || char(9)), ' ') LIKE '**Prompt:**%')";
+
 /// The marker the SERVER appends when it chose the fold target itself.
 ///
 /// AF-616 (mixpeek-frustrations, from a live specimen on this lane's cards):
@@ -5725,6 +5741,78 @@ column=silent type:code=outranked(2)"
         // Leading whitespace must not defeat it: the marker is written by a
         // formatter, not by hand.
         assert!(is_capture_shell(&cap("amux", "\n  **Prompt:** hi", "discarded")));
+    }
+
+    /// AMUX-4697: `CAPTURE_SHELL_SQL` and `is_capture_shell` must select the
+    /// same rows, or a count and a dispatch list differ by rows nobody can name.
+    ///
+    /// Runs BOTH over the same fixtures rather than asserting each separately,
+    /// which is the only arrangement that can catch a drift: two independent
+    /// assertions both stay green while the predicates diverge.
+    #[test]
+    fn the_sql_predicate_and_the_rust_one_select_the_same_rows() {
+        // The REAL schema via the migration chain, not a hand-rolled four-column
+        // stand-in. `tests/schema_fixtures.rs` caught the stand-in and it was
+        // right to: this cell claims the SQL predicate selects the same rows as
+        // the Rust one, and a fixture whose `issues` differs from production
+        // cannot support that claim about production.
+        let conn = crate::db::migrate::test_memdb();
+        // Each case is (id, creator, desc) with the answer the Rust predicate
+        // gives, including the whitespace shapes a formatter can emit.
+        let cases = [
+            ("C-1", "amux", "**Prompt:** hello"),
+            ("C-2", "some-lane", "**Prompt:** hello"),
+            ("C-3", "amux", "Fix the parser"),
+            ("C-4", "amux", "\n  **Prompt:** hi"),
+            ("C-5", "amux", "   **Prompt:** spaces first"),
+            ("C-6", "amux", "\t**Prompt:** tab first"),
+            ("C-7", "amux", "\r\n**Prompt:** crlf first"),
+            ("C-8", "amux", "text then **Prompt:** later"),
+            ("C-9", "amux", ""),
+        ];
+        // Every NOT NULL column the real schema carries. The hand-rolled
+        // four-column stand-in this replaced did not have them, which is the
+        // second thing the fixture guard was protecting: a narrow fixture
+        // accepts inserts production would reject.
+        for (id, creator, desc) in cases {
+            conn.execute(
+                "INSERT INTO issues (id,title,desc,status,creator,created,updated,owner_type, \
+                                     pinned,pos,notified,type,archived,rev,version,lease_generation) \
+                 VALUES (?1,?1,?2,'backlog',?3,1,1,'agent',0,0,0,'code',0,1,1,0)",
+                rusqlite::params![id, desc, creator],
+            )
+            .expect("insert");
+        }
+        let sql_says: Vec<String> = conn
+            .prepare(&format!(
+                "SELECT i.id FROM issues i WHERE {CAPTURE_SHELL_SQL} ORDER BY i.id"
+            ))
+            .expect("prepare")
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("rows");
+        let rust_says: Vec<String> = cases
+            .iter()
+            .filter(|(_, creator, desc)| {
+                let mut r = IssueRow {
+                    creator: (*creator).into(),
+                    desc: (*desc).into(),
+                    status: "backlog".into(),
+                    ..Default::default()
+                };
+                r.id = "x".into();
+                is_capture_shell(&r)
+            })
+            .map(|(id, _, _)| (*id).to_string())
+            .collect();
+        assert_eq!(sql_says, rust_says, "the two predicates must agree row for row");
+        // POSITIVE CONTROL: if this were empty both sides would agree
+        // vacuously, which is the most reassuring output a dead check produces.
+        assert!(
+            rust_says.len() >= 4,
+            "the fixtures must actually contain capture shells; got {rust_says:?}"
+        );
     }
 
     /// AF-616: a fold the SERVER guessed must not read like one a lane
