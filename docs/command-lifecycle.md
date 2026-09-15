@@ -96,3 +96,8 @@ data-only helper processes; working agents retain their normal project context.
 `AMUX_HELPER_THINKING_TOKENS` can override the helper thinking budget. Diagnostics
 count measured calls, including rejected interpretations, and say when coverage
 is incomplete.
+
+Repeated advancement reminders share a durable identity across timestamp, log and
+revision-only changes. Only confirmed delivery suppresses a later worker turn.
+Changed requirements or a new worker lifetime re-arm the reminder; queued
+preconditions refresh in place, and voided delivery remains an observable failure.

@@ -572,7 +572,7 @@ fn apply(
 /// true means this path owns the receipt, including a deferred/failed attempt.
 /// false preserves the legacy path when explicitly disabled or in model-free tests.
 pub(crate) async fn capture(state: &AppState, id: i64, session: &str) -> bool {
-    if !enabled(session) {
+    if !enabled(session) || session_verbs::session_is_isolated(session) {
         return false;
     }
     let Some(client) = board_intake::model_client() else {

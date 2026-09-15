@@ -795,8 +795,8 @@ pub trait Fleet: Send + Sync {
     ///
     /// Default to acknowledged work delivery. A failed enqueue must not be
     /// recorded as a delivered reminder by either a live fleet or a test fake.
-    async fn deliver_about(&self, lane: &str, text: &str, _card: &str, _rev: i64) -> Result<(), String> {
-        self.deliver_work(lane, text).await
+    async fn deliver_about(&self, lane: &str, text: &str, _card: &str, _rev: i64) -> Result<bool, String> {
+        self.deliver_work(lane, text).await.map(|_| true)
     }
 }
 
@@ -919,15 +919,29 @@ impl Fleet for LiveFleet {
         };
         Ok(disposition)
     }
-    async fn deliver_about(&self, lane: &str, text: &str, card: &str, rev: i64) -> Result<(), String> {
-        crate::api::session_verbs::steer_enqueue_precond(
-            &self.state.store, lane, text, GUARD, "", Some((card, rev)),
-        )
-        .await.map_err(str::to_string)?;
-        self.record_prompt(lane, text).await;
-        Ok(())
+    async fn deliver_about(&self, lane: &str, text: &str, card: &str, rev: i64) -> Result<bool, String> {
+        let identity={
+            let c=self.state.store.read().map_err(|e|e.to_string())?;
+            let row=bs::get_issue(&c,card).map_err(|e|e.to_string())?.ok_or("reminder card disappeared")?;
+            let started:f64=c.query_row("SELECT coalesce(max(ts),0) FROM session_events WHERE session=?1 AND type='session.started'",[lane],|r|r.get(0)).map_err(|e|e.to_string())?;
+            reminder_identity(lane,text,&row,started)
+        };
+        let result=crate::api::session_verbs::enqueue_state_reminder(
+            &self.state.store,lane,text,GUARD,card,rev,&identity).await?;
+        if result { self.record_prompt(lane,text).await; }
+        Ok(result)
     }
 
+}
+
+/// A reminder is a reaction to meaningful card state, not to a timer, log
+/// heartbeat or revision counter. A new process lifetime legitimately re-arms it.
+fn reminder_identity(lane:&str,text:&str,row:&bs::IssueRow,started:f64)->String {
+    use sha2::{Digest,Sha256};
+    let state=json!([lane,text,row.id,row.title,row.desc,row.status,row.item_type,
+        row.next_action,row.acceptance_criteria,row.depends_on,row.evidence,row.blocked_on,
+        row.lease_generation,started]);
+    format!("board-state-reminder:{:x}",Sha256::digest(state.to_string().as_bytes()))
 }
 
 impl LiveFleet {
@@ -6691,10 +6705,12 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
             });
         let delivery = match rev {
             Some(r) => fleet.deliver_about(&target, &text, &card, r).await,
-            None => fleet.deliver_work(&target, &text).await,
+            None => fleet.deliver_work(&target, &text).await.map(|_|true),
         };
-        if let Err(error) = delivery {
-            return nudge_delivery_failed(lane, &target, &card, &error).with_counts(eligible, open);
+        match delivery {
+            Err(error)=>return nudge_delivery_failed(lane,&target,&card,&error).with_counts(eligible,open),
+            Ok(false)=>return LaneTrace::skip(lane,"unchanged-reminder","same card state already queued or delivered; no new worker turn").with_counts(eligible,open),
+            Ok(true)=>{},
         }
         // THE COOLDOWN IS PER LANE, AND A REVIEW ROUTE INVOLVES TWO OF THEM.
         // `advance.nudged` is recorded under the REVIEWER (python:13817 — it
@@ -11927,6 +11943,18 @@ mod tests {
     ///
     /// A test that mints its own input can only ever pin ITSELF. This one runs
     /// the real producer into the real parser.
+    #[test]
+    fn reminder_identity_ignores_heartbeat_but_tracks_requirements_and_worker_lifetime() {
+        let conn=board_db();add_card(&conn,"STATE-1","lane","doing","Report","Current report requirements");
+        let mut row=bs::get_issue(&conn,"STATE-1").unwrap().unwrap();
+        let before=reminder_identity("lane","finish",&row,10.0);
+        row.rev+=1;row.updated+=1;row.log=Some("heartbeat".into());
+        assert_eq!(reminder_identity("lane","finish",&row,10.0),before);
+        assert_ne!(reminder_identity("lane","finish",&row,20.0),before);
+        row.acceptance_criteria=Some("[\"include gamma\"]".into());
+        assert_ne!(reminder_identity("lane","finish",&row,10.0),before);
+    }
+
     #[test]
     fn pickup_delivers_current_criteria_and_effective_gate_without_a_lookup_turn() {
         let conn=board_db();

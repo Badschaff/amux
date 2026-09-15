@@ -5418,6 +5418,31 @@ pub(crate) async fn steer_enqueue_idempotent_report(
     .await
 }
 
+/// Only a confirmed prior submission suppresses this state. Voided/failed
+/// attempts are observable refusals, never mislabeled as successful delivery.
+pub(crate) async fn enqueue_state_reminder(store:&crate::db::SharedStore,name:&str,text:&str,guard:&str,card:&str,rev:i64,identity:&str)->Result<bool,String> {
+    use rusqlite::OptionalExtension;
+    store.write_async(|c|{ensure_fleet_tables(c)?;Ok(crate::db::WriteOutcome{applied:false,events:vec![]})}).await.map_err(|e|e.to_string())?;
+    let (already_sent,queued_id)={
+        let c=store.read().map_err(|e|e.to_string())?;
+        let mut stmt=c.prepare("SELECT outcome FROM steering_history WHERE id LIKE ?1").map_err(|e|e.to_string())?;
+        let outcomes=stmt.query_map([format!("{identity}:%")],|r|r.get::<_,Option<String>>(0)).map_err(|e|e.to_string())?
+            .collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+        let queued_id=c.query_row("SELECT id FROM steering_queue WHERE id LIKE ?1 ORDER BY queued_at LIMIT 1",[format!("{identity}:%")],|r|r.get::<_,String>(0)).optional().map_err(|e|e.to_string())?;
+        (outcomes.iter().flatten().any(|v|matches!(submit_verdict_of(v),Some("confirmed"|"retried"))),queued_id)
+    };
+    if already_sent { return Ok(false); }
+    // A revision only distinguishes previously voided attempts. Confirmed
+    // history above is shared across revisions of the same meaningful state.
+    let id=queued_id.unwrap_or_else(||format!("{identity}:{rev}"));
+    let result=steer_enqueue_precond_with_id(store,name,text,guard,"",Some((card,rev)),Some(&id)).await.map_err(str::to_string)?;
+    match result.disposition {
+        StableEnqueueDisposition::New=>Ok(true),
+        StableEnqueueDisposition::AlreadyQueued=>Ok(false),
+        StableEnqueueDisposition::AlreadyDelivered=>Err("this reminder's prior attempt was not confirmed; waiting for changed card state or worker recovery".into()),
+    }
+}
+
 /// A semantically conversational board receipt uses the existing durable outbox.
 /// Stable identity survives a crash between enqueue and receipt finalization.
 pub(crate) async fn enqueue_board_conversation(state: &AppState, name: &str, id: i64, text: &str) -> Result<(), String> {
@@ -5583,9 +5608,9 @@ async fn steer_enqueue_precond_with_id(
                         *value = StableEnqueueDisposition::AlreadyQueued;
                     }
                     conn.execute(
-                        "UPDATE steering_queue SET text=?1, session=?2, guard=?3, sender=?4 \
+                        "UPDATE steering_queue SET text=?1, session=?2, guard=?3, sender=?4,precond_card=?6,precond_rev=?7 \
                          WHERE id=?5",
-                        rusqlite::params![text_s, session, guard_s, sender_s, fixed],
+                        rusqlite::params![text_s, session, guard_s, sender_s, fixed,precond_w.as_ref().map(|(c,_)|c),precond_w.as_ref().map(|(_,r)|r)],
                     )?;
                     if let Ok(mut g) = effective_id_w.lock() {
                         *g = fixed.clone();
@@ -30220,6 +30245,32 @@ mod steer_coalescing_tests {
         let rows: Vec<String> =
             q.query_map([session], |r| r.get(0)).unwrap().filter_map(|r| r.ok()).collect();
         rows
+    }
+
+    #[tokio::test]
+    async fn unchanged_state_reminders_do_not_buy_another_worker_turn() {
+        let (st,_d)=store().await;
+        assert!(enqueue_state_reminder(&st,"lane","Finish the card","board-drive","TASK-1",1,"state-a").await.unwrap());
+        assert!(!enqueue_state_reminder(&st,"lane","Finish the card","board-drive","TASK-1",2,"state-a").await.unwrap());
+        { let c=st.read().unwrap();
+          assert_eq!(c.query_row("SELECT count(*) FROM steering_queue",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+          assert_eq!(c.query_row("SELECT precond_rev FROM steering_queue",[],|r|r.get::<_,i64>(0)).unwrap(),2);
+        }
+        st.write_async(|c|{
+            c.execute("INSERT INTO steering_history(id,session,text,queued_at,delivered_at,outcome) SELECT id,session,text,queued_at,2,'sent' FROM steering_queue",[])?;
+            c.execute("DELETE FROM steering_queue",[])?;
+            Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
+        }).await.unwrap();
+        assert!(!enqueue_state_reminder(&st,"lane","Finish the card","board-drive","TASK-1",3,"state-a").await.unwrap());
+        assert!(pending(&st,"lane").is_empty());
+        assert!(enqueue_state_reminder(&st,"lane","New requirement","board-drive","TASK-1",3,"state-b").await.unwrap());
+        st.write_async(|c|{
+            c.execute("INSERT INTO steering_history(id,session,text,queued_at,delivered_at,outcome) SELECT id,session,text,queued_at,3,'void:card-stale' FROM steering_queue",[])?;
+            c.execute("DELETE FROM steering_queue",[])?;
+            Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
+        }).await.unwrap();
+        assert!(enqueue_state_reminder(&st,"lane","New requirement","board-drive","TASK-1",3,"state-b").await.is_err(),"a void is not a delivered reminder");
+        assert!(enqueue_state_reminder(&st,"lane","New requirement","board-drive","TASK-1",4,"state-b").await.unwrap(),"a stale revision can recover without a duplicate confirmed send");
     }
 
     /// THE CELL THAT WOULD HAVE CAUGHT AMUX-3938. Two DIFFERENT board notes,
