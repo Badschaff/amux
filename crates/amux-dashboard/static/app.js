@@ -1663,9 +1663,17 @@ function _applyIdentityToSettings() {
     if (label) label.textContent = 'Device';
     if (row) row.style.display = '';
   }
+  // The location control belongs to the DEVICE either way: an account holder
+  // still sends from a particular phone, and it is that phone that granted or
+  // refused the permission.
+  try { _settingsRenderGeo(); } catch (e) {}
 }
 
 _initIdentity();
+// A device that already opted in gets a fresh fix without being asked again.
+// Deferred off the boot path: a geolocation call during startup competes with
+// first paint for a value no send needs until the reader types something.
+setTimeout(() => { try { _geoRefresh(); } catch (e) {} }, 4000);
 _renderInstanceSwitcher();
 
 function _getDeviceName() {
@@ -1680,6 +1688,124 @@ function _getDeviceName() {
   if (/Mac/.test(ua)) return 'Mac';
   if (/Linux/.test(ua)) return 'Linux';
   return 'Unknown';
+}
+
+// ═══════ SEND CONTEXT — what a message was composed in (AMUX-4693) ═══════
+//
+// Ethan, 2026-09-15: "all messages, carrying Meta data such as EXIF data like
+// location for where the message is sent from as well as other things like
+// times".
+//
+// The server records when a message ARRIVED and which lane it came from. It
+// cannot know the human end: which device, in what timezone, at what local
+// hour. `ts` is a server epoch, so "was I sending this at 2am" is unanswerable
+// for a sender in another timezone, which is the "times" half of the ask.
+//
+// GEOLOCATION IS OPT-IN, PER DEVICE, AND NEVER ASKED BY A SEND. A composer that
+// triggers a permission prompt has turned typing a message into a system
+// dialog. The prompt happens once, from a control the reader chose to press
+// (_sendContextEnableGeo), and everything here reads only what that already
+// granted.
+const _GEO_FIX_MAX_AGE_MS = 60_000;   // one fix per minute, not one per message
+const _GEO_TIMEOUT_MS = 8_000;
+let _geoFix = null;                   // {lat, lon, accuracy_m, at}
+
+/// What this client knows about the send. Never throws: a message must go out
+/// even if every optional source here fails.
+function _sendContext() {
+  try {
+    const now = new Date();
+    const ctx = {
+      device: _getDeviceName(),
+      platform: navigator.platform || '',
+      app_ver: APP_VER,
+      tz: Intl.DateTimeFormat().resolvedOptions().timeZone || '',
+      // Minutes EAST of UTC, the opposite sign to getTimezoneOffset, because
+      // the stored value is read by humans and by a model. "-480" for Los
+      // Angeles matches every other place an offset is written down.
+      tz_offset_min: -now.getTimezoneOffset(),
+      local_time: now.toLocaleString(),
+    };
+    // A fix older than the window is STALE, and stale location is worse than
+    // none: it says the message came from where the reader was, not where they
+    // are. Dropped rather than aged, and the absence of the key is the signal.
+    if (_geoFix && Date.now() - _geoFix.at <= _GEO_FIX_MAX_AGE_MS) {
+      ctx.geo = {lat: _geoFix.lat, lon: _geoFix.lon, accuracy_m: _geoFix.accuracy_m};
+    }
+    return ctx;
+  } catch (e) {
+    return {app_ver: typeof APP_VER === 'string' ? APP_VER : ''};
+  }
+}
+
+/// Grant this device's geolocation, once, from a control the reader pressed.
+/// Returns the reason it did not happen, or '' on success, so the caller can
+/// say what went wrong rather than silently appearing to work.
+async function _sendContextEnableGeo() {
+  if (!navigator.geolocation) return 'this browser has no geolocation';
+  try {
+    const pos = await new Promise((resolve, reject) =>
+      navigator.geolocation.getCurrentPosition(resolve, reject,
+        {enableHighAccuracy: false, timeout: _GEO_TIMEOUT_MS, maximumAge: _GEO_FIX_MAX_AGE_MS}));
+    _geoFix = {lat: +pos.coords.latitude.toFixed(5), lon: +pos.coords.longitude.toFixed(5),
+               accuracy_m: Math.round(pos.coords.accuracy || 0), at: Date.now()};
+    try { localStorage.setItem('amux_geo_optin', '1'); } catch (e) {}
+    _geoRefresh();
+    return '';
+  } catch (error) {
+    return (error && error.message) || 'permission refused';
+  }
+}
+
+/// Keep a fresh fix while the reader has opted in, without asking again. A
+/// refusal here is silent on purpose: they already answered the question, and
+/// re-raising it on a timer is how an app trains someone to deny it forever.
+function _geoRefresh() {
+  let optedIn = false;
+  try { optedIn = localStorage.getItem('amux_geo_optin') === '1'; } catch (e) {}
+  if (!optedIn || !navigator.geolocation) return;
+  navigator.geolocation.getCurrentPosition(
+    pos => { _geoFix = {lat: +pos.coords.latitude.toFixed(5), lon: +pos.coords.longitude.toFixed(5),
+                        accuracy_m: Math.round(pos.coords.accuracy || 0), at: Date.now()}; },
+    () => {},
+    {enableHighAccuracy: false, timeout: _GEO_TIMEOUT_MS, maximumAge: _GEO_FIX_MAX_AGE_MS});
+}
+
+/// The opt-in control, per device, in Settings > Device.
+///
+/// It exists so the capability reaches the reader: a `_sendContextEnableGeo`
+/// nobody can press is a feature nobody has. Turning it OFF is local and
+/// immediate — the stored preference goes, the cached fix is dropped, and the
+/// next send carries no `geo` key. It does not revoke the browser permission,
+/// which only the browser's own settings can do, and the label says so rather
+/// than implying amux can take it back.
+function _settingsGeoOptedIn() {
+  try { return localStorage.getItem('amux_geo_optin') === '1'; } catch (e) { return false; }
+}
+function _settingsRenderGeo(note) {
+  const btn = document.getElementById('settings-geo-btn');
+  const status = document.getElementById('settings-geo-status');
+  if (!btn) return;
+  const on = _settingsGeoOptedIn();
+  btn.textContent = on ? 'Stop attaching location' : 'Attach location to my messages';
+  if (!status) return;
+  if (note) { status.textContent = note; return; }
+  status.textContent = on
+    ? (_geoFix ? 'On. Last fix ' + Math.round((Date.now() - _geoFix.at) / 1000) + 's ago, accurate to ~'
+                 + _geoFix.accuracy_m + 'm. Messages you send carry it; this device keeps the browser permission until you revoke it there.'
+               : 'On, but no fix yet on this device.')
+    : 'Off. Messages carry your device, timezone and local time, and no location.';
+}
+async function _settingsToggleGeo() {
+  if (_settingsGeoOptedIn()) {
+    try { localStorage.removeItem('amux_geo_optin'); } catch (e) {}
+    _geoFix = null;
+    _settingsRenderGeo('Off. Location will not be attached from this device.');
+    return;
+  }
+  _settingsRenderGeo('Asking this device for permission…');
+  const failure = await _sendContextEnableGeo();
+  _settingsRenderGeo(failure ? 'Not enabled: ' + failure : '');
 }
 
 // ═══════ DRAFTS — offline-created sessions ═══════
@@ -8211,7 +8337,8 @@ async function doSend(name, text, identity = {}) {
   // the server dedups on it, so a retry after a lost response (e.g. the
   // server restarted mid-request AFTER the keys landed) can't deliver twice.
   identity.msg_id = crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random();
-  const sendBody = JSON.stringify({text: payload, record_history: true, msg_id: identity.msg_id});
+  const sendBody = JSON.stringify({text: payload, record_history: true, msg_id: identity.msg_id,
+                                   client_meta: _sendContext()});
   // Ordinary messages return after durable local acceptance. The outbox owns
   // network delivery and retry; only interactive slash commands await the API.
   const sendUrl = API + '/api/sessions/' + encodeURIComponent(name) + '/send';

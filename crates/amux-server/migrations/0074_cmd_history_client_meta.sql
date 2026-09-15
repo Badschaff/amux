@@ -1,0 +1,31 @@
+-- The context a message was SENT IN (AMUX-4693).
+--
+-- Ethan, 2026-09-15: "all messages, carrying Meta data such as EXIF data like
+-- location for where the message is sent from as well as other things like
+-- times".
+--
+-- `cmd_history` records when a message ARRIVED (`ts`, `queued_at`,
+-- `delivered_at`) and which lane it came from (`origin`). It records nothing
+-- about the human end of the send: which device, in what timezone, at what
+-- local hour, from where. `ts` is a server epoch, so it cannot answer "was I
+-- sending this at 2am" for a sender three timezones away.
+--
+-- ONE JSON COLUMN rather than a column per field, because these are written
+-- together by one client at one moment and read together, the shape is still
+-- moving (a device may or may not grant geolocation), and a sparse column per
+-- optional attribute is how a table comes to carry twelve mostly-NULL columns
+-- nobody can name. The keys are documented at the writer, not here, so there is
+-- one place to read.
+--
+-- NULLABLE, no default, no backfill. Every existing row and every client that
+-- sends nothing keeps NULL, and NULL must stay readable as "this client told us
+-- nothing", never as an empty location. A message with no metadata renders
+-- exactly as it does today.
+--
+-- Numbered rather than created at point of use: db/attempts.rs takes the
+-- point-of-use route because AMUX-4533 had the live DB recording migration 69
+-- under a different name than origin, so a numbered file could be skipped
+-- silently. That has since reconciled — the ledger's 68..73 match the files on
+-- disk by name — so the ordinary path is safe again.
+--
+-- ADDCOL: cmd_history client_meta TEXT

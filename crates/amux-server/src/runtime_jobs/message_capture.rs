@@ -476,6 +476,7 @@ mod tests {
             false,
             DeliveryMeta {
                 submit_verdict: Some("stuck"),
+                client_meta: None,
                 ..DeliveryMeta::direct()
             },
         )

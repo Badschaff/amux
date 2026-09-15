@@ -4146,16 +4146,36 @@ pub(crate) async fn cmd_hist_record_schedule(
 /// steering queue (`None` for anything not queued), so the wait a message
 /// endured is answerable from the row the Messages tab already reads instead of
 /// requiring a join against `steering_history` that nothing performs.
-/// How a message reached a lane, and whether it was ever seen to submit.
+/// Ceiling on the sender-context blob (AMUX-4693). Generous for the documented
+/// keys (device, platform, app version, timezone, local time, coordinates) and
+/// far below anything that could bloat the Messages ledger a lane reads on
+/// every refresh.
+const CLIENT_META_MAX_BYTES: usize = 2048;
+
+/// What is known about a message beyond its text.
 ///
-/// One value rather than three parameters: they are written together, read
-/// together, and are meaningless apart — `queued_at` without `delivery` cannot
-/// say what it timed. (It also keeps the recorder under clippy's argument
-/// limit, which is the same argument stated as a lint.)
+/// The first three are one fact: HOW it reached a lane and whether it was ever
+/// seen to submit. They are written together, read together, and are
+/// meaningless apart — `queued_at` without `delivery` cannot say what it timed.
+///
+/// `client_meta` is NOT that fact and is not pretended to be. It is the context
+/// the sender composed in, true at compose time rather than at delivery time,
+/// and independent of all three. It rides here because this struct is what the
+/// recorder already threads, and an eighth parameter would trip the
+/// argument-count lint this struct was introduced to satisfy — a practical
+/// reason, stated as one, rather than a claim that the fields belong together.
 #[derive(Default, Clone, Copy)]
 pub(crate) struct DeliveryMeta<'a> {
     pub delivery: Option<Delivery>,
     pub queued_at_ms: Option<i64>,
+    /// The sender's own context as a JSON object string (AMUX-4693): device,
+    /// platform, app version, timezone, local clock time, and coordinates when
+    /// that device granted permission.
+    ///
+    /// `None` means THIS CLIENT TOLD US NOTHING, and must never be rendered as
+    /// an absent location or a zero fix. Every row written before 0074, and
+    /// every caller that is not a human send, is None forever.
+    pub client_meta: Option<&'a str>,
     /// AMUX-2643. None means "not verified", NEVER "failed" — the queued path
     /// has submitted nothing yet. Inventing one here would be the mislabelling
     /// 0014 exists to end.
@@ -4171,7 +4191,12 @@ pub(crate) struct DeliveryMeta<'a> {
 
 impl DeliveryMeta<'_> {
     pub(crate) fn board(at_ms: i64) -> Self {
-        Self { delivery: Some(Delivery::Board), queued_at_ms: Some(at_ms), submit_verdict: Some("accepted") }
+        Self {
+            delivery: Some(Delivery::Board),
+            queued_at_ms: Some(at_ms),
+            submit_verdict: Some("accepted"),
+            client_meta: None,
+        }
     }
     /// A send handed straight to a live lane, with nothing to verify.
     pub(crate) fn direct() -> Self {
@@ -4203,6 +4228,7 @@ impl DeliveryMeta<'_> {
             delivery: Some(Delivery::Queued),
             queued_at_ms: Some(at_ms),
             submit_verdict: None,
+            client_meta: None,
         }
     }
 }
@@ -4723,6 +4749,21 @@ async fn cmd_hist_record_with_id(
     let board_delivery = delivery.as_deref() == Some("board");
     let submit_verdict = meta.submit_verdict.map(|v| v.to_string());
     let queued_at_ms = meta.queued_at_ms;
+    // Bounded, and only if it parses as a JSON OBJECT. This lands in a column
+    // the Messages tab renders and the Ask panel feeds to a model, so a client
+    // must not be able to write a megabyte of arbitrary text into it, nor a
+    // bare string that every reader then has to defend against. A value that
+    // fails either test is dropped to None, which already means "this client
+    // told us nothing" — the one honest disposition for input we cannot read.
+    let client_meta = meta.client_meta.and_then(|raw| {
+        if raw.len() > CLIENT_META_MAX_BYTES {
+            return None;
+        }
+        serde_json::from_str::<Value>(raw)
+            .ok()
+            .filter(Value::is_object)
+            .map(|v| v.to_string())
+    });
     let now_ms = now_i64() * 1000;
 
     // DUPLICATE-DELIVERY DETECTOR (Ethan's standing rule, 2026-08-11: fix the
@@ -4841,11 +4882,12 @@ async fn cmd_hist_record_with_id(
                 dup_prior_ts_w.store(pts, std::sync::atomic::Ordering::SeqCst);
             }
             conn.execute(
-                "INSERT INTO cmd_history (text, type, session, ts, origin, delivery, queued_at, delivered_at, submit_verdict, capture_pending) \
-                 VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO cmd_history (text, type, session, ts, origin, delivery, queued_at, delivered_at, submit_verdict, capture_pending, client_meta) \
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 rusqlite::params![
                     text, ctype, session, now_ms, origin,
-                    delivery, queued_at_ms, delivered_at_ms, submit_verdict, capture_pending
+                    delivery, queued_at_ms, delivered_at_ms, submit_verdict, capture_pending,
+                    client_meta
                 ],
             )?;
             let row_id = conn.last_insert_rowid();
@@ -17019,6 +17061,17 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
         crate::db::interactions::spawn_blocking(move || backup_session_jsonl(&n, "pre_compact"));
     }
     let record_history = body.get("record_history").map(py_truthy).unwrap_or(false);
+    // The context the sender composed in (AMUX-4693). Serialised back to a
+    // string here rather than threaded as a `&Value` so the recorder's
+    // validation has exactly one input shape to defend, and so a caller that
+    // sends a bare string or a number is already indistinguishable from one
+    // that sent nothing at this point. Absent stays absent: no default object,
+    // because "{}" would claim a client reported and told us nothing, which is
+    // a different fact from not reporting.
+    let client_meta_raw: Option<String> = body
+        .get("client_meta")
+        .filter(|v| v.is_object())
+        .map(|v| v.to_string());
     let deliver_now = body.get("deliver_now").map(py_truthy).unwrap_or(false);
     let defer_busy = !(record_history || deliver_now);
     // [no-board] strip BEFORE anything is sent, and before the origin stamp
@@ -17192,10 +17245,15 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
             delivery: Some(deliv),
             queued_at_ms: q_at,
             submit_verdict: submit_verdict_of(&msg),
+            // Only on the HUMAN branch below. A lane-to-lane send has no
+            // composing human and no device, so attaching this to it would
+            // invent a sender context for a machine.
+            client_meta: None,
         };
         if record_history {
             let email = headers.get("x-amux-user-email").and_then(|v| v.to_str().ok()).unwrap_or("");
             let author = member_actor.as_deref().unwrap_or(email);
+            let meta = DeliveryMeta { client_meta: client_meta_raw.as_deref(), ..meta };
             cmd_hist_record_full(state, name, &orig_text, "user", author, skip_board, meta).await;
         } else if !origin.is_empty() && origin != name {
             cmd_hist_record_full(state, name, &orig_text, "session", &origin, false, meta).await;
@@ -17240,6 +17298,7 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
                 delivery: Some(Delivery::Direct),
                 queued_at_ms: None,
                 submit_verdict: Some(verdict),
+                client_meta: None,
             };
             if record_history {
                 let email =
@@ -23510,6 +23569,72 @@ mod tests {
         );
     }
 
+    /// AMUX-4693: the context a message was composed in is stored, and an
+    /// absent one stays absent.
+    ///
+    /// The NULL half is the one that matters. Every row written before 0074 and
+    /// every non-human send has no client, and a reader must be able to tell
+    /// "this client told us nothing" from "this client reported a location of
+    /// zero". A default `{}` here would collapse those two into one value and
+    /// no later query could separate them again.
+    #[tokio::test]
+    async fn a_senders_context_is_stored_and_its_absence_stays_absent() {
+        let (st, _dir) = state();
+        let meta_json = r#"{"device":"iPhone","tz":"America/New_York","tz_offset_min":-240,"geo":{"lat":40.7128,"lon":-74.006}}"#;
+        cmd_hist_record_full(&st, "lane-ctx", "from my phone", "user", "", true,
+                             DeliveryMeta { client_meta: Some(meta_json), ..DeliveryMeta::direct() }).await;
+        cmd_hist_record_full(&st, "lane-ctx", "from a lane", "session", "peer", true,
+                             DeliveryMeta::direct()).await;
+
+        let read = |text: &str| -> Option<String> {
+            st.store.read().unwrap()
+                .query_row("SELECT client_meta FROM cmd_history WHERE text=?1",
+                           [text], |r| r.get::<_, Option<String>>(0))
+                .unwrap()
+        };
+        let stored = read("from my phone").expect("a reported context must be stored");
+        let v: Value = serde_json::from_str(&stored).expect("stored as JSON");
+        assert_eq!(v["device"], json!("iPhone"));
+        assert_eq!(v["tz_offset_min"], json!(-240), "minutes EAST of UTC, the sign humans write");
+        assert_eq!(v["geo"]["lat"], json!(40.7128), "coordinates survive the round trip");
+        assert_eq!(read("from a lane"), None, "a send with no client reports nothing, not an empty object");
+    }
+
+    /// The column is written by a client, so it is not trusted: a blob that is
+    /// not a JSON OBJECT, or is larger than the ceiling, is dropped to the same
+    /// None as "told us nothing". It lands where the Messages tab renders it
+    /// and the Ask panel feeds it to a model, which is why the floor is a shape
+    /// check and not a length check alone.
+    #[tokio::test]
+    async fn an_unusable_sender_context_is_dropped_rather_than_stored() {
+        let (st, _dir) = state();
+        let huge = format!(r#"{{"device":"{}"}}"#, "x".repeat(CLIENT_META_MAX_BYTES));
+        let cases = [
+            ("bare string", r#""just a string""#),
+            ("array", r#"["not","an","object"]"#),
+            ("not json", "{definitely not json"),
+            ("oversized", huge.as_str()),
+        ];
+        for (name, raw) in cases {
+            cmd_hist_record_full(&st, "lane-bad", name, "user", "", true,
+                                 DeliveryMeta { client_meta: Some(raw), ..DeliveryMeta::direct() }).await;
+            let got: Option<String> = st.store.read().unwrap()
+                .query_row("SELECT client_meta FROM cmd_history WHERE text=?1", [name],
+                           |r| r.get(0))
+                .unwrap();
+            assert_eq!(got, None, "{name} must not be stored");
+        }
+        // CONTROL: the same path stores a well-formed object, so the four
+        // assertions above are a rejection and not a column that never writes.
+        cmd_hist_record_full(&st, "lane-bad", "good one", "user", "", true,
+                             DeliveryMeta { client_meta: Some(r#"{"device":"Mac"}"#), ..DeliveryMeta::direct() }).await;
+        let got: Option<String> = st.store.read().unwrap()
+            .query_row("SELECT client_meta FROM cmd_history WHERE text='good one'", [],
+                       |r| r.get(0))
+            .unwrap();
+        assert!(got.is_some_and(|g| g.contains("Mac")), "the validator must still accept a real object");
+    }
+
     /// THE DETECTOR MUST FIRE ON A CONCURRENT PAIR, NOT ONLY A SEQUENTIAL ONE
     /// (AF-483).
     ///
@@ -23680,7 +23805,7 @@ mod tests {
             "user",
             "",
             false,
-            DeliveryMeta { delivery: Some(Delivery::Direct), queued_at_ms: None, submit_verdict: Some("stuck") },
+            DeliveryMeta { delivery: Some(Delivery::Direct), queued_at_ms: None, submit_verdict: Some("stuck") , client_meta: None},
         )
         .await;
         let (ts, delivered) = last_row(&st);
@@ -23713,7 +23838,7 @@ mod tests {
         // The failed attempt.
         cmd_hist_record_full(
             &st, "lane-dup", text, "user", "", false,
-            DeliveryMeta { delivery: Some(Delivery::Direct), queued_at_ms: None, submit_verdict: Some("stuck") },
+            DeliveryMeta { delivery: Some(Delivery::Direct), queued_at_ms: None, submit_verdict: Some("stuck") , client_meta: None},
         )
         .await;
         // The detector's own query, verbatim, against the seeded table.
@@ -23825,6 +23950,7 @@ mod tests {
                 delivery: Some(Delivery::Queued),
                 queued_at_ms: Some(1_000),
                 submit_verdict: Some("retried"),
+                client_meta: None,
             },
         )
         .await;
@@ -24435,6 +24561,7 @@ mod tests {
                 delivery: Some(Delivery::Direct),
                 queued_at_ms: None,
                 submit_verdict: Some("confirmed"),
+                client_meta: None,
             },
         )
         .await;

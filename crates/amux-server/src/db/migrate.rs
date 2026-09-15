@@ -423,6 +423,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0073_command_intake",
         sql: include_str!("../../migrations/0073_command_intake.sql"),
     },
+    Migration {
+        version: 74,
+        name: "0074_cmd_history_client_meta",
+        sql: include_str!("../../migrations/0074_cmd_history_client_meta.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.

@@ -507,6 +507,11 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
             <input id="settings-device-name" type="text" autocomplete="off"
               onchange="saveDeviceName(this.value)">
           </div>
+          <div class="settings-row" id="settings-geo-row" style="margin-top:8px;">
+            <button class="btn" id="settings-geo-btn" onclick="_settingsToggleGeo()"
+              title="Attach this device's location to messages you send from it"></button>
+          </div>
+          <div id="settings-geo-status" style="font-size:0.72rem;color:var(--dim);margin-top:5px;"></div>
         </div>
         </div>
         <div class="settings-sep"></div>
