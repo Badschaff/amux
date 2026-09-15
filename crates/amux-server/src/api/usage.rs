@@ -1224,6 +1224,9 @@ fn trigger_label(t: &str) -> &'static str {
         // board_drive::record_prompt shipped, pickup turns had no row and were
         // credited to whatever prompt preceded them — including the human's.
         "pickup" => "amux handed this lane a board card",
+        // Live on this box: 573 turns and $320 in a day reading as "other"
+        // because only the steering spelling had a label (AMUX-4582).
+        "task-callback" => "a task callback from a peer",
         "system" => "an amux nudge",
         "direct" | "steering" => "a steering message",
         "" => "no prompt matched; the turn predates this lane's history",
@@ -2143,6 +2146,9 @@ mod usage_report_tests {
         // the question is "did amux hand me this", and the answer is yes.
         assert_eq!(trigger_label("steer:some-future-job"), "an amux nudge");
         assert_eq!(trigger_label("user"), "you typed it");
+        // Both spellings of the same thing read the same: cmd_history writes
+        // `task-callback`, steering writes the guard.
+        assert_eq!(trigger_label("task-callback"), trigger_label("steer:task-callback"));
     }
 
     #[test]
