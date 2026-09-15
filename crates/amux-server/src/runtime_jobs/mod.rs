@@ -54,6 +54,7 @@ pub mod board_hygiene;
 pub mod message_capture;
 pub mod browser_reaper;
 pub mod cdc_poller;
+pub mod codex_ledger;
 pub mod commit_mention_notes;
 pub mod commit_nudge;
 pub mod context_health;
