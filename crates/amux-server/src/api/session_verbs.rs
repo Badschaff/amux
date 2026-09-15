@@ -16736,18 +16736,45 @@ async fn lifecycle_peer_refusal(state: &AppState, name: &str, headers: &HeaderMa
         return None;
     }
     let (origin_lc, target_lc) = (lane_lifecycle(&origin), lane_lifecycle(name));
-    let reason = lifecycle_interaction_refusal(&origin, origin_lc, name, target_lc)?;
-    tracing::warn!(origin = %origin, target = %name, origin_lifecycle = origin_lc,
-        target_lifecycle = target_lc, verdict = "lifecycle_refused", "{reason}");
-    emit_event(state, name, "send.lifecycle_refused",
-        Some(json!({"origin": origin, "target": name,
-                    "origin_lifecycle": origin_lc, "target_lifecycle": target_lc})),
-        None, "lifecycle").await;
-    Some(jresp(StatusCode::CONFLICT, json!({
-        "ok": false, "error": reason, "blocked": "lifecycle", "code": "lifecycle_not_active",
-        "origin_lifecycle": origin_lc, "target_lifecycle": target_lc,
-        "what_to_do": "Only active workers interact. Resume the paused lane (amux resume <name>) or ask the owner; no approval grant changes this.",
-    })))
+    if let Some(reason) = lifecycle_interaction_refusal(&origin, origin_lc, name, target_lc) {
+        tracing::warn!(origin = %origin, target = %name, origin_lifecycle = origin_lc,
+            target_lifecycle = target_lc, verdict = "lifecycle_refused", "{reason}");
+        emit_event(state, name, "send.lifecycle_refused",
+            Some(json!({"origin": origin, "target": name,
+                        "origin_lifecycle": origin_lc, "target_lifecycle": target_lc})),
+            None, "lifecycle").await;
+        return Some(jresp(StatusCode::CONFLICT, json!({
+            "ok": false, "error": reason, "blocked": "lifecycle", "code": "lifecycle_not_active",
+            "origin_lifecycle": origin_lc, "target_lifecycle": target_lc,
+            "what_to_do": "Only active workers interact. Resume the paused lane (amux resume <name>) or ask the owner; no approval grant changes this.",
+        })));
+    }
+    // STOPPED is a THIRD state `lane_lifecycle` cannot see (Ethan, 2026-09-15):
+    // it reads only CC_ARCHIVED/CC_PAUSED from the env file, so a lane that
+    // crashed, was killed outside amux, or never started at all still reads
+    // "active" and sailed straight through the check above — accepted,
+    // queued, and silently stuck (the same shape as the 21-deep steering
+    // queue measured on a genuinely paused lane, but for a lane that isn't
+    // even formally paused). `is_running` is the same live probe
+    // `stop_session_process` already trusts for this exact question; the
+    // common case (tmux session gone entirely) answers from one cheap `tmux
+    // list-sessions` and never reaches the pane-capture path.
+    if !is_running(name).await {
+        tracing::warn!(origin = %origin, target = %name, verdict = "stopped_refused",
+            "interaction refused: '{name}' is not running");
+        emit_event(state, name, "send.stopped_refused",
+            Some(json!({"origin": origin, "target": name})), None, "lifecycle").await;
+        return Some(jresp(StatusCode::CONFLICT, json!({
+            "ok": false,
+            "error": format!(
+                "interaction refused: '{name}' is not running (no live worker process), so no \
+                 peer message reaches it."
+            ),
+            "blocked": "lifecycle", "code": "target_not_running",
+            "what_to_do": "Start or resume the worker before sending, or ask the owner; no approval grant changes this.",
+        })));
+    }
+    None
 }
 
 async fn isolated_peer_refusal(state: &AppState, name: &str, headers: &HeaderMap) -> Option<Response> {
@@ -22273,6 +22300,33 @@ mod tests {
         assert_eq!(body["target_lifecycle"], json!("paused"), "{body}");
         assert_eq!(body["origin_lifecycle"], json!("active"), "{body}");
         assert!(body.get("grant_id").is_none(), "no approval can make a paused lane a peer: {body}");
+    }
+
+    /// AMUX-4661: STOPPED is a third state AMUX-4566's own check cannot see —
+    /// `lane_lifecycle` reads only CC_ARCHIVED/CC_PAUSED, so a target that is
+    /// neither (crashed, killed outside amux, never started) reads "active"
+    /// and sailed through the check the test above pins. No real tmux
+    /// session exists under this test's throwaway name, so `is_running`
+    /// answers false for free — exactly the "gone entirely" case the fix
+    /// targets, with no tmux fixture required.
+    #[tokio::test]
+    async fn a_target_with_no_live_process_is_refused_even_though_its_lifecycle_reads_active() {
+        let (state, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("caller.env"), "CC_TAGS=alpha\n").unwrap();
+        // Neither CC_PAUSED nor CC_ARCHIVED: lane_lifecycle reads "active".
+        std::fs::write(sessions.join("crashed-lane.env"), "CC_TAGS=alpha\n").unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-amux-session", "caller".parse().unwrap());
+        let response = send_post(&state, "crashed-lane", &headers, &json!({"text": "do work"})).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["blocked"], json!("lifecycle"), "{body}");
+        assert_eq!(body["code"], json!("target_not_running"), "{body}");
+        assert!(body.get("grant_id").is_none(), "no approval can make a dead process a peer: {body}");
     }
 
     #[tokio::test]
