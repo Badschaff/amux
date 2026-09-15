@@ -1,6 +1,6 @@
 {
   "measured": true,
-  "n_considered": 2018,
+  "n_considered": 2019,
   "command_handlers": {
     "_applyEmbedView": {
       "kind": "command._applyEmbedView",
@@ -2470,6 +2470,12 @@
     },
     "_switchOrg": {
       "kind": "command._switchOrg",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_syncBannerBeacon": {
+      "kind": "command._syncBannerBeacon",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"

@@ -977,12 +977,67 @@ function _localStorageBytes() {
   }
   return bytes;
 }
+/// The sync banner, recorded (AMUX-4682).
+///
+/// Ethan screenshotted "Syncing 0/2" over two messages the server had already
+/// delivered, and read the worker as stuck. When I went to find out which two
+/// operations it was counting, the answer was that NOTHING recorded it: the
+/// client beacons a composer accept and a display join, and says nothing when
+/// it tells the reader that N operations are unsynced, or for how long. The
+/// most alarming thing this UI can say about delivery was the one thing it
+/// never wrote down (ethos rule 4: an output that can read "0 of 2" must
+/// publish whether the measurement ran).
+///
+/// SHAPE, NEVER TEXT. This card's own next_action asked for "the op labels",
+/// and that would have been wrong: `describeOp` embeds a 30-character preview
+/// of the message body for a send, so beaconing labels would ship worker
+/// message text to /api/client-debug. What goes out is the action, the target
+/// lane, and how long the entry has been queued — enough to identify the
+/// operations afterwards, with none of their content.
+let _syncBannerShownAt = 0;
+function _syncBannerBeacon(phase, items) {
+  try {
+    const list = Array.isArray(items) ? items : [];
+    const now = Date.now();
+    if (phase === 'shown') _syncBannerShownAt = now;
+    const shape = list.slice(0, 12).map(i => {
+      const q = i.item || {};
+      const url = String(q.url || '');
+      const m = url.match(/\/api\/sessions\/([^/?]+)(?:\/(\w+))?/);
+      return {
+        type: i.type || '',
+        status: i.status || '',
+        action: (m && m[2]) || ((q.options && q.options.method) || '').toLowerCase() || '',
+        target: m ? decodeURIComponent(m[1]).slice(0, 40) : '',
+        queued_s: q.queued_at ? Math.round((now - q.queued_at) / 1000) : null,
+        uncertain: !!(q.delivery_uncertain),
+      };
+    });
+    _outboxDiagnostic('sync_banner_' + phase, {
+      items: list.length,
+      done: list.filter(i => i.status === 'done').length,
+      failed: list.filter(i => i.status === 'failed').length,
+      skipped: list.filter(i => i.status === 'skipped').length,
+      up_ms: phase === 'cleared' && _syncBannerShownAt ? now - _syncBannerShownAt : 0,
+      ops: shape,
+      n_considered: list.length,
+    });
+    if (phase === 'cleared') _syncBannerShownAt = 0;
+  } catch (e) {}
+}
+
 function _outboxDiagnostic(verdict, fields) {
   try {
     fetch(API + '/api/client-debug', {method:'POST', _skipOutbox:true,
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({kind:'outbox-storage', verdict, ...fields,
-        measured:true, n_considered:1, ver:APP_VER})}).catch(() => {});
+      // DEFAULTS FIRST, then the caller's fields, so a caller that knows its
+      // real population can say so. This was the other way round, and the
+      // hardcoded `n_considered: 1` silently overwrote any caller that passed
+      // one — a constant standing where the diagnostic contract asks for a
+      // measurement, which is the shape that cannot disagree with the run
+      // whatever happened (found while building the banner beacon, AMUX-4682).
+      body:JSON.stringify({kind:'outbox-storage', verdict,
+        measured:true, n_considered:1, ver:APP_VER, ...fields})}).catch(() => {});
   } catch (_) {}
 }
 function _writeUserStorage(key, value) {
@@ -2924,7 +2979,9 @@ async function _runSyncBanner(quiet = false) {
     // The checklist replaces transient queue feedback, including a toast from
     // an offline write immediately before reconnect. Keep failure toasts intact.
     _clearSyncTransientToast();
+    const wasUp = banner.classList.contains('active');
     banner.classList.add('active');
+    if (!wasUp) _syncBannerBeacon('shown', items);
   }
 
   // A draft is a sequence of accepted writes. Keep its completed steps and
@@ -3052,7 +3109,13 @@ async function _runSyncBanner(quiet = false) {
   // badge and modal, so the sync banner does not need to stay up for them.
   if (!failCount) {
     _clearSyncTransientToast();
-    setTimeout(() => { if (!_syncFlight) banner.classList.remove('active'); }, 2000);
+    setTimeout(() => {
+      if (!_syncFlight) {
+        const wasUp = banner.classList.contains('active');
+        banner.classList.remove('active');
+        if (wasUp) _syncBannerBeacon('cleared', _syncChecklist);
+      }
+    }, 2000);
   }
 }
 
@@ -11120,7 +11183,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.966';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.967';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
