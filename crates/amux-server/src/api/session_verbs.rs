@@ -19156,6 +19156,81 @@ async fn subagent_event_post(state: &AppState, name: &str, ev: &str, body: &Valu
     }
 }
 
+/// The turn ended while this lane was still holding a card, and nothing was
+/// recorded about where that card stands (RR-0052, Invariant 4).
+///
+/// The invariant's other half shipped in 8ed50510: `amux board needs` and
+/// `amux board fail` gave a worker a first-class way to END a turn in BLOCKED
+/// or FAILED instead of stalling. This is the detector for the case those verbs
+/// exist to remove, and it runs on the one edge that proves a turn is over —
+/// the lane's own idle report.
+///
+/// NOT an alarm, and deliberately not a nudge. Crossing one turn boundary
+/// mid-card is ordinary: a lane works, stops, is told to continue, and resumes
+/// on the same attempt. What nobody could measure before is the DEPTH: an
+/// attempt on its fourteenth turn with no outcome is a stall, and it reads
+/// exactly like its first. So each row carries `turn_ends`, and the population
+/// is one row per turn boundary per held card rather than a rate that scales
+/// with reports (a lane holding nothing records nothing, and a `tool-hook`
+/// report is not a boundary).
+///
+/// The caller gates this on the active -> idle TRANSITION, so a lane that
+/// re-reports idle without having worked in between never reaches here. The
+/// count-derived idem key is the second line: two transitions racing each other
+/// compute the same key and `INSERT OR IGNORE` keeps one. It is not what makes
+/// repeat reports harmless, and it cannot be — the key advances as soon as the
+/// first row lands.
+async fn record_turn_end_without_outcome(state: &AppState, session: &str) {
+    let holds = {
+        let Ok(conn) = state.store.read() else { return };
+        match crate::db::attempts::open_holds_for_worker(&conn, session) {
+            Ok(h) => h,
+            Err(error) => {
+                tracing::warn!(
+                    target: "amux::board", session, %error,
+                    measured = false, n_considered = 0,
+                    verdict = "turn_end_holds_unreadable",
+                    "turn boundary: could not read what this lane is holding (RR-0052 Inv 4)"
+                );
+                return;
+            }
+        }
+    };
+    if holds.is_empty() {
+        return;
+    }
+    let now = now_i64();
+    for hold in holds {
+        let prior: i64 = {
+            let Ok(conn) = state.store.read() else { return };
+            conn.query_row(
+                "SELECT COUNT(*) FROM session_events \
+                 WHERE session = ?1 AND type = 'task.turn_ended_without_outcome' \
+                   AND idem LIKE ?2",
+                rusqlite::params![session, format!("turn-end:{}:{}:%", hold.card, hold.attempt)],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+        };
+        let idem = format!("turn-end:{}:{}:{}", hold.card, hold.attempt, prior);
+        emit_event(
+            state,
+            session,
+            "task.turn_ended_without_outcome",
+            Some(json!({
+                "issue": hold.card,
+                "attempt": hold.attempt,
+                "status": hold.status,
+                "held_s": (now - hold.started_at).max(0),
+                "turn_ends": prior + 1,
+            })),
+            Some(idem),
+            "session-report",
+        )
+        .await;
+    }
+}
+
 pub(crate) async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
     // ATTRIBUTION (AMUX-2646). A self-report is the one write in amux that is
     // ONLY ever legitimate from inside the session it describes: the hooks
@@ -19475,7 +19550,23 @@ pub(crate) async fn report_post(state: &AppState, name: &str, headers: &HeaderMa
                 "conv_id": conv_adopt.as_json(),
             }))
         }
-        Ok(_) => {
+        Ok(r) => {
+            // RR-0052 Invariant 4: the turn BOUNDARY, not every idle report.
+            // The write above reports a status change as a Session event, and
+            // that is the only thing here that can tell a lane which just
+            // finished a turn from one that has been idle and re-reports it.
+            // Counting reports instead would make the depth figure a function
+            // of how chatty a lane's hooks are.
+            let became_idle = st == "idle"
+                && r.events.iter().any(|e| {
+                    matches!(
+                        &e.mutation,
+                        amux_core::revision::MutationKind::StatusChanged { to, .. } if to == "idle"
+                    )
+                });
+            if became_idle {
+                record_turn_end_without_outcome(state, name).await;
+            }
             // REACTIVE STEERING DELIVERY: if the session just went idle and has
             // queued steering, deliver the oldest one NOW rather than waiting up
             // to 5s for the poll tick. The report IS the turn boundary — the
@@ -27588,6 +27679,101 @@ mod steer_boundary_tests {
         report_post(&state, "probe", &HeaderMap::new(), &json!({"state": "active", "source": "tool-hook"})).await;
         assert!(hb(&state, "L-MINE") > old, "the reporting lane's lease must be renewed");
         assert_eq!(hb(&state, "L-THEIRS"), old, "another lane's lease is not this report's to renew");
+    }
+
+    /// RR-0052 Invariant 4, the turn-end half. A lane that stops while still
+    /// holding a card owes an answer about where that card stands; when it
+    /// gives none, the boundary is recorded so the DEPTH of a stall is
+    /// measurable. Driven through `report_post` because the Stop hook is the
+    /// only producer of this edge.
+    #[tokio::test]
+    async fn a_turn_that_ends_still_holding_a_card_records_the_boundary_and_its_depth() {
+        let (state, _d) = tstate();
+        let claimed = now_f64() as i64 - 600;
+        state.store.write(move |conn| {
+            crate::db::attempts::ensure_table(conn)?;
+            for (id, owner) in
+                [("H-MINE", "probe"), ("H-THEIRS", "other"), ("H-SETTLED", "probe"), ("H-CLOSED", "probe")]
+            {
+                conn.execute(
+                    "INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type, \
+                     lease_owner,lease_acquired_at,lease_heartbeat_at,lease_expires_at,lease_generation) \
+                     VALUES (?1,?1,'',?2,?3,?4,?4,'agent','code',?3,?4,?4,?5,1)",
+                    rusqlite::params![id, "doing", owner, claimed, claimed + 1800],
+                )?;
+                conn.execute(
+                    "INSERT INTO task_attempts (card,attempt,worker,generation,started_at) VALUES (?1,1,?2,1,?3)",
+                    rusqlite::params![id, owner, claimed],
+                )?;
+            }
+            // Two ways an attempt stops being this turn's debt, each tested
+            // ALONE so neither clause can be dropped while the other covers
+            // for it. H-SETTLED said where the work landed; H-CLOSED is over.
+            conn.execute(
+                "UPDATE task_attempts SET outcome='review', to_status='review', ended_by='probe' \
+                 WHERE card='H-SETTLED'",
+                [],
+            )?;
+            conn.execute("UPDATE task_attempts SET ended_at=?1 WHERE card='H-CLOSED'", [claimed + 60])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+
+        let rows = |state: &AppState| -> Vec<(String, i64, i64)> {
+            let conn = state.store.read().unwrap();
+            let mut st = conn.prepare(
+                "SELECT data FROM session_events WHERE type='task.turn_ended_without_outcome' ORDER BY id"
+            ).unwrap();
+            let out: Vec<String> = st.query_map([], |r| r.get::<_, String>(0)).unwrap().flatten().collect();
+            out.iter()
+                .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+                .map(|v| (
+                    v["issue"].as_str().unwrap_or_default().to_string(),
+                    v["turn_ends"].as_i64().unwrap_or_default(),
+                    v["held_s"].as_i64().unwrap_or_default(),
+                ))
+                .collect()
+        };
+
+        // The turn is running, then it ends.
+        report_post(&state, "probe", &HeaderMap::new(), &json!({"state": "active", "source": "prompt-hook"})).await;
+        assert!(rows(&state).is_empty(), "a turn that is still running has not ended");
+        report_post(&state, "probe", &HeaderMap::new(), &json!({"state": "idle", "source": "stop-hook"})).await;
+        let first = rows(&state);
+        assert_eq!(
+            first.len(), 1,
+            "one row: H-THEIRS is another lane's, H-SETTLED recorded an outcome, H-CLOSED ended. got {first:?}"
+        );
+        assert_eq!(first[0].0, "H-MINE", "another lane's card is not this lane's turn to answer for");
+        assert_eq!(first[0].1, 1, "the first boundary this attempt has crossed");
+        assert!(first[0].2 >= 600, "held_s measures from the claim, got {}", first[0].2);
+
+        // A REPEAT IDLE REPORT IS NOT A SECOND TURN. This is the line that
+        // decides whether `turn_ends` measures stalling or hook chattiness:
+        // the lane never went active in between, so nothing ended.
+        report_post(&state, "probe", &HeaderMap::new(), &json!({"state": "idle", "source": "stop-hook"})).await;
+        assert_eq!(rows(&state).len(), 1, "an idle lane re-reporting idle has not ended another turn");
+
+        // A real second turn: active, then idle again. Same attempt, deeper.
+        report_post(&state, "probe", &HeaderMap::new(), &json!({"state": "active", "source": "prompt-hook"})).await;
+        report_post(&state, "probe", &HeaderMap::new(), &json!({"state": "idle", "source": "stop-hook"})).await;
+        let second = rows(&state);
+        assert_eq!(second.len(), 2, "the second boundary is its own row: {second:?}");
+        assert_eq!(second[1].1, 2, "depth advances with the attempt, not with reports");
+
+        // Answering closes it. Only the OUTCOME is written here, leaving
+        // `ended_at` NULL: saying where the work stands is what settles the
+        // debt, and testing it with both columns set would let either clause
+        // cover for the other.
+        state.store.write(|conn| {
+            conn.execute(
+                "UPDATE task_attempts SET outcome='review', to_status='review', ended_by='probe' \
+                 WHERE card='H-MINE'", [],
+            )?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        report_post(&state, "probe", &HeaderMap::new(), &json!({"state": "active", "source": "prompt-hook"})).await;
+        report_post(&state, "probe", &HeaderMap::new(), &json!({"state": "idle", "source": "stop-hook"})).await;
+        assert_eq!(rows(&state).len(), 2, "an attempt that recorded its outcome is not an open hold");
     }
 
     /// AMUX-3048: subagent start/stop events accumulate a live count in the same

@@ -5538,6 +5538,18 @@ fn advance_text(m: AdvanceMsg<'_>) -> String {
     } else {
         String::new()
     };
+    // The verb, spelled out. Every `amux board <verb>` here is a LITERAL
+    // because `tests/nudge_commands_exist.rs` matches `amux board [a-z]...`
+    // against the CLI's own dispatch table, and an interpolated verb is
+    // invisible to it — the nudge would be unchecked by the guard written to
+    // stop exactly this (AMUX-2140: a nudge named a verb nobody implemented,
+    // the CLI fell through to help and exited 0).
+    let advance_cmd = |card: &str, next: &str| match next {
+        "review" => format!("`amux board review {card}`"),
+        "done" => format!("`amux board done {card} --evidence-stdin`"),
+        "verified" => format!("`amux board verified {card}`"),
+        other => format!("`amux board status {card} {other}`"),
+    };
     let option_one = if reviewer_owns_gate {
         format!(
             "1) Address {}'s feedback, then ping them to re-ack (do NOT force).",
@@ -5545,10 +5557,13 @@ fn advance_text(m: AdvanceMsg<'_>) -> String {
         )
     } else {
         format!(
-            "1) Advance to '{}'. Gate:\n{}\n   Satisfy honestly and move it.",
-            m.gate_next, m.gate_txt
+            "1) Advance to '{}': {}. Gate:\n{}\n   Satisfy honestly and move it.",
+            m.gate_next,
+            advance_cmd(m.card, m.gate_next),
+            m.gate_txt
         )
     };
+    let close_cmd = advance_cmd(m.card, m.term);
     let ball = if m.ball_with_author.is_empty() {
         String::new()
     } else {
@@ -5557,10 +5572,12 @@ fn advance_text(m: AdvanceMsg<'_>) -> String {
     format!(
         "[amux] Idle with {} in '{}': {}{}\n\n\
          {}{}\n\
-         2) Finished? Close to {} with evidence.\n\
-         3) Blocked? Work the blocker. External block: `amux board backlog {} --trigger \"<condition>\"`.\n\
+         2) Finished? Close to {}: {}.\n\
+         3) Blocked? Work the blocker, or file it: `amux board needs {} \"<what it needs first>\"` \
+         (parks this card, resumes when the blocker lands). External: `amux board backlog {} --trigger \"<condition>\"`.\n\
          4) Needs You only under scoped categories: {}. Ordinary choices are yours.\n\
-         5) Mis-shaped (not done-able)? Discard or retype to watch.\n\n\
+         5) Cannot be done? `amux board fail {} --reason \"<why>\"` (quarantined, for the owner). \
+         Mis-shaped? Discard or retype to watch.\n\n\
          {} more queued. Update the card desc with current state before moving on.",
         m.card,
         m.status,
@@ -5569,8 +5586,11 @@ fn advance_text(m: AdvanceMsg<'_>) -> String {
         option_one,
         retype,
         m.term,
+        close_cmd,
+        m.card,
         m.card,
         m.approval_types,
+        m.card,
         m.queued,
     )
 }
@@ -13127,6 +13147,60 @@ mod tests {
         assert!(reviewer_acts_next("review"));
         assert!(reviewer_acts_next("done"));
         assert!(!reviewer_acts_next("doing"), "doing->review is not a sign-off");
+    }
+
+    /// RR-0052 Invariant 4. The verbs `needs` and `fail` shipped in 8ed50510
+    /// and the nudge that fires at every idle boundary named neither, so the
+    /// two exits a stuck worker most needs were reachable only by reading the
+    /// CLI help — a capability that exists and reaches nobody (ethos rule 1).
+    ///
+    /// Every exit is asserted as the COMMAND, not the word: "blocked" as prose
+    /// is what the nudge already said while the verb sat undiscovered.
+    #[test]
+    fn the_advance_nudge_names_every_exit_including_needs_and_fail() {
+        let text = advance_text(AdvanceMsg {
+            card: "AX-1",
+            status: "doing",
+            title: "A card in flight",
+            gate_next: "review",
+            gate_txt: "  [ ] Implemented and merged",
+            term: "done",
+            queued: 3,
+            reviewer: "",
+            ball_with_author: "",
+            item_type: "code",
+            has_evidence: true,
+            approval_types: "budget, customer_outbound",
+        });
+        for cmd in [
+            "amux board review AX-1",
+            "amux board done AX-1",
+            "amux board needs AX-1",
+            "amux board fail AX-1",
+            "amux board backlog AX-1",
+        ] {
+            assert!(text.contains(cmd), "the nudge must name `{cmd}`; got:\n{text}");
+        }
+        // A reviewer holding the gate changes who acts, not which exits exist:
+        // a lane waiting on feedback can still be blocked or defeated.
+        let waiting = advance_text(AdvanceMsg {
+            card: "AX-2",
+            status: "review",
+            title: "Waiting on a reviewer",
+            gate_next: "done",
+            gate_txt: "  [ ] Reviewed",
+            term: "verified",
+            queued: 0,
+            reviewer: "peer-lane",
+            ball_with_author: "",
+            item_type: "code",
+            has_evidence: true,
+            approval_types: "budget",
+        });
+        assert!(waiting.contains("peer-lane"), "the reviewer must still be named:\n{waiting}");
+        assert!(waiting.contains("amux board needs AX-2"), "a waiting card can still be blocked:\n{waiting}");
+        assert!(waiting.contains("amux board fail AX-2"), "a waiting card can still fail:\n{waiting}");
+        assert!(waiting.contains("amux board verified AX-2"), "its terminal is verified, not done:\n{waiting}");
     }
 
     // --- backlog triage ---------------------------------------------------

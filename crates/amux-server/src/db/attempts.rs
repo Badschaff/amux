@@ -203,6 +203,55 @@ pub fn running_attempt_numbers(conn: &Connection) -> rusqlite::Result<HashMap<St
     }
 }
 
+/// One card this worker is still holding with nothing recorded about how the
+/// work stands.
+pub struct OpenHold {
+    pub card: String,
+    pub attempt: i64,
+    pub status: String,
+    /// When the attempt began, in epoch SECONDS (the unit `task_attempts`
+    /// stores). The caller subtracts it from its own `now` rather than reading
+    /// a duration computed at a different moment than the decision.
+    pub started_at: i64,
+}
+
+/// What this worker is still holding, for the turn boundary (RR-0052 Inv 4).
+///
+/// Matched on the LEASE rather than on `task_attempts.worker`: the lease is
+/// what says the card is this lane's to move right now, and a rename moves
+/// `lease_owner` while the attempt keeps the name it was claimed under. Asking
+/// the attempt's worker instead would miss a renamed lane's own card.
+///
+/// Open means NOTHING has been recorded about where the work stands, so both
+/// halves of a close are checked. [`close_running`] writes `ended_at` and
+/// `outcome` together, and either one alone still answers the question this
+/// asks: an `outcome` says where the work landed, and an `ended_at` says the
+/// attempt is over and no longer this lane's to answer for.
+pub fn open_holds_for_worker(conn: &Connection, worker: &str) -> rusqlite::Result<Vec<OpenHold>> {
+    let inner = || -> rusqlite::Result<Vec<OpenHold>> {
+        let mut st = conn.prepare(
+            "SELECT a.card, a.attempt, i.status, a.started_at \
+             FROM task_attempts a JOIN issues i ON i.id = a.card \
+             WHERE i.lease_owner = ?1 AND i.deleted IS NULL \
+               AND a.ended_at IS NULL AND a.outcome IS NULL \
+             ORDER BY a.started_at",
+        )?;
+        let rows = st.query_map([worker], |r| {
+            Ok(OpenHold {
+                card: r.get(0)?,
+                attempt: r.get(1)?,
+                status: r.get(2)?,
+                started_at: r.get(3)?,
+            })
+        })?;
+        rows.collect()
+    };
+    match inner() {
+        Err(e) if missing_table(&e) => Ok(Vec::new()),
+        other => other,
+    }
+}
+
 /// Close running attempts whose card no longer holds a lease. Matched on the
 /// CARD, not the worker name: a lane rename moves `lease_owner` but keeps the
 /// attempt's `worker` as the name it held the card under, and that attempt is
