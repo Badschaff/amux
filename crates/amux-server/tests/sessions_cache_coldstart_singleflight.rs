@@ -128,9 +128,23 @@ fn structural_changes_fail_closed_instead_of_returning_the_raced_snapshot() {
         .nth(1)
         .and_then(|tail| tail.split("Ok(json)").next())
         .expect("sessions cache write-back moved or disappeared");
-    assert!(writeback.contains("registry_fingerprint() == registry_start"));
+    // AMUX-4637 moved the comparison into race_verdict and returns a typed
+    // DiscoveryRaced instead of an untyped bail!, so the write-back now hands
+    // both live readings to race_verdict and returns its error, and race_verdict
+    // must compare BOTH the epoch and the registry. Same property as before:
+    // any structural change during the build refuses the raced snapshot.
+    assert!(writeback.contains("race_verdict("));
     assert!(writeback.contains("SESSIONS_EPOCH.load"));
-    assert!(writeback.contains("anyhow::bail!"));
+    assert!(writeback.contains("registry_fingerprint()"));
+    assert!(writeback.contains("return Err(raced.into());"));
+    let verdict = SRC
+        .split("fn race_verdict(")
+        .nth(1)
+        .and_then(|tail| tail.split("\n}\n").next())
+        .expect("race_verdict moved or disappeared");
+    assert!(verdict.contains("epoch_now == epoch_start"));
+    assert!(verdict.contains("registry_now == registry_start"));
+    assert!(verdict.contains("Err(DiscoveryRaced)"));
     assert!(
         !writeback.contains("caller still gets"),
         "a response that raced an isolation/delete/config change must not be returned"
