@@ -87,6 +87,19 @@ async fn capture(
                 .into_response();
         }
     }
+    // This box runs 24/7 with nobody physically at it, so by the time
+    // anyone calls this endpoint macOS's displaysleep (10 min idle here)
+    // has almost always already fired. `screencapture` against a SLEEPING
+    // display exits 0 and writes a real, valid, near-solid-black PNG --
+    // no error text, nothing that looks like a failure. Confirmed live
+    // 2026-09-15: 68823 bytes / all black while asleep, 7477013 bytes /
+    // real content immediately after waking. `caffeinate -u` asserts the
+    // same "user is active" signal a trackpad touch would, which is the
+    // standard way to wake a display without synthesizing fake input.
+    let _ = tokio::process::Command::new("/usr/bin/caffeinate")
+        .args(["-u", "-t", "1"])
+        .spawn();
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
     // -x: no camera-shutter sound, no cursor. This is a headless server
     // capture, not a person taking a screenshot of their own action.
     let out = tokio::process::Command::new("/usr/sbin/screencapture")
@@ -97,15 +110,35 @@ async fn capture(
     match out {
         Ok(o) if o.status.success() && path.exists() => {
             let meta = tokio::fs::metadata(&path).await.ok();
+            let bytes = meta.map(|m| m.len()).unwrap_or(0);
+            // Not a lie-detector, a cheap honest signal: a 2560x1440 PNG
+            // that is actually solid (or near-solid) black -- asleep
+            // display, or any other reason the display had nothing to show
+            // -- compresses to well under 150KB every time we've measured
+            // it; a real desktop or even just the macOS lock screen wallpaper
+            // runs hundreds of KB to several MB. Below the line means "look
+            // at this before you trust it shows what you wanted", not "this
+            // definitely failed" -- ethos rule 4: the number that produced
+            // the verdict travels WITH the verdict, not just the verdict.
+            const SUSPICIOUSLY_SMALL_BYTES: u64 = 150_000;
+            let likely_blank_or_locked = bytes < SUSPICIOUSLY_SMALL_BYTES;
             tracing::info!(
                 target: "amux::screen", verdict = "capture_ok", measured = true, n_considered = 1,
-                bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0),
-                "screen capture written"
+                bytes, likely_blank_or_locked, "screen capture written"
             );
             Json(json!({
                 "ok": true,
                 "path": path.display().to_string(),
-                "bytes": meta.map(|m| m.len()).unwrap_or(0),
+                "bytes": bytes,
+                "likely_blank_or_locked": likely_blank_or_locked,
+                "note": if likely_blank_or_locked {
+                    "This capture is unusually small for a full-screen PNG, which every solid-black \
+                     frame we've seen has been -- the display may still not be showing real content. \
+                     Also note: macOS shows its OWN lock screen (not the real desktop) to ANY screen \
+                     capture while the Mac is locked, regardless of permission -- that is intentional \
+                     OS behavior with no app-level bypass. Fetch /api/screen/capture/file and look \
+                     before trusting this as \"what's on screen\"."
+                } else { "" },
                 "serve": "/api/screen/capture/file",
             }))
             .into_response()
