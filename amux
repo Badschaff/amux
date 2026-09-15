@@ -2485,7 +2485,8 @@ EOF
 # `$?` caller and every `&& echo moved` printed success on blocked mutations,
 # and a refused status PATCH left desc/status contradicting each other
 # fleet-visible. Codes: 0 ok · 3 gate not acknowledged · 4 WIP/holding limit ·
-# 5 rev mismatch · 1 other refusal or malformed response. Refusals print the
+# 5 rev mismatch · 1 other refusal or malformed response (including a
+# continuation refusal, which --checked cannot clear). Refusals print the
 # server body to STDERR so pipelines keep clean stdout.
 _board_outcome() {
   local _board_response
@@ -2641,7 +2642,24 @@ if "gate" in e:
                         + ("|".join(d.get("valid_types") or [])
                            or "see GET /api/board/contract") + ">")) + "\n")
     sys.exit(3)
-if "holding" in e or "doing" in e or "wip" in e:
+# AMUX-4570. A continuation refusal names doing in its code
+# (doing_requires_next_action, doing_next_action_not_a_sentence) and has
+# nothing to do with a held card. The WIP test below used to match any error
+# containing doing, so this refusal printed the override-doing hint and exited
+# 4, pointing at the one remedy that cannot clear it. Print the server remedy.
+if err in ("doing_requires_next_action", "doing_next_action_not_a_sentence"):
+    why = d.get("why") or ""
+    if why:
+        sys.stderr.write("\n" + str(why) + "\n")
+    how = str(d.get("how") or "amux board next <ID> \"<what the next actor should do>\"")
+    sys.stderr.write("\nSet the next action, then claim again:\n  " + how.replace("<ID>", iid) + "\n")
+    esc = d.get("escape")
+    if esc:
+        sys.stderr.write("  or, only when the next action is genuinely unknowable:\n  "
+                         + str(esc).replace("<ID>", iid) + "\n")
+    sys.exit(1)
+# A real WIP refusal carries a holding list and the error already holding doing.
+if d.get("holding") or "holding" in e or "wip" in e:
     if tgt:
         sys.stderr.write("\nFinish or demote the held card, or hold both deliberately:\n"
                          "  amux board " + tgt + " " + iid + " --override-doing\n")
