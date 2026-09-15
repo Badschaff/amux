@@ -1256,6 +1256,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/events", methods: &["GET"] },
     // -- board
     RouteEntry { path: "/api/board", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/board-lifecycle", methods: &["GET"] },
     RouteEntry { path: "/api/board/export", methods: &["GET"] },
     RouteEntry { path: "/api/board/statuses", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/board/statuses/reorder", methods: &["PUT"] },
@@ -2856,7 +2857,7 @@ fn round4(v: f64) -> f64 {
 /// Every family claimed by a NAMED tab. `http` is the complement of this set,
 /// so the two definitions cannot disagree about what "everything else" means.
 const NAMED_CATEGORY_FAMILIES: &[&str] = &[
-    "/api/board", "/api/schedules", "/api/cal-events", "/api/calendar",
+    "/api/board", "/api/board-lifecycle", "/api/schedules", "/api/cal-events", "/api/calendar",
     "/api/sessions", "/api/workers", "/api/sessions-git", "/api/channels",
     "/api/memory", "/api/memories", "/api/scope", "/api/notes",
     "/api/fs", "/api/file", "/api/files", "/api/upload", "/api/uploads", "/api/library",
@@ -2888,7 +2889,7 @@ fn families_for_category(cat: &str) -> Vec<&'static str> {
 /// category, and the All tab shows it regardless.
 fn category_of(family: &str) -> &'static str {
     match family {
-        "/api/board" | "/api/schedules" | "/api/cal-events" | "/api/calendar" => "board",
+        "/api/board" | "/api/board-lifecycle" | "/api/schedules" | "/api/cal-events" | "/api/calendar" => "board",
         "/api/sessions" | "/api/workers" | "/api/sessions-git" | "/api/channels" => "session",
         "/api/memory" | "/api/memories" | "/api/scope" | "/api/notes" => "memory",
         "/api/fs" | "/api/file" | "/api/files" | "/api/upload" | "/api/uploads"
