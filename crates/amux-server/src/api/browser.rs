@@ -1380,6 +1380,11 @@ fn start_status(e: &anyhow::Error) -> StatusCode {
         || e.downcast_ref::<chrome::ExternalProfileInUse>().is_some()
     {
         StatusCode::CONFLICT
+    } else if e.downcast_ref::<chrome::ProfileMissing>().is_some() {
+        // AMUX-4638: the request named a profile that does not exist. The
+        // caller fixes that by changing the request, so it is a 404, and a 5xx
+        // here sent a typo to every error sweep as a broken browser.
+        StatusCode::NOT_FOUND
     } else {
         StatusCode::BAD_GATEWAY
     }
@@ -3978,6 +3983,34 @@ mod tests {
         let error = body["error"].as_str().unwrap();
         assert!(error.contains("every retry would open another tab"), "{error}");
         assert!(error.contains("Do not retry"), "{error}");
+    }
+
+    /// AMUX-4638: a named profile with no source directory is 404. Built
+    /// through the real import function rather than a hand-made value, so a
+    /// construction site that stops producing `ProfileMissing` fails here too,
+    /// the seam `exit_zero_before_cdp...` closes for delegation.
+    #[test]
+    fn a_missing_named_profile_is_404_and_keeps_its_message() {
+        let home = tempfile::tempdir().unwrap();
+        let chrome_dir = home.path().join("chrome-udd");
+        std::fs::create_dir_all(&chrome_dir).unwrap();
+        let missing =
+            chrome::import_chrome_profile(home.path(), &chrome_dir, "no-such-profile").unwrap_err();
+        assert_eq!(start_status(&missing), StatusCode::NOT_FOUND);
+        let message = missing.to_string();
+        assert!(message.starts_with("Chrome profile \"no-such-profile\" does not exist at "), "{message}");
+        assert!(
+            message.ends_with("; create an amux profile with POST /api/browser/profile/create instead"),
+            "{message}"
+        );
+        let wrapped = chrome::import_chrome_profile(home.path(), &chrome_dir, "no-such-profile")
+            .unwrap_err()
+            .context("while starting the browser");
+        assert_eq!(start_status(&wrapped), StatusCode::NOT_FOUND);
+        // CONTROL: the decision is on the type. The same words in an untyped
+        // error stay 502, so rewording the message cannot change the status.
+        let untyped = anyhow::anyhow!("{message}");
+        assert_eq!(start_status(&untyped), StatusCode::BAD_GATEWAY);
     }
 
     /// The SEAM between "what Chrome did" and "which error type gets built".

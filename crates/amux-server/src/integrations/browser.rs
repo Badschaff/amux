@@ -217,11 +217,7 @@ pub fn import_chrome_profile(
     }
     let source = chrome_dir.join(name);
     if !source.is_dir() {
-        anyhow::bail!(
-            "Chrome profile {name:?} does not exist at {}; create an amux profile with POST \
-             /api/browser/profile/create instead",
-            source.display()
-        );
+        return Err(anyhow::Error::new(ProfileMissing { profile: name.to_string(), source }));
     }
 
     let parent = destination
@@ -2327,6 +2323,33 @@ impl std::fmt::Display for ExternalProfileInUse {
 }
 
 impl std::error::Error for ExternalProfileInUse {}
+
+/// The request named a Chrome profile that has no directory to import.
+///
+/// AMUX-4638: this left `start` as a 502, so a caller's typo reached every 5xx
+/// sweep as an upstream fault and was filed three times (AMUX-4431, AMUX-4509,
+/// AMUX-4638). Typed so the API answers 404 on the TYPE, the rule
+/// [`ProfileDelegated`] follows. Display reproduces the `bail!()` string it
+/// replaces exactly, so anything quoting the message sees no difference.
+#[derive(Debug)]
+pub struct ProfileMissing {
+    pub profile: String,
+    pub source: PathBuf,
+}
+
+impl std::fmt::Display for ProfileMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Chrome profile {:?} does not exist at {}; create an amux profile with POST \
+             /api/browser/profile/create instead",
+            self.profile,
+            self.source.display()
+        )
+    }
+}
+
+impl std::error::Error for ProfileMissing {}
 
 /// Is a Chrome that exited BEFORE CDP bound the delegation signature?
 ///
@@ -4671,6 +4694,7 @@ mod tests {
         assert!(escape.to_string().contains("[A-Za-z0-9._-]+"));
         let missing = import_chrome_profile(home.path(), &chrome, "missing").unwrap_err();
         assert!(missing.to_string().contains("does not exist"));
+        assert!(missing.downcast_ref::<ProfileMissing>().is_some(), "{missing}");
         assert!(!home.path().join("playwright-auth/profiles/missing").exists());
     }
 
