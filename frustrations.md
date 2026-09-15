@@ -3067,3 +3067,14 @@ CARD: AMUX-4689
 SYMPTOM: `scripts/test-contended.sh -p amux-server` printed 17 lines and exited 0 with NO TEST RUN. The budget guard had refused (`{"event": "cargo_budget_refused", "target_bytes": 48094199808, "free_bytes": 356396068864, "reason": "target_size"}`) and the wrapper reported that refusal as a successful run. The contention block still printed "A failure here is NOT build contention" and the worktree block still certified the tree was clean "in this build", both statements about a run that never happened.
 COST: I nearly cited it as the test evidence for AMUX-4527. The commit hook caught it instead, by a different route: "your last run EXITED 124 ... A red run vouches for nothing". Two instruments disagreed about the same run and only the incidental one was right. VERIFY.md's contract is to paste a command and its result line, and the result line here is an empty success.
 FIX: Exit non-zero on `cargo_budget_refused` — a refusal is not a pass, and every caller already handles a non-zero exit. And print the remedy in the same breath: the refusal names `target_bytes` and `reason` but not `scripts/cargo-target-guard.py clear --target <root> --path <candidate>`, which exists and is invisible from there. This is the wrapper's own principle (a green must carry "and nothing was building" beside it) applied to the cheaper half, since a run that did not happen is knowable with certainty rather than inferred.
+
+## Two report chores reached Done with incorrect required metrics
+AREA: gates
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-15
+SESSION: codex-lifecycle
+CARD: AF-393
+SYMPTOM: Fleet validation's MF-1178 and MHC-856 reached Done with claimed passing verification, but independent recomputation found five wrong values. Boolean presence flags were counted as present even when false; missing acceptance criteria were reported as zero instead of 11 and 15. Format, row-total and upper-bound checks passed without proving the requested results.
+COST: Two evaluator-assisted reopens and repeat worker execution were required to correct artifacts already presented as complete. Four other probes passed without evaluator correction; the bad values were detectable from the supplied input and were not a missing-data ambiguity.
+FIX: Open. Require outcome-specific artifact checks and retain their actual results in the completion path; a link, valid JSON and a worker's PASS statement are insufficient. Correcting these two artifacts did not fix the shared gate. Existing AF-393 carries the new evidence; docs/command-lifecycle-fleet-validation-2026-09-15.md records all 17 active workers and the test's limits.
