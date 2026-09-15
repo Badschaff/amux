@@ -7,6 +7,9 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use super::mdai::ModelClient;
 
 static MODEL: OnceLock<Arc<dyn ModelClient>> = OnceLock::new();
+/// AMUX-4655: a model call this slow is named in a WARN. The p50 is ~20 s on
+/// the amux Mac, so a lower floor would fire on most creates and teach nothing.
+const SLOW_MODEL_MS: u64 = 60_000;
 type LaneLocks = std::collections::HashMap<String, Weak<tokio::sync::Mutex<()>>>;
 static LOCKS: OnceLock<Mutex<LaneLocks>> = OnceLock::new();
 
@@ -48,12 +51,17 @@ pub struct Plan {
     pub n_considered: usize,
     pub n_available: usize,
     pub model: Option<String>,
+    /// AMUX-4655: wall time of the model call, None when no call was made.
+    /// A board create's latency is almost entirely this call (measured
+    /// 2026-09-15: creates that skip it return in ~0 s, creates that make it
+    /// take ~20 s at p50), so a slow create has to be able to say so.
+    pub model_ms: Option<u64>,
     #[serde(skip)] candidates: Vec<Candidate>,
 }
 impl Plan {
     fn create(reason: &str, candidates: Vec<Candidate>, available: usize, measured: bool) -> Self {
         Self { decision: Decision { action:"create".into(), task_id:None, reason:reason.into(), title:None, confidence:1.0 }, measured,
-            n_considered:candidates.len(), n_available:available, candidates, model:None }
+            n_considered:candidates.len(), n_available:available, candidates, model:None, model_ms:None }
     }
     pub fn preserve_structured_request(&mut self) {
         self.decision.action = "create".into();
@@ -61,8 +69,9 @@ impl Plan {
         self.decision.reason = "explicit task structure must be preserved in its own record".into();
     }
     pub fn log_line(&self) -> String {
-        format!("semantic intake: action={} target={} measured={} considered={}/{} reason={}", self.decision.action,
-            self.decision.task_id.as_deref().unwrap_or("new"), self.measured, self.n_considered, self.n_available, self.decision.reason)
+        let model_ms = self.model_ms.map_or_else(|| "-".to_string(), |ms| ms.to_string());
+        format!("semantic intake: action={} target={} measured={} considered={}/{} model_ms={} reason={}", self.decision.action,
+            self.decision.task_id.as_deref().unwrap_or("new"), self.measured, self.n_considered, self.n_available, model_ms, self.decision.reason)
     }
 }
 
@@ -173,14 +182,23 @@ pub async fn plan(store: &Store, session: &str, owner: &str, title: &str, descri
     let Some(client) = MODEL.get().cloned() else { return Plan::create("semantic provider unavailable or explicitly disabled; request preserved",candidates,available,false) };
     let model = super::mdai::resolve_model(None);
     let (t,d,rows,m) = (title.to_string(), description.to_string(), candidates.clone(), model.clone());
+    let started = std::time::Instant::now();
     let result = tokio::task::spawn_blocking(move || classify(client.as_ref(), &m, &t, &d, &rows)).await;
+    let model_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let mut plan = match result {
-        Ok(Ok(decision)) => Plan {decision, measured:true, n_considered:candidates.len(), n_available:available, model:Some(model), candidates},
+        Ok(Ok(decision)) => Plan {decision, measured:true, n_considered:candidates.len(), n_available:available, model:Some(model), model_ms:Some(model_ms), candidates},
         result => {
-            tracing::warn!(target:"amux::board_intake", error=?result, "semantic comparison unavailable; incoming request preserved");
-            Plan::create("semantic comparison failed; request preserved separately",candidates,available,false)
+            tracing::warn!(target:"amux::board_intake", error=?result, model_ms, "semantic comparison unavailable; incoming request preserved");
+            let mut failed = Plan::create("semantic comparison failed; request preserved separately",candidates,available,false);
+            failed.model_ms = Some(model_ms);
+            failed
         }
     };
+    if model_ms >= SLOW_MODEL_MS {
+        tracing::warn!(target:"amux::board_intake", verdict = "board_intake_model_slow", session, model_ms,
+            threshold_ms = SLOW_MODEL_MS, n_considered = plan.n_considered, measured = true,
+            "board intake model call was slow; the create waited on it");
+    }
     // A matching title alone never makes an unavailable model count as measured.
     if plan.decision.action == "create" { plan.decision.task_id = None; }
     tracing::info!(target:"amux::board_intake", session, decision=%plan.log_line(), "board intake compared");
@@ -299,6 +317,16 @@ mod tests {
             assert_eq!(result.decision.task_id.as_deref(), Some("AF-existing"));
         }
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn the_log_line_names_the_model_call_time() {
+        let mut plan = Plan::create("no open work in this ownership scope", vec![], 0, true);
+        assert!(plan.log_line().contains(" model_ms=- "), "{}", plan.log_line());
+        plan.model_ms = Some(21_697);
+        assert!(plan.log_line().contains(" model_ms=21697 "), "{}", plan.log_line());
+        let body = serde_json::to_value(&plan).unwrap();
+        assert_eq!(body["model_ms"], serde_json::json!(21_697), "the create response carries it: {body}");
     }
 
     #[test]
