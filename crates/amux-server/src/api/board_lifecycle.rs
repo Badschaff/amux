@@ -682,7 +682,9 @@ async fn capture_inner(
     }
     let hash = format!("{:x}", Sha256::digest(text.as_bytes()));
     let prior_pending = { let c = state.store.read()?;
-        c.query_row("SELECT id FROM cmd_history WHERE session=?1 AND intake_hash=?2 AND id<?3 AND capture_pending!=0 ORDER BY id LIMIT 1",rusqlite::params![session,hash,id],|r|r.get::<_,i64>(0)).optional()? };
+        // A second receipt may arrive before the first planner has claimed its
+        // hash. The durable text and receipt order already identify the original.
+        c.query_row("SELECT id FROM cmd_history WHERE session=?1 AND (intake_hash=?2 OR text=?4) AND id<?3 AND capture_pending!=0 ORDER BY id LIMIT 1",rusqlite::params![session,hash,id,text],|r|r.get::<_,i64>(0)).optional()? };
     if let Some(prior) = prior_pending {
         state.store.write_async(move |c| {
             c.execute("UPDATE cmd_history SET intake_hash=?2,intake_result=?3 WHERE id=?1",rusqlite::params![id,hash,json!({"state":"waiting","waiting_on":prior,"cache":"identical_pending_request"}).to_string()])?;
@@ -914,6 +916,30 @@ mod tests {
         let saved:Value=serde_json::from_str(&raw).unwrap();
         assert_eq!(saved["response"],"not JSON");
         assert_eq!(saved["telemetry"]["attempt_usage"][0]["input_tokens"],120);
+        assert_eq!(c.query_row("SELECT COUNT(*) FROM issues",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    }
+
+    #[tokio::test]
+    async fn simultaneous_receipt_waits_even_before_original_hash_is_claimed() {
+        struct Never;
+        impl mdai::ModelClient for Never {
+            fn complete(&self, _: &str, _: &str) -> Result<String,String> {
+                panic!("duplicate receipt bought another interpretation")
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::db::Store::open(&temp.path().join("duplicate.db")).unwrap());
+        store.write_async(|c| {
+            receipt(c,1,"Produce the fixture reports and check them");
+            receipt(c,2,"Produce the fixture reports and check them");
+            Ok(WriteOutcome{applied:true,events:vec![]})
+        }).await.unwrap();
+        let state = AppState { store, started:std::time::Instant::now(),build_hash:"test".into(),auth_token:None,reconciled:Arc::new(std::sync::atomic::AtomicBool::new(true)) };
+        capture_inner(&state,2,"fixture",Arc::new(Never)).await.unwrap();
+        let c=state.store.read().unwrap();
+        let raw:String=c.query_row("SELECT intake_result FROM cmd_history WHERE id=2",[],|r|r.get(0)).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&raw).unwrap()["waiting_on"],1);
+        assert_eq!(c.query_row("SELECT SUM(intake_attempts) FROM cmd_history",[],|r|r.get::<_,i64>(0)).unwrap(),0);
         assert_eq!(c.query_row("SELECT COUNT(*) FROM issues",[],|r|r.get::<_,i64>(0)).unwrap(),0);
     }
 
