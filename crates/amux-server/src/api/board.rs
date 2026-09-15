@@ -2308,6 +2308,11 @@ pub(crate) struct CallbackDispatch {
     pub attempted: usize,
     pub queued: usize,
     pub refused: usize,
+    /// AMUX-4558: callbacks closed without sending, because a discarded
+    /// capture shell owes its sender nothing. Counted rather than silent: a
+    /// drop nobody can see is how a cleanup that sends nothing and a cleanup
+    /// that sends 118 receipts look identical in the log.
+    pub suppressed: usize,
 }
 
 /// Drain terminal task callbacks through the same durable steering path as all
@@ -2421,6 +2426,48 @@ pub(crate) async fn dispatch_pending_callbacks(
         // request without resolving the dependency" puts a false accusation in
         // front of the one party who will act on it.
         let folded = bs::folded_into_detail(row.log.as_deref());
+        // AMUX-4558. The sender of a captured message made no request, so a
+        // discard owes them no receipt. Suppressed here rather than at arming
+        // time because only this point knows whether the discard was a FOLD:
+        // `folded_into` is written on the way out, and a fold DOES owe the
+        // sender the id their content moved to.
+        if folded.is_none() && bs::is_capture_shell(&row) && row.status == "discarded" {
+            report.suppressed += 1;
+            let id_w = row.id.clone();
+            let stable_w = stable_id.clone();
+            let _ = state
+                .store
+                .write_async(move |conn| {
+                    let Some(mut latest) = bs::get_issue(conn, &id_w)? else {
+                        return Ok(no_write());
+                    };
+                    if latest.callback_message_id.as_deref() != Some(stable_w.as_str()) {
+                        return Ok(no_write());
+                    }
+                    latest.callback_state = Some("suppressed".into());
+                    latest.callback_error = None;
+                    latest.updated = now_secs();
+                    latest.rev += 1;
+                    latest.version += 1;
+                    bs::save_patched(conn, &mut latest)?;
+                    Ok(WriteOutcome {
+                        applied: true,
+                        events: vec![ev_snap(&latest, MutationKind::Updated)],
+                    })
+                })
+                .await;
+            tracing::info!(
+                marker = "callbacks_suppressed_capture_discard",
+                verdict = "callbacks_suppressed_capture_discard",
+                task_id = %row.id,
+                target_session = %target,
+                sender = %row.session.as_deref().unwrap_or("board"),
+                measured = true,
+                n_considered = 1,
+                "closed a capture-discard callback instead of sending a receipt for a message that was not a request"
+            );
+            continue;
+        }
         let folded_note;
         let resolution = if let Some((target, inferred)) = folded.as_ref() {
             // AF-616: an INFERRED target was chosen by adjacency and nothing
@@ -2437,14 +2484,11 @@ pub(crate) async fn dispatch_pending_callbacks(
             folded_note.as_str()
         } else if bs::dependency_is_resolved(&row.status, &row.item_type) {
             "resolved the dependency"
-        } else if bs::is_capture_shell(&row) && row.status == "discarded" {
-            // AF-634. The reader of this sentence is the SENDER of a message,
-            // and "closed the request without resolving the dependency" tells
-            // them a request they never made was dropped. ts-gke received 19 of
-            // these in a night and nearly enumerated all of them before seeing
-            // the shape. Nothing about DELIVERY changes here; only the claim.
-            "discarded the capture of a message you sent, which is not a request and owed you nothing"
         } else {
+            // AF-634's wording for an unfolded capture discard ("owed you
+            // nothing") used to live here. It is gone because that case no
+            // longer reaches this point: AMUX-4558 closes the callback above
+            // instead of composing a receipt. Its reasoning is kept there.
             "closed the request without resolving the dependency"
         };
         let mut prompt = format!(
@@ -2658,6 +2702,121 @@ mod callback_dispatch_tests {
         }).expect("create and complete request");
         let created_id = id.lock().unwrap().clone();
         created_id
+    }
+
+    /// A capture shell: the card amux makes out of somebody's inbound message.
+    /// `fold_target` writes the server's own fold marker into the log.
+    fn capture_shell(state: &AppState, fold_target: Option<&str>) -> String {
+        let new = bs::NewIssue {
+            title: "whats the status on the rollout".into(),
+            desc: "**Prompt:** whats the status on the rollout".into(),
+            status: "todo".into(),
+            session: Some("worker-b".into()),
+            item_type: "code".into(),
+            creator: "amux".into(),
+            owner_type: "agent".into(),
+            due: None,
+            due_time: None,
+            reviewer: None,
+            shepherd: None,
+            gate: vec![],
+            depends_on: vec![],
+            tags: vec![],
+            ask_type: None,
+            ask_question: None,
+            ask_unblocks: None,
+            ask_actor: None,
+            source: Some("agent".into()),
+            requested_by: Some("worker-a".into()),
+            callback_session: Some("worker-a".into()),
+            callback_prompt: None,
+        };
+        let fold = fold_target.map(str::to_owned);
+        let id = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let id_w = id.clone();
+        state.store.write(move |conn| {
+            let mut row = bs::create_issue(conn, &new, 1000)?;
+            if let Some(target) = &fold {
+                row.log = Some(format!("`09:15` capture folded into {target}"));
+            }
+            row.status = "discarded".into();
+            row.updated = 2000;
+            row.rev += 1;
+            row.version += 1;
+            bs::save_patched(conn, &mut row)?;   // armed -> pending on discard
+            *id_w.lock().unwrap() = row.id;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).expect("create and discard the capture");
+        let created = id.lock().unwrap().clone();
+        created
+    }
+
+    fn queued_for(state: &AppState, id: &str) -> i64 {
+        let conn = state.store.read().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM steering_queue WHERE id=?1",
+            [format!("task-callback-{id}")], |r| r.get(0)).unwrap()
+    }
+
+    /// AMUX-4558. Discarding a capture shell used to send its sender a receipt
+    /// for a message that was never a request: one cleanup on backend's board
+    /// would have sent 118 of them to ~20 lanes, and ts-gke got 19 in a night.
+    /// AF-634 fixed the WORDS of that receipt; a message saying it owed you
+    /// nothing is still a message, so now the callback is closed instead.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_discarded_capture_shell_closes_its_callback_instead_of_sending_a_receipt() {
+        let home = tempfile::tempdir().unwrap();
+        // Delivery reads the session env file, and without this the callbacks
+        // are refused with "no-env-file" rather than sent. The guard also holds
+        // the test-env lock, so this test cannot borrow another test's HOME:
+        // that is what made an earlier cut of it pass for the wrong reason.
+        let _home_guard = crate::api::settings::test_env::set_home(home.path());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        for worker in ["worker-a", "worker-b"] {
+            std::fs::write(home.path().join(format!("sessions/{worker}.env")), "CC_TAGS=\"test\"\n").unwrap();
+        }
+        let state = state(home.path());
+
+        let shell = capture_shell(&state, None);
+        let report = dispatch_pending_callbacks(&state, Some(&shell)).await;
+        assert_eq!(
+            (report.attempted, report.queued, report.suppressed, report.refused),
+            (1, 0, 1, 0),
+            "an unfolded capture discard is counted as suppressed, not sent"
+        );
+        assert_eq!(queued_for(&state, &shell), 0, "nothing may reach the sender's queue");
+        {
+            let conn = state.store.read().unwrap();
+            let row = bs::get_issue(&conn, &shell).unwrap().unwrap();
+            assert_eq!(row.callback_state.as_deref(), Some("suppressed"),
+                "the callback is CLOSED, not left pending for the next tick to retry");
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM cmd_history WHERE type='task-callback'",
+                [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        }
+        // A second pass must not find it again: a suppressed callback is terminal.
+        let again = dispatch_pending_callbacks(&state, Some(&shell)).await;
+        assert_eq!((again.attempted, again.suppressed), (0, 0), "suppression is not a retry loop");
+
+        // CONTROL 1: a FOLD still delivers. The sender learns which card their
+        // content became, which is worth the turn it costs them.
+        let folded = capture_shell(&state, Some("REAL-42"));
+        let report = dispatch_pending_callbacks(&state, Some(&folded)).await;
+        assert_eq!((report.queued, report.suppressed), (1, 0), "a fold is not suppressed");
+        assert_eq!(queued_for(&state, &folded), 1);
+        {
+            let conn = state.store.read().unwrap();
+            let text: String = conn.query_row(
+                "SELECT text FROM cmd_history WHERE session='worker-a' AND type='task-callback'",
+                [], |r| r.get(0)).unwrap();
+            assert!(text.contains("folded this capture into REAL-42"), "{text}");
+        }
+
+        // CONTROL 2: a real request that is discarded still reports back. Only
+        // the capture shell is exempt, and `is_capture_shell` is what separates
+        // them; without this the fix would silence genuine requesters.
+        let request = request_at(&state, "discarded");
+        let report = dispatch_pending_callbacks(&state, Some(&request)).await;
+        assert_eq!((report.queued, report.suppressed), (1, 0), "a real request still gets its answer");
+        assert_eq!(queued_for(&state, &request), 1);
     }
 
     /// Code completion has two edges: done records implementation, verified
@@ -12078,6 +12237,7 @@ pub async fn patch_item(
                     "attempted": dispatch.attempted,
                     "queued": dispatch.queued,
                     "refused": dispatch.refused,
+                    "suppressed": dispatch.suppressed,
                 });
                 if let Ok(conn) = state.store.read() {
                     if let Ok(Some(latest)) = bs::get_issue(&conn, &id) {

@@ -7874,6 +7874,7 @@ pub fn spawn(state: AppState) -> super::PeriodicTask {
                     attempted = callbacks.attempted,
                     queued = callbacks.queued,
                     refused = callbacks.refused,
+                    suppressed = callbacks.suppressed,
                     "[board-drive] terminal task callbacks"
                 );
             }
