@@ -7,7 +7,7 @@ test('LC-GATE-REVISION: edit criteria on a verified task, inspect stale evidence
   const r=await request.post('/api/board',{headers,data:{title:'Gate revision acceptance '+info.project.name,type:'chore',gate:first}});
   expect(r.ok()).toBe(true);const card=await r.json();const url='/api/board/'+card.id;
   try {
-    const checked=await request.patch(url,{headers,data:{evidence:'Independent fixture check passed before the criteria amendment.'}});expect(checked.ok(),await checked.text()).toBe(true);
+    const checked=await request.patch(url,{headers,data:{evidence:'Independent fixture check passed before the criteria amendment: e2e/lifecycle/gate-revision.spec.ts'}});expect(checked.ok(),await checked.text()).toBe(true);
     await page.goto('/#issue='+card.id);
     await expect(page.locator('#board-detail-overlay')).toHaveClass(/active/);
     await page.locator('#bd-status-select').selectOption('verified');

@@ -3486,7 +3486,7 @@ async fn a_gate_that_asks_you_to_name_the_peer_refuses_until_a_peer_is_named() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "status": "verified", "gate_checked": ack })),
+        Some(json!({ "status": "verified", "gate_checked": ack, "evidence": EV })),
         &[("X-Amux-Session", "amux-frustrations")],
     )
     .await;
@@ -3518,7 +3518,7 @@ async fn a_gate_that_asks_you_to_name_the_peer_refuses_until_a_peer_is_named() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "status": "verified", "gate_checked": ack })),
+        Some(json!({ "status": "verified", "gate_checked": ack, "evidence": EV })),
         &[("X-Amux-Session", "amux")],
     )
     .await;
@@ -3543,7 +3543,7 @@ async fn a_gate_that_asks_you_to_name_the_peer_refuses_until_a_peer_is_named() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "status": "verified", "gate_checked": ack })),
+        Some(json!({ "status": "verified", "gate_checked": ack, "evidence": EV })),
         &[("X-Amux-Session", "amux-frustrations")],
     )
     .await;
@@ -5409,7 +5409,7 @@ async fn verified_refuses_a_blanket_ack_and_takes_the_enumeration() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "status": "verified", "gate_ack": true })),
+        Some(json!({ "status": "verified", "gate_ack": true, "evidence": EV })),
     )
     .await;
     assert_eq!(st, StatusCode::CONFLICT, "blanket ack must be refused: {v}");
@@ -5438,7 +5438,7 @@ async fn verified_refuses_a_blanket_ack_and_takes_the_enumeration() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "status": "verified", "gate_checked": gate })),
+        Some(json!({ "status": "verified", "gate_checked": gate, "evidence": EV })),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "enumerated ack must be accepted: {v}");
@@ -5460,7 +5460,7 @@ async fn the_blanket_ack_refusal_is_narrow_by_design() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "status": "verified", "gate_ack": true })),
+        Some(json!({ "status": "verified", "gate_ack": true, "evidence": EV })),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "single-criterion gate must still take an ack: {v}");
@@ -5508,10 +5508,55 @@ async fn the_contract_publishes_every_machine_checked_constraint() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "status": "verified", "gate_ack": true })),
+        Some(json!({ "status": "verified", "gate_ack": true, "evidence": EV })),
     )
     .await;
     assert_eq!(refused["code"], "verified_requires_gate_checked");
+}
+
+/// AMUX-4657: `verified` asks for the evidence `done` asks for. The rule bound
+/// the done target only, so a card that never passed done reached verified
+/// with evidence null: mixpeek-homepage-claude saw done refuse MHC-844..847 for
+/// missing evidence, then `amux board verified --checked ...` moved the same
+/// cards from backlog to verified. This card is a one-criterion investigation,
+/// so a blanket ack clears its verified gate and the evidence rule is the only
+/// thing left that can refuse it.
+#[tokio::test]
+async fn verified_requires_the_evidence_done_requires() {
+    let (app, _tmp) = app();
+    let c = create(&app, json!({ "title": "looked again", "type": "investigation", "status": "backlog" })).await;
+    let id = c["id"].as_str().unwrap().to_string();
+    assert_eq!(c["status"], json!("backlog"), "{c}");
+    let url = format!("/api/board/{id}");
+
+    let (st, _, v) = send(&app, "PATCH", &url, Some(json!({ "status": "verified", "gate_ack": true }))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], json!("verified_requires_evidence"), "{v}");
+    assert!(v["error"].as_str().unwrap_or("").starts_with("verified requires evidence"), "{v}");
+    assert!(
+        v["how_to_fix"]["cli"].as_str().unwrap_or("").starts_with(&format!("amux board verified {id} ")),
+        "the remedy names the verb that was refused: {v}"
+    );
+
+    let (st, _, v) =
+        send(&app, "PATCH", &url, Some(json!({ "status": "verified", "gate_ack": true, "evidence": "implemented" }))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], json!("verified_evidence_has_no_artifact"), "{v}");
+
+    let (st, _, v) =
+        send(&app, "PATCH", &url, Some(json!({ "status": "verified", "gate_ack": true, "evidence": "none: n/a" }))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], json!("verified_evidence_none_unexplained"), "{v}");
+
+    let (st, _, v) = send(&app, "PATCH", &url, Some(json!({ "status": "verified", "gate_ack": true, "evidence": EV }))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], json!("verified"), "{v}");
+
+    let (st, _, contract) = send(&app, "GET", "/api/board/contract", None).await;
+    assert_eq!(st, StatusCode::OK);
+    let rule = &contract["done_requires_evidence"];
+    assert!(rule["enforced"].as_str().unwrap_or("").contains("done or verified"), "{rule}");
+    assert_eq!(rule["codes"]["verified"][0], json!("verified_requires_evidence"), "{rule}");
 }
 
 // ---- full export (AMUX-3868) ---------------------------------------------
@@ -6076,7 +6121,7 @@ async fn changed_verified_gate_preserves_history_and_rejects_the_old_checklist()
     let second = vec!["Report total equals 42", "Peer checked malformed input", "Duplicate invoices are rejected"];
     let card = create(&app, json!({"title":"gate revision acceptance", "type":"chore", "gate": first})).await;
     let path = format!("/api/board/{}", card["id"].as_str().unwrap());
-    let (st, _, result) = send(&app, "PATCH", &path, Some(json!({"status":"verified", "gate_checked":first}))).await;
+    let (st, _, result) = send(&app, "PATCH", &path, Some(json!({"status":"verified", "evidence":EV, "gate_checked":first}))).await;
     assert_eq!(st, StatusCode::OK, "{result}");
     let (_, _, initial) = send(&app, "GET", &path, None).await;
     assert_eq!(initial["verification"]["gate_matches"], true);
@@ -6086,9 +6131,9 @@ async fn changed_verified_gate_preserves_history_and_rejects_the_old_checklist()
     assert_eq!(revised["status"], "verified", "preserve historical status while naming stale coverage");
     assert_eq!(revised["verification"]["state"], "needs_reverification");
     assert_eq!(revised["verification"]["gate_snapshot"], json!(first));
-    let (st, _, refused) = send(&app, "PATCH", &path, Some(json!({"status":"verified", "reverify":true, "gate_checked":first}))).await;
+    let (st, _, refused) = send(&app, "PATCH", &path, Some(json!({"status":"verified", "evidence":EV, "reverify":true, "gate_checked":first}))).await;
     assert_eq!(st, StatusCode::CONFLICT, "recheck must enforce amended criteria: {refused}");
-    let (st, _, checked) = send(&app, "PATCH", &path, Some(json!({"status":"verified", "reverify":true, "gate_checked":second}))).await;
+    let (st, _, checked) = send(&app, "PATCH", &path, Some(json!({"status":"verified", "evidence":EV, "reverify":true, "gate_checked":second}))).await;
     assert_eq!(st, StatusCode::OK, "{checked}");
     let (_, _, rechecked) = send(&app, "GET", &path, None).await;
     assert_eq!(rechecked["verification"]["state"], "current");
@@ -6096,10 +6141,10 @@ async fn changed_verified_gate_preserves_history_and_rejects_the_old_checklist()
 
     let other = create(&app, json!({"title":"new gate acceptance", "type":"chore", "gate":second})).await;
     let other_path = format!("/api/board/{}", other["id"].as_str().unwrap());
-    let (st, _, refused) = send(&app, "PATCH", &other_path, Some(json!({"status":"verified", "gate_checked":first}))).await;
+    let (st, _, refused) = send(&app, "PATCH", &other_path, Some(json!({"status":"verified", "evidence":EV, "gate_checked":first}))).await;
     assert_eq!(st, StatusCode::CONFLICT, "{refused}");
     assert_eq!(refused["missing"], json!(["Duplicate invoices are rejected"]));
-    let (st, _, result) = send(&app, "PATCH", &other_path, Some(json!({"status":"verified", "gate_checked":second}))).await;
+    let (st, _, result) = send(&app, "PATCH", &other_path, Some(json!({"status":"verified", "evidence":EV, "gate_checked":second}))).await;
     assert_eq!(st, StatusCode::OK, "{result}");
     let (_, _, checked) = send(&app, "GET", &other_path, None).await;
     assert_eq!(checked["verification"]["state"], "current");

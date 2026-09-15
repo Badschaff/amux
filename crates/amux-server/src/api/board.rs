@@ -1257,11 +1257,16 @@ async fn get_contract(
         // 1372 open cards, measured 2026-08-29). Published here for the AF-112
         // reason the `verified` block gives below.
         "done_requires_evidence": {
-            "rule": "a card entering done must carry `evidence`: what was actually run or produced",
+            "rule": "a card entering done or verified must carry `evidence`: what was actually run or produced",
             "why": "the asset-link rule looks for a path-shaped token anywhere in the desc, which the FILING supplies — a card that names the file it intends to edit passes its own done gate before anyone touches that file",
             "accepts": "a command (backticked, or on a `$ ` line), a repo file path, a URL, a commit sha, a #PR — or `none: <reason>` (3+ words) when the card genuinely produced no artifact",
             "field": "`evidence`, writable on its own so it can be recorded BEFORE the transition that needs it",
-            "enforced": "server-validated on any transition to done; force bypasses it (logged); gate_ack cannot",
+            "enforced": "server-validated on any transition to done or verified; force bypasses it (logged); gate_ack cannot",
+            "verified_too": "AMUX-4657: a card moved straight to verified used to skip this rule, so verified applies it as well",
+            "codes": {
+                "done": ["done_requires_evidence", "done_evidence_has_no_artifact", "done_evidence_none_unexplained"],
+                "verified": ["verified_requires_evidence", "verified_evidence_has_no_artifact", "verified_evidence_none_unexplained"],
+            },
             "override": "set AMUX_DONE_EVIDENCE_REQUIRED=0 in a worker's / group's / global configuration to opt that level out",
             "what_to_run": "the repo's VERIFY.md names the proof for each surface",
         },
@@ -10283,25 +10288,36 @@ pub async fn patch_item(
                     // with no artifact anywhere still gets the older, broader
                     // message it has always got, and this narrower one fires
                     // only once that has been satisfied.
+                    // AMUX-4657: `verified` carries the same rule. It bound `done`
+                    // only, so a card moved straight to verified skipped it:
+                    // mixpeek-homepage-claude saw done refuse MHC-844..847 for
+                    // missing evidence, then moved the same cards from backlog to
+                    // verified with evidence still null. Verified is the stronger
+                    // claim, so it cannot need less recorded proof.
                     let evidence_required = !force
-                        && target == TaskStatus::Done
+                        && matches!(target, TaskStatus::Done | TaskStatus::Verified)
                         && bs::done_evidence_required(next.session.as_deref());
                     if evidence_required {
                         let ev = next.evidence.clone().unwrap_or_default();
                         let verdict = bs::evidence_verdict(&ev);
                         if verdict != bs::EvidenceVerdict::Ok {
+                            let to_verified = target == TaskStatus::Verified;
                             let (why, code) = match verdict {
+                                bs::EvidenceVerdict::Missing if to_verified => (
+                                    "This card records nothing that was run or produced, and `verified` says the work holds in production. A card that never passed `done` never met its evidence rule, so verified applies it: name the command, the URL exercised, the screenshot path, or the commit.",
+                                    "verified_requires_evidence",
+                                ),
                                 bs::EvidenceVerdict::Missing => (
                                     "This card records nothing that was run or produced. `done` is where work stops on this board (3302 done against 3631 verified), so closing one has to name the proof: the command, the URL exercised, the screenshot path, the commit.",
                                     "done_requires_evidence",
                                 ),
                                 bs::EvidenceVerdict::NoArtifact => (
                                     "The evidence on this card is prose with nothing in it to check. Name the artifact: a command in backticks, a repo path, a URL, a commit sha, or a #PR.",
-                                    "done_evidence_has_no_artifact",
+                                    if to_verified { "verified_evidence_has_no_artifact" } else { "done_evidence_has_no_artifact" },
                                 ),
                                 bs::EvidenceVerdict::UnexplainedNone => (
                                     "`none:` is the honest answer when a card genuinely produced no artifact, but it needs the reason after it — that text is what makes the escape countable instead of a blind spot.",
-                                    "done_evidence_none_unexplained",
+                                    if to_verified { "verified_evidence_none_unexplained" } else { "done_evidence_none_unexplained" },
                                 ),
                                 bs::EvidenceVerdict::Ok => unreachable!(),
                             };
@@ -10309,8 +10325,9 @@ pub async fn patch_item(
                             // server-rs.log, and the structured `code` splits
                             // these from other 409s in /api/logs/analyze.
                             tracing::warn!(
-                                "done_evidence_gate: blocked {} -> done for session {} (verdict {:?})",
+                                "done_evidence_gate: blocked {} -> {} for session {} (verdict {:?})",
                                 next.id,
+                                bs::db_status_spelling(target),
                                 next.session.as_deref().unwrap_or("-"),
                                 verdict
                             );
@@ -10319,7 +10336,7 @@ pub async fn patch_item(
                                 PatchOut::Refused(
                                     StatusCode::CONFLICT,
                                     json!({
-                                        "error": "done requires evidence of what was run",
+                                        "error": format!("{} requires evidence of what was run", bs::db_status_spelling(target)),
                                         "code": code,
                                         "ok": false,
                                         "blocked": true,
@@ -10340,7 +10357,7 @@ pub async fn patch_item(
                                             &next.id, next.session.as_deref(), &caller_lane,
                                         ),
                                         "how_to_fix": {
-                                            "cli": format!("amux board done {} --evidence-stdin  (heredoc; inline text is evaluated by YOUR shell)", next.id),
+                                            "cli": format!("amux board {} {} --evidence-stdin  (heredoc; inline text is evaluated by YOUR shell)", bs::db_status_spelling(target), next.id),
                                             "api": "PATCH /api/board/<id> with {\"evidence\": \"...\"} — writable on its own, so record it first and the transition cannot discard it",
                                             "accepted": [
                                                 "a command, in backticks or on a `$ ` line",
