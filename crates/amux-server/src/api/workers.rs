@@ -2035,7 +2035,7 @@ mod tests {
     async fn read_fixture_sessions(app: &axum::Router, stage: &str) -> (StatusCode, HeaderMap, Value) {
         for attempt in 0..5 {
             let result = send(app, "GET", "/api/sessions", None).await;
-            if result.0 != StatusCode::INTERNAL_SERVER_ERROR
+            if result.0 != StatusCode::SERVICE_UNAVAILABLE
                 || result.2["error"].as_str() != Some("sessions list changed during discovery; retry")
                 || attempt == 4
             {
@@ -2050,9 +2050,12 @@ mod tests {
 
     #[tokio::test]
     async fn fixture_session_reader_preserves_errors_and_bounds_epoch_churn() {
-        for (error, expected_reads) in [
-            ("database query failed", 1),
-            ("sessions list changed during discovery; retry", 5),
+        // AMUX-4637: the race is served as 503. The reader retries that pair
+        // only; the same words on a 500 are an ordinary failure and read once.
+        for (error, served, expected_reads) in [
+            ("database query failed", StatusCode::INTERNAL_SERVER_ERROR, 1),
+            ("sessions list changed during discovery; retry", StatusCode::SERVICE_UNAVAILABLE, 5),
+            ("sessions list changed during discovery; retry", StatusCode::INTERNAL_SERVER_ERROR, 1),
         ] {
             let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let observed = calls.clone();
@@ -2060,11 +2063,11 @@ mod tests {
                 let calls = calls.clone();
                 async move {
                     calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error":error})))
+                    (served, axum::Json(json!({"error":error})))
                 }
             }));
             let (status, _, body) = read_fixture_sessions(&app, "negative-control").await;
-            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+            assert_eq!(status, served, "{body}");
             assert_eq!(body["error"], error);
             assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), expected_reads);
         }
@@ -2686,7 +2689,7 @@ mod tests {
         // Retry only its explicit fail-closed response; other failures retain
         // their body below and must not be hidden by a general retry.
         for attempt in 1..5 {
-            if st != StatusCode::INTERNAL_SERVER_ERROR
+            if st != StatusCode::SERVICE_UNAVAILABLE
                 || legacy["error"].as_str() != Some("sessions list changed during discovery; retry")
             {
                 break;
@@ -2730,7 +2733,7 @@ mod tests {
         ] {
             let (mut status, _, mut rows) = send(app, "GET", "/api/sessions", None).await;
             for attempt in 1..5 {
-                if status != StatusCode::INTERNAL_SERVER_ERROR
+                if status != StatusCode::SERVICE_UNAVAILABLE
                     || rows["error"].as_str()
                         != Some("sessions list changed during discovery; retry")
                 {
@@ -2765,7 +2768,7 @@ mod tests {
             async move {
                 if request.uri().path() == "/api/sessions" && race.swap(false, std::sync::atomic::Ordering::SeqCst) {
                     count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error":"sessions list changed during discovery; retry"}))).into_response();
+                    return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({"error":"sessions list changed during discovery; retry"}))).into_response();
                 }
                 next.run(request).await
             }

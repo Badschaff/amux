@@ -2853,30 +2853,88 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
     let conn = store.dedicated_read()?;
     let arr = build_array(&conn)?;
     let json = serde_json::to_string(&arr)?;
-    if SESSIONS_EPOCH.load(std::sync::atomic::Ordering::SeqCst) == epoch_start
-        && registry_fingerprint() == registry_start
-    {
-        if let Ok(mut c) = build_array_cache().lock() {
-            *c = ListSnapshot {
-                store: store_key,
-                stamp: now,
-                json: json.clone(),
-                epoch: epoch_start,
-                runtime_epoch: runtime_epoch_start,
-                registry: registry_start,
-            };
+    match race_verdict(
+        epoch_start,
+        SESSIONS_EPOCH.load(std::sync::atomic::Ordering::SeqCst),
+        registry_start,
+        registry_fingerprint(),
+    ) {
+        Ok(()) => {
+            if let Ok(mut c) = build_array_cache().lock() {
+                *c = ListSnapshot {
+                    store: store_key,
+                    stamp: now,
+                    json: json.clone(),
+                    epoch: epoch_start,
+                    runtime_epoch: runtime_epoch_start,
+                    registry: registry_start,
+                };
+            }
         }
-    } else {
-        // Fail closed as well as refusing the cache write. Returning JSON that
-        // predates an isolation/delete/config change would leak the old fleet
-        // shape to the one request that happened to race the change.
-        tracing::warn!(
-            target: "amux::sessions",
-            "session-list build raced a structural change — refusing the stale response"
-        );
-        anyhow::bail!("sessions list changed during discovery; retry")
+        Err(raced) => {
+            // Fail closed as well as refusing the cache write. Returning JSON that
+            // predates an isolation/delete/config change would leak the old fleet
+            // shape to the one request that happened to race the change.
+            tracing::warn!(
+                target: "amux::sessions",
+                "session-list build raced a structural change — refusing the stale response"
+            );
+            return Err(raced.into());
+        }
     }
     Ok(json)
+}
+
+/// The session-list build raced a structural change and refused to serve it.
+///
+/// AMUX-4637: this was a `bail!`, which every handler turned into a 500, so a
+/// documented, retryable race reached each 5xx sweep as a server fault
+/// (AMUX-4513, then AMUX-4637 once that card closed). The request was fine and
+/// the answer exists a moment later, so handlers answer 503 with Retry-After,
+/// the status the other readers of this projection (commit mentions, deleted
+/// substrate, session detail) already give a discovery failure. Display keeps
+/// the old message, which clients and tests quote.
+#[derive(Debug)]
+pub struct DiscoveryRaced;
+
+impl std::fmt::Display for DiscoveryRaced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("sessions list changed during discovery; retry")
+    }
+}
+
+impl std::error::Error for DiscoveryRaced {}
+
+/// Serve a finished build only if neither the epoch nor the on-disk registry
+/// moved while it ran. Extracted so the construction of [`DiscoveryRaced`] is
+/// pinned by a test rather than only the classifier that reads it.
+fn race_verdict(
+    epoch_start: u64,
+    epoch_now: u64,
+    registry_start: u64,
+    registry_now: u64,
+) -> Result<(), DiscoveryRaced> {
+    if epoch_now == epoch_start && registry_now == registry_start {
+        Ok(())
+    } else {
+        Err(DiscoveryRaced)
+    }
+}
+
+/// 503 with `Retry-After: 1` for the discovery race, 500 for any other build
+/// failure, both as `{"error": message}`. Decided on the TYPE, so rewording the
+/// message cannot move the status.
+pub(crate) fn discovery_failure(e: &anyhow::Error, message: String) -> Response {
+    if e.downcast_ref::<DiscoveryRaced>().is_some() {
+        let mut r = (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": message }))).into_response();
+        r.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static("1"),
+        );
+        r
+    } else {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": message }))).into_response()
+    }
 }
 
 /// Parsed access to the shared sessions projection for sibling APIs.
@@ -2959,11 +3017,7 @@ pub async fn list_sessions_legacy(
             }
             (StatusCode::OK, h, body).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Err(e) => discovery_failure(&e, e.to_string()),
     }
 }
 
@@ -6649,3 +6703,42 @@ Checked, nothing of mine was at risk, no action needed from you.
 #[cfg(test)]
 #[path = "status_chaos_tests.rs"]
 mod status_chaos_tests;
+
+#[cfg(test)]
+mod discovery_race_tests {
+    use super::*;
+
+    /// AMUX-4637: the race is 503 with Retry-After and keeps its message; any
+    /// other build failure stays 500.
+    #[tokio::test]
+    async fn a_discovery_race_is_503_with_retry_after_and_other_failures_stay_500() {
+        // The construction site: a moved epoch or a moved registry is the race.
+        assert!(race_verdict(1, 1, 7, 7).is_ok());
+        assert!(race_verdict(1, 1, 7, 8).is_err(), "a registry change alone is a race");
+        let raced: anyhow::Error = race_verdict(1, 2, 7, 7).unwrap_err().into();
+
+        let r = discovery_failure(&raced, raced.to_string());
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            r.headers().get(axum::http::header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+        let body = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"], "sessions list changed during discovery; retry");
+
+        // Wrapped in context, the way sessions-git reports it, it is still the race.
+        let wrapped = anyhow::Error::from(DiscoveryRaced).context("session list unavailable");
+        let r = discovery_failure(&wrapped, format!("{wrapped:#}"));
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // CONTROLS: the same words untyped, and an ordinary failure, stay 500
+        // with no Retry-After.
+        let untyped = anyhow::anyhow!("sessions list changed during discovery; retry");
+        let r = discovery_failure(&untyped, untyped.to_string());
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(r.headers().get(axum::http::header::RETRY_AFTER).is_none());
+        let db = anyhow::anyhow!("database query failed");
+        assert_eq!(discovery_failure(&db, db.to_string()).status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+}

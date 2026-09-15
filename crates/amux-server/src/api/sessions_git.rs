@@ -135,9 +135,10 @@ pub async fn sessions_git(State(state): State<AppState>) -> Response {
                     // one instead of starting a second.
                     let _g = guard;
                     if let Err(e) = recompute(&st).await {
+                        let detail = format!("{e:#}");
                         tracing::warn!(
                             marker = "sessions_git_bg_refresh_failed",
-                            error = %e,
+                            error = %detail,
                             "background refresh failed; stale data will be served until the ceiling"
                         );
                     }
@@ -179,7 +180,7 @@ pub async fn sessions_git(State(state): State<AppState>) -> Response {
     }
     match recompute(&state).await {
         Ok(v) => ok(v, "miss"),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
+        Err(e) => super::sessions_legacy::discovery_failure(&e, format!("{e:#}")),
     }
 }
 
@@ -205,11 +206,11 @@ fn ok(v: Value, disposition: &str) -> Response {
 ///
 /// The CALLER owns the single-flight guard. This does not take it, so a future
 /// reader cannot accidentally make the background path re-enter it.
-async fn recompute(state: &AppState) -> Result<Value, String> {
+async fn recompute(state: &AppState) -> anyhow::Result<Value> {
     // (name, dir, branch) from the SAME source the session list renders.
     let arr = super::sessions_legacy::legacy_sessions_values(state.store.clone())
         .await
-        .map_err(|e| format!("session list unavailable: {e}"))?;
+        .map_err(|e| e.context("session list unavailable"))?;
     let rows: Vec<(String, String, String)> = arr
         .iter()
         .filter_map(|v| {

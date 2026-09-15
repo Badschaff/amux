@@ -30,7 +30,7 @@ export async function auth(page: Page) {
   return { Authorization: `Bearer ${token}` };
 }
 
-// GET /api/sessions can legitimately 500 once when a concurrent session
+// GET /api/sessions can legitimately 503 once when a concurrent session
 // create/delete races the single-flight list build — the server fails
 // closed rather than serve a stale snapshot and says so in its own error
 // ("sessions list changed during discovery; retry"). These specs create

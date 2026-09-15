@@ -198,7 +198,7 @@ async fn fleet_graph(State(state): State<AppState>) -> Response {
     .await;
     let sessions: Vec<Value> = match sessions_json {
         Ok(Ok(j)) => serde_json::from_str(&j).unwrap_or_default(),
-        Ok(Err(e)) => return internal(e),
+        Ok(Err(e)) => return crate::api::sessions_legacy::discovery_failure(&e, e.to_string()),
         Err(e) => return internal(anyhow::anyhow!("join: {e}")),
     };
 
