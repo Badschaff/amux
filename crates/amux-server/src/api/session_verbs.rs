@@ -19174,6 +19174,12 @@ async fn subagent_event_post(state: &AppState, name: &str, ev: &str, body: &Valu
 /// with reports (a lane holding nothing records nothing, and a `tool-hook`
 /// report is not a boundary).
 ///
+/// WHAT ZERO MEANS HERE. The only producer of this edge is a lane's own Stop
+/// hook, so the population is lanes whose hooks report. A hookless lane records
+/// nothing no matter how long it sits on a card, and its silence is not
+/// evidence that it is not stalling. Read a count from this as "of the lanes
+/// that report", never as "of the fleet".
+///
 /// The caller gates this on the active -> idle TRANSITION, so a lane that
 /// re-reports idle without having worked in between never reaches here. The
 /// count-derived idem key is the second line: two transitions racing each other
@@ -19213,6 +19219,20 @@ async fn record_turn_end_without_outcome(state: &AppState, session: &str) {
             .unwrap_or(0)
         };
         let idem = format!("turn-end:{}:{}:{}", hold.card, hold.attempt, prior);
+        // Greppable beside the durable row, so `/api/logs/analyze` can group
+        // these without a join and a sweep can see the distribution.
+        //
+        // INFO, not WARN, and deliberately no threshold yet: "deep enough to be
+        // a stall" is a number nobody can honestly pick before this has run
+        // long enough to show what normal looks like. Choosing one now would be
+        // a guess wearing a measurement's clothes.
+        tracing::info!(
+            target: "amux::board", session, card = %hold.card, attempt = hold.attempt,
+            status = %hold.status, turn_ends = prior + 1, held_s = (now - hold.started_at).max(0),
+            measured = true, n_considered = 1,
+            verdict = "turn_ended_without_outcome",
+            "turn ended while this lane still held the card, with no outcome recorded (RR-0052 Inv 4)"
+        );
         emit_event(
             state,
             session,
