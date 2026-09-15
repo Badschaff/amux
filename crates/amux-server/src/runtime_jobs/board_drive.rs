@@ -829,12 +829,10 @@ impl Fleet for LiveFleet {
         //
         // The owner's peek/send are untouched — that is the documented boundary.
         //
-        // Isolation no longer excludes a lane from board_drive. The flag
-        // blocks inter-worker SENDS (a peer can't message an isolated lane),
-        // but the server's own card automation is not a peer message — it is
-        // the owner's board working as designed. Without this, every card on
-        // an isolated lane sits in backlog/todo permanently (AF-xxx, measured
-        // on `amux`: 138 backlog + 46 todo, zero driven).
+        // Isolated lanes stay LISTED so each tick names them: `drive_lane`
+        // skips them as `isolated` before any claim (AMUX-4542), because the
+        // delivery gate refuses amux automation into them. Listing them keeps
+        // the reason visible on /api/debug/board-drive instead of a silent gap.
         crate::api::session_verbs::all_lane_names()
     }
     fn auto_pickup_enabled(&self, lane: &str) -> bool {
@@ -6332,7 +6330,28 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
         return LaneTrace::skip(lane, "opted-out", "CC_AUTO_PICKUP=0 in the session env")
             .with_counts(eligible, open);
     }
-    // Isolation no longer blocks board automation — see `lanes()` comment.
+    // AMUX-4542. ISOLATION VETOES SELECTION, because delivery still refuses it.
+    // 36ab5405 (2026-09-10) removed this skip so isolated lanes would be driven,
+    // but the queue's isolation gate (`isolation_refusal`, AMUX-3764) still
+    // refuses every Automation send into an isolated lane. The halves disagreed:
+    // each tick claimed a card, delivery refused, the claim was reverted, and the
+    // lane read `mid-turn`. Measured 2026-09-14: desktop/DESKT-30 claimed 314
+    // times in one window, nothing ever delivered. `is_isolated` is the same
+    // `session_is_isolated` the refusal reads, so the two cannot come apart
+    // again. The lane that motivated 36ab5405 (`amux`) is no longer isolated and
+    // stays driven. Whether an isolated lane should take board automation is its
+    // owner's call; the exit is clearing CC_ISOLATED on that lane.
+    if fleet.is_isolated(lane) {
+        tracing::info!(target: "amux::board_drive", session = lane, measured = true, n_considered = 1,
+            verdict = "isolated_not_claimed",
+            "board_drive: isolated lane skipped before any claim; delivery would refuse amux automation");
+        return LaneTrace::skip(
+            lane,
+            "isolated",
+            "isolated workers refuse amux automation, so no card is claimed for them; clear CC_ISOLATED on the lane to take board automation, or send as the owner",
+        )
+        .with_counts(eligible, open);
+    }
     // A stopped lane is woken only after a selector has found real work.
     // Re-select after start: the preflight authorizes a wake, not a stale card
     // mutation. An exact surviving claim comes first: resuming its own Doing
@@ -10219,16 +10238,44 @@ mod tests {
         assert_eq!(drive_lane(&state, &stopped, "lane").await.reason, "not-running-no-dispatchable-work");
         assert_eq!(stopped.starts.load(std::sync::atomic::Ordering::SeqCst), 0);
 
-        // Isolated workers are now driven by board automation (isolation only
-        // blocks inter-worker sends, not the server's own card dispatch).
+        // AMUX-4542: an isolated lane is skipped before the wake decision, so
+        // a stopped isolated worker is never started for dispatch either.
         let isolated = BoundaryFleet::default();
         isolated.running.store(false, std::sync::atomic::Ordering::SeqCst);
         isolated.isolated.store(true, std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(drive_lane(&state, &isolated, "lane").await.reason, "not-running-no-dispatchable-work");
+        assert_eq!(drive_lane(&state, &isolated, "lane").await.reason, "isolated");
+        assert_eq!(isolated.starts.load(std::sync::atomic::Ordering::SeqCst), 0);
         let opted = BoundaryFleet::default();
         opted.running.store(false, std::sync::atomic::Ordering::SeqCst);
         opted.enabled.store(false, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(drive_lane(&state, &opted, "lane").await.reason, "opted-out");
+    }
+
+    /// AMUX-4542. A RUNNING isolated lane at a turn boundary, with a claimable
+    /// todo card, is skipped before any claim: no task.claimed event, nothing
+    /// delivered, and the card is still todo. Before the fix every tick
+    /// claimed, was refused by the delivery gate, and reverted (314 claims of
+    /// desktop/DESKT-30 in one window).
+    #[tokio::test]
+    async fn an_isolated_lane_is_never_claimed_for_because_delivery_would_refuse_it() {
+        let (_dir, state, store) = drive_state();
+        drive_card(&store, "ISO", "todo", "agent", "code");
+        let isolated = BoundaryFleet::default();
+        isolated.isolated.store(true, std::sync::atomic::Ordering::SeqCst);
+        let trace = drive_lane(&state, &isolated, "lane").await;
+        assert_eq!(trace.reason, "isolated", "{trace:?}");
+        assert_eq!(drive_events(&store, "task.claimed"), 0, "no claim to revert");
+        assert!(isolated.delivered.lock().unwrap().is_empty(), "nothing typed into an isolated lane");
+        let conn = store.read().unwrap();
+        let status: String = conn.query_row("SELECT status FROM issues WHERE id='ISO'", [], |r| r.get(0)).unwrap();
+        assert_eq!(status, "todo");
+
+        // The control: the same lane NOT isolated claims and delivers.
+        drop(conn);
+        let ordinary = BoundaryFleet::default();
+        let trace = drive_lane(&state, &ordinary, "lane").await;
+        assert_eq!(drive_events(&store, "task.claimed"), 1, "{trace:?}");
+        assert_eq!(ordinary.delivered.lock().unwrap().len(), 1, "{trace:?}");
     }
 
     #[tokio::test]
