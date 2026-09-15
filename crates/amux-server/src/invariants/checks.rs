@@ -679,6 +679,8 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     // SECONDS: DEFAULT (unixepoch('subsec')) in migration 0061.
     ("board_change_log", "changed_at", false),
     ("cmd_history", "delivered_at", true),
+    ("cmd_history", "intake_called_at", false),
+    ("cmd_history", "intake_retry_at", false),
     ("cmd_history", "queued_at", true),
     ("cmd_history", "ts", true),
     ("dictation_history", "ts", true),
