@@ -10821,7 +10821,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.957';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.958';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -17376,7 +17376,12 @@ function _peekMessagesBadge() {
 // 753 schedule vs 2784 human across the fleet, but concentrated on a handful
 // of sessions where they bury everything you typed).
 let _peekMsgFilter = 'human';   // all | human | session | schedule
-function _peekMsgSetFilter(k) { _peekMsgFilter = k; _peekMessagesRender(); }
+function _peekMsgSetFilter(k) {
+  if (_peekMsgFilter === k) return;
+  _peekMsgFilter = k;
+  _peekMsgPage = 1;            // a page number against a different population means nothing
+  _peekMessagesLoad(false);    // the SERVER applies the kind now
+}
 function _peekMsgRenderChips(items) {
   const bar = document.getElementById('peek-messages-filter');
   if (!bar) return;
@@ -17384,7 +17389,13 @@ function _peekMsgRenderChips(items) {
   // Seed from _MSG_KIND_ORDER so every chip reads 0 rather than undefined
   // when no messages of that kind exist (unstamped/unknown were missing).
   const counts = _MSG_KIND_ORDER.reduce((a, k) => (a[k] = 0, a), { all: 0 });
-  items.forEach(e => { const k = _msgKind(e); if (k in counts) counts[k]++; counts.all++; });
+  // Server totals when we have them: the list is ONE PAGE now, so counting the
+  // loaded rows would label each chip with its share of this page (AMUX-4666).
+  if (_peekMsgCounts && _peekMsgCountsFor === peekSession) {
+    Object.keys(counts).forEach(k => { counts[k] = +(_peekMsgCounts[k] || 0); });
+  } else {
+    items.forEach(e => { const k = _msgKind(e); if (k in counts) counts[k]++; counts.all++; });
+  }
   // Same rule as the body: a chip reading "Human 0" while the fetch is still
   // running is a measurement that has not run, rendered as a result. An
   // ellipsis is the honest placeholder — it cannot be mistaken for a count.
@@ -17607,6 +17618,8 @@ let _peekMsgDone = false;     // no older server page remains
 // stores, so choosing 100 per page once means 100 in both.
 let _peekMsgPage = 1;         // 1-based
 let _peekMsgTotal = null;     // x-amux-total for this worker; null = not reported
+let _peekMsgCounts = null;    // per-kind totals for the whole worker (?counts=1)
+let _peekMsgCountsFor = '';   // which session those counts belong to
 let _peekMsgLoading = false;  // true while the session-scoped fetch is in flight
 const _PEEK_MSG_PAGE = 60;    // fallback page size only; the reader's choice lives in _msgsPageSize (AMUX-4666). 200 rows was 40-120s under fleet load (AMUX-4476)
 
@@ -17630,9 +17643,10 @@ function _mergeUnechoed(serverRows, session) {
 async function _peekMsgFetch(scope, offset, pageSize) {
   const sc = (typeof scope === 'string') ? { level: 'worker', name: scope } : (scope || {});
   const page = pageSize || _msgsPageSize || _PEEK_MSG_PAGE;
-  const q = sc.level === 'group'  ? '&group=' + encodeURIComponent(sc.name)
+  const q = (sc.level === 'group'  ? '&group=' + encodeURIComponent(sc.name)
           : sc.level === 'global' ? ''
-          : '&session=' + encodeURIComponent(sc.name);
+          : '&session=' + encodeURIComponent(sc.name))
+          + (_peekMsgFilter && _peekMsgFilter !== 'all' ? '&kind=' + encodeURIComponent(_peekMsgFilter) : '');
   const r = await fetch(API + '/api/history?limit=' + page + '&offset=' + (offset || 0) + q, { headers: _authHeaders() });
   if (!r.ok) throw new Error('history ' + r.status);
   const _t = r.headers && r.headers.get('x-amux-total');
@@ -17662,6 +17676,12 @@ async function _peekMessagesLoad(more) {
   try {
     const rows = await _peekMsgFetch({ level: 'worker', name: sess }, _peekMsgOffset);
     if (peekSession !== sess) { _peekMsgLoading = false; return; }
+    if (_peekMsgCountsFor !== sess) {
+      fetch(API + '/api/history?counts=1&session=' + encodeURIComponent(sess), { headers: _authHeaders() })
+        .then(x => x.json())
+        .then(c => { if (peekSession === sess) { _peekMsgCounts = c; _peekMsgCountsFor = sess; _peekMessagesRender(); } })
+        .catch(() => {});
+    }
     _peekMsgServerRows = rows;                  // a page REPLACES, it does not accumulate
     const size = _msgsPageSize || _PEEK_MSG_PAGE;
     _peekMsgDone = _peekMsgTotal === null
