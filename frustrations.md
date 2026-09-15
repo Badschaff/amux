@@ -3034,3 +3034,14 @@ CARD: AF-791
 SYMPTOM: The unpublished fingerprint regression script required an ignored scratch/af791-evidence/cargo-specimen and passed an extra test filter through a wrapper that already invokes cargo test. A clean checkout lacked the specimen, and a zero-test result could satisfy its loose success check.
 COST: Blocked verification while reconciling the user's request to publish every pending amux change.
 FIX: Create an owned temporary, dependency-free fixture; preserve source mtime to nanosecond precision; require exactly one passing fixture test. The normal run passes both cases. Disabling the fingerprint refresh makes the preserved-mtime case fail; the mutation helper restores the exact bytes afterward.
+
+## Haiku command intake uses both attempts without producing runnable work
+AREA: board
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-15
+SESSION: lifecycle-haiku-r3-0915 (evaluator: codex-lifecycle)
+CARD: AF-904
+SYMPTOM: MSG-63706 exhausted two interpretation attempts: verify with no existing ID, then invented canonical IDs. The duplicate MSG-63707 waited without another call. No command graph was committed; the subsequent execution fixtures were introduced directly and do not prove automatic intake.
+COST: 10,346 measured input/cache tokens, 1,630 output tokens and a five-minute retry delay; the third trial could not demonstrate unattended command completion.
+FIX: fac6452b supplies explicit identity repair instructions and retains raw attempts; deterministic regressions pass, but successful live recovery is unproven. Enforce structured output without hiding extra calls. All three authorized Haiku workers are paused; do not claim a fourth trial ran.
