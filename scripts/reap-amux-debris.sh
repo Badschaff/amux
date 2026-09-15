@@ -203,6 +203,14 @@ fi
 targets_removed=0; targets_kb=0; targets_kept=0
 shared_target="${AMUX_SHARED_TARGET:-$HOME/.amux/rust-build-target}"
 target_root="${AMUX_DEBRIS_TARGET_ROOT:-$HOME/.amux}"
+# WHERE IT LOOKED, in the summary. The first scheduled run of this arm printed
+# "0 (0 MB), 0 kept" while three side targets sat on the same machine: under the
+# scheduler $HOME resolves elsewhere, so the glob matched nothing. A no-op and a
+# wrong root render identically unless the root is named beside the count
+# (ethos rule 4), and the fix for the root is a different fix than the fix for
+# a busy target.
+targets_root_state=present
+[ -d "$target_root" ] || targets_root_state=MISSING
 for t in "$target_root"/rust-build-target-*; do
   [ -d "$t" ] || continue
   [ "$t" = "$shared_target" ] && continue
@@ -236,6 +244,7 @@ echo "amux-debris: mode=$mode age_floor=${AGE_HOURS}h"
 echo "amux-debris: temp dirs ${dirs_removed} (${mb} MB), kept ${dirs_kept_fresh} younger than the floor"
 echo "amux-debris: worktrees ${wt_removed} of ${wt_considered} considered, ${wt_dirty} left alone as dirty, ${wt_local_only} kept because HEAD is on no remote, ${wt_in_use} kept in use"
 echo "amux-debris: side cargo targets ${targets_removed} ($((targets_kb / 1024)) MB), ${targets_kept} kept as busy or fresh (idle floor ${TARGET_IDLE_HOURS}h; the shared target is never a candidate)"
+echo "amux-debris: side-target root ${target_root} ${targets_root_state}"
 [ -n "$cwds" ] || echo "amux-debris: cwd probe unavailable (lsof missing or empty), so ${wt_unprobed} worktree(s) were not removed"
 # Non-zero only on a real failure, so a scheduler run that reclaims nothing is
 # still a success. Reclaiming nothing is the healthy steady state.

@@ -196,6 +196,19 @@ check "busy side target still present" "yes" "$([ -d "$TR2/rust-build-target-bus
 case "$out" in *"side cargo targets 0 ("*) echo "  ok   report counts nothing reclaimed while it is busy" ;;
   *) echo "  FAIL report claims a reclaim while the target was busy: $out"; fails=$((fails+1)) ;; esac
 
+echo "12. a side-target root that does not exist says so instead of reading as clean"
+# The first scheduled run printed "0 (0 MB), 0 kept" because $HOME resolved
+# elsewhere under the scheduler. A wrong root must not render like a machine
+# with nothing to reclaim.
+out=$(AMUX_DEBRIS_TARGET_ROOT="$FIX/no-such-root" AMUX_DEBRIS_ROOTS="$FIX/none" \
+      "$REAPER" --apply --repo /nonexistent 2>&1)
+case "$out" in *"side-target root $FIX/no-such-root MISSING"*) echo "  ok   the missing root is named" ;;
+  *) echo "  FAIL a missing side-target root is not reported: $out"; fails=$((fails+1)) ;; esac
+out=$(AMUX_DEBRIS_TARGET_ROOT="$TR" AMUX_SHARED_TARGET="$TR/rust-build-target-shared" \
+      AMUX_DEBRIS_ROOTS="$FIX/none" "$REAPER" --repo /nonexistent 2>&1)
+case "$out" in *"side-target root $TR present"*) echo "  ok   control: a real root reports present" ;;
+  *) echo "  FAIL a real root did not report present: $out"; fails=$((fails+1)) ;; esac
+
 echo
 if [ "$fails" -eq 0 ]; then echo "PASS: reap-amux-debris — all checks passed"; exit 0; fi
 echo "reap-amux-debris: $fails check(s) FAILED"; exit 1
