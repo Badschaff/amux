@@ -4699,8 +4699,15 @@ pub(crate) async fn cmd_hist_record_full(
     skip_board: bool,
     meta: DeliveryMeta<'_>,
 ) {
+    let _ = cmd_hist_record_with_id(state, session, text, ctype, origin, skip_board, meta).await;
+}
+
+async fn cmd_hist_record_with_id(
+    state: &AppState, session: &str, text: &str, ctype: &str, origin: &str,
+    skip_board: bool, meta: DeliveryMeta<'_>,
+) -> i64 {
     if session.is_empty() || text.is_empty() {
-        return;
+        return 0;
     }
     let session = session.to_string();
     let text = redact_secrets(text);
@@ -4837,9 +4844,10 @@ pub(crate) async fn cmd_hist_record_full(
             let row_id = conn.last_insert_rowid();
             msg_row_id_w.store(row_id, std::sync::atomic::Ordering::SeqCst);
             conn.execute(
-                "DELETE FROM cmd_history WHERE session=?1 AND capture_pending=0 AND id NOT IN \
+                "DELETE FROM cmd_history WHERE session=?1 AND capture_pending=0 AND ts<?3 \
+                 AND NOT EXISTS (SELECT 1 FROM issues i WHERE i.id=cmd_history.card_id AND i.deleted IS NULL AND i.archived=0 AND i.status NOT IN ('done','verified','discarded','quarantined','cancelled')) AND id NOT IN \
                  (SELECT id FROM cmd_history WHERE session=?1 ORDER BY ts DESC LIMIT ?2)",
-                rusqlite::params![session, CMD_HIST_KEEP],
+                rusqlite::params![session, CMD_HIST_KEEP, now_ms-3_600_000],
             )?;
             // cmd_history is the durable Messages ledger, but this write used
             // to publish no StateEvent. A healthy SSE client therefore had no
@@ -4955,6 +4963,7 @@ pub(crate) async fn cmd_hist_record_full(
             .await;
         }
     }
+    msg_row_id.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Resume only explicitly pending message consequences. This does not deliver a
@@ -10467,6 +10476,15 @@ fn mark_pending_structured_resume(state: &AppState, name: &str, reason: &str) ->
         }
     };
     let mut pending = meta;
+    if context.card.is_none() && state.store.read().ok().is_some_and(|conn| empty_resume_queue(&conn,name).unwrap_or(false)) {
+        for key in ["pending_structured_resume", "pending_structured_resume_reason", "pending_structured_resume_context", "pending_structured_resume_token"] {
+            pending.remove(key);
+        }
+        if save_resume_meta(name,&pending).is_err() { return false; }
+        tracing::info!(session=name,measured=true,n_considered=1,model_calls=0,verdict="empty_restart_no_model_turn",
+            "new worker has no request or open work; config restart does not manufacture a paid turn");
+        return true;
+    }
     pending.insert("pending_structured_resume".into(), json!(now_i64()));
     pending.insert("pending_structured_resume_reason".into(), json!(reason));
     pending.insert("pending_structured_resume_context".into(), json!(&context));
@@ -10480,6 +10498,10 @@ fn mark_pending_structured_resume(state: &AppState, name: &str, reason: &str) ->
         reason, measured = true, n_considered = 1, verdict = "swap_context_persisted",
         "worker restart preserved exact durable task and directory");
     true
+}
+
+fn empty_resume_queue(conn: &rusqlite::Connection, name: &str) -> rusqlite::Result<bool> {
+    conn.query_row("SELECT NOT EXISTS(SELECT 1 FROM cmd_history WHERE session=?1 AND (type='user' OR capture_pending!=0)) AND NOT EXISTS(SELECT 1 FROM issues WHERE session=?1 AND archived=0 AND deleted IS NULL AND status NOT IN ('done','verified','discarded','quarantined','cancelled'))",[name],|r|r.get(0))
 }
 
 // The resume protocol must observe a failed write; save_meta's historical
@@ -16982,6 +17004,44 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
             }),
         );
     }
+    // A command is a durable request before it is execution. Sending its raw
+    // text first raced the planner and invited a second, worker-created board.
+    if matches!(send_origin, SendOrigin::Owner)
+        && super::board_lifecycle::stage_owner_command(name, &orig_text)
+    {
+        let actor = member_actor.as_deref().unwrap_or("");
+        let id = cmd_hist_record_with_id(state, name, &orig_text, "user", actor,
+            skip_board, DeliveryMeta::queued(now_i64()*1000)).await;
+        let receipt = state.store.read().ok().and_then(|c| c.query_row(
+            "SELECT intake_result FROM cmd_history WHERE id=?1", [id],
+            |r|r.get::<_,Option<String>>(0)).ok());
+        let Some(saved) = receipt else {
+            send_dedup_forget(state,name,&msg_id).await;
+            return jresp(StatusCode::SERVICE_UNAVAILABLE,json!({"ok":false,"error":"request could not be retained; retry is safe"}));
+        };
+        let result: Value = saved.and_then(|v|serde_json::from_str(&v).ok()).unwrap_or(Value::Null);
+        let kind = result["decision"]["kind"].as_str().unwrap_or("");
+        // Interpretation can establish that this is conversation, not work.
+        // Preserve one receipt, and deliver such a message normally.
+        if matches!(kind, "information" | "question" | "policy") {
+            let (ok, message) = send_text(state,name,&text,defer_busy,send_origin).await;
+            let (submitted, submission) = submission_verdict(ok,&message);
+            let landed = submitted == Some(true);
+            let verdict = submission.to_string();
+            let _ = state.store.write_async(move |c| {
+                c.execute("UPDATE cmd_history SET submit_verdict=?2,delivered_at=CASE WHEN ?3 THEN ?4 ELSE delivered_at END WHERE id=?1",
+                    rusqlite::params![id,verdict,landed,now_i64()*1000])?;
+                Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
+            }).await;
+            if ok { send_dedup_accept(state,name,&msg_id,&format!("MSG-{id}")).await; }
+            else { send_dedup_forget(state,name,&msg_id).await; }
+            return jresp(if ok {StatusCode::OK} else {StatusCode::CONFLICT},json!({"ok":ok,"message":message,"id":format!("MSG-{id}"),"submitted":submitted,"submission":submission}));
+        }
+        send_dedup_accept(state,name,&msg_id,&format!("MSG-{id}")).await;
+        tracing::info!(session=name,message_id=id,root=?result.get("root"),measured=true,n_considered=1,
+            verdict="command_retained_before_dispatch","request accepted; existing board dispatcher owns execution, no duplicate raw prompt sent");
+        return jresp(StatusCode::OK,json!({"ok":true,"id":format!("MSG-{id}"),"message":"accepted into board lifecycle","submitted":null,"submission":"queued","root":result.get("root"),"task_ids":result.get("task_ids"),"planning":result.get("state")}));
+    }
     let mut queue_id = None;
     let (ok, msg) = if ConversationRestart::active(name) {
         // Do not hold an HTTP request through a slow provider stop. Mobile
@@ -20217,7 +20277,7 @@ async fn apply_live_config_change(
                         mode: SwapMode::Restart,
                         applied: restarted,
                         note: if restarted {
-                            " (live switch failed; session restarted to apply it, board-state resume queued)"
+                            " (live switch failed; session restarted to apply it, pending work resumes from board)"
                         } else {
                             " (live switch failed AND the restart failed — the session may still be on the old model)"
                         },
@@ -20242,7 +20302,7 @@ async fn apply_live_config_change(
                 mode,
                 applied: restarted,
                 note: if restarted {
-                    " (session restarted; board-state resume queued)"
+                    " (session restarted; pending work resumes from board)"
                 } else {
                     " (restart failed)"
                 },
@@ -20341,7 +20401,7 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
         } else if !was_running {
             set_confirmed_active_model(name, &provider_val, None);
         }
-        let suffix = if restarted { " (session restarted; board-state resume queued)" } else { "" };
+        let suffix = if restarted { " (session restarted; pending work resumes from board)" } else { "" };
         let body = json!({"ok": true, "message": format!("provider set to {}{suffix}", provider_label(&provider_val))});
         return if restarted { j200_slow_ok(body, "worker-restart") } else { j200(body) };
     }
@@ -20521,7 +20581,7 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
         }
         let restarted = if was_running { restart_for_swap(state, name, &provider).await } else { false };
         let state_word = if enabled { "enabled" } else { "disabled" };
-        let suffix = if restarted { " (session restarted; board-state resume queued)" } else { "" };
+        let suffix = if restarted { " (session restarted; pending work resumes from board)" } else { "" };
         let body = json!({"ok": true, "message": format!("yolo {state_word}{suffix}")});
         return if restarted { j200_slow_ok(body, "worker-restart") } else { j200(body) };
     }
@@ -31186,5 +31246,23 @@ mod transcript_cache_retention_tests {
         assert_eq!(cache["active"].2, Some(123));
         assert_eq!(prune_transcript_evidence(&mut cache, 1400.0, 15.0), 1);
         assert!(cache.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_token_tests {
+    use super::*;
+
+    #[test]
+    fn empty_restart_does_not_invent_work_but_real_requests_and_tasks_survive() {
+        let c = crate::db::migrate::test_memdb();
+        assert!(empty_resume_queue(&c,"new-worker").unwrap());
+        c.execute("INSERT INTO issues(id,title,desc,status,session,type,created,updated) VALUES('SEED-1','Seed','Existing verified fixture','done','new-worker','chore',1,1)",[]).unwrap();
+        assert!(empty_resume_queue(&c,"new-worker").unwrap());
+        c.execute("UPDATE issues SET status='todo' WHERE id='SEED-1'",[]).unwrap();
+        assert!(!empty_resume_queue(&c,"new-worker").unwrap());
+        c.execute("UPDATE issues SET status='done' WHERE id='SEED-1'",[]).unwrap();
+        c.execute("INSERT INTO cmd_history(session,text,type,ts,capture_pending) VALUES('new-worker','Please answer this question','user',1,0)",[]).unwrap();
+        assert!(!empty_resume_queue(&c,"new-worker").unwrap());
     }
 }

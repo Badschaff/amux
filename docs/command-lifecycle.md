@@ -52,3 +52,26 @@ Validation evidence is recorded per fresh Haiku worker against a fixed 10-point
 scorecard. Unit tests use deterministic model fakes; only the live rounds spend
 provider tokens. Do not claim full lifecycle effectiveness from compilation or
 from a worker saying it finished: inspect the resulting board and artifacts.
+
+## Conservative execution and recovery
+
+Owner commands enter the durable Messages ledger before execution. After
+reconciliation, the board dispatcher delivers canonical work; the original raw
+command is not also sent to the worker. Informational commands still reach the
+conversation. Paused workers retain requests without starting interpretation or
+execution. Isolated workers retain their explicit raw pass-through behavior.
+
+A completed interpretation is saved before graph mutation. Recovery reuses it
+without another model call; a revision bump alone does not invalidate it when
+requirements still match. Changed requirements are reinterpreted within the
+same bounded attempt allowance. Refinements replace superseded criteria and can
+reopen the original command epic for current-output verification.
+
+Read-only helpers use a compact system prompt and low effort. The CLI's
+`AMUX_HELPER_MAX_BUDGET_USD` ceiling defaults to 0.10 per helper invocation.
+This is a maximum, not a spend target or an invoice measurement. A failed warm
+helper returns to the caller's retry policy instead of silently running another
+paid helper. Provider-reported input, output and cache usage is retained where
+available, with explicit coverage of measured receipts. Worker execution costs
+remain separate in the existing token ledger. Empty new-worker configuration
+restarts do not generate a continuation turn.

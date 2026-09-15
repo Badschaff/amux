@@ -84,8 +84,7 @@ pub(super) fn stream_command(cli: &str, model: &str) -> Command {
     if !model.trim().is_empty() {
         cmd.arg("--model").arg(model.trim());
     }
-    cmd.env_remove("CLAUDECODE").env_remove("CLAUDE_CODE_ENTRYPOINT");
-    cmd.current_dir(std::env::temp_dir());
+    super::read_only_helper_options(&mut cmd);
     cmd
 }
 
@@ -103,8 +102,13 @@ pub(super) fn message_line(prompt: &str) -> String {
 /// Reads the LAST result event, and refuses one marked `is_error` rather than
 /// handing its text back as an answer: the CLI reports a refusal, a quota stop
 /// or a hit turn limit in exactly that shape, and those are not model output.
+#[cfg(test)]
 pub(super) fn parse_result(stdout: &str) -> Result<String, String> {
-    let mut answer: Option<Result<String, String>> = None;
+    parse_completion(stdout).map(|result| result.text)
+}
+
+pub(super) fn parse_completion(stdout: &str) -> Result<super::ModelCompletion, String> {
+    let mut answer: Option<Result<super::ModelCompletion, String>> = None;
     for line in stdout.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -121,7 +125,7 @@ pub(super) fn parse_result(stdout: &str) -> Result<String, String> {
         } else if text.is_empty() {
             Err("helper returned a result event with no text".to_string())
         } else {
-            Ok(text)
+            Ok(super::ModelCompletion { text, usage: event.get("usage").filter(|v| v.is_object()).cloned() })
         });
     }
     answer.unwrap_or_else(|| Err("helper produced no result event".to_string()))
@@ -194,6 +198,13 @@ mod tests {
     /// parallel threads. Without this, one test's helper answers another's
     /// `take` (or makes its `prepare` skip), which reads as a broken feature.
     static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn provider_usage_is_preserved_and_missing_usage_is_not_zero() {
+        let result=parse_completion(r#"{"type":"result","result":"{}","usage":{"input_tokens":11,"output_tokens":7,"cache_read_input_tokens":80}}"#).unwrap();
+        assert_eq!(result.usage.unwrap()["cache_read_input_tokens"],80);
+        assert!(parse_completion(r#"{"type":"result","result":"{}"}"#).unwrap().usage.is_none());
+    }
 
     #[test]
     fn the_answer_is_the_last_result_event_and_an_error_result_is_not_an_answer() {
