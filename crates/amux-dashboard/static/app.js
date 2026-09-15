@@ -1803,6 +1803,15 @@ function _uiComponentCheck(root = document) {
     const a = luminance(bg), b = luminance(fg);
     if ((Math.max(a,b)+.05)/(Math.min(a,b)+.05) < 4.5) issues.push((button.id || 'primary-button') + ':low-contrast');
   });
+  root.querySelectorAll('.peek-issue-item').forEach(row => {
+    const box = row.getBoundingClientRect(), title = row.querySelector('.peek-issue-title');
+    const overlay = row.closest('.overlay');
+    if (!title || !box.width || !box.height || box.bottom < 0 || box.top > innerHeight ||
+        (overlay && !overlay.classList.contains('active'))) return;
+    considered++;
+    if (title.getBoundingClientRect().bottom > box.bottom + 1)
+      issues.push((row.dataset.id || 'board-row') + ':board-row-content-overflow');
+  });
   return {measured:true,n_considered:considered,issues};
 }
 
@@ -1912,7 +1921,7 @@ function _modalLayoutCheck() {
     }, 350);
   };
   new MutationObserver(records => {
-    if (records.some(r => r.type === 'childList' ? r.target === document.body :
+    if (records.some(r => r.type === 'childList' ? r.target === document.body || r.target.matches?.('[data-component="board-list"],#peek-issues-list') :
       r.target.matches?.(_dialogSelector) && !r.target.classList.contains('amux-dialog-viewport'))) refresh();
     else if (records.some(r => r.type === 'attributes' && (r.target === document.body || r.target.matches?.(_dialogSelector)))) {
       clearTimeout(timer); timer = setTimeout(refresh, 50);
@@ -10878,7 +10887,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.960';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.961';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.

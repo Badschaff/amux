@@ -22,7 +22,9 @@ function card(id,session,status,title) {
     depends_on:[],archived:false,created:1,updated:1,pos:0};
 }
 const board=[card('SP-787','studio-plg','backlog','OpenAPI submission parameters'),
-  card('FX-1','linked-worker','doing','First outcome'),card('FX-2','linked-worker','doing','Second outcome')];
+  card('FX-1','linked-worker','doing','First outcome'),card('FX-2','linked-worker','doing','Second outcome'),
+  ...Array.from({length:18},(_,i)=>card('WRAP-'+i,'studio-plg','backlog',
+    'A long board title must wrap inside its own row when a worker has more tasks than fit on a phone screen'))];
 let payload=[worker('studio-plg',null),worker('linked-worker','FX-1'),
   worker('paused-worker','FX-9',{lifecycle:'paused',running:false})];
 const browser=await chromium.launch({headless:true});
@@ -73,10 +75,18 @@ try {
     await page.evaluate(()=>{openPeek('studio-plg');setPeekTab('issues');});
     await page.locator('#peek-issues-list-activity [data-worker="studio-plg"]').waitFor();
     assert.equal(await page.locator('#peek-issues-list-activity [data-worker="linked-worker"]').count(),0);
+    await page.waitForFunction(()=>getComputedStyle(document.getElementById('peek-overlay')).opacity==='1');
+    assert.equal(await page.evaluate(()=>_uiComponentCheck().issues.filter(i=>i.endsWith(':board-row-content-overflow')).length),0);
+    if(width===390) {
+      const broken=await page.addStyleTag({content:'.peek-issue-item {flex-shrink:1 !important;}'});
+      assert.ok(await page.evaluate(()=>_uiComponentCheck().issues.some(i=>i.endsWith(':board-row-content-overflow'))),
+        'diagnostic must detect the original compressed-row failure');
+      await broken.evaluate(el=>el.remove());
+    }
     payload=[worker('studio-plg',null,{lifecycle:'paused',running:false}),payload[1],payload[2]];
     await page.evaluate(data=>window.__activityStreams.find(s=>s.onmessage).onmessage({data:JSON.stringify({type:'sessions',payload:data})}),payload);
     await page.waitForFunction(()=>document.getElementById('peek-issues-list-activity').hidden);
-    console.log(`PASS ${width}px: missing link visible, exact-card highlight, same-status SSE switch, filtered task retained, worker scope, pause clears activity`);
+    console.log(`PASS ${width}px: missing link visible, exact-card highlight, same-status SSE switch, filtered task retained, worker scope, pause clears activity, wrapped rows contained`);
     await context.close();
     payload=[worker('studio-plg',null),worker('linked-worker','FX-1'),worker('paused-worker','FX-9',{lifecycle:'paused',running:false})];
   }

@@ -86,6 +86,15 @@ writes refused. They created no workers or provider calls. Run
 overlays the checkout's JS/CSS and checks missing links, exact-card emphasis,
 same-status SSE task changes, filters, worker scope, and Pause.
 
+The deployed build `187b6318` was subsequently checked with real API data and
+unmodified served assets at both widths. Studio had moved to a valid SP-918
+claim; its title and Working now state appeared on both boards. This live
+screenshot check also exposed pre-existing mobile list rows shrinking below
+their wrapped content. Rows now retain their content height, and the shared
+component diagnostic reports `board-row-content-overflow` to client-debug if
+that failure returns. The browser regression restores the old shrink rule
+temporarily and confirms that the diagnostic detects it.
+
 ## Validation scope and remaining work
 
 A detached full server run passed 2,501 unit tests plus integrations and doctests.
