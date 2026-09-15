@@ -8,7 +8,8 @@
 //!   the last dictation proxy row in py_proxy's PROXIED_FAMILIES). It is a
 //!   line-for-line port of the Python engine (amux-server.py ~27217-27650 +
 //!   ~72074): a warm openai-whisper WORKER subprocess (same inline worker
-//!   script, same `~/.cache/whisper/<model>.pt` presence detection, same
+//!   script, `<model>.pt` presence detection in `~/.amux/models/whisper`
+//!   then `~/.cache/whisper` (AMUX-4627), same
 //!   `AMUX_WHISPER_MODEL` / `AMUX_WHISPER_PYTHON` env knobs) preferred, the
 //!   Gemini `generateContent` API as fallback and as the AI-edit engine
 //!   (same `AMUX_DICTATION_MODEL` default `gemini-2.5-flash`, same BYO-key
@@ -903,14 +904,16 @@ async fn gemini_generate(key: &str, parts: Value, timeout_s: u64) -> (String, St
 // the module and the weights are on this box, dictation runs locally;
 // otherwise it falls through to Gemini. Same binary, both deployments.
 
-/// py:27302 `_WHISPER_WORKER` — the inline worker script, verbatim. Kept
-/// byte-identical to Python's so both origins run the same engine.
+/// py:27302 `_WHISPER_WORKER` — the inline worker script. It matched Python's
+/// byte for byte until AMUX-4627 added `download_root`, which makes the model
+/// load from the directory `whisper_weights_path` found instead of
+/// openai-whisper's default `~/.cache/whisper`.
 const WHISPER_WORKER_PY: &str = r#"
 import sys, json, os
 try:
     import torch; torch.set_num_threads(max(2, min(6, (os.cpu_count() or 4) - 2)))
     import whisper
-    m = whisper.load_model(os.environ["AMUX_WHISPER_MODEL"], device="cpu")
+    m = whisper.load_model(os.environ["AMUX_WHISPER_MODEL"], device="cpu", download_root=os.environ.get("AMUX_WHISPER_DIR") or None)
 except Exception as e:
     print(json.dumps({"fatal": str(e)[:200]}), flush=True); sys.exit(1)
 print(json.dumps({"ready": True}), flush=True)
@@ -932,11 +935,31 @@ fn whisper_model_name() -> String {
 /// BEFORE anything loads a model: a missing model makes openai-whisper
 /// reach out to download, which hung ~300s on the Python host — exactly
 /// wrong for a feature whose point is working with no uplink.
+///
+/// AMUX-4627: `~/.amux/models/whisper` is checked first. `~/.cache` is a cache,
+/// and cleanups treat it as one: the Disk tab's tool-cache roots include it as
+/// "Generic tool cache", a past Disk scan listed `~/.cache/whisper` itself as a
+/// finding (frustrations-archive.md), and the weights vanished from there on
+/// 2026-08-17 and again before 2026-09-14, silently sending every clip to
+/// Gemini. The cache stays a fallback so a host that only has the old copy
+/// keeps working.
 fn whisper_weights_path(name: &str) -> Option<PathBuf> {
-    let p = PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join(".cache/whisper")
-        .join(format!("{name}.pt"));
-    p.exists().then_some(p)
+    whisper_weights_in(&PathBuf::from(std::env::var("HOME").unwrap_or_default()), name)
+}
+
+fn whisper_weights_in(home: &std::path::Path, name: &str) -> Option<PathBuf> {
+    [".amux/models/whisper", ".cache/whisper"]
+        .iter()
+        .map(|dir| home.join(dir).join(format!("{name}.pt")))
+        .find(|p| p.exists())
+}
+
+/// The directory the worker should load from, or "" to let openai-whisper use
+/// its default. Passed as `AMUX_WHISPER_DIR`.
+fn whisper_weights_dir() -> String {
+    whisper_weights_path(&whisper_model_name())
+        .and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned()))
+        .unwrap_or_default()
 }
 
 /// Run `cmd` with args, killed after `timeout` — std::process has no
@@ -1079,9 +1102,10 @@ async fn whisper_available() -> bool {
     if whisper_weights_path(&name).is_none() {
         if !WEIGHTS_WARNED.swap(true, Ordering::Relaxed) {
             tracing::warn!(
-                "[dictation] whisper '{name}' weights ABSENT (~/.cache/whisper/{name}.pt) \
-                 — falling back to gemini, which hallucinates on unclear audio. Restore: \
-                 python3 -c \"import whisper; whisper.load_model('{name}')\""
+                "[dictation] whisper '{name}' weights ABSENT (neither ~/.amux/models/whisper/{name}.pt \
+                 nor ~/.cache/whisper/{name}.pt) — falling back to gemini, which hallucinates on \
+                 unclear audio. Restore: python3 -c \"import os, whisper; whisper.load_model('{name}', \
+                 download_root=os.path.expanduser('~/.amux/models/whisper'))\""
             );
         }
         return false;
@@ -1103,6 +1127,7 @@ async fn whisper_start(st: &mut WhisperState) {
     let spawned = tokio::process::Command::new(&py)
         .args(["-u", "-c", WHISPER_WORKER_PY])
         .env("AMUX_WHISPER_MODEL", whisper_model_name())
+        .env("AMUX_WHISPER_DIR", whisper_weights_dir())
         .env("PYTHONUNBUFFERED", "1")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -1133,7 +1158,11 @@ async fn whisper_start(st: &mut WhisperState) {
         tracing::warn!("[dictation] whisper worker failed to start: {}", truncate_chars(line.trim(), 160));
         return;
     }
-    tracing::info!("[dictation] whisper '{}' warm via {py}", whisper_model_name());
+    tracing::info!(
+        "[dictation] whisper '{}' warm via {py}, weights from {}",
+        whisper_model_name(),
+        whisper_weights_dir()
+    );
     st.worker = Some(WhisperWorker { child, stdin, stdout });
 }
 
@@ -1702,6 +1731,23 @@ pub(crate) mod tests {
         *WHISPER_OVERRIDE.lock().unwrap() = whisper;
         *GEMINI_KEY_OVERRIDE.lock().unwrap() = key.map(String::from);
         *GEMINI_BASE_OVERRIDE.lock().unwrap() = base;
+    }
+
+    /// AMUX-4627: the lookup prefers ~/.amux/models/whisper, still finds the
+    /// old cache copy, and never counts another model's file.
+    #[test]
+    fn whisper_weights_prefer_amux_models_and_fall_back_to_the_cache() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(super::whisper_weights_in(home.path(), "base"), None);
+        let cache = home.path().join(".cache/whisper");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("base.pt"), b"w").unwrap();
+        assert_eq!(super::whisper_weights_in(home.path(), "base"), Some(cache.join("base.pt")));
+        let models = home.path().join(".amux/models/whisper");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("base.pt"), b"w").unwrap();
+        assert_eq!(super::whisper_weights_in(home.path(), "base"), Some(models.join("base.pt")));
+        assert_eq!(super::whisper_weights_in(home.path(), "small"), None);
     }
 
     fn app() -> (axum::Router, tempfile::TempDir) {
