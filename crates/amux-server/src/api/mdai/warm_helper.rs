@@ -265,7 +265,7 @@ mod tests {
                 // substitution strips the trailing newline, and the newline is
                 // exactly what ends a stream-json message.
                 "#!/bin/sh\n\
-                 date +%s%N > {marker}\n\
+                 date +%s%N > {marker}.tmp && mv {marker}.tmp {marker}\n\
                  bytes=$(wc -c | tr -d ' ')\n\
                  printf '{{\"type\":\"result\",\"is_error\":false,\"result\":\"saw %s bytes\"}}\\n' \"$bytes\"\n",
                 marker = started_file.display()
