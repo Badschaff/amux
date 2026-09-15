@@ -1606,6 +1606,12 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // against the live server (AMUX-2871). Each was reported as unrouted while
     // answering, because the census reads this table.
     RouteEntry { path: "/api/client-debug", methods: &["GET", "POST"] },
+    // Both of screen::routes()'s paths. The census reads this TABLE, so a
+    // mounted-but-unlisted route answers fine while every count reports it as
+    // unrouted (AMUX-4661's route, listed here after proxy_composition and this
+    // census both went red on origin/main).
+    RouteEntry { path: "/api/screen/capture", methods: &["GET"] },
+    RouteEntry { path: "/api/screen/capture/file", methods: &["GET"] },
     RouteEntry { path: "/api/memory/global", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/review/week", methods: &["GET"] },
     RouteEntry { path: "/api/review/digest", methods: &["GET"] },

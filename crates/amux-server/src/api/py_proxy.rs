@@ -77,6 +77,11 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
         "/api/_clear_sw",
         "service-worker cleanup landing outside the service worker intercept scope (api/static_files.rs)",
     ),
+    (
+        "/api/screen",
+        "loopback-only screenshot capture (api/screen.rs); native, never proxied — \
+         the bytes are of the owner's physical display",
+    ),
     ("/api/calendar.ics", "iCal feed"),
     ("/api/sync", "delta sync"),
     ("/api/events", "SSE stream"),
