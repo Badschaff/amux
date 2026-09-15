@@ -27,6 +27,7 @@ const EV: &str = "ran `cargo test -p amux-server`";
 fn app_with_store() -> (axum::Router, std::sync::Arc<Store>, tempfile::TempDir) {
     std::env::set_var("AMUX_DONE_LINK_REQUIRED", "1");
     std::env::set_var("AMUX_DONE_EVIDENCE_REQUIRED", "1");
+    pin_approval_policy();
     let dir = tempfile::tempdir().unwrap();
     let store = std::sync::Arc::new(Store::open(&dir.path().join("amux-test.db")).unwrap());
     let state = AppState {
@@ -39,12 +40,33 @@ fn app_with_store() -> (axum::Router, std::sync::Arc<Store>, tempfile::TempDir) 
     (router(state), store, dir)
 }
 
+/// Pin the authorization categories, for the reason the done-gates below are
+/// pinned: `approval_types` falls back to the real `~/.amux/amux.env`, so this
+/// suite's result depended on the operator's own fleet policy.
+///
+/// Measured 2026-09-15: on a box whose global policy is
+/// `AMUX_APPROVAL_TYPES=budget,customer_outbound`,
+/// `creating_a_needsyou_card_needs_a_typed_ask_just_like_the_transition_does`
+/// failed with 409 `needsyou_outside_approval_policy` on its CONTROL — the leg
+/// that proves the gate did not simply ban needsyou creation outright. It
+/// passes on a default box, so this reads as a regression only for whoever
+/// configured a policy, which is the worst audience to hand a false red to.
+///
+/// `*` is the documented legacy default, so this restores what the assertions
+/// were written against rather than inventing a policy. The suite that does
+/// test a restricted policy, `command_approval_policy.rs`, sets its own value
+/// and runs in its own process, so the two cannot reach each other.
+fn pin_approval_policy() {
+    std::env::set_var("AMUX_APPROVAL_TYPES", "*");
+}
+
 fn app() -> (axum::Router, tempfile::TempDir) {
     // Pin the global done-link gate ON so this suite is hermetic (not dependent
     // on whether the real ~/.amux disables it): the gate tests here provide a
     // link where they reach done, and done_requires_an_asset_link asserts it.
     std::env::set_var("AMUX_DONE_LINK_REQUIRED", "1");
     std::env::set_var("AMUX_DONE_EVIDENCE_REQUIRED", "1");
+    pin_approval_policy();
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("amux-test.db")).unwrap();
     let state = AppState {
