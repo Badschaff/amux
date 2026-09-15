@@ -561,21 +561,28 @@ mod tests {
         let db = tempfile::tempdir().unwrap();
         let store: crate::db::SharedStore =
             std::sync::Arc::new(crate::db::Store::open(&db.path().join("t.db")).unwrap());
+        // AMUX-4645: an owner name no real lane can have. The enqueue refuses a
+        // paused, isolated or archived target by reading the REAL sessions dir,
+        // and this test deliberately does not take HomeGuard (see below), so a
+        // fleet lane sharing the old literal name ("gtm-engine", paused on the
+        // amux host since 2026-09-14) made this fail on that host and pass in CI.
+        let owner = format!("reaper-notice-{}", ulid::Ulid::new().to_string().to_lowercase());
 
         // Prove the target exists through the durable worker row that the
         // enqueue chokepoint already understands. Do not take HomeGuard here:
         // this test also exercises the process-global browser registry, and a
         // parallel browser test can take those two locks in the opposite order.
         // The first guarded draft wedged 14 unrelated tests in the full suite.
+        let row_owner = owner.clone();
         store
-            .write_async(|conn| {
+            .write_async(move |conn| {
                 conn.execute(
                     "INSERT INTO _amux_workers \
                      (id, display_name, name_aliases, cwd, provider, model, state, created_at, updated_at) \
-                     VALUES ('wrk_reaper_notice', 'gtm-engine', '[]', '/tmp', 'claude', \
+                     VALUES ('wrk_reaper_notice', ?1, '[]', '/tmp', 'claude', \
                              'test', '{\"state\":\"stopped\"}', \
                              '2026-09-04T00:00:00Z', '2026-09-04T00:00:00Z')",
-                    [],
+                    [&row_owner],
                 )?;
                 Ok(crate::db::WriteOutcome {
                     applied: true,
@@ -586,7 +593,7 @@ mod tests {
             .unwrap();
 
         crate::integrations::browser::test_clear_running();
-        crate::integrations::browser::test_seed_running_port("hubspot", "gtm-engine", u32::MAX, 1);
+        crate::integrations::browser::test_seed_running_port("hubspot", &owner, u32::MAX, 1);
 
         let reaped = crate::integrations::browser::test_with_kill_capture(async {
             let reaped = tick_with_limits(home.path(), Some(&store), 0, 1, 0).await;
@@ -620,7 +627,7 @@ mod tests {
             out
         };
         crate::integrations::browser::test_clear_running();
-        crate::integrations::browser::test_seed_running_port("ttl-only", "gtm-engine", u32::MAX, 1);
+        crate::integrations::browser::test_seed_running_port("ttl-only", &owner, u32::MAX, 1);
         let expired = crate::integrations::browser::test_with_kill_capture(async {
             tick_with_limits(home.path(), Some(&store), 0, 0, 1).await
         }).await;
@@ -628,7 +635,7 @@ mod tests {
         crate::integrations::browser::test_clear_running();
 
         let mine: Vec<&(String, String)> =
-            rows.iter().filter(|(s, _)| s == "gtm-engine").collect();
+            rows.iter().filter(|(s, _)| *s == owner).collect();
         assert_eq!(
             mine.len(),
             1,
