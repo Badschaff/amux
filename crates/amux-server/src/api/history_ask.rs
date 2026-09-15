@@ -288,19 +288,40 @@ pub async fn ask(State(state): State<AppState>, Json(body): Json<AskBody>) -> Re
     let (thread, history_turns) = render_history(&body.history, MAX_HISTORY_CHARS);
     let prompt = build_prompt(&question, &scope, days, &corpus, included, available, &thread);
     let model = super::mdai::resolve_model(None);
-    let client = client();
     let started = std::time::Instant::now();
-    let (m, p) = (model.clone(), prompt);
-    let call = tokio::task::spawn_blocking(move || client.complete(&m, &p)).await;
+    // ONE retry, and the caller owns it deliberately. The read-only client
+    // answers from a helper started before the call and returns a failure on
+    // that exchange straight through ("caller owns the retry budget, no hidden
+    // cold retry"), so a helper that died while idle, or a single refused
+    // exchange, would otherwise surface to the reader as "the model could not
+    // answer this question". The second attempt runs after that helper is gone,
+    // which is the cold path. Bounded at two so a persistent failure is still
+    // reported rather than retried forever.
+    let mut attempts = 0u32;
+    let mut first_error = String::new();
+    let answer = loop {
+        attempts += 1;
+        let client = client();
+        let (m, p) = (model.clone(), prompt.clone());
+        let call = tokio::task::spawn_blocking(move || client.complete(&m, &p)).await;
+        let why = match call {
+            Ok(Ok(text)) => break Ok(unfence(&text)),
+            Ok(Err(e)) => e,
+            Err(e) => format!("the model call panicked or was cancelled: {e}"),
+        };
+        if attempts == 1 {
+            first_error = why.clone();
+            tracing::warn!(target: "amux::history_ask", verdict = "ask_model_retry",
+                measured = true, n_considered = included, error = %why,
+                "the model call failed; retrying once off the pre-started helper");
+            continue;
+        }
+        break Err(format!("{why} (first attempt: {first_error})"));
+    };
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let answer = match call {
-        Ok(Ok(text)) => unfence(&text),
-        other => {
-            let why = match other {
-                Ok(Err(e)) => e,
-                Err(e) => format!("the model call panicked or was cancelled: {e}"),
-                Ok(Ok(_)) => unreachable!(),
-            };
+    let answer = match answer {
+        Ok(text) => text,
+        Err(why) => {
             tracing::warn!(target: "amux::history_ask", verdict = "ask_model_unavailable",
                 measured = false, n_considered = included, elapsed_ms, error = %why,
                 "a messages question could not be answered");
@@ -315,6 +336,7 @@ pub async fn ask(State(state): State<AppState>, Json(body): Json<AskBody>) -> Re
                     "n_available": available,
                     "window_days": days,
                     "elapsed_ms": elapsed_ms,
+                    "attempts": attempts,
                 }),
             );
         }
@@ -337,6 +359,9 @@ pub async fn ask(State(state): State<AppState>, Json(body): Json<AskBody>) -> Re
         // follow-up that had context from one that silently lost it.
         "history_turns": history_turns,
         "history_turns_sent": body.history.len(),
+        // 2 means the first call failed and the retry carried it. Visible, so a
+        // flaky helper shows up as a number rather than as slowness.
+        "attempts": attempts,
     }))
 }
 
@@ -539,6 +564,51 @@ mod tests {
         assert_eq!(v["n_considered"], 0, "{v}");
         assert!(v["why_unmeasured"].as_str().unwrap().contains("no messages"), "{v}");
         assert!(seen.lock().unwrap_or_else(|e| e.into_inner()).is_none(), "no corpus means no model call");
+    }
+
+    /// AMUX-4681. The read-only client answers from a helper started before the
+    /// call and hands a failed exchange straight back ("caller owns the retry
+    /// budget, no hidden cold retry"). A helper that died while idle would
+    /// otherwise reach the reader as "the model could not answer this question",
+    /// which is what happened in the browser at 14:40Z over 260 messages.
+    #[tokio::test]
+    async fn a_first_failed_call_is_retried_once_and_the_answer_says_it_took_two() {
+        let _guard = ONE_AT_A_TIME.lock().await;
+        struct FlakyOnce(std::sync::Mutex<u32>);
+        impl ModelClient for FlakyOnce {
+            fn complete(&self, _m: &str, _p: &str) -> Result<String, String> {
+                let mut n = self.0.lock().unwrap_or_else(|e| e.into_inner());
+                *n += 1;
+                if *n == 1 {
+                    Err("claude exited with status 1: {\"type\":\"system\"}".into())
+                } else {
+                    Ok("the second attempt answered [MSG-1]".into())
+                }
+            }
+        }
+        *TEST_MODEL.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(Arc::new(FlakyOnce(std::sync::Mutex::new(0))));
+        let (state, _dir) = state_with(&[(1, now_ms() - 60_000, "amux", "direct", "a message")]);
+        let r = ask(State(state), Json(AskBody { question: "what happened?".into(), ..Default::default() })).await;
+        let v = body_of(r).await;
+        assert_eq!(v["_status"], 200, "the retry carries it: {v}");
+        assert_eq!(v["attempts"], 2, "and the answer says it took two: {v}");
+        assert!(v["answer"].as_str().unwrap().contains("second attempt"), "{v}");
+    }
+
+    /// Bounded: a model that always fails is reported, not retried forever, and
+    /// the refusal carries both attempts' reasons.
+    #[tokio::test]
+    async fn a_persistent_failure_stops_at_two_attempts_and_reports_both() {
+        let _guard = ONE_AT_A_TIME.lock().await;
+        let seen = with_model(Err("quota exhausted".into()));
+        let (state, _dir) = state_with(&[(1, now_ms() - 60_000, "amux", "direct", "a message")]);
+        let r = ask(State(state), Json(AskBody { question: "what happened?".into(), ..Default::default() })).await;
+        let v = body_of(r).await;
+        assert_eq!(v["_status"], 503, "{v}");
+        assert_eq!(v["attempts"], 2, "two attempts, not an endless retry: {v}");
+        assert!(v["why_unmeasured"].as_str().unwrap().contains("first attempt"), "both attempts named: {v}");
+        assert!(seen.lock().unwrap_or_else(|e| e.into_inner()).is_some(), "the model was really called");
     }
 
     /// A model that cannot answer is a refusal with the reason, never a blank
