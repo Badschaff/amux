@@ -122,10 +122,26 @@ pub trait Pane: Send + Sync {
 /// prefix, so pending input starting with one is OURS — never something the
 /// user is composing at a real terminal." Space-insensitive because
 /// `pending_input` strips whitespace when it un-wraps the box.
+///
+/// A SECOND provably-ours shape (AMUX-4661, live specimen: mvs-infra's
+/// composer held `[amuxauto-pickup]ClaimedMI-5166...` unsubmitted with no
+/// live turn or agents). `board_drive`'s own nudges — `PICKUP_ANCHOR`
+/// ("[amux auto-pickup] Claimed ") and the auto-continue nudge ("[amux
+/// auto-continue] ...") — never carry the dashboard's `[H:MM AM]` stamp, so
+/// this doc's own words already named the gap: "anything else is left
+/// alone — including amux's own agent-to-agent messages, which is a real
+/// coverage gap." `[amux <word>]` at the start is exactly as provable as the
+/// time stamp — no person composing a real terminal command starts it with
+/// the literal token `amux` immediately followed by a hyphenated lowercase
+/// word — so it gets the same trust. General on the SHAPE rather than an
+/// enumerated list of literal prefixes, so a future board_drive nudge is
+/// covered without another edit here.
 pub fn is_amux_ghost(pending: &str) -> bool {
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| regex::Regex::new(r"^\[\d{1,2}:\d{2}[AP]M\]").expect("ghost prefix regex"));
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"^(\[\d{1,2}:\d{2}[AP]M\]|\[amux[a-z][a-z-]*\])").expect("ghost prefix regex")
+    });
     re.is_match(pending)
 }
 
@@ -557,5 +573,39 @@ mod tests {
         assert!(is_amux_ghost("[4:05AM]something"));
         assert!(!is_amux_ghost("hello [06:55 PM] not at the start"));
         assert!(!is_amux_ghost(""));
+    }
+
+    /// AMUX-4661, live specimen: mvs-infra's composer held
+    /// `[amuxauto-pickup]ClaimedMI-5166...` unsubmitted, with no live turn or
+    /// agents, and no rescue ever fired for it — the doc comment on
+    /// `is_amux_ghost` named this exact gap before this test existed. Both of
+    /// board_drive's real nudge prefixes are pinned by name so a rename of
+    /// either literal (`PICKUP_ANCHOR` or the auto-continue nudge) is caught
+    /// here rather than silently reopening the gap.
+    #[test]
+    fn board_drive_nudges_are_recognised_as_provably_amuxs_own() {
+        assert!(is_amux_ghost("[amuxauto-pickup]ClaimedMI-5166\u{2014}workitnow"));
+        assert!(is_amux_ghost("[amuxauto-continue]Yourtodoqueueisempty"));
+        // The shape generalises, not just these two literal strings — a
+        // future board_drive nudge under the same `[amux <word>]` convention
+        // must not need a second edit here.
+        assert!(is_amux_ghost("[amuxsome-future-nudge]whatevertextfollows"));
+    }
+
+    /// The widened pattern must stay exactly as blind to a real human as the
+    /// original — a person's terminal command never starts with the literal
+    /// token `amux` immediately followed by a hyphenated lowercase word, but
+    /// the negative space around that claim is the one worth pinning: a bare
+    /// "amux" mention mid-sentence, and the word without the bracket, must
+    /// both still read as a human composing.
+    #[test]
+    fn the_amux_prefix_pattern_does_not_widen_into_ordinary_text() {
+        assert!(!is_amux_ghost("amuxisbrokenpleasefixit"));
+        assert!(!is_amux_ghost("checkwithamuxaboutthis"));
+        assert!(!is_amux_ghost("[AMUXAUTO-PICKUP]uppercaseisnotthestamp"));
+        // Space-stripped, matching what composer_state actually returns: a
+        // digit immediately after `amux` (a bare card id, say) is not a
+        // hyphenated word and must not match either.
+        assert!(!is_amux_ghost("[amux4123]notahyphenatedword"));
     }
 }
