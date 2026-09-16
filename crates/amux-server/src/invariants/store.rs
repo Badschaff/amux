@@ -54,9 +54,13 @@ pub async fn record(store: &SharedStore, results: Vec<InvariantResult>, duration
             let ts = now();
             for r in &results {
                 conn.execute(
+                    // `build` is stamped per ROW rather than per batch: the
+                    // auto-builder can swap the binary mid-pass, and a
+                    // batch-level stamp would then claim one build for verdicts
+                    // produced by two (AMUX-4719).
                     "INSERT INTO _amux_invariant_result
-                       (ts, invariant_id, status, entity_key, expected, observed, evidence, duration_ms)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                       (ts, invariant_id, status, entity_key, expected, observed, evidence, duration_ms, build)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
                     rusqlite::params![
                         ts,
                         r.invariant_id,
@@ -66,6 +70,7 @@ pub async fn record(store: &SharedStore, results: Vec<InvariantResult>, duration
                         r.observed,
                         r.evidence.to_string(),
                         duration_ms,
+                        crate::build_hash(),
                     ],
                 )?;
 
@@ -249,7 +254,7 @@ pub fn latest_per_invariant(store: &SharedStore) -> anyhow::Result<Vec<serde_jso
                       WHERE r.invariant_id = ids.id) AS mt
                FROM ids WHERE id IS NOT NULL
          )
-         SELECT r.invariant_id, r.status, r.entity_key, r.expected, r.observed, r.ts, r.evidence
+         SELECT r.invariant_id, r.status, r.entity_key, r.expected, r.observed, r.ts, r.evidence, r.build
            FROM _amux_invariant_result r
            JOIN latest l ON l.invariant_id = r.invariant_id AND l.mt = r.ts
           ORDER BY r.invariant_id",
@@ -267,6 +272,9 @@ pub fn latest_per_invariant(store: &SharedStore) -> anyhow::Result<Vec<serde_jso
                 "observed":     r.get::<_, String>(4)?,
                 "checked_at":   ts,
                 "age_s":        (now - ts).max(0.0),
+                // Which BUILD produced this verdict. '' for rows written before
+                // migration 0078, which reads as unknown rather than mismatched.
+                "build":        r.get::<_, String>(7).unwrap_or_default(),
             });
             // AMUX-4538. Checks store their causal slice in `evidence` (a
             // failure's per-card sample, for instance) and this read dropped

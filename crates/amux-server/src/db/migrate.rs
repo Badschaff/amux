@@ -443,6 +443,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0077_search_docs_prompt_seconds",
         sql: include_str!("../../migrations/0077_search_docs_prompt_seconds.sql"),
     },
+    Migration {
+        version: 78,
+        name: "0078_invariant_result_build",
+        sql: include_str!("../../migrations/0078_invariant_result_build.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.

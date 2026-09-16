@@ -1,0 +1,15 @@
+-- AMUX-4719. Which BUILD produced a verdict.
+--
+-- `/api/health/invariants` served the previous build's verdicts with
+-- `stale: false` for one monitor cadence after every deploy. `stale` is not
+-- wrong: it answers "is the producer alive", and the producer was. The reader's
+-- question is different, "did these verdicts come from the running code", and
+-- nothing in the payload could answer it.
+--
+-- This box runs an auto-builder that swaps the binary on every commit, so that
+-- window recurs many times an hour, and it lands exactly on the lane checking
+-- the fix it just shipped.
+--
+-- Empty default: rows written before this column existed have no build, and
+-- '' reads as unknown rather than as a mismatch.
+ALTER TABLE _amux_invariant_result ADD COLUMN build TEXT NOT NULL DEFAULT '';

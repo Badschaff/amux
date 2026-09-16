@@ -15,6 +15,35 @@ use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use serde_json::json;
 
+/// Which build produced the stored verdicts, and whether it is the one serving.
+///
+/// Pure, so the three-way answer is testable without a store and without
+/// actually deploying: the case that matters most cannot be reproduced on
+/// demand, because it exists only in the ~30s window after a binary swap.
+///
+/// UNKNOWN IS NULL, NOT FALSE. Rows written before migration 0078 carry no
+/// build, and answering "no, these are not from the running build" for them
+/// would be an assertion nothing measured. A reader who cannot be told must not
+/// be told "no" (ethos rule 4).
+///
+/// MORE THAN ONE BUILD IS REPORTED AS A LIST rather than collapsed. The
+/// auto-builder can swap the binary mid-pass, so a batch can genuinely carry
+/// two, and picking one would invent a verdict about which.
+fn verdict_build_agreement(
+    builds: &std::collections::BTreeSet<String>,
+    serving: &str,
+) -> (serde_json::Value, serde_json::Value) {
+    match builds.len() {
+        0 => (serde_json::Value::Null, serde_json::Value::Null),
+        1 => {
+            let b = builds.iter().next().cloned().unwrap_or_default();
+            let matches = b == serving;
+            (json!(b), json!(matches))
+        }
+        _ => (json!(builds.iter().cloned().collect::<Vec<_>>()), json!(false)),
+    }
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/health/invariants", axum::routing::get(health))
@@ -95,6 +124,19 @@ async fn health(
     let confidence = stored_confidence(mon_fresh, has_stored, fail, unknown);
     let live = store::live_incidents(&state.store).unwrap_or_default();
     let last_age = snap.as_ref().and_then(|s| s.last_tick_at).map(|t| ((now - t).max(0.0) * 10.0).round() / 10.0);
+    // The build the stored verdicts came from. Taken from the rows rather than
+    // from a process global, because that is the fact being reported.
+    // DISAGREEMENT AMONG ROWS IS REPORTED, NOT COLLAPSED: the builder can swap
+    // the binary mid-pass, so a batch can genuinely carry two builds, and
+    // picking one would be inventing a verdict about which.
+    let builds: std::collections::BTreeSet<String> = latest
+        .iter()
+        .filter_map(|l| l.get("build").and_then(|b| b.as_str()))
+        .filter(|b| !b.is_empty())
+        .map(str::to_string)
+        .collect();
+    let (verdicts_build, verdicts_from_serving_build) =
+        verdict_build_agreement(&builds, &state.build_hash);
 
     let body = json!({
         "source": "stored",
@@ -104,6 +146,26 @@ async fn health(
         // `stale` is true whenever the verdict cannot be trusted as current —
         // dead/stalled/hung producer, OR nothing stored yet.
         "stale": !mon_fresh || !has_stored,
+        // AMUX-4719. `stale` answers "is the PRODUCER alive". A reader verifying
+        // a fix they just shipped is asking something else: "did these verdicts
+        // come from the running code". Those come apart for one monitor cadence
+        // after every deploy, and this box swaps the binary on every commit, so
+        // the window recurs many times an hour and lands precisely on the lane
+        // checking its own change. Self-traced: 2b63f1a9 was live at /api/health
+        // while this endpoint still served the retired build's verdicts with
+        // stale:false, and the available conclusion was "the fix did not work".
+        //
+        // A SIBLING FIELD RATHER THAN A WIDER `stale`, deliberately. Existing
+        // readers treat stale as "the monitor is down" and some alarm on it;
+        // widening it would fire that alarm after every deploy for a producer
+        // that is perfectly healthy. Two questions, two fields.
+        //
+        // Stated rather than inferable: `monitor.ticks` already discloses this
+        // to anyone who knows to divide by the cadence, which is the inference
+        // ethos rule 4 says to replace with a fact.
+        "serving_build": state.build_hash.clone(),
+        "verdicts_build": verdicts_build.clone(),
+        "verdicts_from_serving_build": verdicts_from_serving_build,
         "monitor": {
             "state": mon_state,             // ok|alive|stalled|hung|dead|not_spawned|disabled|starting
             "last_tick_age_s": last_age,    // null = never ticked; distinct from old (starting vs stalled)
@@ -333,7 +395,8 @@ async fn debug(State(state): State<AppState>) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{filtered_body, monitor_liveness, stored_confidence};
+    use super::{filtered_body, monitor_liveness, stored_confidence, verdict_build_agreement};
+    use serde_json::json;
     use crate::invariants::InvariantResult;
     use crate::runtime_jobs::registry::Snapshot;
 
@@ -462,5 +525,40 @@ mod tests {
         let (ran, _, body) = matched("queue.has_live_consumer");
         assert!(ran, "a failing check ran; ran must not be a synonym for passed");
         assert_eq!(body["results"][0]["status"], "fail");
+    }
+
+    /// AMUX-4719. `/api/health/invariants` served the previous build's verdicts
+    /// with `stale: false` for one monitor cadence after every deploy.
+    #[test]
+    fn the_payload_says_which_build_produced_the_verdicts() {
+        let set = |v: &[&str]| -> std::collections::BTreeSet<String> {
+            v.iter().map(|s| s.to_string()).collect()
+        };
+
+        // Agreement: the verdicts came from the code answering this request.
+        let (b, ok) = verdict_build_agreement(&set(&["abc123"]), "abc123");
+        assert_eq!(b, json!("abc123"));
+        assert_eq!(ok, json!(true));
+
+        // THE INCIDENT. The builder adopted a new binary, the monitor has not
+        // re-run yet, and the endpoint is serving the retired image's verdicts.
+        // Pre-fix this was indistinguishable from agreement.
+        let (b, ok) = verdict_build_agreement(&set(&["old-build"]), "new-build");
+        assert_eq!(b, json!("old-build"), "the reader must see WHICH build produced them");
+        assert_eq!(ok, json!(false));
+
+        // UNKNOWN IS NULL, NOT FALSE. Rows predating migration 0078 carry no
+        // build; answering "no" there asserts something nothing measured.
+        let (b, ok) = verdict_build_agreement(&set(&[]), "any-build");
+        assert_eq!(b, serde_json::Value::Null, "an unmeasured build is null, not a mismatch");
+        assert_eq!(ok, serde_json::Value::Null, "and the agreement is null, not false");
+
+        // A batch spanning a mid-pass swap reports BOTH rather than picking.
+        let (b, ok) = verdict_build_agreement(&set(&["one", "two"]), "one");
+        assert_eq!(b, json!(["one", "two"]), "a split batch must report both builds");
+        assert_eq!(
+            ok, json!(false),
+            "a batch that spans a swap is not wholly from the serving build, even though one row is"
+        );
     }
 }
