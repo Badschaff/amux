@@ -6,7 +6,12 @@
 # that it reports and the owning lane decides, and that promise is a property of
 # the SOURCE, not of any run. A test that only checks output would stay green on
 # the day somebody adds an --apply.
-set -uo pipefail
+# -e is required by the AF-561 ratchet: a harness that prints a verdict without
+# it reports PASS after calling a helper that does not exist, because bash writes
+# "command not found" to stderr and carries on. Verified before and after per
+# AF-562, since -e changes behaviour in scripts not written for it: exit 0 and 8
+# cells both ways.
+set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 SUT="$HERE/claude-scratch-report.sh"
 FAIL=0
@@ -88,7 +93,12 @@ RAN=$((RAN+1))
 
 # The promise, checked against the source. `--apply`, rm -rf, unlink and
 # os.remove must all be absent; this tool has no deletion path by construction.
-bad=$(grep -nE 'rm -rf|--apply|unlink|os\.remove|shutil\.rmtree' "$SUT" | grep -v '^[0-9]*:#' | wc -l | tr -d ' ')
+# `|| true` because ZERO MATCHES IS THE PASSING ANSWER here. Under `set -e`
+# with pipefail a grep that finds nothing exits 1 and takes the script with it,
+# so the cell that proves this tool has no delete path would never run, and the
+# harness would report 7 cells instead of 8 while still saying ALL PASS. That is
+# the AF-562 hazard the guard warns about, hit on the first try.
+bad=$(grep -nE 'rm -rf|--apply|unlink|os\.remove|shutil\.rmtree' "$SUT" | grep -v '^[0-9]*:#' | wc -l | tr -d ' ' || true)
 cell no_delete_path 0 "$bad"
 
 echo
