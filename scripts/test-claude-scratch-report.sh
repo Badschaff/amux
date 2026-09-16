@@ -47,7 +47,8 @@ mk caceffea-c12d-475e-a18e-26729434a5d8 0 4   # owner-held, fresh -> OWNER-HELD
 
 out=$(CLAUDE_SCRATCH_ROOT="$ROOT" CLAUDE_PROJECTS_DIR="$PROJS" AMUX_SESSIONS_DIR="$SESS" \
       bash "$SUT" --tsv --dead-days 3 2>/dev/null)
-klass() { awk -F'\t' -v c="$1" '$5 ~ c {print $3; exit}' <<<"$out"; }
+klass() { awk -F'\t' -v c="$1" '$6 ~ c {print $3; exit}' <<<"$out"; }
+reachof() { awk -F'\t' -v c="$1" '$6 ~ c {print $4; exit}' <<<"$out"; }
 
 cell live_is_live       LIVE          "$(klass 'fresh-one')"
 cell silent_is_dead     DEAD          "$(klass 'stale-one')"
@@ -59,19 +60,26 @@ cell silent_is_dead     DEAD          "$(klass 'stale-one')"
 # live tooling scratch. Unknown liveness must never collapse into DEAD.
 cell absent_is_not_dead NO-TRANSCRIPT "$(klass 'notx-one')"
 
-# Owner-held wins over its own liveness: these are held pending Ethan, so they
-# must never be offered as actionable no matter what their transcript says.
-cell owner_held_wins    OWNER-HELD    "$(klass 'caceffea')"
+# REACHABILITY IS COMPUTED, NOT PINNED. solo-lane has no tmux pane, so the
+# owner cannot be told about these bytes right now and the report must say so.
+# The 2026-09-14 list hardcoded two UUIDs as owner-held; both lanes are running
+# again as of today, so a pinned rule would still be routing their 58.8 GB to
+# Ethan while the owners sat there able to act.
+cell down_lane_unreachable UNREACHABLE-lane-down "$(reachof 'fresh-one')"
+
+# Prior escalation is recorded ALONGSIDE live reachability, never instead of it.
+cell escalation_is_noted_not_substituted \
+     "UNREACHABLE-lane-down,escalated-09-14" "$(reachof 'caceffea')"
 
 # Attribution: a workspace with exactly one lane names it.
-cell sole_owner_named   solo-lane     "$(awk -F'\t' '$5 ~ /fresh-one/{print $4; exit}' <<<"$out")"
+cell sole_owner_named   solo-lane     "$(awk -F'\t' '$6 ~ /fresh-one/{print $5; exit}' <<<"$out")"
 
 # A shared workspace must NOT name one lane. Add a second lane on the same dir
 # and the answer has to become the candidate list.
 printf 'CC_DIR="/Users/x/Dev/solo"\n' > "$SESS/second-lane.env"
 out2=$(CLAUDE_SCRATCH_ROOT="$ROOT" CLAUDE_PROJECTS_DIR="$PROJS" AMUX_SESSIONS_DIR="$SESS" \
        bash "$SUT" --tsv --dead-days 3 2>/dev/null)
-shared=$(awk -F'\t' '$5 ~ /fresh-one/{print $4; exit}' <<<"$out2")
+shared=$(awk -F'\t' '$6 ~ /fresh-one/{print $5; exit}' <<<"$out2")
 case "$shared" in
   AMBIGUOUS:2-candidates*) echo "PASS shared_is_ambiguous: $shared" ;;
   *) echo "FAIL shared_is_ambiguous: expected AMBIGUOUS:2-candidates, got '$shared'"; FAIL=$((FAIL+1)) ;;

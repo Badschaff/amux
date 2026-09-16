@@ -39,12 +39,17 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# OWNER-HELD. These two were surfaced to their lanes on 2026-09-14 and could not
-# be actioned: mixpeek-ops-server was not running and mixpeek-cicd is paused, so
-# both are waiting on Ethan. They are reported for completeness and never
-# appear as actionable, so nobody sweeps a scratchpad whose disposition the
-# owner still holds.
-OWNER_HELD="caceffea-c12d-475e-a18e-26729434a5d8 db837290-839f-4c5a-addc-4aa3c72a4256"
+# Conversations that were escalated to Ethan on 2026-09-14 because their lane
+# could not act: mixpeek-ops-server was not running and mixpeek-cicd was paused.
+#
+# THIS LIST IS HISTORY, NOT A CLASSIFICATION. Reachability is COMPUTED below on
+# every run, because "the owner has to decide this" is a fact about whether the
+# lane is up right now, and pinning it to a UUID freezes a Sunday afternoon into
+# the tool. Measured 2026-09-16: both lanes are running again, so both entries
+# would still be reported as owner-held by a hardcoded rule while their owners
+# sat there able to act. The list is kept only so the report can say a
+# conversation has been escalated before.
+ESCALATED_2026_09_14="caceffea-c12d-475e-a18e-26729434a5d8 db837290-839f-4c5a-addc-4aa3c72a4256"
 
 now=$(date +%s)
 
@@ -81,12 +86,26 @@ attribute() {
   echo "AMBIGUOUS:${n}-candidates${running:+ running=$running}"
 }
 
-emit() {  # size_gb  age  class  owner  path
-  if [ "$TSV" = 1 ]; then printf '%s\t%s\t%s\t%s\t%s\n' "$@"
-  else printf '%-8s %-14s %-13s %-34s %s\n' "$@"; fi
+# Whether whoever owns these bytes can be told about them right now. The
+# 2026-09-14 delivery failed on exactly this and had no way to say so: two of
+# three lanes were down, the asks went nowhere, and both scratchpads then grew
+# by ~6 GB each while the report still read as delivered.
+reachability() {
+  local owner=$1
+  case "$owner" in
+    unattributed) echo "no-owner" ;;
+    AMBIGUOUS:*running=*) echo "reachable-via-candidates" ;;
+    AMBIGUOUS:*) echo "UNREACHABLE-all-candidates-down" ;;
+    *) grep -qx "$owner" <<<"$running_lanes" && echo "reachable" || echo "UNREACHABLE-lane-down" ;;
+  esac
 }
 
-[ "$TSV" = 1 ] || emit "SIZE_GB" "TRANSCRIPT" "CLASS" "OWNER" "CONVERSATION"
+emit() {  # size_gb  age  class  reach  owner  path
+  if [ "$TSV" = 1 ]; then printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$@"
+  else printf '%-8s %-11s %-13s %-26s %-30s %s\n' "$@"; fi
+}
+
+[ "$TSV" = 1 ] || emit "SIZE_GB" "TRANSCRIPT" "CLASS" "REACH" "OWNER" "CONVERSATION"
 
 tot=0; n_conv=0; n_live=0; n_dead=0; n_notx=0; n_held=0
 gb_live=0; gb_dead=0; gb_notx=0; gb_held=0
@@ -110,29 +129,88 @@ for cdir in "$ROOT"/*/*/; do
     # actionable.
     cls=NO-TRANSCRIPT; agestr="absent"
   fi
+  # CAN THE OWNER ACT? This is orthogonal to whether the bytes are stale, and
+  # folding the two together is what made the 09-14 list go out of date: a
+  # scratchpad is the owner's problem when its lane is up, and Ethan's only
+  # while it is not. Computed per run from the live pane list.
+  owner=$(attribute "$proj")
+  reach=$(reachability "$owner")
   # An `if`, not a `case`: bash 3.2 (what /bin/bash is on this Mac) mis-parses a
   # case statement nested inside $( ), taking the pattern's `)` as the end of
   # the command substitution.
-  if [[ " $OWNER_HELD " == *" $conv "* ]]; then cls=OWNER-HELD; fi
+  if [[ " $ESCALATED_2026_09_14 " == *" $conv "* ]]; then reach="$reach,escalated-09-14"; fi
 
-  emit "$gb" "$agestr" "$cls" "$(attribute "$proj")" "$proj/$conv"
+  emit "$gb" "$agestr" "$cls" "$reach" "$owner" "$proj/$conv"
 done | sort -k1 -rn
 )
+
+# Per-conversation totals are not actionable for a LIVE lane: nobody deletes the
+# scratchpad they are working in. The actionable unit is the SUBFOLDER that has
+# not been written in days while the conversation around it is busy, which is
+# where the growth actually sits (mixpeek-homepage was holding gitG, cand3 and
+# cand4 at 3.6 GB each). Reported for every conversation big enough to matter,
+# LIVE ones included, because those are the ones a lane can still act on.
+stale_subfolders() {
+  local cdir=$1 sub kb gb reported=
+  for sub in "$cdir"*/ "$cdir"*/*/; do
+    [ -d "$sub" ] || continue
+    # A stale parent already covers everything beneath it, so reporting the
+    # child as well would let someone add the two figures and double-count the
+    # same bytes. Shallower entries come first in this glob order, so skipping
+    # anything under an already-reported path keeps the widest honest unit.
+    local skip=
+    for r in $reported; do
+      case "$sub" in "$r"*) skip=1; break ;; esac
+    done
+    [ -z "$skip" ] || continue
+    kb=$(du -sk "$sub" 2>/dev/null | awk '{print $1}'); [ -n "$kb" ] || continue
+    gb=$(awk -v k="$kb" 'BEGIN{printf "%.2f", k/1048576}')
+    awk -v g="$gb" -v m="$MIN_GB" 'BEGIN{exit !(g>=m)}' || continue
+    # "Has ANY file under here been written in the window?" -print -quit stops
+    # at the first hit, so this stays cheap on a 43 GB tree. The question is
+    # asked of FILES, never of the directory's own mtime.
+    if [ -n "$(find "$sub" -type f -newermt "-${DEAD_DAYS} days" -print -quit 2>/dev/null)" ]; then
+      continue   # written recently; the lane is still using it
+    fi
+    reported="$reported $sub"
+    printf '    %6s GB  no writes in %sd  %s\n' "$gb" "$DEAD_DAYS" "${sub#"$ROOT"/}"
+  done
+}
 printf '%s\n' "$report"
+
+if [ "$TSV" != 1 ]; then
+  printf '\nSTALE SUBFOLDERS (>= %s GB, no file written in %s days)\n' "$MIN_GB" "$DEAD_DAYS"
+  printf 'The part a lane can act on without touching what it is still using.\n\n'
+  found=0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    gb=$(awk '{print $1}' <<<"$line"); path=$(awk '{print $NF}' <<<"$line")
+    awk -v g="$gb" -v m="$MIN_GB" 'BEGIN{exit !(g>=m)}' 2>/dev/null || continue
+    subs=$(stale_subfolders "$ROOT/$path/")
+    [ -n "$subs" ] || continue
+    found=$((found+1))
+    printf '  %s  [%s]\n%s\n' "$path" "$(awk '{print $3}' <<<"$line")" "$subs"
+  done <<<"$report"
+  [ "$found" -gt 0 ] || printf '  none: no subfolder >= %s GB has been idle %s days\n' "$MIN_GB" "$DEAD_DAYS"
+fi
 
 # Summary computed from the rows above, never written by hand. Every count
 # carries the population it is over.
 printf '%s\n' "$report" | awk -v min="$MIN_GB" '
-  { g=$1+0; c=$3; tot+=g; n++
-    if (c=="LIVE") { L+=g; nl++ } else if (c=="DEAD") { D+=g; nd++ }
-    else if (c=="OWNER-HELD") { H+=g; nh++ } else { U+=g; nu++ }
-    if (g>=min) { big++ } }
+  { g=$1+0; c=$3; r=$4; tot+=g; n++
+    if (c=="LIVE") { L+=g; nl++ } else if (c=="DEAD") { D+=g; nd++ } else { U+=g; nu++ }
+    if (r ~ /^UNREACHABLE/) { X+=g; nx++ } else if (r=="no-owner") { N+=g; nn++ } else { R+=g; nr++ }
+    if (g>=min) big++ }
   END {
     printf "\n%d conversation(s), %.1f GB total\n", n, tot
-    printf "  LIVE          %5.1f GB over %d  (transcript written recently; not a cleanup target)\n", L, nl
-    printf "  DEAD          %5.1f GB over %d  (transcript silent; the only reapable class)\n", D, nd
-    printf "  OWNER-HELD    %5.1f GB over %d  (surfaced 09-14, lane could not act; Ethan decides)\n", H, nh
-    printf "  NO-TRANSCRIPT %5.1f GB over %d  (liveness unknown; never actionable)\n", U, nu
-    printf "  %d of %d conversation(s) are >= %s GB\n", big, n, min
+    printf "\nBY LIVENESS (is the data still in use)\n"
+    printf "  LIVE           %5.1f GB over %d  transcript written recently, not a target\n", L, nl
+    printf "  DEAD           %5.1f GB over %d  transcript silent, the only reapable class\n", D, nd
+    printf "  NO-TRANSCRIPT  %5.1f GB over %d  liveness unknown, never actionable\n", U, nu
+    printf "\nBY REACH (can the owner be told, right now)\n"
+    printf "  reachable      %5.1f GB over %d  ask the lane; it can act today\n", R, nr
+    printf "  UNREACHABLE    %5.1f GB over %d  lane is down, so this is Ethans call\n", X, nx
+    printf "  no owner       %5.1f GB over %d  no lane CC_DIR encodes to this project\n", N, nn
+    printf "\n  %d of %d conversation(s) are >= %s GB\n", big, n, min
     if (tot>0) printf "  reapable share: %.1f%% of all bytes here\n", 100*D/tot
   }'
