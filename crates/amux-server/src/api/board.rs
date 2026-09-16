@@ -1309,7 +1309,8 @@ async fn get_contract(
             "rule": "an identified worker may create cards only on its own board; `session` must equal the verified X-Amux-Worker/X-Amux-Session identity. The one exception is a ROUTED REQUEST (AMUX-4653): POST `request_to: \"<lane>\"` files the card on THAT lane's board, with `requested_by` forced to the verified caller and a completion callback armed to them",
             "peer_links": "cross-worker collaboration is represented without transferring board ownership: set `reviewer` or `shepherd` to the peer and use `depends_on` for cross-board task dependencies",
             "cli": "amux board request <worker> <title> files the card on <worker>'s board as a todo their dispatch offers them, with the caller as requester and a terminal callback armed back to the caller",
-            "request_to": "requires a verified caller; refused for your own lane (request_to_self), a lane that does not exist (unknown_lane), an archived one (archived_lane), an isolated one (isolated_lane), a `session` that disagrees with it (request_target_ambiguous), or a terminal status (request_created_terminal). `requested_by` is never read from the body. Each routed request logs marker=board_request_routed",
+            "request_to": "requires a verified caller; refused for your own lane (request_to_self), a lane that does not exist (unknown_lane), an unusable name (invalid_lane_name), a `session` that disagrees with it (request_target_ambiguous), or a terminal status (request_created_terminal). `requested_by` is never read from the body. Each routed request logs marker=board_request_routed",
+            "request_to_eligibility": "WHO may receive one is not decided here: it is `cross_group_send_ok`, the resolver every peer path shares, so a routed request refuses exactly what a direct send refuses (code peer_interaction_refused, 403, with the resolver's own message and a descriptive `target_lifecycle`). That covers lifecycle (AMUX-4566: active workers interact only with active workers, so a paused or archived lane on either end is refused), isolated targets, and the cross-group allow-list. A second predicate here would be a way around a gate messages cannot pass",
             "security": "a worker cannot create an unassigned card, and cannot place a new card on another worker's board except through `request_to`, which records who asked and answers back to them; anonymous/human control-plane callers retain administrative placement",
         },
         "capture_decomposition": {
@@ -4581,11 +4582,12 @@ pub async fn create_item(
                 }),
             );
         }
-        if let Some(why) = super::session_verbs::request_target_refusal(target) {
-            let status = match why {
+        if let Some((code, why)) =
+            super::session_verbs::request_target_refusal(&hdr_session, target)
+        {
+            let status = match code {
                 "unknown_lane" => StatusCode::NOT_FOUND,
-                "isolated_lane" => StatusCode::FORBIDDEN,
-                "archived_lane" => StatusCode::CONFLICT,
+                "peer_interaction_refused" => StatusCode::FORBIDDEN,
                 _ => StatusCode::BAD_REQUEST,
             };
             tracing::warn!(
@@ -4593,18 +4595,23 @@ pub async fn create_item(
                 marker = "board_request_target_refused",
                 requester = %hdr_session,
                 target_lane = %target,
-                verdict = why,
+                verdict = code,
                 measured = true,
                 "routed board request refused: the target cannot receive one"
             );
             return err(
                 status,
                 json!({
-                    "error": "that lane cannot receive a routed request",
-                    "code": why,
+                    // The resolver writes this sentence and names its own
+                    // remedy, so the refusal a request sees is word for word
+                    // the one a send sees.
+                    "error": why,
+                    "code": code,
                     "request_to": target,
-                    "how_to_fix": "name a registered, non-archived, non-isolated lane, \
-                                   or file the card on your own board and link the peer",
+                    // DESCRIPTIVE, never the decision. The verdict above comes
+                    // from one resolver; this is here so a caller can branch
+                    // without matching prose.
+                    "target_lifecycle": super::session_verbs::lane_lifecycle(target),
                 }),
             );
         }

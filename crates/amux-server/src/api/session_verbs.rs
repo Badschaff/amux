@@ -16327,35 +16327,46 @@ pub(crate) fn session_is_isolated(name: &str) -> bool {
 }
 
 /// Why a lane cannot receive a ROUTED board request, or `None` when it can
-/// (AMUX-4653).
+/// (AMUX-4653). Returns `(code, message)`.
 ///
-/// The name is checked before anything builds a path from it, which is the
-/// ordering `a_stored_display_name_cannot_escape_the_sessions_dir` pins for the
-/// send route and the same hazard here: these paths are built by concatenating
-/// the name into `sessions/`.
+/// Only two checks are answered here, and both are structural facts about the
+/// NAME rather than policy. The name is validated before anything builds a path
+/// from it, which is the ordering `a_stored_display_name_cannot_escape_the_
+/// sessions_dir` pins for the send route and the same hazard here: these paths
+/// are built by concatenating the name into `sessions/`.
 ///
-/// A PAUSED lane is a legitimate target and an ARCHIVED one is not. A pause
-/// ends, and paused lanes already hold cards (AMUX-4663 is four of them), so a
-/// request that waits for a resume is doing its job. That is why this does not
-/// reuse `all_lane_names`, which drops paused and archived together.
+/// EVERYTHING ELSE IS [`cross_group_send_ok`], deliberately, and this function
+/// exists in the shape it does because the first cut got that wrong. It
+/// hand-rolled lifecycle and isolation and allowed a PAUSED target, reasoning
+/// that a card waits where a message cannot. That reasoning contradicted an
+/// owner decision the resolver already carries: "ACTIVE WORKERS INTERACT ONLY
+/// WITH ACTIVE WORKERS (Ethan, 2026-09-14 14:32, AMUX-4566). A paused or
+/// archived lane is out of the fleet: it does not message, request or route to
+/// peers, and no peer reaches it." The resolver's own comment names this exact
+/// caller: "the one resolver every peer path shares, so a direct send, a board
+/// request callback and reviewer routing all refuse a paused or archived lane
+/// the same way."
 ///
-/// An isolated lane is refused because isolation is the explicit opt-out from
-/// peer interaction, and a card landing on its board is peer interaction that
-/// also arms a callback back out.
-pub(crate) fn request_target_refusal(name: &str) -> Option<&'static str> {
+/// It also silently dropped the CROSS-GROUP policy, which `cross_group_send_ok`
+/// enforces for every send. A lane with no standing allowance to another group
+/// could route a card to them, so the request verb would have been a way around
+/// a gate messages cannot pass. Caught live: 7 of 20 stranded-card reports were
+/// refused as paused by `amux send` on the same afternoon a routed request to a
+/// paused lane succeeded. Two components disagreeing about one fact.
+///
+/// If allowing a durable card where a message is refused is right, that is an
+/// argument to change the ONE resolver, on its own card, not a second resolver
+/// quietly disagreeing with it.
+pub(crate) fn request_target_refusal(requester: &str, name: &str) -> Option<(&'static str, String)> {
     if !valid_session_name(name) {
-        return Some("invalid_lane_name");
+        return Some(("invalid_lane_name", format!("'{name}' is not a valid lane name")));
     }
     if !env_path(name).exists() {
-        return Some("unknown_lane");
+        return Some(("unknown_lane", format!("no lane named '{name}' is registered")));
     }
-    if parse_env(name).get("CC_ARCHIVED") == Some("1") {
-        return Some("archived_lane");
-    }
-    if session_is_isolated(name) {
-        return Some("isolated_lane");
-    }
-    None
+    cross_group_send_ok(requester, name)
+        .err()
+        .map(|why| ("peer_interaction_refused", why))
 }
 
 /// The lifecycle label for a tmux lane: archived beats paused beats active.

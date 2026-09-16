@@ -38,6 +38,11 @@ fn fleet_home() -> &'static std::path::Path {
         std::fs::write(sessions.join("lane-paused.env"), "CC_DIR=/tmp\nCC_PAUSED=1\n").expect("paused");
         std::fs::write(sessions.join("lane-archived.env"), "CC_DIR=/tmp\nCC_ARCHIVED=1\n").expect("archived");
         std::fs::write(sessions.join("lane-iso.env"), "CC_DIR=/tmp\nCC_ISOLATED=1\n").expect("isolated");
+        // An explicit EMPTY allow-list is the visible deny (AMUX-4015/4018), and
+        // it is the axis the first cut of request_to dropped entirely.
+        std::fs::write(sessions.join("lane-muted.env"), "CC_DIR=/tmp\nCC_GROUPS=alpha\nCC_SEND_ALLOW=\n")
+            .expect("muted");
+        std::fs::write(sessions.join("lane-other.env"), "CC_DIR=/tmp\nCC_GROUPS=beta\n").expect("other");
         std::env::set_var("AMUX_HOME", dir.path());
         std::env::set_var("AMUX_APPROVAL_TYPES", "*");
         dir.path().to_path_buf()
@@ -189,18 +194,23 @@ async fn the_body_cannot_choose_who_the_requester_is() {
     assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
 }
 
-/// Who may receive a routed request, and who may not. Each refusal has its own
-/// status because they are different problems: a typo, an opt-out, and a lane
-/// that is gone.
+/// Who may receive a routed request, and who may not.
+///
+/// Only the two NAME facts are decided here. Everything else is
+/// `cross_group_send_ok`, the one resolver every peer path shares, so a routed
+/// request refuses exactly what a direct send refuses. The first cut hand-rolled
+/// lifecycle and isolation, allowed a PAUSED target, and dropped the cross-group
+/// policy outright; the paused cell below is the one that flipped.
 #[tokio::test]
 async fn a_request_target_must_be_a_lane_that_can_receive_one() {
     let (app, _store, _dir) = app();
 
     for (target, want_status, want_code) in [
         ("lane-nobody", StatusCode::NOT_FOUND, "unknown_lane"),
-        ("lane-iso", StatusCode::FORBIDDEN, "isolated_lane"),
-        ("lane-archived", StatusCode::CONFLICT, "archived_lane"),
         ("../escaped", StatusCode::BAD_REQUEST, "invalid_lane_name"),
+        ("lane-iso", StatusCode::FORBIDDEN, "peer_interaction_refused"),
+        ("lane-archived", StatusCode::FORBIDDEN, "peer_interaction_refused"),
+        ("lane-paused", StatusCode::FORBIDDEN, "peer_interaction_refused"),
     ] {
         let (st, v) = post_as(
             &app,
@@ -212,17 +222,46 @@ async fn a_request_target_must_be_a_lane_that_can_receive_one() {
         assert_eq!(v["code"], json!(want_code), "{target}: {v}");
     }
 
-    // A PAUSED lane IS a valid target. A pause ends, and paused lanes already
-    // hold cards (AMUX-4663 is four of them), so refusing here would make a
-    // lane's own pause silently reject work meant for it.
-    let (st, v) = post_as(
+    // AMUX-4566, and the cell that would have caught my mistake: a PAUSED lane
+    // is out of the fleet and receives nothing, the same as a direct send.
+    // I shipped the opposite, reasoning that a durable card waits where a
+    // message cannot. It cost a live card (AT-24) on a paused lane.
+    let (_, v) = post_as(
         &app,
         "lane-a",
-        json!({ "title": "waits for the resume", "request_to": "lane-paused" }),
+        json!({ "title": "waits for nothing", "request_to": "lane-paused" }),
     )
     .await;
-    assert_eq!(st, StatusCode::CREATED, "a paused lane must still receive: {v}");
-    assert_eq!(v["session"], json!("lane-paused"), "{v}");
+    assert_eq!(v["target_lifecycle"], json!("paused"), "branch without matching prose: {v}");
+    assert!(
+        v["error"].as_str().unwrap_or_default().contains("paused"),
+        "the resolver writes the refusal, so a request reads what a send reads: {v}"
+    );
+
+    // AND THE REQUESTER'S OWN LIFECYCLE, which is the half a target-only check
+    // cannot express: a paused lane does not route work out either.
+    let (st, v) = post_as(
+        &app,
+        "lane-paused",
+        json!({ "title": "from a paused lane", "request_to": "lane-b" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    assert_eq!(v["code"], json!("peer_interaction_refused"), "{v}");
+
+    // THE CROSS-GROUP POLICY, which the first cut dropped outright. A lane whose
+    // allow-list is an explicit empty value may not send to another group, and
+    // it must not be able to route a CARD there either. Without this the request
+    // verb is a way around a gate every message has to pass.
+    let (st, v) = post_as(
+        &app,
+        "lane-muted",
+        json!({ "title": "around the gate", "request_to": "lane-other" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    assert_eq!(v["code"], json!("peer_interaction_refused"), "{v}");
+    assert_eq!(v["target_lifecycle"], json!("active"), "not a lifecycle refusal: {v}");
 
     // Routing to yourself is a plain create with extra steps, and accepting it
     // would arm a callback from a lane to itself.
