@@ -515,6 +515,12 @@ pub fn spawn(state: AppState) -> super::PeriodicTask {
 
 #[cfg(test)]
 mod tests {
+    /// Serialises the three tests that drive `needsyou_sweep`, because it reads
+    /// and writes the process-global `LAST_NEEDSYOU_RUN` (AMUX-4713). Async, so
+    /// the guard can be held across the `.await` without tripping
+    /// `clippy::await_holding_lock`.
+    static SWEEP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     use super::*;
 
     #[test]
@@ -736,8 +742,32 @@ mod tests {
     /// NAMED human must not be auto-discarded just because a discard-age
     /// clock ran out. The clock measures the lane's inaction; here the lane
     /// has none to answer for.
+    ///
+    /// AMUX-4713: this test and the two below hold `SWEEP_LOCK` for their whole
+    /// body, and that is load-bearing. `needsyou_sweep` does a check-then-act on
+    /// the process-global `LAST_NEEDSYOU_RUN`, returning (0, 0) when the last
+    /// run was under 23h ago, so `store(0)` at the top of one test can be
+    /// overwritten by another's `store(now)` before its own `load`. The sweep
+    /// then returns having done nothing and the reader sees `warned: 0`, which
+    /// is indistinguishable from "it ran and found nothing to warn about".
+    ///
+    /// Measured 2026-09-16: a_typed_ask_under_the_discard_age_gets_the_ordinary_warn
+    /// failed in a full run (left 0, right 1) while passing alone and passing
+    /// with all 13 `needsyou` neighbours.
+    ///
+    /// SPACING THE CLOCKS WAS TRIED FIRST AND IS WRONG, which is worth recording
+    /// because it looks right. Giving each test a `now` more than 23h apart only
+    /// helps if they run in ASCENDING order: if the later-clock test runs first,
+    /// the earlier one loads a `last` GREATER than its own `now`, the delta goes
+    /// negative, and `delta < 23h` suppresses it just the same. Measured over 6
+    /// parallel runs: 1 of 6 still failed with the clocks spaced, against 4 of 6
+    /// with them collapsed. Reduced, not fixed, which is the most dangerous
+    /// shape a fix can have.
+    ///
+    /// The lock removes the interleaving instead of trying to survive it.
     #[tokio::test]
     async fn a_typed_ask_past_the_discard_age_is_exempted_not_discarded() {
+        let _serial = SWEEP_LOCK.lock().await;
         let (state, _dir) = hygiene_state();
         LAST_NEEDSYOU_RUN.store(0, std::sync::atomic::Ordering::Relaxed);
         let now = 2_000_000i64;
@@ -758,6 +788,7 @@ mod tests {
     /// exemption is for a NAMED human waiting, not a blanket amnesty.
     #[tokio::test]
     async fn an_untyped_legacy_ask_past_the_discard_age_is_still_discarded() {
+        let _serial = SWEEP_LOCK.lock().await;
         let (state, _dir) = hygiene_state();
         LAST_NEEDSYOU_RUN.store(0, std::sync::atomic::Ordering::Relaxed);
         let now = 2_000_000i64;
@@ -773,6 +804,7 @@ mod tests {
     /// note — this fix must not change behavior for the common case.
     #[tokio::test]
     async fn a_typed_ask_under_the_discard_age_gets_the_ordinary_warn() {
+        let _serial = SWEEP_LOCK.lock().await;
         let (state, _dir) = hygiene_state();
         LAST_NEEDSYOU_RUN.store(0, std::sync::atomic::Ordering::Relaxed);
         let now = 2_000_000i64;
