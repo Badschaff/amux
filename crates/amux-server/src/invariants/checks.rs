@@ -6508,6 +6508,13 @@ pub struct UnrecordedScheduleOutcome {
     pub count: i64,
     pub title: String,
     pub session: String,
+    /// Seconds the schedule's NEWEST unknown has been outstanding: to its next
+    /// success, or to now when there has not been one. This is the cost of the
+    /// unknown, and it is the schedule's own cadence (AMUX-4546).
+    pub outstanding_s: i64,
+    /// Whether any later run of this schedule has succeeded. False means the
+    /// tick is still in doubt right now.
+    pub recovered: bool,
 }
 
 /// AF-582. `delivery='unknown'` is the honest discriminator
@@ -6533,43 +6540,108 @@ pub struct UnrecordedScheduleOutcome {
 /// A pass is genuinely zero restarts-mid-fire in the window, not merely
 /// zero rows read (that distinction is the caller's `Unknown` on a failed
 /// store read, not this function's problem).
+///
+/// # Zero was never reachable, so the check keyed on the wrong thing (AMUX-4546)
+///
+/// The old expectation was "0 schedule_runs with delivery='unknown' in the last
+/// 24h". Measured over the seven days to 2026-09-16 it was met on none of them:
+/// 26, 15, 12, 3, 4, 4, 9. The auto-builder swaps this binary on every commit,
+/// 9 distinct restarts landed mid-fire in the last 24h alone, and against 716
+/// fires a day a restart inside SOME schedule's delivery window is a certainty.
+/// A check that cannot pass is a permanent red, which is ethos rule 3, and a
+/// permanent red is where a real signal goes to hide.
+///
+/// # What the flat count could not say
+///
+/// An unknown costs whatever the schedule's own cadence is, and the headline
+/// gave every one of them the same weight. The same 2026-09-16 window:
+///
+/// ```text
+///   SCHED-320 every 15m   x4   recovered in 14.0-15.8m
+///   SCHED-455 every 20m   x1   recovered in 20.3m
+///   SCHED-184 every 4h    x2   recovered in 239.7m and 719.7m
+///   SCHED-346 daily 8:45  x1   STILL OUT after 22.4h
+///   SCHED-415 daily 18:15 x1   STILL OUT after 12.9h
+/// ```
+///
+/// A 15-minute blip and a 22-hour gap were both "1". So the check now fails on
+/// schedules whose tick is STILL outstanding, reports the recovered ones with
+/// what they cost, and PASSES when every unknown in the window has been
+/// followed by a success. The restarts are unchanged and still visible; what
+/// changes is that the verdict tracks whether anything is actually missing.
 pub fn unrecorded_schedule_outcomes_are_visible(
     window_h: i64,
     rows: &[UnrecordedScheduleOutcome],
 ) -> Vec<InvariantResult> {
     const ID: &str = "scheduler.unrecorded_delivery_outcomes";
     let total: i64 = rows.iter().map(|r| r.count).sum();
-    if total == 0 {
-        return vec![InvariantResult::pass(ID)];
-    }
     let mut sorted: Vec<&UnrecordedScheduleOutcome> = rows.iter().collect();
-    sorted.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.schedule_id.cmp(&b.schedule_id)));
-    let named: Vec<String> = sorted
+    sorted.sort_by(|a, b| {
+        b.outstanding_s
+            .cmp(&a.outstanding_s)
+            .then_with(|| b.count.cmp(&a.count))
+            .then_with(|| a.schedule_id.cmp(&b.schedule_id))
+    });
+    let (out_now, recovered): (Vec<&&UnrecordedScheduleOutcome>, Vec<&&UnrecordedScheduleOutcome>) =
+        sorted.iter().partition(|r| !r.recovered);
+    let row = |r: &&&UnrecordedScheduleOutcome| {
+        serde_json::json!({
+            "schedule_id": r.schedule_id,
+            "count": r.count,
+            "title": r.title,
+            "session": r.session,
+            "outstanding_s": r.outstanding_s,
+            "recovered": r.recovered,
+        })
+    };
+    // BOTH LISTS IN BOTH ARMS. "no restart interrupted a fire" and "several did
+    // and every schedule has since caught up" are different facts about the
+    // fleet, and a bare pass reports the first while meaning the second.
+    let ev = serde_json::json!({
+        "total": total,
+        "window_h": window_h,
+        "schedules_still_out": out_now.len(),
+        "schedules_recovered": recovered.len(),
+        "still_out": out_now.iter().map(row).collect::<Vec<_>>(),
+        "recovered": recovered.iter().map(row).collect::<Vec<_>>(),
+        "recovered_note": "these schedules fired again and succeeded, so the interrupted tick \
+                           cost one cadence and nothing is outstanding. The restart is real and \
+                           is not a defect in the schedule.",
+    });
+    if out_now.is_empty() {
+        let mut ok = InvariantResult::pass(ID);
+        ok.evidence = ev;
+        return vec![ok];
+    }
+    let named: Vec<String> = out_now
         .iter()
         .map(|r| {
+            let mins = r.outstanding_s / 60;
             if r.title.is_empty() {
-                format!("{} x{}", r.schedule_id, r.count)
+                format!("{} x{} (outstanding {}m)", r.schedule_id, r.count, mins)
             } else {
-                format!("{} x{} ({}, {})", r.schedule_id, r.count, r.title, r.session)
+                format!(
+                    "{} x{} outstanding {}m ({}, {})",
+                    r.schedule_id, r.count, mins, r.title, r.session
+                )
             }
         })
         .collect();
     let mut out = InvariantResult::new(ID, Status::Fail);
-    out.expected = format!("0 schedule_runs with delivery='unknown' in the last {window_h}h");
+    out.expected =
+        format!("every delivery='unknown' run in the last {window_h}h is followed by a success");
     out.observed = format!(
-        "{total} run(s) across {} schedule(s) recorded delivery='unknown' in the last {window_h}h \
-         — the server restarted mid-fire (AF-515); status='error' on these rows is not a job \
-         failure, it is an unrecorded outcome. By schedule: {}",
-        rows.len(),
-        named.join("; ")
+        "{} schedule(s) of the {total} unrecorded fire(s) in the last {window_h}h have NOT \
+         succeeded since: {}. The server restarted mid-fire (AF-515); status='error' on these \
+         rows is not a job failure, it is an unrecorded outcome, and for these the work may \
+         simply not have happened. A further {} schedule(s) were interrupted and have already \
+         caught up on their own next tick — those are in evidence.recovered and cost one \
+         cadence each.",
+        out_now.len(),
+        named.join("; "),
+        recovered.len(),
     );
-    out.evidence = serde_json::json!({
-        "total": total,
-        "window_h": window_h,
-        "by_schedule": sorted.iter().map(|r| serde_json::json!({
-            "schedule_id": r.schedule_id, "count": r.count, "title": r.title, "session": r.session,
-        })).collect::<Vec<_>>(),
-    });
+    out.evidence = ev;
     vec![out]
 }
 
@@ -6704,12 +6776,29 @@ mod schedule_kind_tests {
 mod unrecorded_schedule_outcome_tests {
     use super::*;
 
+    /// Still-outstanding by default, so every test written before AMUX-4546
+    /// keeps exercising the FAIL arm it was written against. Those tests are
+    /// about how a failure READS, and that is unchanged.
     fn row(id: &str, count: i64, title: &str, session: &str) -> UnrecordedScheduleOutcome {
         UnrecordedScheduleOutcome {
             schedule_id: id.into(),
             count,
             title: title.into(),
             session: session.into(),
+            outstanding_s: 3600,
+            recovered: false,
+        }
+    }
+
+    /// A schedule that was interrupted and has since succeeded.
+    fn recovered_row(id: &str, count: i64, outstanding_s: i64) -> UnrecordedScheduleOutcome {
+        UnrecordedScheduleOutcome {
+            schedule_id: id.into(),
+            count,
+            title: String::new(),
+            session: String::new(),
+            outstanding_s,
+            recovered: true,
         }
     }
 
@@ -6730,11 +6819,15 @@ mod unrecorded_schedule_outcome_tests {
         let out = unrecorded_schedule_outcomes_are_visible(24, &rows);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].status, Status::Fail);
-        assert!(out[0].observed.contains("4 run"), "{}", out[0].observed);
         assert!(out[0].observed.contains("2 schedule"), "{}", out[0].observed);
-        let by_schedule = out[0].evidence["by_schedule"].as_array().expect("evidence carries the breakdown");
-        assert_eq!(by_schedule.len(), 2, "every affected schedule must be named, not just the total");
+        // AMUX-4546 moved the breakdown from `by_schedule` to the still_out /
+        // recovered split. The PROPERTY this test exists for is unchanged:
+        // every affected schedule is named, not just counted.
+        let still_out = out[0].evidence["still_out"].as_array().expect("evidence carries the breakdown");
+        assert_eq!(still_out.len(), 2, "every affected schedule must be named, not just the total");
         assert_eq!(out[0].evidence["total"], 4);
+        assert!(out[0].observed.contains("SCHED-1") && out[0].observed.contains("SCHED-2"),
+                "{}", out[0].observed);
     }
 
     /// AF-582 follow-up, gtm-ticker: `/api/health/invariants` carries no
@@ -6764,6 +6857,11 @@ mod unrecorded_schedule_outcome_tests {
     /// The worst offender first, so the reading is "one schedule is hit 8x
     /// more than anything else" rather than a diffuse "six things fired
     /// late" -- the ordering IS the actionable claim, not cosmetics.
+    ///
+    /// AMUX-4546: the primary key is now how long the tick has been
+    /// OUTSTANDING, with count as the tiebreak. All three rows here carry the
+    /// same outstanding time, so this still pins the count ordering it was
+    /// written for.
     #[test]
     fn schedules_are_ordered_worst_offender_first() {
         let rows = vec![row("SCHED-A", 1, "", ""), row("SCHED-B", 8, "", ""), row("SCHED-C", 2, "", "")];
@@ -6772,6 +6870,96 @@ mod unrecorded_schedule_outcome_tests {
         let pos_c = out[0].observed.find("SCHED-C").expect("C present");
         let pos_a = out[0].observed.find("SCHED-A").expect("A present");
         assert!(pos_b < pos_c && pos_c < pos_a, "expected B (8) < C (2) < A (1): {}", out[0].observed);
+    }
+
+    /// THE LONGEST-OUTSTANDING TICK LEADS, NOT THE MOST FREQUENT (AMUX-4546).
+    ///
+    /// Measured on the live board 2026-09-16: SCHED-320 fires every 15m and
+    /// took 4 of the 9 unknowns, every one recovered on its own next tick.
+    /// SCHED-346 fires daily, took 1, and was still outstanding 22.4 hours
+    /// later. Ordering by count puts the harmless one first and the reader
+    /// spends their attention on a 15-minute blip.
+    #[test]
+    fn a_long_outstanding_tick_outranks_a_frequent_but_recovered_one() {
+        let rows = vec![
+            recovered_row("SCHED-320", 4, 15 * 60),
+            UnrecordedScheduleOutcome {
+                schedule_id: "SCHED-346".into(),
+                count: 1,
+                title: "rb2b inbound tick".into(),
+                session: "gtm-ticker".into(),
+                outstanding_s: 22 * 3600 + 24 * 60,
+                recovered: false,
+            },
+        ];
+        let out = unrecorded_schedule_outcomes_are_visible(24, &rows);
+        assert_eq!(out[0].status, Status::Fail);
+        assert!(out[0].observed.contains("SCHED-346"), "the outstanding one leads: {}", out[0].observed);
+        assert!(!out[0].observed.contains("SCHED-320 x4"),
+                "the recovered 4x must not be in the headline: {}", out[0].observed);
+        assert!(out[0].observed.contains("1344m"), "the cost is stated in the headline: {}", out[0].observed);
+        assert_eq!(out[0].evidence["schedules_still_out"], serde_json::json!(1));
+        assert_eq!(out[0].evidence["schedules_recovered"], serde_json::json!(1));
+        // SHOWN, NOT DROPPED. The recovered schedule stays in the payload: a
+        // reader has to be able to see the restart happened and see that it
+        // cost one cadence.
+        assert_eq!(out[0].evidence["recovered"][0]["schedule_id"], serde_json::json!("SCHED-320"));
+    }
+
+    /// THE SORT IS TESTED HERE, NOT BY THE CELL ABOVE (AMUX-4546).
+    ///
+    /// Found by mutation, and worth stating because the cell above LOOKS like
+    /// it pins the ordering. It does not: its two rows are in different
+    /// partitions, so only one ever reaches the headline and the comparator
+    /// never has to discriminate. Swapping the sort to count-first left it
+    /// green. That is coverage of partition-or-ordering reported as coverage
+    /// of ordering.
+    ///
+    /// Both rows here are STILL OUT, so the partition cannot decide it, and
+    /// their two keys disagree: count puts the 4x first, outstanding time puts
+    /// the 22-hour one first. That is the live shape on 2026-09-16, where
+    /// ordering by count would have led with four recovered 15-minute blips.
+    #[test]
+    fn among_outstanding_schedules_the_costliest_leads_not_the_most_frequent() {
+        let mut frequent = row("SCHED-FREQ", 4, "every 15m tick", "mvs-infra");
+        frequent.outstanding_s = 15 * 60;
+        let mut costly = row("SCHED-DAILY", 1, "daily tick", "gtm-ticker");
+        costly.outstanding_s = 22 * 3600;
+        let out = unrecorded_schedule_outcomes_are_visible(24, &[frequent, costly]);
+        assert_eq!(out[0].status, Status::Fail);
+        let pos_costly = out[0].observed.find("SCHED-DAILY").expect("daily present");
+        let pos_frequent = out[0].observed.find("SCHED-FREQ").expect("frequent present");
+        assert!(
+            pos_costly < pos_frequent,
+            "22h outstanding must outrank 4 blips of 15m; ordering by COUNT is the defect this \
+             check was changed to fix: {}",
+            out[0].observed
+        );
+    }
+
+    /// EVERY UNKNOWN RECOVERED IS A PASS, AND IT SAYS WHY (AMUX-4546).
+    ///
+    /// The old expectation was zero unknowns in 24h. Over the seven days to
+    /// 2026-09-16 that was met on none of them (26, 15, 12, 3, 4, 4, 9),
+    /// because the auto-builder restarts this binary on every commit and 716
+    /// fires a day guarantee one lands mid-delivery. A check that cannot pass
+    /// is a permanent red, and a permanent red is where a real signal hides.
+    ///
+    /// "no restart interrupted a fire" and "several did and every schedule has
+    /// caught up" are different facts, so the pass has to carry the second.
+    #[test]
+    fn a_window_where_every_interrupted_schedule_caught_up_passes_with_the_history_visible() {
+        let rows = vec![recovered_row("SCHED-320", 4, 15 * 60), recovered_row("SCHED-455", 1, 20 * 60)];
+        let out = unrecorded_schedule_outcomes_are_visible(24, &rows);
+        assert_eq!(out[0].status, Status::Pass, "nothing is outstanding: {:?}", out[0]);
+        let ev = &out[0].evidence;
+        assert_eq!(ev["total"], serde_json::json!(5), "the restarts are still counted: {ev}");
+        assert_eq!(ev["schedules_still_out"], serde_json::json!(0), "{ev}");
+        assert_eq!(ev["schedules_recovered"], serde_json::json!(2), "{ev}");
+        assert!(
+            ev["recovered_note"].as_str().unwrap_or_default().contains("cost one cadence"),
+            "a pass with 5 interrupted fires behind it must explain itself: {ev}"
+        );
     }
 
     /// A schedule deleted after firing still gets reported -- an empty

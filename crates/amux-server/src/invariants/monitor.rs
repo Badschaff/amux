@@ -773,25 +773,53 @@ fn unrecorded_schedule_outcomes_check(state: &AppState) -> Vec<InvariantResult> 
     let Ok(conn) = state.store.read() else {
         return vec![InvariantResult::unknown(ID, "could not read the store")];
     };
+    let now = crate::config::now_f64();
     let cutoff = chrono::Utc::now().timestamp() - window_h * 3600;
     // AF-582 follow-up (gtm-ticker): a count with no names sends a reader
     // back to /api/schedules/runs to re-derive exactly this join. LEFT JOIN
     // because a schedule can be deleted after firing; a row must still be
     // reported, just without a title/session to show for it.
+    //
+    // RECOVERY RIDES ALONG (AMUX-4546). An unknown costs whatever the
+    // schedule's own cadence is, and the flat count cannot express that: on
+    // 2026-09-16 the same "1" stood for a 15-minute blip on an every-15m tick
+    // and a 22-hour gap on a daily one. `last_success_after` is the newest
+    // successful run of the SAME schedule after its most recent unknown, so
+    // NULL means the schedule has not succeeded since and the tick is still
+    // outstanding right now.
+    //
+    // SUCCESS IS THREE STATUSES, NOT ONE. Shell runs record 'ok'; tmux
+    // deliveries record 'delivered' or 'queued'. Filtering on 'ok' alone finds
+    // only shell recoveries and reports every healthy tmux schedule as never
+    // having recovered — it invented a stalled SCHED-455 while that schedule
+    // was firing every 20 minutes exactly as configured.
     let rows: Vec<checks::UnrecordedScheduleOutcome> = conn
         .prepare(
-            "SELECT r.schedule_id, COUNT(*), COALESCE(s.title,''), COALESCE(s.session,'') \
+            "SELECT r.schedule_id, COUNT(*), COALESCE(s.title,''), COALESCE(s.session,''), \
+                    MAX(r.ran_at) AS newest_unknown, \
+                    (SELECT MIN(n.ran_at) FROM schedule_runs n \
+                       WHERE n.schedule_id = r.schedule_id \
+                         AND n.ran_at > MAX(r.ran_at) \
+                         AND n.status IN ('ok','delivered','queued')) AS recovered_at \
              FROM schedule_runs r LEFT JOIN schedules s ON s.id = r.schedule_id \
              WHERE r.delivery='unknown' AND r.ran_at > ?1 \
              GROUP BY r.schedule_id",
         )
         .and_then(|mut st| {
             st.query_map([cutoff], |r| {
+                let newest_unknown: f64 = r.get(4)?;
+                let recovered_at: Option<f64> = r.get(5)?;
                 Ok(checks::UnrecordedScheduleOutcome {
                     schedule_id: r.get(0)?,
                     count: r.get(1)?,
                     title: r.get(2)?,
                     session: r.get(3)?,
+                    // Seconds from the newest unknown to the schedule's next
+                    // success, or to NOW when there has not been one: a tick
+                    // outstanding for 22h and one that recovered in 15m are
+                    // different facts and must not render as the same number.
+                    outstanding_s: (recovered_at.unwrap_or(now) - newest_unknown).max(0.0) as i64,
+                    recovered: recovered_at.is_some(),
                 })
             })
             .map(|it| it.flatten().collect::<Vec<_>>())
