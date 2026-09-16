@@ -242,6 +242,67 @@ pub(crate) fn capture_after_probe_timeout(probe: serde_json::Value) {
     }
 }
 
+/// Parse one `top -l 1 -stats pid,mem,cmprs,cpu,time,command` row's size field.
+///
+/// top writes sizes with a unit suffix (`4096B`, `7904K`, `10M`, `16G`) and the
+/// suffix is what carries the magnitude, so a numeric parse alone reads 16G as
+/// sixteen. Returns bytes.
+fn top_size_bytes(field: &str) -> Option<u64> {
+    let (num, mult) = match field.chars().last()? {
+        'B' => (&field[..field.len() - 1], 1u64),
+        'K' => (&field[..field.len() - 1], 1024),
+        'M' => (&field[..field.len() - 1], 1024 * 1024),
+        'G' => (&field[..field.len() - 1], 1024 * 1024 * 1024),
+        '0'..='9' => (field, 1),
+        _ => return None,
+    };
+    num.parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.0).map(|v| (v * mult as f64) as u64)
+}
+
+/// Rank host processes by FOOTPRINT (resident + compressed) rather than RSS.
+///
+/// AMUX-4617. `top_rss` ranks by resident memory and that is the wrong
+/// discriminator on a machine with memory compression. The specimen: the
+/// procwarden menubar agent held 27 GB of footprint, 26 GB of it compressed,
+/// with 4 MB resident, so it sat nowhere near the top of an RSS ranking while
+/// being the largest consumer on the box (AF-875).
+///
+/// Still true here, measured 2026-09-16 on live output: the largest process by
+/// footprint is 44.00 GB against 16.00 GB resident, so an RSS ranking
+/// understates it by 28 GB.
+///
+/// Pure, so the ranking is testable without a host under memory pressure. That
+/// matters more than usual here: the condition this exists to catch cannot be
+/// produced on demand.
+fn footprint_summary(top_raw: &str) -> serde_json::Value {
+    let mut rows = Vec::new();
+    for line in top_raw.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 5 { continue; }
+        // top marks the sampling process with a trailing `*`.
+        let pid = match f[0].trim_end_matches('*').parse::<u32>() { Ok(p) => p, Err(_) => continue };
+        let (Some(mem), Some(cmprs)) = (top_size_bytes(f[1]), top_size_bytes(f[2])) else { continue };
+        let cpu = f[3].parse::<f64>().unwrap_or(0.0);
+        if !cpu.is_finite() { continue; }
+        rows.push(serde_json::json!({
+            "pid": pid,
+            "footprint_bytes": mem + cmprs,
+            "resident_bytes": mem,
+            "compressed_bytes": cmprs,
+            "cpu_pct": cpu,
+            "command": f[4..].join(" "),
+        }));
+    }
+    let count = rows.len();
+    rows.sort_by_key(|r| std::cmp::Reverse(r["footprint_bytes"].as_u64()));
+    serde_json::json!({
+        "measured": count > 0,
+        "n_considered": count,
+        "why_unmeasured": if count == 0 { Some("top returned no parseable process rows") } else { None },
+        "top_footprint": rows.into_iter().take(20).collect::<Vec<_>>(),
+    })
+}
+
 fn host_process_summary(raw: &str) -> serde_json::Value {
     let mut rows = Vec::new();
     for line in raw.lines() {
@@ -280,6 +341,22 @@ async fn capture_stall_evidence(observation: &Observation, trigger: &str, probe:
     );
     evidence["host_processes"] = match processes {
         Ok(out) if out.status.success() => host_process_summary(&String::from_utf8_lossy(&out.stdout)),
+        result => serde_json::json!({"measured": false, "n_considered": 0,
+            "why_unmeasured": match result { Ok(out) => out.status.to_string(), Err(error) => error }}),
+    };
+    // AMUX-4617. Ranked apart from `host_processes` rather than replacing it:
+    // `ps` has no footprint field at all, so this needs `top`, and the two
+    // answer different questions. RSS says what is resident NOW, footprint says
+    // what the process is holding, and on a compressing host those diverge by
+    // tens of GB. Both are kept so a reader can see the divergence, which is
+    // the evidence that the ranking changed anything.
+    evidence["host_footprint"] = match output(
+        "top",
+        &["-l", "1", "-n", "200", "-stats", "pid,mem,cmprs,cpu,command"],
+    )
+    .await
+    {
+        Ok(out) if out.status.success() => footprint_summary(&String::from_utf8_lossy(&out.stdout)),
         result => serde_json::json!({"measured": false, "n_considered": 0,
             "why_unmeasured": match result { Ok(out) => out.status.to_string(), Err(error) => error }}),
     };
@@ -505,6 +582,59 @@ mod tests {
         let msg = spawn_allowed_from(std::path::Path::new("/tmp/h"), false).unwrap_err();
         assert!(msg.contains(SPAWN_OVERRIDE), "refusal must name its override: {msg}");
         assert!(msg.contains("/tmp/h"), "refusal must name the home it refused: {msg}");
+    }
+
+    /// AMUX-4617. RSS is the wrong discriminator on a host with memory
+    /// compression, and the specimen is the reason: the procwarden menubar agent
+    /// held 27 GB with 26 GB of it compressed and 4 MB resident, so it ranked
+    /// nowhere near the top by RSS while being the largest consumer on the box.
+    #[test]
+    fn processes_rank_by_footprint_so_a_compressed_hog_cannot_hide() {
+        // THE SPECIMEN, in top's own format. procwarden is last by resident
+        // memory and first by footprint, which is the whole inversion.
+        let raw = "\
+PID    MEM CMPRS %CPU COMMAND
+101    4096B 26G 0.1 procwarden
+202    2G 0B 5.0 honest-big
+303    900M 100M 1.0 middling
+bogus  1G 1G 1.0 unparseable
+404    NaN 1G 1.0 bad-number
+";
+        let v = footprint_summary(raw);
+        assert_eq!(v["measured"], true);
+        // The header, the non-numeric pid and the NaN row are all dropped.
+        assert_eq!(v["n_considered"], 3, "only parseable process rows count: {v}");
+
+        let top = &v["top_footprint"];
+        assert_eq!(top[0]["pid"], 101, "the compressed hog must rank FIRST: {top}");
+        assert_eq!(top[0]["footprint_bytes"], 26u64 * 1024 * 1024 * 1024 + 4096);
+        assert_eq!(top[0]["resident_bytes"], 4096, "and it is tiny resident, which is why RSS missed it");
+
+        // POSITIVE CONTROL: a genuinely resident process still ranks by its real
+        // size, so this is a better ranking rather than one that simply prefers
+        // compression.
+        assert_eq!(top[1]["pid"], 202);
+        assert_eq!(top[1]["compressed_bytes"], 0);
+
+        // THE ORDER IS THE CLAIM. Under the old RSS ranking 101 would be LAST of
+        // the three; asserting only that it appears would pass for a ranking
+        // that never changed.
+        let order: Vec<u64> = top.as_array().unwrap().iter().map(|r| r["pid"].as_u64().unwrap()).collect();
+        assert_eq!(order, vec![101, 202, 303], "ranked by footprint, not residency: {top}");
+
+        // Unit suffixes carry the magnitude: a numeric parse alone reads 16G as
+        // sixteen and would sort it below a 900M row.
+        assert_eq!(top_size_bytes("16G"), Some(16 * 1024 * 1024 * 1024));
+        assert_eq!(top_size_bytes("7904K"), Some(7904 * 1024));
+        assert_eq!(top_size_bytes("4096B"), Some(4096));
+        assert_eq!(top_size_bytes("12"), Some(12));
+        assert_eq!(top_size_bytes("NaN"), None);
+
+        // An empty probe is UNMEASURED, not a healthy host with no processes.
+        let none = footprint_summary("");
+        assert_eq!(none["measured"], false);
+        assert_eq!(none["n_considered"], 0);
+        assert!(none["why_unmeasured"].is_string(), "silence must say why: {none}");
     }
 
     #[test]
