@@ -541,6 +541,48 @@ fn env_val(file_env: &std::collections::BTreeMap<String, String>, key: &str) -> 
 /// copied into server.env by hand (AMUX-3341, and the connectors-setup "reuse
 /// this one" note). The value is for presence/masking and the server's own OAuth
 /// flow only; never emitted raw.
+/// What this box CANNOT reach right now, and the exact env key that would fix
+/// each one (AF-372).
+///
+/// Returns `(connector id, missing key names)` for every registry provider whose
+/// credentials are not all resolvable, sorted by id. Empty means every connector
+/// has its keys, which is a DIFFERENT fact from "the probe did not run" and the
+/// caller is expected to say which (AF-320).
+///
+/// WHY THIS IS A FUNCTION AND NOT A NEW CHECK. The whole status ladder already
+/// existed behind GET /api/connectors, key by key, with `set` per key. AF-372
+/// asked for a preflight that "names the credential by the KEY it needs", and
+/// that answer was already computed. What did not exist was any path by which a
+/// lane learned it before hitting a 401 mid-task. So this pulls the same
+/// resolution out of the HTTP handler and into something the memory composer can
+/// call, rather than inventing a second source of truth for which keys matter.
+///
+/// Pure over `home`, so a test drives a fixture server.env instead of this box.
+/// Google is resolved through `resolve_cred_in`, which also accepts the
+/// service-account and oauth-client-file paths, so a connector usable by
+/// delegation is not reported as missing keys it does not need.
+pub(crate) fn credential_gaps_in(home: &std::path::Path) -> Vec<(&'static str, Vec<&'static str>)> {
+    let file_env = parse_env_file(&home.join("server.env"));
+    let mut out: Vec<(&'static str, Vec<&'static str>)> = REGISTRY
+        .iter()
+        .filter_map(|p| {
+            let missing: Vec<&'static str> = env_keys(p)
+                .into_iter()
+                .filter(|k| resolve_cred_in(home, &file_env, p.category, k).is_none())
+                .collect();
+            (!missing.is_empty()).then_some((p.id, missing))
+        })
+        .collect();
+    out.sort_by_key(|(id, _)| *id);
+    out
+}
+
+/// How many providers the registry knows, so a caller can report a share rather
+/// than a bare count: "3 of 8" is measurable, "3 unusable" is not.
+pub(crate) fn connector_count() -> usize {
+    REGISTRY.len()
+}
+
 fn resolve_cred_in(
     home: &std::path::Path,
     file_env: &std::collections::BTreeMap<String, String>,
@@ -3895,4 +3937,50 @@ mod tests {
         assert_eq!(d["scope_count"], n);
         assert_eq!(d["permits"].as_array().map(Vec::len), Some(n), "{d:#}");
     }
+    /// AF-372: the gaps are real keys, resolved against a real server.env.
+    ///
+    /// Pure over `home`, so this drives a fixture rather than this box. The
+    /// specimen matters: `slack` needs two keys and setting ONE of them must
+    /// still report the other, because "partially configured" is the state a
+    /// caller most easily mistakes for done.
+    #[test]
+    fn credential_gaps_name_the_unset_keys_and_clear_when_set() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("server.env"), "").unwrap();
+
+        let gaps = credential_gaps_in(home.path());
+        let slack: Vec<&str> = gaps
+            .iter()
+            .find(|(id, _)| *id == "slack")
+            .map(|(_, m)| m.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            slack,
+            vec!["SLACK_CLIENT_ID", "SLACK_CLIENT_SECRET"],
+            "an empty server.env must name both slack keys: {gaps:?}"
+        );
+        assert!(connector_count() >= gaps.len(), "the share needs a denominator");
+
+        // HALF-CONFIGURED IS STILL A GAP.
+        std::fs::write(home.path().join("server.env"), "SLACK_CLIENT_ID=abc\n").unwrap();
+        let gaps = credential_gaps_in(home.path());
+        let slack: Vec<&str> = gaps
+            .iter()
+            .find(|(id, _)| *id == "slack")
+            .map(|(_, m)| m.clone())
+            .unwrap_or_default();
+        assert_eq!(slack, vec!["SLACK_CLIENT_SECRET"], "the set key drops out, the unset one stays");
+
+        // AND BOTH SET CLEARS IT, or the check could be reporting a constant.
+        std::fs::write(
+            home.path().join("server.env"),
+            "SLACK_CLIENT_ID=abc\nSLACK_CLIENT_SECRET=def\n",
+        )
+        .unwrap();
+        assert!(
+            !credential_gaps_in(home.path()).iter().any(|(id, _)| *id == "slack"),
+            "slack is fully configured and must disappear from the gaps"
+        );
+    }
+
 }

@@ -11196,6 +11196,91 @@ const FLEET_ROSTER_HEADER: &str = "\n## Fleet — who else is running (auto-gene
 /// Excludes archived/isolated lanes. It deliberately includes the reader: the
 /// roster is one shared generated file, so a per-reader omission would either
 /// require N copies or make the contents depend on whoever regenerated it.
+/// What this box cannot reach, in the file every lane already reads (AF-372).
+///
+/// THE SHAPE OF THE PROBLEM WAS DELIVERY, NOT DETECTION. The signal fired 5
+/// times in one day against a 0.77/day baseline, and every specimen arrived
+/// MID-TASK: Ethan's own words were "we always forget to add permissions to the
+/// right place". Credential-shaped cards were 13% of `needsyou`, all of them
+/// work that had already started. Meanwhile GET /api/connectors already computed
+/// exactly the right answer, key by key, with `set` per key. Nobody queried it
+/// before working, because a check you have to know to run is not a preflight.
+///
+/// So this publishes the same resolution into MEMORY.md, which the session reads
+/// by default, for the reason the roster below it does (ethos rule 1: who
+/// receives this WITHOUT opting in).
+///
+/// SAYS SO WHEN EVERYTHING IS FINE, rather than going quiet. Silence is what
+/// "the probe did not run" also looks like, and a lane that sees nothing cannot
+/// tell a clean box from a broken check (AF-320). An empty registry is reported
+/// as unmeasured for the same reason.
+///
+/// NOT LANE-SCOPED, and that is measured rather than assumed: connector
+/// credentials resolve out of ~/.amux/server.env, and GET /api/connectors
+/// returns the same 3 unusable connectors for `amux` and for `gtm-engine`. The
+/// card asked for resolution against the lane's scope env; for these keys there
+/// is nothing per-lane to resolve, and claiming otherwise would be a per-lane
+/// answer with no per-lane input behind it.
+fn credential_preflight() -> String {
+    credential_preflight_from(
+        crate::api::connectors::connector_count(),
+        &crate::api::connectors::credential_gaps_in(&home()),
+    )
+}
+
+/// The renderer, with its inputs injected.
+///
+/// SPLIT OUT BECAUSE THE HAPPY PATH WAS UNTESTABLE WITHOUT IT. A mutation that
+/// made the all-configured branch return an empty string left every cell green,
+/// because this box HAS gaps (3 of 8 connectors) so that branch never executed.
+/// A test cannot reach it by arranging the world; it has to be handed the state.
+/// Same seam as `index_once_at` and `lifecycle_interaction_refusal`.
+fn credential_preflight_from(n: usize, gaps: &[(&'static str, Vec<&'static str>)]) -> String {
+    // EVERY PROSE LINE IS ITS OWN COMPLETE LITERAL, joined with concat!. A
+    // multi-line literal keeps its source indentation unless every line ends in
+    // a `\` continuation, and this string is written into every worker's
+    // MEMORY.md, where baked-in leading spaces turn a paragraph into an indented
+    // code block (AMUX-3810, which cost the roster header above its table).
+    // Caught here by a test reading the rendered bytes rather than the source.
+    if n == 0 {
+        return concat!(
+            "\n## Credentials: UNMEASURED (auto-generated, do not edit)\n\n",
+            "The connector registry is empty, so nothing was checked. ",
+            "This is not a clean bill.\n",
+        )
+        .to_string();
+    }
+    if gaps.is_empty() {
+        return format!(
+            "{}{n}{}",
+            "\n## Credentials: all ",
+            concat!(
+                " connectors have their keys (auto-generated, do not edit)\n\n",
+                "Measured against ~/.amux/server.env. Stated rather than left silent: ",
+                "no section here would look the same as a check that never ran.\n",
+            ),
+        );
+    }
+    let mut out = format!(
+        "{}{}{} of {n}{}",
+        "\n## Credentials: ",
+        gaps.len(),
+        "",
+        concat!(
+            " connectors cannot be used right now (auto-generated, do not edit)\n\n",
+            "Measured against ~/.amux/server.env. If your task needs one of these it will ",
+            "fail AT THE CALL, not here, so check this before you start rather than after ",
+            "a 401. Values are set with POST /api/connectors/<id>/credentials and are ",
+            "written to server.env, never returned.\n\n",
+            "| connector | env keys that are unset |\n|---|---|\n",
+        ),
+    );
+    for (id, missing) in gaps {
+        out.push_str(&format!("| {} | {} |\n", id, missing.join(", ")));
+    }
+    out
+}
+
 fn fleet_roster() -> String {
     let mut rows: Vec<(String, String, String, String, String)> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(sessions_dir()) {
@@ -11579,7 +11664,10 @@ fn write_claude_memory(name: &str, work_dir: &str) {
     // (ts-gke's option 3, which their mixpeek file violates with 122 lines after
     // the roster).
     let preserved = preserved_agent_pointers(&claude_mem_dir, &composed);
-    let composed = composed + &preserved + &fleet_roster();
+    // BEFORE the roster, deliberately. The comment above says the tail is what a
+    // read ceiling drops and the roster is the re-derivable thing; a credential
+    // gap is the more actionable of the two, so it sits above it (AF-372).
+    let composed = composed + &preserved + &credential_preflight() + &fleet_roster();
     let _ = std::fs::write(&claude_mem_file, &composed);
 }
 
@@ -31258,6 +31346,107 @@ mod roster_tests {
             "a shared roster must tell the reader it lists them too: {r}"
         );
         assert!(r.contains("$AMUX_SESSION"), "and how to identify themselves in it: {r}");
+    }
+
+    /// AF-372: the preflight NEVER goes silent, because silence is what a check
+    /// that did not run also looks like.
+    ///
+    /// Three states, three different sentences: some connectors unusable (name
+    /// them and their keys), all configured (say so), registry empty (say
+    /// UNMEASURED and that it is not a clean bill). That last one is the
+    /// AF-320 contract: a caller must be able to tell an absent problem from an
+    /// absent measurement.
+    #[test]
+    fn the_credential_preflight_says_which_of_its_three_states_it_is_in() {
+        let out = super::credential_preflight();
+        assert!(!out.is_empty(), "it must never be silent");
+        assert!(out.contains("## Credentials"), "it must be a named section: {out}");
+
+        let gaps = crate::api::connectors::credential_gaps_in(&super::home());
+        if gaps.is_empty() {
+            assert!(
+                out.contains("have their keys"),
+                "a clean box must SAY it is clean rather than print nothing: {out}"
+            );
+        } else {
+            // THE KEYS, not a vague warning. The card's own requirement was
+            // "AMUX_X is unset for this lane" rather than "you may need
+            // credentials", and a table of ids with no keys would fail it.
+            for (id, missing) in &gaps {
+                assert!(out.contains(id), "the connector must be named: {out}");
+                for k in missing {
+                    assert!(out.contains(k), "the env key {k} must be named: {out}");
+                }
+            }
+            assert!(out.contains("fail AT THE CALL"), "and say when the cost lands: {out}");
+        }
+        // The denominator, so "3 unusable" cannot be read without "of 8".
+        assert!(
+            out.contains(&format!("of {}", crate::api::connectors::connector_count()))
+                || gaps.is_empty(),
+            "a count needs its population: {out}"
+        );
+    }
+
+    /// ALL THREE STATES, DRIVEN DIRECTLY. The cell above can only exercise
+    /// whichever state this box happens to be in, and a mutation proved that
+    /// matters: emptying the all-configured branch left every assertion green,
+    /// because this box has 3 of 8 connectors unusable so that branch never ran.
+    #[test]
+    fn every_preflight_state_says_something_different() {
+        let some = super::credential_preflight_from(
+            8,
+            &[("slack", vec!["SLACK_CLIENT_ID", "SLACK_CLIENT_SECRET"])],
+        );
+        assert!(some.contains("1 of 8 connectors cannot be used"), "{some}");
+        assert!(some.contains("SLACK_CLIENT_SECRET"), "the KEY, not a vague warning: {some}");
+        assert!(some.contains("fail AT THE CALL"), "{some}");
+
+        // THE BRANCH THE MUTATION EXPOSED. A clean box says it is clean.
+        let none = super::credential_preflight_from(8, &[]);
+        assert!(!none.trim().is_empty(), "silence is what a dead check looks like: {none:?}");
+        assert!(none.contains("all 8 connectors have their keys"), "{none}");
+        assert!(none.contains("## Credentials"), "{none}");
+
+        // AND AN EMPTY REGISTRY IS UNMEASURED, not clean (AF-320).
+        let unmeasured = super::credential_preflight_from(0, &[]);
+        assert!(unmeasured.contains("UNMEASURED"), "{unmeasured}");
+        assert!(unmeasured.contains("not a clean bill"), "{unmeasured}");
+
+        // NO BAKED-IN INDENTATION, asserted on the RENDERED BYTES. A multi-line
+        // Rust literal keeps its source indentation unless every line ends in a
+        // `\` continuation, and this text goes into MEMORY.md where leading
+        // spaces make markdown render a paragraph as a code block (AMUX-3810).
+        // The first cut of this function had exactly that: "This is not" and "a
+        // clean bill" came out seventeen spaces apart. Reading the source would
+        // not have caught it; reading the output did.
+        for rendered in [&some, &none, &unmeasured] {
+            for line in rendered.lines() {
+                assert!(
+                    !line.starts_with(' '),
+                    "a line is indented, which markdown renders as a code block: {line:?}"
+                );
+            }
+            assert!(!rendered.contains("  "), "doubled spaces leaked in: {rendered:?}");
+        }
+
+        // The three must be genuinely different sentences, or a reader cannot
+        // tell which one they are looking at.
+        assert_ne!(some, none);
+        assert_ne!(none, unmeasured);
+        assert_ne!(some, unmeasured);
+    }
+
+    /// It rides ABOVE the roster in the composed file, because a read ceiling
+    /// drops the tail and the roster is the re-derivable half.
+    #[test]
+    fn the_preflight_sits_above_the_roster() {
+        let composed =
+            String::new() + &super::credential_preflight() + &super::fleet_roster();
+        let pre = composed.find("## Credentials").expect("preflight present");
+        if let Some(roster) = composed.find("## Fleet") {
+            assert!(pre < roster, "credentials must precede the roster: {pre} vs {roster}");
+        }
     }
 
     /// Empty means EMPTY — a single-worker install must not get a table header
