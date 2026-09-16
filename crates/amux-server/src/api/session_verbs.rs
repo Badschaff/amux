@@ -11815,6 +11815,33 @@ fn inherited_instruction_files(work_dir: &str, names: &[String]) -> Vec<Value> {
     out
 }
 
+/// What to tell a sender who asked for `no_board` on text that will get a card
+/// anyway (AMUX-4555).
+///
+/// `--no-board` is REFUSED for substantive work, deliberately: transport intent
+/// is not a semantic exemption, and the no-silent-work rule (AMUX-3071) owns
+/// that call. The refusal was correct and completely silent. The send answered
+/// `ok:true` with no mention of it, so a caller had no way to learn their flag
+/// did nothing, and the board audit AMUX-4551 read 37 correctly-minted cards as
+/// a bug because nothing in the response or the events said otherwise.
+///
+/// Returns None when there is nothing to disclose, so the field is absent
+/// rather than `false` on the ordinary path: a sender who did not ask for
+/// `no_board` should not have to read a line about it.
+fn no_board_refusal_notice(skip_board: bool, text: &str) -> Option<&'static str> {
+    if !skip_board {
+        return None;
+    }
+    let substantive = amux_core::board::title_from_prompt(text).is_some()
+        && !amux_core::board::is_informational_query(text);
+    substantive.then_some(
+        "no_board was REFUSED for this message: it reads as substantive work, and substantive \
+         work gets a ledger card whoever asks otherwise (AMUX-3071). The flag still applies to \
+         control text and informational queries, which are cardless anyway. A \
+         task.cardless_rejected receipt records this refusal on the recipient.",
+    )
+}
+
 fn no_board_re() -> &'static regex::Regex {
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
@@ -16079,7 +16106,18 @@ pub(crate) async fn steer_mutate(
         }
         let client_id: String = body_str(body, "msg_id").trim().chars().take(64).collect();
         // Strip [no-board] before ENQUEUE (AC-183): decide, then strip.
-        let _skip_board = body.get("no_board").map(py_truthy).unwrap_or(false) || no_board_re().is_match(&text);
+        //
+        // CARRIED, NOT DISCARDED (AMUX-4555). This was `_skip_board`: computed
+        // correctly and then thrown away, because the record below hardcoded
+        // `false`. The consequence is not that a card appears — for substantive
+        // work the card is deliberate, and `record_rejected_cardless_receipt`
+        // is supposed to say so. The consequence is that the receipt could
+        // never fire from a queued send, and every `task.cardless` event it
+        // produced claimed `requested_no_board: false` about a send that had
+        // requested exactly that. Measured 2026-09-16: 0
+        // `task.cardless_rejected` events in the table, ever, and 223 of 224
+        // `task.cardless` events in 7 days carrying a hardcoded false.
+        let skip_board = body.get("no_board").map(py_truthy).unwrap_or(false) || no_board_re().is_match(&text);
         if no_board_re().is_match(&text) {
             text = no_board_re().replace(&text, "").trim().to_string();
             if text.is_empty() {
@@ -16170,7 +16208,7 @@ pub(crate) async fn steer_mutate(
             // value for a queued message and a hole for a direct one, and one
             // label made it mean both.
             cmd_hist_record_full(
-                state, name, &text, "user", email, false,
+                state, name, &text, "user", email, skip_board,
                 DeliveryMeta::queued(now_i64() * 1000),
             )
             .await;
@@ -16190,6 +16228,8 @@ pub(crate) async fn steer_mutate(
                 None => format!("queued — delivers to '{name}' at its next turn boundary"),
                 Some(r) => block_reason_explain(r, name),
             },
+            // Absent unless it applies (AMUX-4555).
+            "no_board_refused": no_board_refusal_notice(skip_board, &text),
         }));
     }
     jresp(StatusCode::METHOD_NOT_ALLOWED, json!({"error": "method not allowed"}))
@@ -17449,7 +17489,10 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
             let meta = DeliveryMeta { client_meta: client_meta_raw.as_deref(), ..meta };
             cmd_hist_record_full(state, name, &orig_text, "user", author, skip_board, meta).await;
         } else if !origin.is_empty() && origin != name {
-            cmd_hist_record_full(state, name, &orig_text, "session", &origin, false, meta).await;
+            // skip_board, not `false` (AMUX-4555). This is the DELIVERED peer
+            // branch and the one the 37 reported cards came through.
+            cmd_hist_record_full(state, name, &orig_text, "session", &origin, skip_board, meta)
+                .await;
         }
     } else {
         // A FAILED DELIVERY IS A DELIVERY EVENT (AMUX-3903).
@@ -17499,7 +17542,12 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
                 let author = member_actor.as_deref().unwrap_or(email);
                 cmd_hist_record_full(state, name, &orig_text, "user", author, skip_board, meta).await;
             } else if !origin.is_empty() && origin != name {
-                cmd_hist_record_full(state, name, &orig_text, "session", &origin, false, meta).await;
+                // skip_board, not `false` (AMUX-4555). A PEER send is the shape
+                // this bug was reported from: mixpeek-orchestrator's every-4h
+                // accountability check sends --no-board to ~40 lanes and this
+                // branch dropped the flag before the capture could see it.
+                cmd_hist_record_full(state, name, &orig_text, "session", &origin, skip_board, meta)
+                    .await;
             }
         }
         if !msg_id.is_empty() {
@@ -17558,6 +17606,12 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     // invisible until it drops a message for ten minutes (AMUX-2629).
     if msg.contains("on retry") {
         resp["retried"] = json!(true);
+    }
+    // THE FLAG THAT DID NOTHING SAYS SO (AMUX-4555). Set only when `no_board`
+    // was asked for AND the text is substantive enough to be carded anyway;
+    // otherwise the key is absent rather than false.
+    if let Some(notice) = no_board_refusal_notice(skip_board, &orig_text) {
+        resp["no_board_refused"] = json!(notice);
     }
     // Python additionally reports recipient_gated from its in-memory
     // credit-gate state (_session_auto_actions) — process state this origin
@@ -23760,6 +23814,153 @@ mod tests {
             "a DIRECT send really was delivered when it was recorded — blanking this too \
              would throw away true information instead of removing false information"
         );
+    }
+
+    /// A REQUESTED no_board REACHES THE CAPTURE, ON EVERY PATH (AMUX-4555).
+    ///
+    /// `--no-board` is REFUSED for substantive work by design, so the card is
+    /// minted either way and this test does not argue with that. What must not
+    /// happen is the refusal going unrecorded: `record_rejected_cardless_receipt`
+    /// writes a `task.cardless_rejected` event, and it fires only if the flag
+    /// survives the trip.
+    ///
+    /// It did not. Three call sites passed a literal `false` — the queued
+    /// record and both peer-send records — while only the direct human branch
+    /// carried the real value. Measured on the live DB 2026-09-16 before the
+    /// fix: `task.cardless_rejected` had 0 rows EVER, and 223 of 224
+    /// `task.cardless` events in 7 days reported `requested_no_board: false`,
+    /// which was the hardcoded argument rather than anything a sender asked for.
+    ///
+    /// Both halves are asserted. A test that only checked the true case would
+    /// pass against a version that hardcoded `true` instead, which is the same
+    /// defect pointing the other way.
+    #[tokio::test]
+    async fn a_requested_no_board_is_recorded_on_the_capture_and_an_unrequested_one_is_not() {
+        let (st, _dir) = state();
+        // Substantive text: `title_from_prompt` must return Some, or the
+        // refusal branch is not the one under test.
+        let work = "Rebuild the shard index for tenant 42 and report the residual count";
+
+        cmd_hist_record_full(&st, "lane-nb", work, "session", "peer-lane", true,
+                             DeliveryMeta::queued(11)).await;
+        let asked = cardless_rejected_count(&st, "lane-nb");
+        assert_eq!(
+            asked, 1,
+            "a no_board send on substantive work must leave a task.cardless_rejected receipt; \
+             0 here is the shape that made the live table empty for the life of the feature"
+        );
+
+        cmd_hist_record_full(&st, "lane-plain", work, "session", "peer-lane", false,
+                             DeliveryMeta::queued(12)).await;
+        assert_eq!(
+            cardless_rejected_count(&st, "lane-plain"),
+            0,
+            "a send that did NOT ask for no_board must leave no refusal receipt — otherwise \
+             the event says nothing about what the sender wanted"
+        );
+    }
+
+    /// NO SEND PATH MAY HARDCODE THE no_board ARGUMENT (AMUX-4555).
+    ///
+    /// The cell above asserts `cmd_hist_record_full` HONOURS the flag, and that
+    /// function was never broken. The bug was three CALLERS passing a literal
+    /// `false` into it, and a test that enters at the callee cannot see that:
+    /// measured by mutation, reverting the peer-send call site to `false` left
+    /// the cell above passing 1 of 1. A check pinning the wrong layer is
+    /// exactly as green as one pinning the right layer.
+    ///
+    /// So this reads the shipped source and counts. The property is "every send
+    /// path passes the value it computed", and its violation is a literal in
+    /// the seventh argument, which is a thing a grep can see and a unit test
+    /// standing below the defect cannot.
+    ///
+    /// ONE production call site may legitimately pass `false`, and it is named
+    /// rather than counted: `cmd_hist_record_full(.., "schedule", ..)` at the
+    /// scheduler seam. A scheduler command has no `--no-board` to honour, so
+    /// `false` there is the computed truth and not a dropped argument.
+    /// THE POPULATION IS EVERY PRODUCTION CALL, AND GETTING THAT WRONG IS HOW
+    /// THE FIRST VERSION OF THIS TEST PASSED A BROKEN TREE.
+    ///
+    /// It split the file at the first `#[cfg(test)]` and scanned what came
+    /// before, on the assumption that fixtures live at the bottom. They do not:
+    /// the split landed at line 12,516 of 32,254, so the "production half"
+    /// excluded the send handlers at 16,210 and 17,494 — the only two call
+    /// sites this test exists to watch. Both mutations passed. A count is only
+    /// as good as the set it ranges over, and mine ranged over a set chosen to
+    /// exclude the evidence.
+    ///
+    /// Production calls are discriminated by their FIRST ARGUMENT, not by
+    /// position in the file: handlers pass `state`, fixtures pass `&st`. That
+    /// is a property of the code rather than of its layout, so it cannot drift
+    /// when someone moves a module.
+    #[test]
+    fn no_send_path_hardcodes_the_no_board_argument() {
+        let src = include_str!("session_verbs.rs");
+        let flat = src.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut sites: Vec<&str> = Vec::new();
+        let mut rest = flat.as_str();
+        while let Some(at) = rest.find("cmd_hist_record_") {
+            let seg = &rest[at..];
+            let end = seg.find(')').unwrap_or(seg.len()).min(160);
+            let call = &seg[..end];
+            // `state` as the first argument is the handler path; `&st` is a
+            // fixture. A signature reads `state: &AppState` and is excluded by
+            // requiring the comma.
+            // Both spellings: `join(" ")` leaves the comma attached to the
+            // token, so a multi-line call normalises to `( state, name,` and a
+            // single-line one to `(state, name,`. Checking only the first form
+            // is what left the multi-line QUEUED call site invisible and its
+            // mutation green.
+            // AND it must carry a delivery meta, which every real call site
+            // does. Without that clause the four pattern strings in THIS test
+            // match themselves and inflate the count — a detector counting its
+            // own source is the purest form of measuring the query.
+            if (call.starts_with("cmd_hist_record_full( state,")
+                || call.starts_with("cmd_hist_record_full(state,")
+                || call.starts_with("cmd_hist_record_with_id( state,")
+                || call.starts_with("cmd_hist_record_with_id(state,"))
+                && (call.contains("DeliveryMeta") || call.contains(", meta"))
+            {
+                sites.push(call);
+            }
+            rest = &rest[at + "cmd_hist_record_".len()..];
+        }
+        assert_eq!(
+            sites.len(),
+            9,
+            "the scan must see all 9 production call sites. A LOWER number means the detector \
+             stopped matching rather than that the call sites went away, which is exactly how \
+             the first two versions of this test passed a broken tree: one scanned a window \
+             that excluded the send handlers, the other missed the multi-line spelling and left \
+             the queued call site invisible. A HIGHER number means a new send path exists that \
+             nobody has checked. Sites: {sites:#?}"
+        );
+        let hardcoded: Vec<&&str> =
+            sites.iter().filter(|c| c.contains(", false,") || c.contains(", false ,")).collect();
+        assert_eq!(
+            hardcoded.len(),
+            1,
+            "exactly one production call site may pass a literal false, the scheduler seam. \
+             Before AMUX-4555 there were three, and the two extra ones discarded a sender's \
+             no_board on the queued and peer paths. Hardcoded: {hardcoded:#?}"
+        );
+        assert!(
+            hardcoded[0].contains("\"schedule\""),
+            "the one permitted literal must be the scheduler seam, where there is no \
+             --no-board to honour; got {:?}",
+            hardcoded[0]
+        );
+    }
+
+    /// How many `task.cardless_rejected` receipts a lane has.
+    fn cardless_rejected_count(st: &AppState, session: &str) -> i64 {
+        let conn = st.store.read().expect("read");
+        conn.query_row(
+            "SELECT COUNT(*) FROM session_events WHERE session=?1 AND type='task.cardless_rejected'",
+            [session],
+            |r| r.get(0),
+        )
+        .unwrap_or(-1)
     }
 
     /// AMUX-4693: the context a message was composed in is stored, and an
