@@ -202,6 +202,14 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-send-time-stamp.sh
+      # AMUX-4615. The report over /private/tmp/claude-501 must keep having NO
+      # delete path: the lane that owns the bytes decides, not amux. That is a
+      # property of the SOURCE, so the cell greps it; a test that only ran the
+      # tool would stay green the day somebody adds an --apply.
+      - name: the claude-scratch report still deletes nothing (AMUX-4615)
+        run: |
+          set -uo pipefail
+          ./scripts/test-claude-scratch-report.sh
       # AF-561, THE RATCHET. A scripts/test-*.sh that prints a verdict without
       # `set -e` will report PASS after calling a helper that does not exist —
       # bash writes "command not found" to stderr and the suite carries on, and
