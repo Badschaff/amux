@@ -179,6 +179,30 @@ pub static PANE_CAPTURE_LAST_TIMEOUT_DETAIL: std::sync::Mutex<Option<serde_json:
 /// evidence" — which is why bounding is safe here and would not be if the pane
 /// were load-bearing for a decision.
 fn capture_pane_bounded(pt: &str, lane: &str) -> Option<String> {
+    // THE CHOKE POINT FOR EVERY PANE READ, which is why suppression belongs
+    // here rather than at the three call sites.
+    //
+    // `SUPPRESS_FLEET_FOR_TEST` used to cover only `python_fleet_sessions`, the
+    // env-file enumeration, so a unit test could still scrape the machine's
+    // real tmux. `legacy_sessions_http_serializes_sticky_runtime_board_truth`
+    // inserts a fixture worker named `tubescience` with backend_ref
+    // `amux-tubescience`, which is the live TubeScience lane's actual session
+    // name on this box, so the test's verdict was whatever that lane happened
+    // to be doing. It failed on 2026-09-15 with status "waiting" instead of
+    // "unattributed", carrying the real pane verbatim
+    // ("Enter to select / navigate / Esc to cancel"), and passed 40 minutes
+    // earlier on the same code. On a GitHub runner no such session exists, so
+    // this is green in CI and red only on the box the fleet runs on, which is
+    // backwards for a dogfooding repo (AMUX-4703).
+    //
+    // Returning None is already a supported answer: see this function's own
+    // docstring above, a killed capture returns None and callers treat an
+    // absent pane as no contradicting evidence. So suppression reuses a path
+    // the callers already handle rather than inventing a test-only one.
+    #[cfg(test)]
+    if fleet_suppressed() {
+        return None;
+    }
     use std::process::{Command, Stdio};
     // POLICY IN CONFIG, not a constant (ethos D4). A timeout hardcoded here is
     // a ceiling nobody can move when the fleet grows.
@@ -3413,9 +3437,48 @@ fn blocked_names(home: &std::path::Path) -> std::collections::BTreeSet<String> {
 /// lanes hit it). Named deviation: the root fix is capturing home in AppState
 /// at startup instead of re-reading env per request (carded); until then this
 /// is the only race-free way to keep the unit test's verdict machine-independent.
+/// How many live guards are asking for suppression.
+///
+/// A DEPTH, NOT A BOOL, because cargo runs a binary's tests in PARALLEL and the
+/// obvious RAII shape is wrong here. With a bool and a saved previous value:
+/// test A stores true (saw false), test B stores true (saw true), A finishes and
+/// restores FALSE while B is still running, and B silently loses its
+/// suppression mid-assertion. A counter has no such ordering hazard: the flag is
+/// on while anyone holds it and off when the last guard drops.
 #[cfg(test)]
-pub(crate) static SUPPRESS_FLEET_FOR_TEST: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static SUPPRESS_FLEET_DEPTH: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Hold host-fleet suppression for as long as this value is alive.
+///
+/// The three call sites used to `store(true)` and never restore, so the flag was
+/// a one-way switch: once any of them ran, EVERY later test in that binary
+/// inherited suppression without asking for it. The failure that hides is a
+/// false green, a test meaning to exercise the fleet path and silently getting a
+/// suppressed one (AMUX-4703).
+#[cfg(test)]
+pub(crate) struct FleetSuppression;
+
+#[cfg(test)]
+impl Drop for FleetSuppression {
+    fn drop(&mut self) {
+        SUPPRESS_FLEET_DEPTH.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Suppress host-fleet reads until the returned guard drops. Bind it
+/// (`let _fleet = suppress_fleet_for_test();`), because `let _ =` drops it
+/// immediately and suppresses nothing.
+#[cfg(test)]
+pub(crate) fn suppress_fleet_for_test() -> FleetSuppression {
+    SUPPRESS_FLEET_DEPTH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    FleetSuppression
+}
+
+#[cfg(test)]
+pub(crate) fn fleet_suppressed() -> bool {
+    SUPPRESS_FLEET_DEPTH.load(std::sync::atomic::Ordering::SeqCst) > 0
+}
 
 /// AMUX-2820 / last_human_ts. The rows are already ordered `ts ASC` by the
 /// caller's own query (they double as the source for `task_markers`), so an
@@ -3434,7 +3497,7 @@ fn last_human_ts_from_user_messages(
 
 fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
     #[cfg(test)]
-    if SUPPRESS_FLEET_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+    if fleet_suppressed() {
         return vec![];
     }
     let home = amux_home();
@@ -4421,6 +4484,55 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
 pub(crate) mod tests {
     use super::*;
     static PROBE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// AMUX-4703. The flag was a one-way switch and the pane read ignored it.
+    ///
+    /// Serialised against other suppression users: this cell asserts on the
+    /// GLOBAL depth returning to zero, which a concurrent holder would
+    /// legitimately keep above zero. The lock is what makes the assertion about
+    /// this test's own guards rather than about scheduling.
+    #[test]
+    fn fleet_suppression_is_scoped_and_reaches_the_pane_read() {
+        let _serial = PROBE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!fleet_suppressed(), "precondition: nothing is suppressing yet");
+
+        {
+            let _outer = suppress_fleet_for_test();
+            assert!(fleet_suppressed(), "a held guard suppresses");
+
+            // THE ROOT FIX: the pane read consults the same flag. Before this,
+            // suppression covered only the env-file enumeration, so a unit test
+            // still scraped the machine's real tmux and inherited whatever a
+            // live lane of the same name was doing.
+            assert_eq!(
+                capture_pane_bounded(&pane_target("amux-tubescience"), "tubescience"),
+                None,
+                "a suppressed pane read must not reach the host's tmux"
+            );
+
+            // NESTING, and this is why the depth is a counter rather than a
+            // bool with a saved previous value. Cargo runs a binary's tests in
+            // parallel; with the bool shape the inner guard would observe
+            // `true`, restore `true` on drop, and the outer would then restore
+            // `false` while a third holder was still mid-assertion.
+            {
+                let _inner = suppress_fleet_for_test();
+                assert!(fleet_suppressed(), "two guards still suppress");
+            }
+            assert!(
+                fleet_suppressed(),
+                "dropping the INNER guard must not release the outer one's suppression"
+            );
+        }
+
+        // The leak this card is about: three call sites stored `true` and never
+        // restored, so every later test in the binary inherited suppression and
+        // a test meaning to exercise the fleet path got a suppressed one.
+        assert!(
+            !fleet_suppressed(),
+            "suppression must end when the last guard drops, not persist for the binary"
+        );
+    }
 
     #[test]
     fn steering_transport_identity_joins_receipt_and_session_without_text_deduplication() {

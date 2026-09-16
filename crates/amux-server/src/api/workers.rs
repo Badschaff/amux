@@ -2670,8 +2670,9 @@ mod tests {
         // the legacy route merges the REAL fleet (env + tmux read at call
         // time) and the assertion below depends on how many live sessions
         // this box runs. See SUPPRESS_FLEET_FOR_TEST for the named deviation.
-        crate::api::sessions_legacy::SUPPRESS_FLEET_FOR_TEST
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Bound, so suppression ends with this test instead of leaking into
+        // every later one in this binary (AMUX-4703).
+        let _fleet = crate::api::sessions_legacy::suppress_fleet_for_test();
         let (app, _dir) = app();
         let id = create(&app, "w").await;
 
@@ -2718,8 +2719,9 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_sessions_stores_do_not_share_cached_rows() {
-        crate::api::sessions_legacy::SUPPRESS_FLEET_FOR_TEST
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Bound, so suppression ends with this test instead of leaking into
+        // every later one in this binary (AMUX-4703).
+        let _fleet = crate::api::sessions_legacy::suppress_fleet_for_test();
         let (first, _first_dir) = app();
         let (second, _second_dir) = app();
         create(&first, "first-store-worker").await;
@@ -2755,8 +2757,9 @@ mod tests {
     /// poll. A later control prompt cannot erase a still-live claimed card.
     #[tokio::test]
     async fn legacy_sessions_http_serializes_sticky_runtime_board_truth() {
-        crate::api::sessions_legacy::SUPPRESS_FLEET_FOR_TEST
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Bound, so suppression ends with this test instead of leaking into
+        // every later one in this binary (AMUX-4703).
+        let _fleet = crate::api::sessions_legacy::suppress_fleet_for_test();
         let (app, dir) = app();
         // Deterministic counterpart of CI's shared discovery-epoch race: the
         // idle read must retain the same retry policy as the initial read.
