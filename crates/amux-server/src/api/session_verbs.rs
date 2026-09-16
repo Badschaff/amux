@@ -9029,8 +9029,33 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
             // the adapter-vs-launch-arm drift the launch-matches-adapter invariant
             // guards (AMUX-3155). Adding it here is what makes a dashboard- or
             // (post-AMUX-3164 convergence) CLI-launched ollama worker responsive.
+            //
+            // AND `low` IS A GUARANTEED FAILURE FOR A MODEL THAT CANNOT THINK
+            // (AMUX-4611). qwen3-coder reports capabilities completion+tools and
+            // no thinking; every turn died with `"qwen3-coder:30b-65k" does not
+            // support thinking`, 32 occurrences in one 4-second exec, exit 1.
+            //
+            // Measured 2026-09-16 against codex-cli 0.153.4, one exec each:
+            //   qwen3-coder (no thinking)  low -> FAIL 32x   none -> ok, replied
+            //   qwen3-coder (no thinking)  minimal -> FAIL 32x
+            //   qwen3-coder (no thinking)  OMITTED -> FAIL 32x
+            //   qwen3:4b    (thinking)     low -> ok         none -> ok
+            //
+            // OMITTING IS NOT THE FIX, which is what the card proposed. The
+            // global ~/.codex/config.toml sets model_reasoning_effort="medium",
+            // so dropping the flag inherits medium and fails identically. The
+            // value has to be explicit.
+            //
+            // `none` works for BOTH classes, so a probe-free constant is
+            // tempting and is deliberately not taken: the only evidence that
+            // `none` is SAFE for a thinking model is a one-token prompt that
+            // exercises no reasoning. Switching thinking-capable models off
+            // `low` would be changing behaviour on evidence that cannot see the
+            // difference. So the capability decides, and each model keeps the
+            // setting measured good for it.
             if !opts.contains("model_reasoning_effort") {
-                opts += " -c model_reasoning_effort=low";
+                let effort = ollama_reasoning_effort(&model).await;
+                opts += &format!(" -c model_reasoning_effort={effort}");
             }
             if let Some(gr) = run_cmd("git", &["-C", &work_dir, "rev-parse", "--show-toplevel"], OP_TIMEOUT).await {
                 if gr.status.success() {
@@ -11840,6 +11865,60 @@ fn no_board_refusal_notice(skip_board: bool, text: &str) -> Option<&'static str>
          control text and informational queries, which are cardless anyway. A \
          task.cardless_rejected receipt records this refusal on the recipient.",
     )
+}
+
+/// Which `model_reasoning_effort` codex should get for an ollama model.
+///
+/// `low` for a model whose capabilities include `thinking`, `none` otherwise.
+/// See the launch arm for the measurements; the short version is that `low`
+/// kills a non-thinking model on every turn and `none` is fine for both, but
+/// only `low` is evidenced as good for a thinking one.
+///
+/// SHELLS OUT, matching `OllamaAdapter::models` which already runs `ollama
+/// list`, rather than adding an HTTP client to this module for one probe.
+///
+/// FAILS TOWARD `none`. A missing binary, a stopped daemon or a timeout means
+/// the capability is UNKNOWN, and the two candidates are not symmetric under
+/// ignorance: `none` costs a thinking model some reasoning depth, `low` costs a
+/// non-thinking model every single turn. An unknown answer takes the one that
+/// cannot hard-fail, and says so in the log.
+/// The DECISION half of [`ollama_reasoning_effort`], split from the subprocess
+/// so it can be tested without an ollama daemon — the same seam shape as
+/// `credential_preflight_from` and `apply_archive_status_move`.
+///
+/// Returns `(effort, verdict)`. `ollama show` prints a `Capabilities` block
+/// listing one capability per line; `thinking` appears there and nowhere else
+/// in the output for the models measured on 2026-09-16.
+pub(crate) fn reasoning_effort_from_show(show_output: &str) -> (&'static str, &'static str) {
+    if show_output.to_lowercase().contains("thinking") {
+        ("low", "thinking_capable")
+    } else {
+        ("none", "no_thinking_capability")
+    }
+}
+
+async fn ollama_reasoning_effort(model: &str) -> &'static str {
+    let probe = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::process::Command::new("ollama").arg("show").arg(model).output(),
+    )
+    .await;
+    let (effort, verdict) = match probe {
+        Ok(Ok(o)) if o.status.success() => {
+            reasoning_effort_from_show(&String::from_utf8_lossy(&o.stdout))
+        }
+        _ => ("none", "capability_unknown"),
+    };
+    tracing::info!(
+        target: "amux::sessions",
+        model,
+        effort,
+        verdict,
+        measured = true,
+        n_considered = 1,
+        "ollama reasoning effort chosen from model capabilities (AMUX-4611)"
+    );
+    effort
 }
 
 fn no_board_re() -> &'static regex::Regex {
@@ -23858,6 +23937,51 @@ mod tests {
             "a send that did NOT ask for no_board must leave no refusal receipt — otherwise \
              the event says nothing about what the sender wanted"
         );
+    }
+
+    /// A NON-THINKING OLLAMA MODEL MUST NOT BE SENT `low` (AMUX-4611).
+    ///
+    /// Measured 2026-09-16, codex-cli 0.153.4, one `codex exec` per row:
+    ///
+    /// ```text
+    ///   qwen3-coder:30b-65k  (completion, tools)            low     -> exit 1, 32x "does not support thinking"
+    ///   qwen3-coder:30b-65k                                 minimal -> exit 1, 32x
+    ///   qwen3-coder:30b-65k                                 OMITTED -> exit 1, 32x
+    ///   qwen3-coder:30b-65k                                 none    -> exit 0, model replied
+    ///   qwen3:4b             (completion, tools, thinking)  low     -> exit 0
+    ///   qwen3:4b                                            none    -> exit 0
+    /// ```
+    ///
+    /// OMITTING IS NOT NEUTRAL, which is what the originating card proposed:
+    /// the global ~/.codex/config.toml sets model_reasoning_effort="medium", so
+    /// dropping the flag inherits medium and fails identically.
+    ///
+    /// The unknown arm is the one worth arguing about. A missing binary or a
+    /// stopped daemon leaves the capability UNKNOWN, and the candidates are not
+    /// symmetric there: `none` costs a thinking model some depth, `low` costs a
+    /// non-thinking model every turn. Unknown takes the value that cannot
+    /// hard-fail.
+    #[test]
+    fn reasoning_effort_follows_the_models_thinking_capability() {
+        let thinking = "  Capabilities\n    completion\n    tools\n    thinking\n";
+        let plain = "  Capabilities\n    completion\n    tools\n";
+        assert_eq!(
+            reasoning_effort_from_show(thinking),
+            ("low", "thinking_capable"),
+            "a thinking-capable model keeps the setting measured good for it"
+        );
+        assert_eq!(
+            reasoning_effort_from_show(plain),
+            ("none", "no_thinking_capability"),
+            "`low` here is a guaranteed per-turn failure, which is the whole bug"
+        );
+        // CASE-INSENSITIVE, because the match is on ollama's rendered output and
+        // a capitalised heading would otherwise read as no-thinking on a model
+        // that can — the silent direction of this bug.
+        assert_eq!(reasoning_effort_from_show("Capabilities\n  THINKING\n").0, "low");
+        // The empty answer is NOT treated as thinking-capable. An `ollama show`
+        // that printed nothing must not be read as a capability report.
+        assert_eq!(reasoning_effort_from_show("").0, "none");
     }
 
     /// NO SEND PATH MAY HARDCODE THE no_board ARGUMENT (AMUX-4555).

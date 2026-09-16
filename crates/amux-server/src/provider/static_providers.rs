@@ -244,10 +244,28 @@ impl ProviderAdapter for OllamaAdapter {
                 "workspace-write".into(),
                 // Local models don't support extended thinking (xhigh). The
                 // global ~/.codex/config.toml may set model_reasoning_effort=xhigh
-                // for OpenAI models; override it here so ollama workers use low
-                // effort and are responsive (xhigh hangs qwen, ~30min wasted: AH-81).
+                // for OpenAI models; override it here so ollama workers are
+                // responsive (xhigh hangs qwen, ~30min wasted: AH-81).
+                //
+                // `none`, NOT `low` (AMUX-4611). `low` is a guaranteed failure
+                // for a model without the `thinking` capability: qwen3-coder
+                // died on every turn with `does not support thinking`, 32
+                // occurrences in one exec. Measured 2026-09-16 on codex-cli
+                // 0.153.4, `none` works for both a thinking and a non-thinking
+                // model; `low`, `minimal` and omitting the flag all fail the
+                // non-thinking one (omitting inherits "medium" from the global
+                // config, so it is not a neutral choice).
+                //
+                // THIS PATH CANNOT PROBE and the launch arm can, which is why
+                // they differ. `build_command` is sync, so it has no way to ask
+                // `ollama show` what the model can do; session_verbs.rs's arm
+                // is async and keeps `low` for thinking-capable models because
+                // that is the setting measured good for them. A caller that
+                // cannot discriminate takes the value that never hard-fails.
+                // `provider.launch_matches_adapter` compares the BINARY, not
+                // the flags, so this difference is not drift it would flag.
                 "-c".into(),
-                "model_reasoning_effort=low".into(),
+                "model_reasoning_effort=none".into(),
             ],
             PromptMode::HeadlessStructured => vec![
                 "codex".into(),
@@ -320,7 +338,10 @@ mod tests {
         let interactive_expected = vec![
             "codex", "--oss", "--local-provider", "ollama", "--model", "qwen3.8:27b",
             "-a", "never", "--sandbox", "workspace-write",
-            "-c", "model_reasoning_effort=low",
+            // `none`, not `low` (AMUX-4611): this path is sync and cannot ask
+            // `ollama show` whether the model can think, and `low` is a
+            // guaranteed per-turn failure for one that cannot.
+            "-c", "model_reasoning_effort=none",
         ];
         // HeadlessStructured: no extra flags needed (headless driver handles approvals).
         let headless_expected = vec![
