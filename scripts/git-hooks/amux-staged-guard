@@ -432,13 +432,35 @@ def _derive_session_from_tmux():
     prefix, or no tmux at all) still resolves to "" and takes the existing
     no-op path below — this only recovers a lane that lost its own identity,
     it never invents one for a human.
+
+    AND THE PREFIX IS NOT ENOUGH (AMUX-4602). `amux-` is a naming convention;
+    the env file under ~/.amux/sessions is what makes a lane. A server test that
+    reached start_session created a live `amux-client-left-fixture` on the
+    machine's real tmux server, the fleet adopted it, and this function named it
+    as the committer of a peer's work: ba203699 permanently carries
+    `Amux-Committer: client-left-fixture`, and the owner got a "Session
+    client-left-fixture is committing" notice for a session that was never a lane.
+
+    Measured 2026-09-16: 0 of 29 live amux- tmux sessions lack an env file, so
+    requiring one costs nothing today and refuses the next leaked fixture by
+    construction rather than by anyone remembering.
     """
     try:
         name = subprocess.run(["tmux", "display-message", "-p", "#S"],
                               capture_output=True, text=True, timeout=3).stdout.strip()
     except Exception:
         return ""
-    return name[len("amux-"):] if name.startswith("amux-") else ""
+    if not name.startswith("amux-"):
+        return ""
+    lane = name[len("amux-"):]
+    home = os.environ.get("AMUX_HOME") or os.path.join(os.path.expanduser("~"), ".amux")
+    if not os.path.isfile(os.path.join(home, "sessions", "%s.env" % lane)):
+        sys.stderr.write(
+            "amux staged-guard: tmux session %r has no env file under %s/sessions, "
+            "so it is NOT a lane and will not be named as a committer (AMUX-4602).\n"
+            % (name, home))
+        return ""
+    return lane
 
 
 def _orphan_deletions(staged):

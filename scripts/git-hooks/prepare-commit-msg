@@ -106,7 +106,19 @@ if command -v tmux >/dev/null 2>&1; then
       _ah=$((_ah + 1))
       _match="$(printf '%s\n' "$_panes" | awk -v p="$_ap" '$1==p {print $2; exit}')"
       case "$_match" in
-        amux-*) _anc_lane="${_match#amux-}"; break ;;
+        amux-*)
+          # AMUX-4602: A TMUX SESSION IS NOT A LANE. An `amux-` prefix is a
+          # naming convention; the env file is what makes a lane. A server test
+          # that reached start_session once created a live `amux-client-left-fixture`
+          # on the machine's real tmux server, the fleet adopted it, and the
+          # staged guard named it as a committer: ba203699 still carries
+          # `Amux-Committer: client-left-fixture` for a session that was never a
+          # lane. Measured today: 0 of 29 live amux- sessions lack an env file,
+          # so this costs nothing and refuses the next leak by construction.
+          if [ -f "${AMUX_HOME:-$HOME/.amux}/sessions/${_match#amux-}.env" ]; then
+            _anc_lane="${_match#amux-}"
+          fi
+          break ;;
       esac
       _ap="$(ps -o ppid= -p "$_ap" 2>/dev/null | tr -d ' ')"
       case "$_ap" in ''|0|1) break ;; esac
@@ -142,7 +154,13 @@ fi
 if [ -z "$stamp" ]; then
   _mr43_tname="$(tmux display-message -p '#S' 2>/dev/null)"
   case "$_mr43_tname" in
-    amux-*) stamp="${_mr43_tname#amux-}" ;;
+    # Same env-file requirement as the walk above (AMUX-4602): recovering a
+    # lane's lost identity is the point; inventing one for a stray tmux session
+    # is the failure this guard already produced once.
+    amux-*)
+      if [ -f "${AMUX_HOME:-$HOME/.amux}/sessions/${_mr43_tname#amux-}.env" ]; then
+        stamp="${_mr43_tname#amux-}"
+      fi ;;
   esac
 fi
 stamp="${stamp:-(human)}"

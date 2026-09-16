@@ -303,5 +303,42 @@ else
   rm -f "$_t2"
 fi
 
+# ---------------------------------------------------------------------------
+# AMUX-4602: a tmux session with no env file is NOT a lane.
+#
+# `amux-` is a naming convention; the env file under ~/.amux/sessions is what
+# makes a lane. A server test that reached start_session once created a live
+# `amux-client-left-fixture` on the machine's real tmux server, the fleet
+# adopted it, and the commit stamp named it: ba203699 permanently carries
+# `Amux-Committer: client-left-fixture` for a session that was never a lane.
+#
+# Both recovery paths are covered because both strip the same prefix: the
+# MR-43 `tmux display-message` fallback, and the AMUX-4559 ancestry walk.
+# Pointing AMUX_HOME at an empty directory is exactly what a leaked fixture
+# looks like to them — the pane is real, the lane is not.
+# ---------------------------------------------------------------------------
+echo "cell: a tmux session without an env file is not a lane"
+_empty_home="$(mktemp -d)"
+_t="$(mktemp)"; printf 'subject line\n' > "$_t"
+AMUX_HOME="$_empty_home" AMUX_SESSION="" sh "$HOOK" "$_t" >/dev/null 2>&1
+_got="$(sed -n 's/^Amux-Session:[[:space:]]*//p' "$_t" | head -1)"
+if [ "$_got" = "(human)" ]; then
+  ok "no env file under AMUX_HOME -> (human), not an invented lane name"
+else
+  no "a session with no env file must not be named" "got Amux-Session: $_got"
+fi
+# THE CONTROL, without which the cell above passes against a hook that always
+# answers (human) and has stopped recovering real lanes at all.
+_t2="$(mktemp)"; printf 'subject line\n' > "$_t2"
+AMUX_SESSION="" sh "$HOOK" "$_t2" >/dev/null 2>&1
+_got2="$(sed -n 's/^Amux-Session:[[:space:]]*//p' "$_t2" | head -1)"
+if [ "$_got2" != "(human)" ] && [ -n "$_got2" ]; then
+  ok "and a REAL lane with an env file still resolves ($_got2)"
+else
+  # Outside a pane there is nothing to recover; say so rather than fail.
+  printf '  ..   SKIPPED control: not in an amux- pane with an env file, nothing to recover\n'
+fi
+rm -rf "$_empty_home" "$_t" "$_t2"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
