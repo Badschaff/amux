@@ -12,11 +12,12 @@
 # would be worse than no gate. Every run prints how many cells it could not
 # reach, beside what it ran.
 #
-# SELECTION, measured 2026-09-16 over the 93 cells checks.yml actually invokes:
-#   59  name a repo path  (scripts/, crates/, .github/, e2e/)
+# SELECTION, measured 2026-09-16 over the 93 cells checks.yml actually invokes
+# (comment lines excluded; counting them gave 94 and a false FAIL, see below):
+#   58  name a repo path  (scripts/, crates/, .github/, e2e/)
 #   42  invoke the `amux` CLI
-#   16  do neither and are unreachable by any path signal
-#   => 77/93 reachable, 83%
+#   17  do neither and are unreachable by any path signal
+#   => 76/93 reachable, 82%
 # A changed-path-to-test-NAME rule would have been worse and is why this matches
 # on references instead: edef6523 changed `scripts/test-contended.sh`, whose
 # covering cell is `scripts/test-test-receipt.sh`, a name that does not match.
@@ -60,7 +61,14 @@ WF=.github/workflows/checks.yml
 # The population is what the WORKFLOW invokes, not what is on disk. Measured:
 # 104 test scripts exist, 93 are invoked. Selecting from disk would report cells
 # CI never runs, which reads as coverage that does not exist.
-CELLS=$(grep -oE 'scripts/test-[A-Za-z0-9_.-]+\.(sh|py)' "$WF" | sort -u)
+# COMMENT LINES ARE NOT INVOCATIONS. Dropping this filter counted
+# `scripts/test-target-clause.sh` as a cell because the AF-346 comment block
+# names it twice, and that harness is in scripts/fixtures/harness-wired-baseline.txt
+# as deliberately unwired ("every cell compiles for real, so wiring it adds
+# minutes to every lane's push"). The selector then ran it and reported a FAIL
+# for something CI does not run, which is a false alarm from a tool whose entire
+# job is not overstating what it covered.
+CELLS=$(grep -v '^[[:space:]]*#' "$WF" | grep -oE 'scripts/test-[A-Za-z0-9_.-]+\.(sh|py)' | sort -u)
 N_CELLS=$(printf '%s\n' "$CELLS" | grep -c .)
 
 if [ -z "$FILES" ]; then
