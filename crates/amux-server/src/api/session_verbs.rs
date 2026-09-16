@@ -3844,6 +3844,27 @@ fn model_lives_in_cc_model(provider: &str) -> bool {
     provider == "ollama"
 }
 
+/// Whether this provider's reasoning effort is decided by the MODEL rather than
+/// by a `--effort` in CC_FLAGS.
+///
+/// The ollama arm builds its own `opts` and never appends CC_FLAGS. It sets
+/// `-c model_reasoning_effort=<derived>` from `ollama_reasoning_effort(model)`,
+/// because a model without the `thinking` capability hard-fails on every turn at
+/// any other value (AMUX-4611: qwen3-coder:30b-65k, 32 occurrences of "does not
+/// support thinking", exit 1, on each of `low`, `minimal` and OMITTED).
+///
+/// So a `--effort` written for one of these providers is inert, and restarting a
+/// running worker to apply it is a teardown bought for no observable change
+/// (AMUX-4729).
+///
+/// A SEPARATE PREDICATE FROM `model_lives_in_cc_model`, even though both answer
+/// "ollama" today. They are different facts: one is where the model NAME is
+/// stored, the other is who decides the reasoning effort. Collapsing them would
+/// make the next provider that shares one and not the other silently wrong.
+fn effort_is_model_derived(provider: &str) -> bool {
+    provider == "ollama"
+}
+
 /// The model a worker is configured for, read from wherever its provider keeps
 /// it, falling back to the provider default.
 ///
@@ -21171,6 +21192,13 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
             "model": model_val,
             "message": format!("model set to {model_val}{}", rep.note),
         });
+        // The RESTART here is legitimate: the model is a launch argument for
+        // this provider, so it genuinely changed. The effort riding along in the
+        // same request still did not, and a caller who sent both would otherwise
+        // read one success as covering the other (AMUX-4729).
+        if effort_is_model_derived(&current_provider) && body.get("effort").is_some() {
+            out["effort_governed_by"] = json!("model_capability");
+        }
         if let Some(e) = rep.hot_error {
             out["hot_error"] = json!(e);
         }
@@ -21201,6 +21229,34 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
         let was_running = running;
         if let Err((status, error)) = write_swap_config(state, name, &cfg, was_running, "effort change") {
             return jresp(status, json!({"error": error}));
+        }
+        let shown_effort = if effort_val.is_empty() { "default".to_string() } else { effort_val.clone() };
+        // AMUX-4729. For a provider whose effort the MODEL decides, the env
+        // write above is the whole of what this request can honestly do. The
+        // live apply below would send a running worker through
+        // `plan_config_swap`, which gives a non-claude provider Restart, so the
+        // pre-fix behaviour was to tear down and relaunch a worker in order to
+        // apply a flag its launch arm never reads.
+        //
+        // The request is ACCEPTED rather than refused, on purpose: the SPA sends
+        // `effort` alongside `model` on every model change (app.js
+        // `payload.effort = _effortVal`), so a 400 here would break changing an
+        // ollama worker's model from the UI, which is the very thing AMUX-4607
+        // just made possible. Stored, disclosed, and not paid for with a
+        // restart.
+        if effort_is_model_derived(&current_provider) {
+            return j200(json!({
+                "ok": true,
+                "applied": false,
+                "mode": SwapMode::EnvOnly.tag(),
+                "effort": shown_effort,
+                "effort_governed_by": "model_capability",
+                "message": format!(
+                    "effort recorded as {shown_effort}, and it does not change what this worker runs: \
+                     an ollama worker's reasoning effort is derived from its model's own capability at \
+                     launch, so no restart was taken"
+                ),
+            }));
         }
         // `/effort <level>` is hot on the same slash surface as `/model`
         // (verified 2026-08-09: "Set effort level to high (saved as your
@@ -27265,6 +27321,69 @@ CLAUDE-POSTFIX-COMPLETE
         let e = envf("olla");
         assert!(!e.contains("CC_MODEL"), "swapping off ollama must clear CC_MODEL, got:\n{e}");
         assert!(e.contains("--model"), "claude takes its model in CC_FLAGS, got:\n{e}");
+    }
+
+    /// AMUX-4729. An ollama worker's reasoning effort comes from its model's
+    /// capability, so a `--effort` in CC_FLAGS changes nothing its launch arm
+    /// reads, and restarting to apply one buys a teardown for no change.
+    #[tokio::test]
+    async fn an_effort_patch_on_ollama_is_disclosed_and_costs_no_restart() {
+        // WHAT THE EARLY RETURN AVOIDS, stated where a reader can see it. This
+        // is the planner's real answer for a RUNNING ollama worker, and it is
+        // why the branch returns before `apply_live_config_change`. A stopped
+        // session would answer EnvOnly either way, so the response assertions
+        // below cannot show this on their own.
+        let caps = crate::api::workers::provider_caps("ollama");
+        assert_eq!(
+            plan_config_swap("ollama", &caps, true, true),
+            SwapMode::Restart,
+            "a running ollama worker would be RESTARTED to apply an effort it never reads"
+        );
+        // POSITIVE CONTROL on the planner: claude really does get the cheap
+        // path, so the line above is about ollama rather than about everything.
+        let cc = crate::api::workers::provider_caps("claude");
+        assert_eq!(plan_config_swap("claude", &cc, true, true), SwapMode::Hot);
+
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let sessions = home.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("olla.env"), "CC_DIR=\"/tmp\"\nCC_PROVIDER=\"ollama\"\nCC_MODEL=\"qwen3:4b\"\n").unwrap();
+        std::fs::write(sessions.join("clod.env"), "CC_DIR=\"/tmp\"\nCC_FLAGS=\"--model opus\"\n").unwrap();
+        let (state, _dir) = state();
+        let app: Router = routes().with_state(state);
+
+        // Effort only, ollama: accepted and DISCLOSED.
+        let (st, v) = call(&app, "PATCH", "/api/sessions/olla/config", Some(json!({"effort": "high"}))).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(
+            v["effort_governed_by"], json!("model_capability"),
+            "the response must say what actually decides this worker's effort: {v}"
+        );
+        assert_eq!(v["applied"], json!(false), "nothing was applied to a live process: {v}");
+
+        // ACCEPTED, NOT REFUSED, and this is load-bearing. The SPA sends
+        // `effort` alongside `model` on every model change, so a 400 here would
+        // break changing an ollama worker's model from the UI.
+        let (st, v) = call(
+            &app, "PATCH", "/api/sessions/olla/config",
+            Some(json!({"model": "qwen3-coder:30b-65k", "effort": "high"})),
+        ).await;
+        assert_eq!(st, StatusCode::OK, "a model+effort patch must still work for ollama: {v}");
+        assert_eq!(v["effort_governed_by"], json!("model_capability"), "{v}");
+        let env = std::fs::read_to_string(sessions.join("olla.env")).unwrap();
+        assert!(env.contains("CC_MODEL=\"qwen3-coder:30b-65k\""), "the model half must still land: {env}");
+
+        // POSITIVE CONTROL: a claude session is untouched by any of this. Its
+        // effort IS read from CC_FLAGS, so it must not be disclosed away.
+        let (st, v) = call(&app, "PATCH", "/api/sessions/clod/config", Some(json!({"effort": "high"}))).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert!(
+            v.get("effort_governed_by").is_none(),
+            "a claude worker's effort is NOT model-derived and must not claim to be: {v}"
+        );
+        let env = std::fs::read_to_string(sessions.join("clod.env")).unwrap();
+        assert!(env.contains("--effort high"), "claude still takes its effort in CC_FLAGS: {env}");
     }
 
     /// The refusal must advertise the set it enforces, not a stale subset.
