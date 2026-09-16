@@ -386,7 +386,109 @@ async fn resolve_rel(method: Method, RawQuery(q): RawQuery) -> Response {
             return Json(json!({ "resolved": s, "exists": true, "tried": tried })).into_response();
         }
     }
+    // Git fallback: the file may exist on origin/main even though it is not
+    // on disk (shared checkout behind origin, graft-push workflows). Ethan's
+    // screenshots 2026-09-16: gtm-engine committed a file, pushed it, and the
+    // link said "does not exist here" because the mixpeek checkout was 4957
+    // commits behind origin/main. The ancestor walk found the correct path but
+    // the file genuinely was not on the filesystem.
+    if !exists {
+        if let Some(git_path) = git_resolve_rel(&cwd, &rel).await {
+            tried.push(git_path.clone());
+            return Json(json!({
+                "resolved": git_path, "exists": true,
+                "source": "git", "tried": tried,
+            }))
+            .into_response();
+        }
+    }
     Json(json!({ "resolved": resolved, "exists": exists, "tried": tried })).into_response()
+}
+
+/// Try to locate a file in `origin/main` of the nearest git repo, returning
+/// its absolute path (repo_root / repo-relative) if found. Called only after
+/// the on-disk ancestor walk and descent have both failed, so this is the
+/// last resort. Two candidates: `rel` as-is (workers often print repo-root-
+/// relative paths) and `cwd_rel/rel` (the cwd-relative interpretation).
+pub(crate) async fn git_resolve_rel(cwd: &str, rel: &str) -> Option<String> {
+    let rel_clean = rel.trim().trim_start_matches('/').trim_start_matches("./");
+    if rel_clean.is_empty() {
+        return None;
+    }
+    let toplevel = git_toplevel_of(cwd).await?;
+    let mut candidates = vec![rel_clean.to_string()];
+    if let Ok(cwd_rel) = Path::new(cwd).strip_prefix(&toplevel) {
+        let joined = cwd_rel.join(rel_clean);
+        let s = joined.to_string_lossy().into_owned();
+        if s != rel_clean {
+            candidates.push(s);
+        }
+    }
+    for candidate in &candidates {
+        let ok = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::process::Command::new("git")
+                .args(["-C", &toplevel, "cat-file", "-t", &format!("origin/main:{candidate}")])
+                .output(),
+        )
+        .await
+        .ok()?
+        .ok()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+        if ok {
+            return Some(format!("{}/{}", toplevel.trim_end_matches('/'), candidate));
+        }
+    }
+    None
+}
+
+/// Read a file's content from `origin/main` in the nearest git repo.
+pub(crate) async fn git_show_file(cwd: &str, rel: &str) -> Option<(String, Vec<u8>)> {
+    let rel_clean = rel.trim().trim_start_matches('/').trim_start_matches("./");
+    if rel_clean.is_empty() {
+        return None;
+    }
+    let toplevel = git_toplevel_of(cwd).await?;
+    let mut candidates = vec![rel_clean.to_string()];
+    if let Ok(cwd_rel) = Path::new(cwd).strip_prefix(&toplevel) {
+        let joined = cwd_rel.join(rel_clean);
+        let s = joined.to_string_lossy().into_owned();
+        if s != rel_clean {
+            candidates.push(s);
+        }
+    }
+    for candidate in &candidates {
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::process::Command::new("git")
+                .args(["-C", &toplevel, "show", &format!("origin/main:{candidate}")])
+                .output(),
+        )
+        .await;
+        if let Ok(Ok(output)) = output {
+            if output.status.success() {
+                let abs_path = format!("{}/{}", toplevel.trim_end_matches('/'), candidate);
+                return Some((abs_path, output.stdout));
+            }
+        }
+    }
+    None
+}
+
+async fn git_toplevel_of(dir: &str) -> Option<String> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::process::Command::new("git")
+            .args(["-C", dir, "rev-parse", "--show-toplevel"])
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()
+    .filter(|o| o.status.success())
+    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    .filter(|s| !s.is_empty())
 }
 
 /// The descent counterpart to `resolve_rel_candidates`'s ancestor walk —

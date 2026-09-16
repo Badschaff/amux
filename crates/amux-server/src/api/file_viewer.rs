@@ -52,8 +52,9 @@
 //!   shutil.which quietly fails there.
 
 use super::fs::{
-    expanduser, is_dangerous_write, is_path_allowed, j, mtime_secs, not_found, parse_body,
-    parse_qs, pystr, qs_get, real_list_dirs, resolve_rel_candidates, resolve_rel_descend,
+    expanduser, git_show_file, is_dangerous_write, is_path_allowed, j, mtime_secs, not_found,
+    parse_body, parse_qs, pystr, qs_get, real_list_dirs, resolve_rel_candidates,
+    resolve_rel_descend,
 };
 use super::AppState;
 use crate::db::WriteOutcome;
@@ -276,7 +277,18 @@ async fn view(req: Request) -> Response {
     }
     let meta = match std::fs::metadata(&p) {
         Ok(m) if m.is_file() => m,
-        _ => return j(404, json!({"error": "file not found"})),
+        _ => {
+            // Git fallback: the file may have been committed and pushed but
+            // the local checkout is behind origin/main (graft-push workflow).
+            let cwd_qs = qs_get(&qs, "cwd").unwrap_or("");
+            let fpath_qs = qs_get(&qs, "path").unwrap_or("");
+            if !cwd_qs.is_empty() && !fpath_qs.is_empty() {
+                if let Some(resp) = view_from_git(cwd_qs, fpath_qs).await {
+                    return resp;
+                }
+            }
+            return j(404, json!({"error": "file not found"}));
+        }
     };
     let ext = py_suffix(&p);
 
@@ -418,6 +430,64 @@ async fn view(req: Request) -> Response {
             "is_markdown": is_md, "is_csv": is_csv, "is_html": is_html,
         }),
     )
+}
+
+/// Serve a file's content from `origin/main` when it does not exist on disk.
+/// Handles text and image types (the common cases for worker-committed files
+/// that the local checkout has not received yet).
+async fn view_from_git(cwd: &str, fpath: &str) -> Option<Response> {
+    let (abs_path, content) = git_show_file(cwd, fpath).await?;
+    let git_path = Path::new(&abs_path);
+    if !is_path_allowed(git_path) {
+        return None;
+    }
+    let ext = py_suffix(git_path);
+
+    if let Some(mime) = mime_of(IMAGE_MIMES, &ext) {
+        let data_url = format!("data:{mime};base64,{}", B64.encode(&content));
+        return Some(j(
+            200,
+            json!({
+                "path": abs_path, "is_image": true, "mime": mime,
+                "size": content.len(), "data_url": data_url,
+                "source": "git",
+            }),
+        ));
+    }
+
+    if content[..content.len().min(8192)].contains(&0) {
+        return Some(j(
+            200,
+            json!({
+                "path": abs_path, "is_binary": true,
+                "size": content.len(), "ext": ext,
+                "source": "git",
+            }),
+        ));
+    }
+
+    let mut text = String::from_utf8_lossy(&content).into_owned();
+    let is_md = matches!(ext.as_str(), ".md" | ".markdown" | ".mdx");
+    let is_csv = matches!(ext.as_str(), ".csv" | ".tsv");
+    let is_html = matches!(ext.as_str(), ".html" | ".htm");
+    let limit: usize = if is_csv { 5_000_000 } else { 200_000 };
+    if text.chars().count() > limit {
+        let cut = text.char_indices().nth(limit).map(|(i, _)| i).unwrap_or(text.len());
+        text.truncate(cut);
+        text.push_str(if is_csv {
+            "\n... (truncated at 5MB)"
+        } else {
+            "\n\n... (truncated at 200KB)"
+        });
+    }
+    Some(j(
+        200,
+        json!({
+            "path": abs_path, "content": text,
+            "is_markdown": is_md, "is_csv": is_csv, "is_html": is_html,
+            "source": "git",
+        }),
+    ))
 }
 
 /// Python's writable-extension allowlist for PUT /api/file (py:67909-67918).

@@ -3697,7 +3697,7 @@ async function _waitForMessageReceipt(input, init, signal) {
 }
 async function _boundedMutationFetch(input, init) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15000);
+  const timer = setTimeout(() => controller.abort('Send timed out (15s)'), 15000);
   const signal = init && init.signal
     ? AbortSignal.any([init.signal, controller.signal]) : controller.signal;
   const original = (async () => {
@@ -11183,7 +11183,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.967';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.968';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -20057,6 +20057,13 @@ async function openFilePreview(path) {
     dlBtn.dataset.filename = data.path.split('/').pop();
     dlBtn.style.display = '';
     _renderFileBody(data, _fileViewMode);
+    if (data.source === 'git') {
+      const banner = document.createElement('div');
+      banner.style.cssText = 'padding:6px 12px;font-size:0.78rem;color:var(--dim);background:rgba(127,127,127,0.08);border-radius:6px;margin:8px 12px 0';
+      banner.textContent = 'Showing version from origin/main (file is not on the local working tree)';
+      const body = document.getElementById('file-body');
+      body.insertBefore(banner, body.firstChild);
+    }
     // Save EVERY opened previewable file for offline viewing (text, images, PDF,
     // ebooks, HTML, CSV) up to a per-file cap. setFile stamps ts=now, so ts is
     // the last-opened time — the 30-day pruner (_idb.pruneFiles, run at startup)
