@@ -58,6 +58,87 @@ msg_file="$1"
 # exemption, only correcting which of the three causes (paragraph above) this
 # commit actually was.
 stamp="$AMUX_SESSION"
+
+# AMUX-4559: RECORD WHEN PROCESS ANCESTRY CONTRADICTS THE ENVIRONMENT, because
+# the environment is what was wrong and nothing could see it.
+#
+# Four unpushed commits — 87f7adec, 2a395b8d, a86bc0de, 1010835e — carry ONE
+# `Amux-Agent: pid=1079`, proving a single agent process made all four, and
+# THREE different `Amux-Session` values: mixpeek-oss, mixpeek-frustrations
+# twice, backend. Each carries the matching `Amux-Conversation` for its wrong
+# lane, so the pair reads as corroborated. mixpeek-oss confirmed by
+# server-stamped message that it has never touched this repo; its workspace is
+# /Users/ethan/Dev/mixpeek-public.
+#
+# MR-43 below could not have caught any of them. It fires only when
+# $AMUX_SESSION is EMPTY, and in all four cases it was set — to the wrong lane.
+# An inherited-but-wrong value is the common case, not the missing one.
+#
+# The walk is the same idea `Amux-Agent` already relies on and the test already
+# pins: process ancestry is the one identity no env var can move. A tmux pane's
+# pid is the lane's own process, so the first ancestor that IS a pane pid names
+# the lane that is really committing. Measured while writing this, from a shell
+# with AMUX_SESSION unset: four hops, python -> bash -> claude -> pane 65910 =
+# `amux-amux`.
+#
+# RECORDS, DOES NOT OVERRIDE, and that boundary is deliberate.
+#
+# Making ancestry the stamp is probably the right end state, and it is NOT a
+# change to make in passing. Every lane in this shared checkout commits through
+# this hook, so getting it wrong mis-attributes everything rather than the four
+# commits it would fix. `scripts/test-commit-stamp.sh` encodes the current
+# contract in 7 cells that set $AMUX_SESSION and expect the stamp to follow it,
+# and an override makes that contract untestable from inside a pane: the
+# harness itself runs in one, so it can no longer express "a different lane
+# committed this". Rewriting that contract is a decision with its own card.
+#
+# What this does instead is make the disagreement VISIBLE and greppable, which
+# is precisely what the board audit could not do: it had to notice by hand that
+# one `Amux-Agent` pid carried three session stamps. A consumer that wants the
+# ancestry answer now has it on the commit.
+_anc_lane=""
+if command -v tmux >/dev/null 2>&1; then
+  _panes="$(tmux list-panes -a -F '#{pane_pid} #{session_name}' 2>/dev/null)"
+  if [ -n "$_panes" ]; then
+    _ap=$$
+    _ah=0
+    while [ "$_ah" -lt 12 ]; do
+      _ah=$((_ah + 1))
+      _match="$(printf '%s\n' "$_panes" | awk -v p="$_ap" '$1==p {print $2; exit}')"
+      case "$_match" in
+        amux-*) _anc_lane="${_match#amux-}"; break ;;
+      esac
+      _ap="$(ps -o ppid= -p "$_ap" 2>/dev/null | tr -d ' ')"
+      case "$_ap" in ''|0|1) break ;; esac
+    done
+  fi
+fi
+# `anc_disagrees` carries the ancestry answer when it contradicts the
+# environment. The stamp itself is unchanged.
+anc_disagrees=""
+if [ -n "$_anc_lane" ] && [ -n "$stamp" ] && [ "$stamp" != "$_anc_lane" ]; then
+  anc_disagrees="$_anc_lane"
+fi
+# An EMPTY $AMUX_SESSION is the one case where ancestry supplies the stamp, and
+# that is not an override: MR-43 below already does exactly this through
+# `tmux display-message`. The walk just resolves it for a process whose $TMUX
+# is missing too, which is the same lane by a sturdier route.
+if [ -z "$stamp" ] && [ -n "$_anc_lane" ]; then
+  stamp="$_anc_lane"
+fi
+
+# MR-43: before falling all the way to "(human)", try recovering a lane's own
+# identity from the tmux pane it is actually running in — $AMUX_SESSION can go
+# missing IN-PROCESS (spawn always injects it, session_verbs.rs) without the
+# lane having stopped being a lane. Scoped to amux- prefixed panes ONLY, so
+# this cannot touch the human case above: a human's own shell is never in one,
+# so it still falls through to "(human)" exactly as before. Not weakening the
+# exemption, only correcting which of the three causes (paragraph above) this
+# commit actually was.
+#
+# Still reached when the ancestry walk above found nothing: `tmux
+# display-message` resolves through $TMUX rather than the process tree, so it
+# covers a lane whose pane pid the walk could not see.
 if [ -z "$stamp" ]; then
   _mr43_tname="$(tmux display-message -p '#S' 2>/dev/null)"
   case "$_mr43_tname" in
@@ -292,6 +373,25 @@ done
 # stamp is not the lane that ran `git commit`. An always-present field would make
 # them hunt for a comparison instead. The pre-push guard reads it and drops the
 # ask-the-author advice for those commits.
+# AMUX-4559: the SAME disagreement shape, one layer earlier. When the process
+# tree and $AMUX_SESSION named different lanes, ancestry won and this records
+# what the environment claimed, so the correction is auditable instead of
+# invisible. `grep Amux-Env-Claimed` is the index of every commit where an
+# inherited variable would have mis-attributed the work.
+if [ -n "$anc_disagrees" ]; then
+  printf '\namux commit-stamp: $AMUX_SESSION says `%s`, but this process descends from\n' "$stamp" >&2
+  printf '  the pane of `%s`. An inherited variable can be wrong and the process tree\n' "$anc_disagrees" >&2
+  printf '  cannot, so `Amux-Ancestry: %s` is added beside the stamp. The stamp is\n' "$anc_disagrees" >&2
+  printf '  UNCHANGED: which of the two should win is AMUX-4559s open question and\n' >&2
+  printf '  not something this hook decides silently. If you did not mean to commit\n' >&2
+  printf '  as `%s`, amend now. `grep Amux-Ancestry` finds every such commit.\n\n' "$stamp" >&2
+  git interpret-trailers --in-place --if-exists doNothing \
+    --trailer "Amux-Ancestry: $anc_disagrees" "$msg_file" 2>/dev/null || {
+    grep -q "^Amux-Ancestry: " "$msg_file" 2>/dev/null \
+      || printf 'Amux-Ancestry: %s\n' "$anc_disagrees" >> "$msg_file"
+  }
+fi
+
 _declared="$(git interpret-trailers --parse "$msg_file" 2>/dev/null \
   | sed -n 's/^Amux-Session:[[:space:]]*//p' | head -1)"
 if [ -n "$_declared" ] && [ "$_declared" != "$stamp" ]; then

@@ -224,11 +224,17 @@ case "$D_MSG" in
   *"Amux-Committer"*) no "an AGREEING stamp must not add Amux-Committer" "got '$D_MSG'" ;;
   *) ok "no Amux-Committer when the declared stamp agrees (presence is the signal)" ;;
 esac
-if [ -z "$D_ERR" ]; then
-  ok "an agreeing stamp is silent"
-else
-  no "an agreeing stamp must not warn" "got '$D_ERR'"
-fi
+# SCOPED TO THE COMMITTER WARNING, not to total silence (AMUX-4559). This
+# harness runs inside a real amux pane, so setting $AMUX_SESSION to a fixture
+# lane is itself an env/ancestry disagreement and the hook now says so on
+# stderr — correctly, and about a different fact than this cell tests. The
+# property here is "an agreeing DECLARATION produces no committer complaint",
+# and asserting empty stderr conflated that with "the hook is silent about
+# everything", which is a strictly weaker claim wearing a stronger one.
+case "$D_ERR" in
+  *"already declares"*) no "an agreeing stamp must not warn about the declaration" "got '$D_ERR'" ;;
+  *) ok "an agreeing declaration draws no committer complaint" ;;
+esac
 
 # NEGATIVE CONTROL 2: the ordinary path, which is every commit on this box.
 declare_run "" my-lane
@@ -237,6 +243,65 @@ case "$D_MSG" in
   *"Amux-Session: my-lane"*) ok "an undeclared message is stamped exactly as before" ;;
   *) no "the ordinary stamp path must be unchanged" "got '$D_MSG'" ;;
 esac
+
+
+# ---------------------------------------------------------------------------
+# AMUX-4559: the env/ancestry disagreement is RECORDED.
+#
+# Four commits on 2026-09-14 (87f7adec, 2a395b8d, a86bc0de, 1010835e) carry one
+# `Amux-Agent: pid=1079` and THREE different `Amux-Session` values, each with
+# the matching wrong `Amux-Conversation` so the pair read as corroborated. The
+# only way to notice was to compare agent pids across commits by hand.
+#
+# This harness runs inside a real amux pane, so any fixture lane it sets is by
+# construction a disagreement — which is what makes the positive case testable
+# here at all. The NEGATIVE control is the one that needs care: it has to name
+# the pane's own lane, or it would be asserting that a disagreement is silent.
+# ---------------------------------------------------------------------------
+echo "cell: env/ancestry disagreement"
+_pane_lane=""
+_pp=$$
+_hops=0
+_panelist="$(tmux list-panes -a -F '#{pane_pid} #{session_name}' 2>/dev/null || true)"
+while [ -n "$_panelist" ] && [ "$_hops" -lt 12 ]; do
+  _hops=$((_hops + 1))
+  _m="$(printf '%s\n' "$_panelist" | awk -v p="$_pp" '$1==p {print $2; exit}')"
+  case "$_m" in amux-*) _pane_lane="${_m#amux-}"; break ;; esac
+  _pp="$(ps -o ppid= -p "$_pp" 2>/dev/null | tr -d ' ')"
+  case "$_pp" in ''|0|1) break ;; esac
+done
+
+if [ -z "$_pane_lane" ]; then
+  # Stated, not skipped silently: outside a pane this cell cannot run, and a
+  # quiet skip would read as a pass (ethos rule 4).
+  printf '  ..   SKIPPED: not running under an amux- tmux pane, so there is no ancestry to disagree with\n'
+else
+  _t="$(mktemp)"; printf 'subject line\n' > "$_t"
+  AMUX_SESSION="definitely-not-this-lane" sh "$HOOK" "$_t" >/dev/null 2>&1
+  if grep -q "^Amux-Ancestry: ${_pane_lane}\$" "$_t"; then
+    ok "a lying \$AMUX_SESSION is contradicted by Amux-Ancestry: $_pane_lane"
+  else
+    no "a lying \$AMUX_SESSION must record the ancestry lane" "got '$(grep -a '^Amux-' "$_t" | tr '\n' ' ')'"
+  fi
+  if grep -q "^Amux-Session: definitely-not-this-lane\$" "$_t"; then
+    ok "and the stamp itself is UNCHANGED (this records, it does not override)"
+  else
+    no "the stamp must not be overridden by this change" "got '$(grep -a '^Amux-Session:' "$_t")'"
+  fi
+  rm -f "$_t"
+
+  # NEGATIVE CONTROL: agreement must add nothing. Without this the cell above
+  # would pass against a hook that stamped Amux-Ancestry unconditionally, which
+  # would destroy the field's whole property — presence IS the signal.
+  _t2="$(mktemp)"; printf 'subject line\n' > "$_t2"
+  AMUX_SESSION="$_pane_lane" sh "$HOOK" "$_t2" >/dev/null 2>&1
+  if grep -q "^Amux-Ancestry: " "$_t2"; then
+    no "an AGREEING \$AMUX_SESSION must not add Amux-Ancestry" "got '$(grep -a '^Amux-' "$_t2" | tr '\n' ' ')'"
+  else
+    ok "no Amux-Ancestry when the environment and the process tree agree"
+  fi
+  rm -f "$_t2"
+fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
