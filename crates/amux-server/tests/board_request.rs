@@ -220,6 +220,17 @@ async fn a_request_target_must_be_a_lane_that_can_receive_one() {
         .await;
         assert_eq!(st, want_status, "{target}: {v}");
         assert_eq!(v["code"], json!(want_code), "{target}: {v}");
+        // AN ABSENCE READS AS AN ABSENCE. `lane_lifecycle` answers "active" for
+        // a lane with no env file, so an unconditional field reported a
+        // lifecycle for a lane the same response says does not exist. Measured
+        // in prod on 274f619e before this cell existed: request_to
+        // "lane-nobody" answered 404 unknown_lane with target_lifecycle
+        // "active". The field is present only when a real lane was judged.
+        if want_code == "peer_interaction_refused" {
+            assert!(v["target_lifecycle"].is_string(), "{target}: {v}");
+        } else {
+            assert!(v.get("target_lifecycle").is_none(), "no lane was judged: {target}: {v}");
+        }
     }
 
     // AMUX-4566, and the cell that would have caught my mistake: a PAUSED lane

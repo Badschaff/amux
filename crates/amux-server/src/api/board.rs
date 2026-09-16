@@ -4599,21 +4599,26 @@ pub async fn create_item(
                 measured = true,
                 "routed board request refused: the target cannot receive one"
             );
-            return err(
-                status,
-                json!({
-                    // The resolver writes this sentence and names its own
-                    // remedy, so the refusal a request sees is word for word
-                    // the one a send sees.
-                    "error": why,
-                    "code": code,
-                    "request_to": target,
-                    // DESCRIPTIVE, never the decision. The verdict above comes
-                    // from one resolver; this is here so a caller can branch
-                    // without matching prose.
-                    "target_lifecycle": super::session_verbs::lane_lifecycle(target),
-                }),
-            );
+            let mut body = json!({
+                // The resolver writes this sentence and names its own remedy,
+                // so the refusal a request sees is word for word the one a
+                // send sees.
+                "error": why,
+                "code": code,
+                "request_to": target,
+            });
+            // DESCRIPTIVE, never the decision, and OMITTED when there is no
+            // lane to describe. `lane_lifecycle` reads an env file that does
+            // not exist for an unknown lane, finds no flags, and answers
+            // "active" — so an unconditional field reported a lifecycle for a
+            // lane that is not there, next to a code saying it is not there.
+            // Measured in prod on 274f619e: request_to "lane-nobody" answered
+            // 404 unknown_lane with target_lifecycle "active". An absence has
+            // to read as an absence.
+            if code == "peer_interaction_refused" {
+                body["target_lifecycle"] = json!(super::session_verbs::lane_lifecycle(target));
+            }
+            return err(status, body);
         }
     }
 
