@@ -3854,13 +3854,39 @@ fn model_lives_in_cc_model(provider: &str) -> bool {
 /// worker created the correct way — CC_MODEL set, no `--model` in CC_FLAGS —
 /// ran its chosen model and reported the provider DEFAULT on its own row, with
 /// nothing erroring (AMUX-4607).
-fn configured_model_for(provider: &str, cfg: &EnvFile) -> String {
+/// Takes the two VALUES rather than an `EnvFile`, because the roster reads the
+/// same env files through `config::parse_env_file`, a second parser returning a
+/// map. A resolver bound to one parser's type is a resolver the other caller
+/// cannot share, and not sharing it is what AMUX-4728 is (`fleet_roster`
+/// resolved the model for the one provider nobody runs).
+fn configured_model_for(provider: &str, cc_model: &str, cc_flags: &str) -> String {
+    configured_model_with_default(
+        provider,
+        cc_model,
+        cc_flags,
+        &default_model_for_provider(provider),
+    )
+}
+
+/// The same rule with the provider default supplied by the caller.
+///
+/// Split out for COST, not for taste: `default_model_for_provider` reaches
+/// `get_default_model`, which reads `defaults.env` off disk on every call, and
+/// `fleet_roster` resolves one row per worker. Folding the default in would
+/// have made a 140-row table 140 file reads. The rule stays in one place; only
+/// the expensive input is hoisted.
+fn configured_model_with_default(
+    provider: &str,
+    cc_model: &str,
+    cc_flags: &str,
+    provider_default: &str,
+) -> String {
     let raw = if model_lives_in_cc_model(provider) {
-        cfg.get_or("CC_MODEL", "").trim().to_string()
+        cc_model.trim().to_string()
     } else {
-        extract_model_from_flags(cfg.get_or("CC_FLAGS", ""))
+        extract_model_from_flags(cc_flags)
     };
-    if raw.is_empty() { default_model_for_provider(provider) } else { raw }
+    if raw.is_empty() { provider_default.to_string() } else { raw }
 }
 
 /// Route `model` into the env key `provider` actually launches from, clearing
@@ -9048,7 +9074,7 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
             // field there); falls back to the provider default (qwen3.8:27b).
             // Read through the SHARED resolver so the worker's own row cannot
             // report a different model than this launch uses (AMUX-4607).
-            let model = configured_model_for("ollama", &cfg);
+            let model = configured_model_for("ollama", cfg.get_or("CC_MODEL", ""), cfg.get_or("CC_FLAGS", ""));
             // An ollama worker's model belongs in CC_MODEL (read just above); a
             // `--model` in CC_FLAGS is inert here — this arm launches with
             // CC_MODEL and never appends CC_FLAGS, so that flag is silently
@@ -11485,7 +11511,30 @@ fn fleet_roster() -> String {
                 .unwrap_or_default();
             let desc = env.get("CC_DESC").cloned().unwrap_or_default();
             let provider = env.get("CC_PROVIDER").cloned().unwrap_or_else(|| "claude".into());
-            let model = env.get("CC_MODEL").cloned().unwrap_or_default();
+            // AMUX-4728. This read CC_MODEL with no provider test, and the model
+            // only lives there for ollama: every agent CLI carries it as
+            // `--model X` inside CC_FLAGS. Measured 2026-09-16 over all 140 files
+            // in ~/.amux/sessions, 0 set CC_MODEL and 0 ran provider=ollama, so
+            // the column headed `provider / model` resolved the model for the one
+            // provider nobody runs and printed a bare provider on all 140 rows.
+            //
+            // NO DEFAULT IS SUPPLIED HERE, and that is the point of passing "".
+            // The view resolves an unset model to `default_model_for_provider`,
+            // which bottoms out in a hardcoded "sonnet" when defaults.env carries
+            // no flags. Measured on this box: defaults.env is
+            // CC_DEFAULT_FLAGS="", and 35 of 140 workers set no --model at all.
+            // Those 35 launch with no --model on the command line, so the CLI
+            // picks and amux does not know the answer. Printing "claude / sonnet"
+            // for them would put a guess in every lane's memory wearing the same
+            // shape as the 105 rows that are measured. An unset model stays
+            // empty and `runtime` below renders the bare provider, which is the
+            // true statement.
+            let model = configured_model_with_default(
+                &provider,
+                env.get("CC_MODEL").map(String::as_str).unwrap_or(""),
+                env.get("CC_FLAGS").map(String::as_str).unwrap_or(""),
+                "",
+            );
             let runtime = if model.is_empty() { provider } else { format!("{provider} / {model}") };
             let dir = env.get("CC_DIR").cloned().unwrap_or_default();
             let branch = env.get("CC_BRANCH").cloned().unwrap_or_default();
@@ -15503,7 +15552,7 @@ async fn get_dispatch(
             if !out.contains_key("creator") {
                 out.insert("creator".into(), json!(cfg.get_or("CC_CREATOR", "")));
             }
-            let configured = configured_model_for(&provider, &cfg);
+            let configured = configured_model_for(&provider, cfg.get_or("CC_MODEL", ""), cfg.get_or("CC_FLAGS", ""));
             out.insert("name".into(), json!(name));
             out.insert("dir".into(), json!(cfg.get_or("CC_DIR", "")));
             out.insert("provider".into(), json!(provider));
@@ -31934,6 +31983,57 @@ mod roster_tests {
     fn no_worker_memory_block_when_the_lane_recorded_nothing() {
         assert_eq!(compose_worker_block("amux", "   \n  "), "");
         assert_eq!(compose_worker_block("amux", ""), "");
+    }
+
+    /// AMUX-4728. The roster's column is headed `provider / model` and read
+    /// CC_MODEL with no provider test. The model only lives there for ollama;
+    /// every agent CLI carries it as `--model X` in CC_FLAGS. Measured over all
+    /// 140 files in ~/.amux/sessions on 2026-09-16: 0 set CC_MODEL and 0 ran
+    /// provider=ollama, so the column resolved the model for the one provider
+    /// nobody runs and printed a bare provider on all 140 rows.
+    ///
+    /// Hermetic, unlike its neighbour below, which early-returns when the box
+    /// has no live workers and so asserts nothing on a clean machine.
+    #[test]
+    fn the_roster_resolves_a_model_for_every_provider_not_just_ollama() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let sessions = home.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        // The shape 140 of 140 real files use: an agent CLI with --model in CC_FLAGS.
+        std::fs::write(sessions.join("claude-lane.env"), "CC_DIR=\"/tmp\"\nCC_FLAGS=\"--model opus\"\n").unwrap();
+        // POSITIVE CONTROL for the path that already worked. Without it this
+        // cell passes for a fix that simply swapped one key for the other.
+        std::fs::write(
+            sessions.join("ollama-lane.env"),
+            "CC_DIR=\"/tmp\"\nCC_PROVIDER=\"ollama\"\nCC_MODEL=\"qwen3:4b\"\n",
+        )
+        .unwrap();
+        // No model chosen anywhere: the row must still say what it runs.
+        std::fs::write(sessions.join("bare-lane.env"), "CC_DIR=\"/tmp\"\n").unwrap();
+
+        let r = super::fleet_roster();
+        assert!(
+            r.contains("claude / opus"),
+            "a claude worker's model lives in CC_FLAGS and must reach the column: {r}"
+        );
+        assert!(
+            r.contains("ollama / qwen3:4b"),
+            "the ollama path must keep working: {r}"
+        );
+        // AND NO INVENTED MODEL for the worker that chose none. The view's
+        // resolver falls back to `default_model_for_provider`, which bottoms out
+        // in a hardcoded "sonnet"; a worker with no --model launches without one
+        // and the CLI picks, so amux does not know. A guess rendered in the same
+        // shape as the measured rows is worse than a blank.
+        assert!(
+            !r.contains("claude / sonnet"),
+            "an unconfigured worker must not be given a model it never chose: {r}"
+        );
+        assert!(
+            r.contains("| `bare-lane` |") && r.contains("| claude |"),
+            "the unconfigured row should name the provider alone: {r}"
+        );
     }
 
     #[test]
