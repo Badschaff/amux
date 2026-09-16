@@ -1,0 +1,27 @@
+-- AMUX-4710: /api/usage/attribution credits each token_ledger row to the last
+-- prompt its lane received, with three correlated subqueries over cmd_history
+-- (`WHERE h.session = ? ... ORDER BY h.ts DESC LIMIT 1`). cmd_history had an
+-- index on ts alone and none on session, so every one of those lookups scanned
+-- the table, once per ledger row in the window.
+--
+-- Measured on a copy of the live DB 2026-09-16, hours=24 (13,002 ledger rows,
+-- 11,604 cmd_history rows, 1,023,054 token_ledger rows):
+--
+--   as shipped                          3.41 s
+--   + this index                        0.09 s   (38x)
+--   + this index + a sargable predicate 0.05 s   (68x)
+--
+-- Same 14 groups and identical totals in all four runs.
+--
+-- The index is what does the work. The non-sargable `h.ts/1000 <= lg.ts` was
+-- the obvious suspect and is worth ~3% on its own (3.41 s -> 3.31 s): with the
+-- index present SQLite can walk (session, ts) in descending order and stop at
+-- the first row that satisfies the division, so it never needed the range seek
+-- as much as it needed the ordering.
+--
+-- steering_history already had idx_steering_hist_session(session, delivered_at)
+-- and a sargable predicate, which is why only the cmd_history half was slow.
+--
+-- All three readers of PROMPT_SOURCE_SRC benefit: by_source, the top-origins
+-- list and the markdown report.
+CREATE INDEX IF NOT EXISTS idx_cmd_history_session_ts ON cmd_history(session, ts);

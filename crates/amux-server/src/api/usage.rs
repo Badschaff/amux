@@ -1185,14 +1185,30 @@ struct AttributionQuery {
 /// origins, the markdown report) rather than restated in each: a view must
 /// share the predicate of the mechanism it describes, and three copies of a
 /// join is how two of them end up disagreeing.
+///
+/// # The cmd_history predicate is written for the index (AMUX-4710)
+///
+/// `h.ts` is milliseconds and `lg.ts` is seconds, so the comparison has to
+/// convert. Doing it as `h.ts/1000 <= lg.ts` puts the computation on the
+/// INDEXED side and no index on `h.ts` can serve it. `h.ts <= lg.ts*1000 + 999`
+/// is the same predicate with the arithmetic moved to the constant side, and
+/// the `+ 999` is not a fudge: integer division truncates, so `h.ts/1000 <= X`
+/// admits every millisecond of second X, and dropping it would silently stop
+/// crediting a prompt that landed later in the same second as the turn.
+///
+/// The predicate is the smaller half. Measured on a copy of the live DB,
+/// hours=24: as shipped 3.41 s, predicate alone 3.31 s, migration 0076's
+/// `cmd_history(session, ts)` index alone 0.09 s, both 0.05 s. Identical rows
+/// in all four. The index is what does the work; this form lets it seek the
+/// range rather than walk it.
 const PROMPT_SOURCE_SRC: &str = "\
  src AS (SELECT lg.*, \
    (SELECT h.ts/1000 FROM cmd_history h \
-      WHERE h.session = lg.session AND h.ts/1000 <= lg.ts ORDER BY h.ts DESC LIMIT 1) AS c_ts, \
+      WHERE h.session = lg.session AND h.ts <= lg.ts * 1000 + 999 ORDER BY h.ts DESC LIMIT 1) AS c_ts, \
    (SELECT COALESCE(h.type,'') FROM cmd_history h \
-      WHERE h.session = lg.session AND h.ts/1000 <= lg.ts ORDER BY h.ts DESC LIMIT 1) AS c_type, \
+      WHERE h.session = lg.session AND h.ts <= lg.ts * 1000 + 999 ORDER BY h.ts DESC LIMIT 1) AS c_type, \
    (SELECT COALESCE(h.origin,'') FROM cmd_history h \
-      WHERE h.session = lg.session AND h.ts/1000 <= lg.ts ORDER BY h.ts DESC LIMIT 1) AS c_origin, \
+      WHERE h.session = lg.session AND h.ts <= lg.ts * 1000 + 999 ORDER BY h.ts DESC LIMIT 1) AS c_origin, \
    (SELECT s.delivered_at FROM steering_history s \
       WHERE s.session = lg.session AND s.delivered_at <= lg.ts ORDER BY s.delivered_at DESC LIMIT 1) AS s_ts, \
    (SELECT COALESCE(NULLIF(s.guard,''),'steering') FROM steering_history s \
@@ -1524,6 +1540,107 @@ mod tests {
             top.iter().any(|r| r["source"] == "schedule" && r["is_background"] == json!(true)),
             "a schedule's row must be flagged background: {v}"
         );
+    }
+
+    /// THE `+ 999` IN THE cmd_history PREDICATE IS LOAD-BEARING (AMUX-4710).
+    ///
+    /// The join was written `h.ts/1000 <= lg.ts`, which puts the arithmetic on
+    /// the indexed column and no index can serve it. Moving it to the constant
+    /// side is what lets `idx_cmd_history_session_ts` seek, and the naive move
+    /// is `h.ts <= lg.ts * 1000`. That is a DIFFERENT predicate: integer
+    /// division truncates, so the original admits every millisecond of the
+    /// ledger row's own second, and the naive form admits only millisecond
+    /// zero.
+    ///
+    /// The fixture is that second. A prompt at `now-60` with 500 ms, a turn at
+    /// `now-60` exactly. Under the original and under `+ 999` the turn is the
+    /// peer's; under `lg.ts * 1000` the peer's prompt is invisible and the turn
+    /// falls back to the human's, which is the same foreground/background
+    /// inversion AMUX-4582 fixed one layer up. A sub-second gap between a
+    /// delivery and the turn it started is the ORDINARY case here, not an edge.
+    ///
+    /// A STEERING ROW SITS BETWEEN THEM ON PURPOSE, so that BOTH cmd_history
+    /// subqueries this predicate appears in are load-bearing. `c_type` supplies
+    /// the answer and `c_ts` decides whether cmd_history beats steering at all;
+    /// with steering empty, a mutation of `c_ts` alone would leave the test
+    /// green and the coverage would be for one of two copies.
+    #[tokio::test]
+    async fn a_prompt_later_in_the_same_second_as_the_turn_still_credits_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::db::Store::open(&dir.path().join("attr-ms.db")).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        store
+            .write(move |conn| {
+                // The human, a clear second earlier.
+                conn.execute(
+                    "INSERT INTO cmd_history (text, type, session, ts, origin) VALUES (?,?,?,?,?)",
+                    rusqlite::params!["p", "user", "lane", (now - 120) * 1000, ""],
+                )?;
+                // A steering delivery in between: newer than the human, older
+                // than the peer. It wins only if the peer's row is dropped.
+                conn.execute(
+                    "INSERT INTO steering_history (id, session, text, delivered_at, guard, sender) \
+                     VALUES (?,?,?,?,?,?)",
+                    rusqlite::params!["s1", "lane", "nudge", (now - 90) as f64, "", "amux"],
+                )?;
+                // The peer's message, in the SAME second as the turn, 500 ms in.
+                conn.execute(
+                    "INSERT INTO cmd_history (text, type, session, ts, origin) VALUES (?,?,?,?,?)",
+                    rusqlite::params!["p", "session", "lane", (now - 60) * 1000 + 500, "peer-lane"],
+                )?;
+                conn.execute(
+                    "INSERT INTO token_ledger (ts, session, conversation, model, input, cache_read, \
+                     cache_write, output, cost_usd, task) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    rusqlite::params![now - 60, "lane", "c", "opus", 10, 0, 0, 5, 4.0, ""],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+        let state = AppState {
+            store: Arc::new(store),
+            started: Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let app = axum::Router::new()
+            .nest(
+                "/api/usage",
+                routes_with(probe_fn(UsageProbe::Ok(json!({})), Arc::new(AtomicUsize::new(0)))),
+            )
+            .with_state(state);
+        let res = app
+            .oneshot(
+                Request::builder().uri("/api/usage/attribution?hours=1").body(Body::empty()).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let by: std::collections::HashMap<String, f64> = v["by_source"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| (r["source"].as_str().unwrap_or("").to_string(), r["cost_usd"].as_f64().unwrap_or(0.0)))
+            .collect();
+        assert_eq!(
+            by.get("session"),
+            Some(&4.0),
+            "the prompt 500 ms into the turn's own second must still win: {v}"
+        );
+        assert_eq!(
+            by.get("user"),
+            None,
+            "4.0 here is the truncation bug — the human absorbed a peer-triggered turn: {v}"
+        );
+        assert_eq!(
+            by.get("steer:steering"),
+            None,
+            "and 4.0 HERE is the same bug seen through c_ts: with the peer's row dropped, the \
+             steering delivery at now-90 becomes the newest thing this lane received: {v}"
+        );
+        assert_eq!(v["background_pct"], json!(100.0), "{v}");
     }
 
     /// A fixture probe that counts how many times it was called.

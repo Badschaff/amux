@@ -173,3 +173,45 @@ fn the_migrated_test_db_carries_the_newest_columns() {
         );
     }
 }
+
+/// The indexes a query's cost DEPENDS ON survive the migration chain.
+///
+/// A missing index is the quietest schema regression there is: every query
+/// still returns the right rows, so nothing fails, and the only symptom is a
+/// latency card filed hours later against an endpoint that looks fine. That is
+/// how AMUX-4710 was found, at 38x.
+///
+/// Named individually, with what each one costs when it is gone, because a
+/// count would pass against any set of the right size.
+#[test]
+fn the_indexes_that_carry_a_query_are_in_the_migrated_schema() {
+    let mut c = rusqlite::Connection::open_in_memory().unwrap();
+    amux_server::db::migrate::apply_all(&mut c).expect("migrations apply to a fresh db");
+    let have: Vec<String> = c
+        .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name IS NOT NULL")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    for (idx, why) in [
+        (
+            "idx_cmd_history_session_ts",
+            "AMUX-4710: /api/usage/attribution runs three correlated subqueries over \
+             cmd_history per ledger row. Without this it scans the table each time: 3.41s \
+             against 0.09s on a 24h window.",
+        ),
+        (
+            "idx_issues_epic",
+            "AMUX-4590: /api/history joins each card to its epic lineage. Without this a \
+             limit=500 page spent 9,753ms in one query and the phone saw 30-99s.",
+        ),
+        (
+            "idx_steering_hist_session",
+            "the other half of the attribution join. It is the half that was already fast, \
+             which is the only reason the cmd_history half was diagnosable.",
+        ),
+    ] {
+        assert!(have.contains(&idx.to_string()), "{idx} missing. {why}\ngot {have:?}");
+    }
+}
