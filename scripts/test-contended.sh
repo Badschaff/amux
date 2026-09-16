@@ -312,26 +312,31 @@ esac
 # BEFORE the run and for a failed disk probe AFTER one, while its mid-run kills
 # return 124 or 128+signal. Reading 75 as "nothing ran" would be the same
 # inference-instead-of-measurement this script exists to stop.
-_RUN_LOG=$(mktemp) || _RUN_LOG=""
-if [ -x "$_safe" ]; then
-  # It writes its own receipt for a `test` run; this script writes one at the
-  # end, so tell it not to. Two identical receipts would be harmless and
-  # confusing, and the one written last is the one that saw the final tree.
-  if [ -n "$_RUN_LOG" ]; then
-    _TC_RECEIPT=1 "$_safe" test "$@" 2>&1 | tee "$_RUN_LOG"
-    RC=${PIPESTATUS[0]}
-  else
+#
+# ONE CALL SITE PER RUNNER, BEHIND A FUNCTION. The tee and the mktemp-failure
+# fallback are a second axis, and writing them out inline multiplied two choices
+# into four copies of the run line. `scripts/test-test-receipt.sh` cell n counts
+# occurrences of the safe-cargo invocation and expects one; the duplicate broke
+# it, and CI stayed red for five commits before anyone read the step. A count
+# assertion is the right check here precisely because a second run line is how
+# an unprotected or receipt-less path gets added.
+_run_under_test() {
+  if [ -x "$_safe" ]; then
+    # It writes its own receipt for a `test` run; this script writes one at the
+    # end, so tell it not to. Two identical receipts would be harmless and
+    # confusing, and the one written last is the one that saw the final tree.
     _TC_RECEIPT=1 "$_safe" test "$@"
-    RC=$?
-  fi
-else
-  if [ -n "$_RUN_LOG" ]; then
-    cargo test "$@" 2>&1 | tee "$_RUN_LOG"
-    RC=${PIPESTATUS[0]}
   else
     cargo test "$@"
-    RC=$?
   fi
+}
+_RUN_LOG=$(mktemp) || _RUN_LOG=""
+if [ -n "$_RUN_LOG" ]; then
+  _run_under_test "$@" 2>&1 | tee "$_RUN_LOG"
+  RC=${PIPESTATUS[0]}
+else
+  _run_under_test "$@"
+  RC=$?
 fi
 # ${PIPESTATUS[0]} rather than $?, and it is NOT load-bearing here: `set -o
 # pipefail` on line 24 already makes $? the rightmost non-zero status, so both
