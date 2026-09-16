@@ -1,0 +1,26 @@
+-- The status a card held before its LANE was archived (AMUX-4715).
+--
+-- `archive_session_issues` flips `archived` on every card a session owns, with
+-- no status filter, so archiving a lane with live work produced cards that are
+-- archived AND still claim to be live: 969 of them across 59 lanes on
+-- 2026-09-16. The invariant `board.archived_cards_are_terminal` fails on
+-- exactly those, and it is right to. No view, no drain, no nudge and no human
+-- ever surfaces them again, while their status says the work is in flight.
+--
+-- WHY A COLUMN AND NOT A STATUS FILTER. Three rules were available and two lose
+-- something (AMUX-4715 records all three). Discarding non-terminal cards on
+-- archive satisfies the invariant and makes a currently REVERSIBLE operation
+-- lossy: a lane archived by mistake recovers today by unarchiving, and under
+-- that rule its live work is already terminal when it comes back. Leaving them
+-- unarchived trades this invariant for `board.todo_is_reachable_by_dispatch`,
+-- because their lane is gone and nothing can dispatch them. Remembering the
+-- prior status is the only one that satisfies both and loses nothing.
+--
+-- NULLABLE, no default, no backfill. NULL means "this card's status was never
+-- moved by an archive", which is true of every existing row including the 969
+-- already in this state: they are AMUX-4537's report to dispose of, and
+-- back-filling a guess here would fabricate a pre-archive status none of them
+-- recorded. A card archived from a terminal status also keeps NULL, because
+-- nothing was moved.
+--
+-- ADDCOL: issues pre_archive_status TEXT

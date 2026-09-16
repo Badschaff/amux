@@ -9961,17 +9961,75 @@ async fn archive_session(state: &AppState, name: &str) -> (bool, String) {
     (true, "archived".into())
 }
 
+/// The status half of archiving a lane, on a plain connection (AMUX-4715).
+///
+/// Separated from `archive_session_issues` so it can be driven by a test with a
+/// memdb instead of a live `AppState`, which is the seam `index_once_at` and
+/// `credential_preflight_from` use for the same reason. A round trip is the
+/// property that matters here and it cannot be asserted through an async
+/// handler that needs a whole server.
+pub(crate) fn apply_archive_status_move(
+    conn: &rusqlite::Connection,
+    name: &str,
+    flag: i64,
+    now: i64,
+) -> rusqlite::Result<usize> {
+    if flag == 1 {
+        // Remember, then terminal. `pre_archive_status` is written ONLY where it
+        // is NULL: archiving an already-archived lane a second time must not
+        // overwrite the original status with `discarded`, which would make the
+        // second archive the lossy one.
+        conn.execute(
+            "UPDATE issues SET pre_archive_status = status, status = 'discarded', updated = ?1 \
+             WHERE session = ?2 AND deleted IS NULL \
+               AND status NOT IN ('done','verified','discarded','quarantined','cancelled') \
+               AND pre_archive_status IS NULL",
+            rusqlite::params![now, name],
+        )
+    } else {
+        // Restore exactly what was taken, and only that. A card whose status was
+        // never moved by an archive has NULL here and is left alone, which is
+        // every card predating this change including the 969 AMUX-4537 reports.
+        conn.execute(
+            "UPDATE issues SET status = pre_archive_status, pre_archive_status = NULL, updated = ?1 \
+             WHERE session = ?2 AND deleted IS NULL AND pre_archive_status IS NOT NULL",
+            rusqlite::params![now, name],
+        )
+    }
+}
+
 /// py:25107 _archive_session_issues — flip the archived bit on the lane's
 /// cards, both directions.
+///
+/// AND MAKE THEM TERMINAL ON THE WAY IN, REVERSIBLY (AMUX-4715). This used to
+/// flip `archived` with no status filter, so archiving a lane with live work
+/// produced cards that are archived AND still claim to be in flight: 969 of
+/// them across 59 lanes on 2026-09-16, which is what
+/// `board.archived_cards_are_terminal` fails on. No view, no drain, no nudge
+/// and no human surfaces an archived card again, so a `doing` one is a lie that
+/// nobody is positioned to notice.
+///
+/// The prior status goes to `pre_archive_status` and comes BACK on unarchive.
+/// The cheap version of this fix is a status filter that discards instead, and
+/// it quietly makes a reversible operation lossy: archiving is undone today by
+/// unarchiving, and a lane archived by mistake would come back with its live
+/// work already terminal. The other candidate, leaving them unarchived, just
+/// moves the red to `board.todo_is_reachable_by_dispatch`, because their lane
+/// is gone and nothing can dispatch them.
+///
+/// ONE WRITE, both directions, so a lane cannot end up half-archived: the
+/// status move and the `archived` flip are the same transaction.
 async fn archive_session_issues(state: &AppState, name: &str, flag: i64) {
     let name = name.to_string();
     let _ = state
         .store
         .write_async(move |conn| {
+            let now = now_i64();
+            let _ = apply_archive_status_move(conn, &name, flag, now);
             let n = conn
                 .execute(
                     "UPDATE issues SET archived=?1, updated=?2 WHERE session=?3 AND deleted IS NULL AND archived!=?1",
-                    rusqlite::params![flag, now_i64(), name],
+                    rusqlite::params![flag, now, name],
                 )
                 .unwrap_or(0);
             Ok(crate::db::WriteOutcome {
@@ -31346,6 +31404,95 @@ mod roster_tests {
             "a shared roster must tell the reader it lists them too: {r}"
         );
         assert!(r.contains("$AMUX_SESSION"), "and how to identify themselves in it: {r}");
+    }
+
+    /// AMUX-4715: archiving a lane makes its live cards terminal, and
+    /// unarchiving gives them back.
+    ///
+    /// The invariant `board.archived_cards_are_terminal` fails on 969 cards
+    /// across 59 lanes because this used to flip `archived` with no status
+    /// filter. The cheap fix discards on archive and quietly makes a reversible
+    /// operation lossy; the round trip below is the property that distinguishes
+    /// the two, and it is why the column exists.
+    #[test]
+    fn archiving_a_lane_is_lossless_for_its_live_cards() {
+        let conn = crate::db::migrate::test_memdb();
+        let add = |id: &str, session: &str, status: &str| {
+            conn.execute(
+                "INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type, \
+                                     pinned,pos,notified,type,archived,rev,version,lease_generation) \
+                 VALUES (?1,?1,'',?2,?3,1,1,'agent',0,0,0,'code',0,1,1,0)",
+                rusqlite::params![id, status, session],
+            )
+            .expect("insert");
+        };
+        let status = |id: &str| -> String {
+            conn.query_row("SELECT status FROM issues WHERE id=?1", [id], |r| r.get(0)).unwrap()
+        };
+        let pre = |id: &str| -> Option<String> {
+            conn.query_row("SELECT pre_archive_status FROM issues WHERE id=?1", [id], |r| r.get(0))
+                .unwrap()
+        };
+
+        add("A-DOING", "gone-lane", "doing");
+        add("A-TODO", "gone-lane", "todo");
+        add("A-DONE", "gone-lane", "done");
+        add("B-DOING", "other-lane", "doing");
+
+        // ARCHIVE. Live cards go terminal and remember what they were.
+        super::apply_archive_status_move(&conn, "gone-lane", 1, 100).expect("archive");
+        assert_eq!(status("A-DOING"), "discarded", "a live card must not stay live once archived");
+        assert_eq!(status("A-TODO"), "discarded");
+        assert_eq!(pre("A-DOING").as_deref(), Some("doing"));
+        assert_eq!(pre("A-TODO").as_deref(), Some("todo"));
+
+        // A card that was ALREADY terminal is untouched, and records nothing:
+        // nothing was moved, so a pre-archive status would be an invention.
+        assert_eq!(status("A-DONE"), "done");
+        assert_eq!(pre("A-DONE"), None, "no status was taken, so none is remembered");
+
+        // ANOTHER LANE'S CARD IS NOT TOUCHED. Without this the query could be
+        // archiving the whole board and every assertion above would still pass.
+        assert_eq!(status("B-DOING"), "doing");
+        assert_eq!(pre("B-DOING"), None);
+
+        // A SECOND ARCHIVE MUST NOT OVERWRITE THE MEMORY with `discarded`,
+        // which would make the second one the lossy operation.
+        super::apply_archive_status_move(&conn, "gone-lane", 1, 200).expect("archive twice");
+        assert_eq!(pre("A-DOING").as_deref(), Some("doing"), "the original status survives");
+
+        // UNARCHIVE. Exactly what was taken comes back.
+        super::apply_archive_status_move(&conn, "gone-lane", 0, 300).expect("unarchive");
+        assert_eq!(status("A-DOING"), "doing", "the round trip must restore the original status");
+        assert_eq!(status("A-TODO"), "todo");
+        assert_eq!(pre("A-DOING"), None, "and the memory is spent");
+        assert_eq!(status("A-DONE"), "done", "a card that was never moved is still not moved");
+        assert_eq!(status("B-DOING"), "doing");
+    }
+
+    /// A card with NO remembered status is left alone by an unarchive.
+    ///
+    /// This is every one of the 969 cards already in the broken state
+    /// (AMUX-4537). Unarchiving one of their lanes must not invent a status for
+    /// them or blank the one they have; they are that card's report to dispose
+    /// of, not this change's to guess at.
+    #[test]
+    fn an_unarchive_leaves_cards_that_predate_the_column_alone() {
+        let conn = crate::db::migrate::test_memdb();
+        conn.execute(
+            "INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type, \
+                                 pinned,pos,notified,type,archived,rev,version,lease_generation) \
+             VALUES ('OLD-1','OLD-1','','todo','gone-lane',1,1,'agent',0,0,0,'code',1,1,1,0)",
+            [],
+        )
+        .expect("insert");
+
+        let moved = super::apply_archive_status_move(&conn, "gone-lane", 0, 100).expect("unarchive");
+        assert_eq!(moved, 0, "nothing to restore, so nothing is written");
+        let status: String = conn
+            .query_row("SELECT status FROM issues WHERE id='OLD-1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "todo", "its status is untouched, not blanked");
     }
 
     /// AF-372: the preflight NEVER goes silent, because silence is what a check
