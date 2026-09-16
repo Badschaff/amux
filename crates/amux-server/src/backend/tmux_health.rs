@@ -259,6 +259,57 @@ fn top_size_bytes(field: &str) -> Option<u64> {
     num.parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.0).map(|v| (v * mult as f64) as u64)
 }
 
+/// (CC_DIR, lane) for every worker env file. Read once per evidence capture,
+/// not per process.
+fn lane_dirs() -> Vec<(String, String)> {
+    let dir = crate::api::session_verbs::home().join("sessions");
+    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let mut out = Vec::new();
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("env") { continue; }
+        let Some(lane) = path.file_stem().and_then(|x| x.to_str()) else { continue };
+        let cfg = crate::api::session_verbs::EnvFile::load(&path);
+        if let Some(d) = cfg.get("CC_DIR").filter(|d| !d.is_empty()) {
+            out.push((d.to_string(), lane.to_string()));
+        }
+    }
+    out
+}
+
+/// Which lane owns a process, from its EXECUTABLE PATH.
+///
+/// AMUX-4617 asks for the owner of each heavy process. The obvious signal is the
+/// process's cwd, and it is unavailable here: `lsof -p <pid> -d cwd` returns
+/// nothing on this host even for amux-server's own pid, with no permission error
+/// printed, which is a TCC/SIP restriction rather than a flag mistake. The
+/// executable path needs no per-pid permission at all, and it is enough for the
+/// case this card is about, because a lane's dev server runs out of the lane's
+/// own tree (`.../ai-for-smbs/smb-workspace/backend/.venv/bin/python`).
+///
+/// LONGEST PREFIX WINS, and that is not a detail. Lane CC_DIRs NEST: measured
+/// 2026-09-16 there are 102 distinct ones and `/Users/ethan/Dev` is itself a
+/// lane's CC_DIR, so those ai-for-smbs python processes match three lanes at
+/// once. Reporting the first match would name whichever lane happened to sort
+/// first and blame the wrong owner, which is worse than reporting none: the
+/// whole point is to tell someone their process is running, and telling the
+/// wrong someone is how AMUX-4550's audit says noise gets made.
+///
+/// Boundary-anchored: `/a/bc` must not match a lane rooted at `/a/b`.
+fn owner_from_exe_path<'a>(exe: &str, lanes: &'a [(String, String)]) -> Option<&'a str> {
+    let mut best: Option<(&str, usize)> = None;
+    for (dir, lane) in lanes {
+        let d = dir.trim_end_matches('/');
+        if d.is_empty() { continue; }
+        let under = exe.strip_prefix(d).is_some_and(|rest| rest.starts_with('/'));
+        if !under { continue; }
+        if best.is_none_or(|(_, n)| d.len() > n) {
+            best = Some((lane.as_str(), d.len()));
+        }
+    }
+    best.map(|(lane, _)| lane)
+}
+
 /// Rank host processes by FOOTPRINT (resident + compressed) rather than RSS.
 ///
 /// AMUX-4617. `top_rss` ranks by resident memory and that is the wrong
@@ -274,7 +325,19 @@ fn top_size_bytes(field: &str) -> Option<u64> {
 /// Pure, so the ranking is testable without a host under memory pressure. That
 /// matters more than usual here: the condition this exists to catch cannot be
 /// produced on demand.
-fn footprint_summary(top_raw: &str) -> serde_json::Value {
+/// `top` is the only source of the compressed figure and its COMMAND column is
+/// TRUNCATED (`com.apple.Virtua`), so it cannot name an owner. `ps` carries the
+/// full executable path and is already being collected for `host_processes`, so
+/// the two are joined on pid rather than shelling out a third time.
+fn footprint_summary(top_raw: &str, ps_raw: &str, lanes: &[(String, String)]) -> serde_json::Value {
+    let mut exe_by_pid: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+    for line in ps_raw.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 6 { continue; }
+        if let Ok(pid) = f[0].parse::<u32>() {
+            exe_by_pid.insert(pid, f[5..].join(" "));
+        }
+    }
     let mut rows = Vec::new();
     for line in top_raw.lines() {
         let f: Vec<&str> = line.split_whitespace().collect();
@@ -284,13 +347,20 @@ fn footprint_summary(top_raw: &str) -> serde_json::Value {
         let (Some(mem), Some(cmprs)) = (top_size_bytes(f[1]), top_size_bytes(f[2])) else { continue };
         let cpu = f[3].parse::<f64>().unwrap_or(0.0);
         if !cpu.is_finite() { continue; }
+        let exe = exe_by_pid.get(&pid).cloned().unwrap_or_default();
+        let owner = owner_from_exe_path(&exe, lanes);
         rows.push(serde_json::json!({
             "pid": pid,
             "footprint_bytes": mem + cmprs,
             "resident_bytes": mem,
             "compressed_bytes": cmprs,
             "cpu_pct": cpu,
+            // top's own column, truncated, kept because it is what top saw.
             "command": f[4..].join(" "),
+            "executable": exe,
+            // null, not "unknown": a process outside every lane tree HAS no lane
+            // owner, and saying so is different from failing to look.
+            "owner_lane": owner,
         }));
     }
     let count = rows.len();
@@ -339,6 +409,13 @@ async fn capture_stall_evidence(observation: &Observation, trigger: &str, probe:
         output("ps", &["-A", "-o", "pid=,ppid=,stat=,pcpu=,rss=,comm="]),
         output("uptime", &[]),
     );
+    // Taken BEFORE the match below consumes `processes`: the owner join needs
+    // the same ps output, and running ps twice would sample two different
+    // instants for one report.
+    let ps_for_owner = match &processes {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+        _ => String::new(),
+    };
     evidence["host_processes"] = match processes {
         Ok(out) if out.status.success() => host_process_summary(&String::from_utf8_lossy(&out.stdout)),
         result => serde_json::json!({"measured": false, "n_considered": 0,
@@ -350,13 +427,16 @@ async fn capture_stall_evidence(observation: &Observation, trigger: &str, probe:
     // what the process is holding, and on a compressing host those diverge by
     // tens of GB. Both are kept so a reader can see the divergence, which is
     // the evidence that the ranking changed anything.
+    let lanes = lane_dirs();
     evidence["host_footprint"] = match output(
         "top",
         &["-l", "1", "-n", "200", "-stats", "pid,mem,cmprs,cpu,command"],
     )
     .await
     {
-        Ok(out) if out.status.success() => footprint_summary(&String::from_utf8_lossy(&out.stdout)),
+        Ok(out) if out.status.success() => {
+            footprint_summary(&String::from_utf8_lossy(&out.stdout), &ps_for_owner, &lanes)
+        }
         result => serde_json::json!({"measured": false, "n_considered": 0,
             "why_unmeasured": match result { Ok(out) => out.status.to_string(), Err(error) => error }}),
     };
@@ -600,7 +680,20 @@ PID    MEM CMPRS %CPU COMMAND
 bogus  1G 1G 1.0 unparseable
 404    NaN 1G 1.0 bad-number
 ";
-        let v = footprint_summary(raw);
+        let ps = "\
+101 1 S 0.1 4 /Users/e/Dev/smb/backend/.venv/bin/python
+202 1 S 5.0 2097152 /usr/bin/honest
+303 1 S 1.0 921600 /Users/e/Dev/other/bin/tool
+";
+        // CC_DIRs NEST in reality: measured 2026-09-16, /Users/ethan/Dev is
+        // itself a lane's CC_DIR alongside /Users/ethan/Dev/ai-for-smbs, so a
+        // lane process matches several. The fixture reproduces that.
+        let lanes = vec![
+            ("/Users/e/Dev".to_string(), "broad-lane".to_string()),
+            ("/Users/e/Dev/smb".to_string(), "smb-lane".to_string()),
+            ("/Users/e/Dev/oth".to_string(), "decoy-lane".to_string()),
+        ];
+        let v = footprint_summary(raw, ps, &lanes);
         assert_eq!(v["measured"], true);
         // The header, the non-numeric pid and the NaN row are all dropped.
         assert_eq!(v["n_considered"], 3, "only parseable process rows count: {v}");
@@ -631,7 +724,19 @@ bogus  1G 1G 1.0 unparseable
         assert_eq!(top_size_bytes("NaN"), None);
 
         // An empty probe is UNMEASURED, not a healthy host with no processes.
-        let none = footprint_summary("");
+        // OWNER, from the executable path, because cwd is unavailable on this
+        // host. The longest matching CC_DIR wins: pid 101 is under both
+        // /Users/e/Dev and /Users/e/Dev/smb, and naming the broad one would
+        // blame the wrong lane.
+        assert_eq!(top[0]["owner_lane"], "smb-lane", "longest CC_DIR prefix must win: {top}");
+        // A process outside every lane tree has NO owner, which is null rather
+        // than a guess or the string "unknown".
+        assert!(top[1]["owner_lane"].is_null(), "/usr/bin/honest belongs to no lane: {top}");
+        // BOUNDARY, not substring: /Users/e/Dev/other must not match a lane
+        // rooted at /Users/e/Dev/oth.
+        assert_eq!(top[2]["owner_lane"], "broad-lane", "decoy-lane is a prefix of the string, not of the path: {top}");
+
+        let none = footprint_summary("", "", &lanes);
         assert_eq!(none["measured"], false);
         assert_eq!(none["n_considered"], 0);
         assert!(none["why_unmeasured"].is_string(), "silence must say why: {none}");
