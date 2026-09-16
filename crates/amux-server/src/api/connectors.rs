@@ -1334,11 +1334,33 @@ async fn set_credentials(Path(id): Path<String>, Json(body): Json<Value>) -> Res
             std::env::set_var(k, v);
         }
     }
+    // REPUBLISH THE PREFLIGHT, because this is the event that makes it stale
+    // (AF-372).
+    //
+    // Every worker's MEMORY.md carries a "Credentials" section naming the keys
+    // this box cannot reach. `refresh_fleet_rosters` is documented as
+    // "deliberately not on a timer: nothing about the roster decays on its own",
+    // which is true of a ROSTER and false of a credential: the moment a key is
+    // pasted here, every one of those files keeps asserting it is unset, and
+    // stays wrong until somebody happens to rename a worker.
+    //
+    // So it is refreshed on the WRITE, which is the signal that doc asks for
+    // rather than the timer it rejects. O(fleet) small file writes, on an action
+    // a human takes by hand a few times a year.
+    let refreshed = crate::api::session_verbs::refresh_fleet_rosters();
+    tracing::info!(
+        marker = "connector_credentials_republished",
+        connector = %id,
+        memories_rewritten = refreshed,
+        measured = true,
+        "credential preflight refreshed in every worker's memory after a key changed"
+    );
     Json(json!({
         "ok": true,
         "connector": id,
         "written": written,
         "rejected": rejected,
+        "memories_refreshed": refreshed,
         "note": "stored in ~/.amux/server.env; restart is not required for this run. Values are never returned.",
     }))
     .into_response()
