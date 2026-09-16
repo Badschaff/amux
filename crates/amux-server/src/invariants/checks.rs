@@ -2069,6 +2069,18 @@ pub fn todo_is_reachable_by_dispatch(
     }))]
 }
 
+/// One (lane, card) pair that crossed the repeat threshold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepeatOfferPair {
+    pub lane: String,
+    pub card: String,
+    pub claims: i64,
+    /// Whether the card has since reached a terminal status. A closed card
+    /// cannot be re-offered again, so its repeats are history rather than a
+    /// live fault.
+    pub card_closed: bool,
+}
+
 /// Is a lane being handed the same card over and over? (AF-543)
 ///
 /// The drain re-offers a card a lane has already declined, and until now nobody
@@ -2094,42 +2106,71 @@ pub fn todo_is_reachable_by_dispatch(
 /// defer marker, or a re-park refresh is an open decision (AF-514) that belongs
 /// to Ethan; publishing the number does not presuppose any of them, and it is
 /// the number all three would need.
+///
+/// SPLITS RESOLVED FROM LIVE, because the raw count is dominated by history and
+/// reads as an emergency that is not there (AMUX-4541). Measured on the live
+/// board 2026-09-16: 40 pairs over threshold carrying 847 claims between them,
+/// of which 23 pairs and 742 claims (88% of the claims) are on cards that have
+/// since CLOSED. The headline said "worst 315x". That pair is desktop/DESKT-30,
+/// a verified card whose last claim landed 55 minutes before its final update,
+/// and the 7-day window kept re-reporting it for days afterwards. The worst
+/// pair on a card anyone can still act on is 25x.
+///
+/// So a reader triaging this was pointed at the wrong end of the distribution.
+/// The counts were all correct; the framing was not, which is the same defect
+/// one level up from the one the check exists to report.
 pub fn repeat_offers_are_visible(
-    offenders: &[(String, String, i64)],
+    pairs: &[RepeatOfferPair],
     total_pairs: i64,
     threshold: i64,
 ) -> Vec<InvariantResult> {
     const ID: &str = "board.repeat_offers_are_visible";
-    if offenders.is_empty() {
+    let (live, closed): (Vec<&RepeatOfferPair>, Vec<&RepeatOfferPair>) =
+        pairs.iter().partition(|p| !p.card_closed);
+    let row = |p: &&RepeatOfferPair| {
+        json!({"lane": p.lane, "card": p.card, "claims": p.claims})
+    };
+    let closed_claims: i64 = closed.iter().map(|p| p.claims).sum();
+    // BOTH HALVES IN THE EVIDENCE WHETHER IT PASSES OR FAILS. A reader has to be
+    // able to tell "nothing is cycling" from "the cycling stopped when the cards
+    // closed", and those are different facts about the fleet.
+    let shared = json!({
+        "threshold": threshold,
+        "pairs_considered": total_pairs,
+        "over_threshold_live": live.len(),
+        "over_threshold_closed": closed.len(),
+        "closed_claims": closed_claims,
+        "closed_note": "these pairs crossed the threshold on cards that have SINCE CLOSED. A \
+                        closed card cannot be re-offered, so they are history inside the window, \
+                        not a live fault. They dominate the raw count.",
+        "live": live.iter().take(10).map(row).collect::<Vec<_>>(),
+        "closed": closed.iter().take(10).map(row).collect::<Vec<_>>(),
+    });
+    if live.is_empty() {
         // The population, beside the zero: "no lane is being cycled" and "no
         // claim events were readable" are different facts (ethos rule 4).
-        return vec![InvariantResult::pass(ID).evidence(json!({
-            "over_threshold": 0,
-            "threshold": threshold,
-            "pairs_considered": total_pairs,
-        }))];
+        return vec![InvariantResult::pass(ID).evidence(shared)];
     }
-    let worst = offenders.iter().map(|(_, _, n)| *n).max().unwrap_or(0);
+    let worst = live.iter().map(|p| p.claims).max().unwrap_or(0);
     let named: Vec<String> =
-        offenders.iter().take(5).map(|(l, c, n)| format!("{l}/{c} {n}x")).collect();
+        live.iter().take(5).map(|p| format!("{}/{} {}x", p.lane, p.card, p.claims)).collect();
     vec![InvariantResult::fail(
         ID,
         "no lane is being re-offered the same card past the threshold".to_string(),
         format!(
-            "{} (lane, card) pair(s) of {total_pairs} were claimed {threshold}+ times in the              window, worst {worst}x: {}. The drain is serving a card its lane has already              declined, repeatedly, and the cooldown cannot see it because it reads              task.claimed as a rate limit rather than a count. This REPORTS only — what a              repeat should mean is AF-514's open decision.",
-            offenders.len(),
+            "{} (lane, card) pair(s) of {total_pairs} were claimed {threshold}+ times in the \
+             window ON A CARD THAT IS STILL LIVE, worst {worst}x: {}. A further {} pair(s) \
+             carrying {closed_claims} claim(s) crossed the threshold on cards that have since \
+             closed and are in evidence.closed, because a closed card cannot be re-offered. The \
+             drain is serving a card its lane has already declined, and the cooldown cannot see \
+             it because it reads task.claimed as a rate limit rather than a count. This REPORTS \
+             only; what a repeat should mean is AF-514's open decision.",
+            live.len(),
             named.join(", "),
+            closed.len(),
         ),
     )
-    .evidence(json!({
-        "over_threshold": offenders.len(),
-        "threshold": threshold,
-        "pairs_considered": total_pairs,
-        "worst": worst,
-        "top": offenders.iter().take(10)
-            .map(|(l, c, n)| json!({"lane": l, "card": c, "claims": n}))
-            .collect::<Vec<_>>(),
-    }))]
+    .evidence(shared)]
 }
 
 /// A card claiming to be live work, hidden from everything that could act (AF-544).
@@ -6843,8 +6884,68 @@ mod todo_reachable_tests {
 mod repeat_offer_tests {
     use super::*;
 
-    fn pair(l: &str, c: &str, n: i64) -> (String, String, i64) {
-        (l.to_string(), c.to_string(), n)
+    fn pair(l: &str, c: &str, n: i64) -> RepeatOfferPair {
+        RepeatOfferPair { lane: l.into(), card: c.into(), claims: n, card_closed: false }
+    }
+
+    fn closed_pair(l: &str, c: &str, n: i64) -> RepeatOfferPair {
+        RepeatOfferPair { lane: l.into(), card: c.into(), claims: n, card_closed: true }
+    }
+
+    /// A RESOLVED BURST MUST NOT READ AS A LIVE ONE (AMUX-4541).
+    ///
+    /// Measured on the live board 2026-09-16: 40 pairs over threshold carrying
+    /// 847 claims, of which 23 pairs and 742 claims are on cards that have SINCE
+    /// CLOSED. The headline said "worst 315x", and that pair is
+    /// desktop/DESKT-30, a verified card whose last claim landed 55 minutes
+    /// before its final update. The worst pair anyone can still act on is 25x.
+    /// The counts were right and the framing aimed the reader at the 88% of the
+    /// claims that nothing can be done about.
+    #[test]
+    fn repeats_on_a_closed_card_are_reported_apart_from_live_ones() {
+        // The live board's shape: one small live case, one enormous closed one.
+        let out = repeat_offers_are_visible(
+            &[pair("studio-plg", "SP-762", 5), closed_pair("desktop", "DESKT-30", 315)],
+            1856,
+            4,
+        );
+        assert_eq!(out[0].status, Status::Fail, "a live pair still fails");
+        let d = format!("{:?}", out[0]);
+        assert!(d.contains("worst 5x"), "the worst LIVE case leads, not the closed one: {d}");
+        assert!(!d.contains("worst 315x"), "a closed card must not set the headline: {d}");
+        assert!(d.contains("STILL LIVE"), "{d}");
+
+        let ev = &out[0].evidence;
+        assert_eq!(ev["over_threshold_live"], serde_json::json!(1), "{ev}");
+        assert_eq!(ev["over_threshold_closed"], serde_json::json!(1), "{ev}");
+        assert_eq!(ev["closed_claims"], serde_json::json!(315), "{ev}");
+        assert_eq!(ev["live"][0]["card"], serde_json::json!("SP-762"), "{ev}");
+        // SHOWN, NOT DROPPED. The closed pairs stay in the payload: a reader has
+        // to be able to see the burst happened and see that it ended.
+        assert_eq!(ev["closed"][0]["card"], serde_json::json!("DESKT-30"), "{ev}");
+    }
+
+    /// ALL-CLOSED PASSES, AND SAYS WHY (AMUX-4541).
+    ///
+    /// "nothing is cycling" and "the cycling stopped when the cards closed" are
+    /// different facts about the fleet, and a bare pass reports the first while
+    /// meaning the second.
+    #[test]
+    fn a_window_of_only_closed_repeats_passes_with_the_history_still_visible() {
+        let out = repeat_offers_are_visible(
+            &[closed_pair("desktop", "DESKT-30", 315), closed_pair("desktop", "DESKT-31", 302)],
+            1856,
+            4,
+        );
+        assert_eq!(out[0].status, Status::Pass, "no live card is being re-offered");
+        let ev = &out[0].evidence;
+        assert_eq!(ev["over_threshold_live"], serde_json::json!(0), "{ev}");
+        assert_eq!(ev["over_threshold_closed"], serde_json::json!(2), "{ev}");
+        assert_eq!(ev["closed_claims"], serde_json::json!(617), "{ev}");
+        assert!(
+            ev["closed_note"].as_str().unwrap_or_default().contains("cannot be re-offered"),
+            "a pass that had 617 claims behind it must explain itself: {ev}"
+        );
     }
 
     /// AF-543. The failing arm must NAME the pairs, because the remedy is a

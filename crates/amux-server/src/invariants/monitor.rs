@@ -2002,13 +2002,27 @@ fn repeat_offer_check(state: &AppState) -> Vec<InvariantResult> {
     // json_extract in SQL rather than pulling 1279 rows into Rust to group them:
     // the store can do this, and ethos rule 2 says not to spend the process on
     // string manipulation a GROUP BY already does.
-    let rows: Result<Vec<(String, String, i64)>, _> = conn
+    // The card's CURRENT status rides along, so the check can tell a live fault
+    // from history: a pair that crossed the threshold on a card which has since
+    // closed cannot be re-offered again (AMUX-4541). Measured on this board,
+    // those are 23 of 40 pairs and 742 of 847 claims, so without the join the
+    // headline is a resolved burst.
+    let rows: Result<Vec<(String, String, i64, bool)>, _> = conn
         .prepare(
-            "SELECT session, json_extract(data, '$.issue') AS issue, COUNT(*) AS n              FROM session_events              WHERE type='task.claimed' AND ts > ?1 AND issue IS NOT NULL              GROUP BY session, issue ORDER BY n DESC",
+            "SELECT e.session, json_extract(e.data, '$.issue') AS issue, COUNT(*) AS n, \
+                    COALESCE(MAX(i.status IN ('done','verified','discarded','quarantined','cancelled')), 0) \
+             FROM session_events e LEFT JOIN issues i ON i.id = json_extract(e.data, '$.issue') \
+             WHERE e.type='task.claimed' AND e.ts > ?1 AND issue IS NOT NULL \
+             GROUP BY e.session, issue ORDER BY n DESC",
         )
         .and_then(|mut st| {
             st.query_map([cut], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)? != 0,
+                ))
             })
             .map(|it| it.flatten().collect())
         });
@@ -2016,9 +2030,17 @@ fn repeat_offer_check(state: &AppState) -> Vec<InvariantResult> {
         return vec![InvariantResult::unknown(ID, "task.claimed query failed")];
     };
     let total = all.len() as i64;
-    let offenders: Vec<(String, String, i64)> =
-        all.into_iter().filter(|(_, _, n)| *n >= REPEAT_OFFER_THRESHOLD).collect();
-    checks::repeat_offers_are_visible(&offenders, total, REPEAT_OFFER_THRESHOLD)
+    let pairs: Vec<checks::RepeatOfferPair> = all
+        .into_iter()
+        .filter(|(_, _, n, _)| *n >= REPEAT_OFFER_THRESHOLD)
+        .map(|(lane, card, claims, card_closed)| checks::RepeatOfferPair {
+            lane,
+            card,
+            claims,
+            card_closed,
+        })
+        .collect();
+    checks::repeat_offers_are_visible(&pairs, total, REPEAT_OFFER_THRESHOLD)
 }
 
 fn todo_reachable_check(state: &AppState) -> Vec<InvariantResult> {
