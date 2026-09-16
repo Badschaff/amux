@@ -519,6 +519,11 @@ jobs:
       # feature looks exactly like a working one.
       - name: CDP keepalive reaches a self-signed amux
         run: ./scripts/test-cdp-keepalive.sh
+      # AMUX-4689: a refused test run must certify nothing. The refusal half
+      # compiles nothing; the control reuses the workspace target dir and the
+      # smallest crate, so this stays a seconds-scale step in the no-compile job.
+      - name: A refused test run certifies nothing
+        run: ./scripts/test-contended-refusal.sh
       # AMUX-3891. The CLI is symlinked straight into the working tree and ~50
       # lanes invoke it while it is being edited, so it MUST be parseable in one
       # read: bash holds a byte offset, and a rewrite mid-invocation resumes it

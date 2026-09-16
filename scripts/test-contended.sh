@@ -306,20 +306,92 @@ esac
 # `cargo test` here failed the pane's whole scope and took the interactive
 # session down with it, which is the exact hazard the wrapper prevents. On a
 # host with no systemd the wrapper execs cargo directly and this is a no-op.
+# TEE, so this script can answer "did cargo start at all" from what the budget
+# guard ACTUALLY EMITTED rather than inferring it from an exit code (AMUX-4689).
+# 75 is not a clean discriminator: cargo-budget.py returns it both for a refusal
+# BEFORE the run and for a failed disk probe AFTER one, while its mid-run kills
+# return 124 or 128+signal. Reading 75 as "nothing ran" would be the same
+# inference-instead-of-measurement this script exists to stop.
+_RUN_LOG=$(mktemp) || _RUN_LOG=""
 if [ -x "$_safe" ]; then
   # It writes its own receipt for a `test` run; this script writes one at the
   # end, so tell it not to. Two identical receipts would be harmless and
   # confusing, and the one written last is the one that saw the final tree.
-  _TC_RECEIPT=1 "$_safe" test "$@"
+  if [ -n "$_RUN_LOG" ]; then
+    _TC_RECEIPT=1 "$_safe" test "$@" 2>&1 | tee "$_RUN_LOG"
+    RC=${PIPESTATUS[0]}
+  else
+    _TC_RECEIPT=1 "$_safe" test "$@"
+    RC=$?
+  fi
 else
-  cargo test "$@"
+  if [ -n "$_RUN_LOG" ]; then
+    cargo test "$@" 2>&1 | tee "$_RUN_LOG"
+    RC=${PIPESTATUS[0]}
+  else
+    cargo test "$@"
+    RC=$?
+  fi
 fi
-RC=$?
+# ${PIPESTATUS[0]} rather than $?, and it is NOT load-bearing here: `set -o
+# pipefail` on line 24 already makes $? the rightmost non-zero status, so both
+# read 75 on a refusal. Confirmed by mutation, which is why this says so instead
+# of claiming a fix it does not make: swapping in $? left all 11 cells green.
+#
+# Kept because the two answer different questions. pipefail gives "something in
+# the pipeline failed"; PIPESTATUS[0] gives "the status of the command whose
+# result this is". Those diverge if `tee` itself fails, on a full disk or an
+# unwritable TMPDIR, where pipefail would report a passing suite as a failure.
+#
+# Worth stating plainly, because the ORIGINAL bug report on AMUX-4689 was
+# exactly this confusion one level out: `test-contended.sh ... | tail` in an
+# interactive shell with no pipefail reports tail's 0, and that was filed as the
+# script exiting 0 on a refusal. The script was always right; the measurement
+# was not.
 
 DIRTY_AFTER=$(dirty_now)
 
 kill "$SAMPLER" 2>/dev/null
 wait "$SAMPLER" 2>/dev/null
+
+# NOTHING RAN, SO CERTIFY NOTHING (AMUX-4689).
+#
+# Measured 2026-09-15 with the budget forced to refuse: this script printed its
+# contention, targets and worktree clauses anyway. Every one of them describes a
+# run, and there had been none:
+#
+#   contention: the auto-builder was NOT rebuilding during this run, so the shared
+#   contention: binary was stable under it. A failure here is NOT build contention.
+#   worktree:  clean at start and end, so no peer's uncommitted source was in this build.
+#
+# VERIFY.md's contract is to paste the command AND ITS RESULT LINE as evidence,
+# and that block IS the result line. A lane pasting it is pasting reassurance
+# about work that did not occur, which is this script's own subject one level up.
+#
+# The test is the EMITTED EVENT, not the exit code. `cargo_budget_started` is
+# printed immediately before the child is spawned, so its absence means cargo
+# never started. The whole clause is skipped when the log could not be captured,
+# because "no marker found" and "nothing was looked at" are different facts and
+# only one of them justifies suppressing the report.
+if [ -n "$_RUN_LOG" ] && [ -s "$_RUN_LOG" ] \
+   && ! grep -q '"event": "cargo_budget_started"' "$_RUN_LOG" \
+   && grep -q '"event": "cargo_budget_refused"' "$_RUN_LOG"; then
+  _tc_target="${CARGO_TARGET_DIR:-$HOME/.amux/rust-build-target}"
+  echo ""
+  echo "refused:   NO TEST RAN. The budget guard refused before cargo started, so the"
+  echo "refused:   contention, targets and worktree clauses are SUPPRESSED: each one"
+  echo "refused:   describes a run, and there was none. This is not a pass, and not a"
+  echo "refused:   failure of the code under test. Exit status is $RC."
+  echo "refused:   The refusal above names target_bytes/free_bytes/reason but no remedy."
+  echo "refused:   Reclaim the shared target dir:"
+  echo "refused:     python3 scripts/cargo-target-guard.py clear --target \"$_tc_target\""
+  echo "refused:   Inspect first with --dry-run. To raise the ceiling for ONE run instead:"
+  echo "refused:     AMUX_CARGO_MAX_TARGET_GB=<n> scripts/test-contended.sh $*"
+  echo "refused:   (the default is 40; \`du -sh\` the target dir to pick a number)"
+  rm -f "$_RUN_LOG"
+  exit "$RC"
+fi
+rm -f "$_RUN_LOG"
 
 if [ -s "$FLAG" ]; then
   builds=$(sort -u "$FLAG" | tr '\n' ' ' | sed 's/ *$//')
