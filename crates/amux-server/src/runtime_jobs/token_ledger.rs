@@ -606,6 +606,19 @@ pub fn spawn(state: crate::api::AppState) -> Option<super::PeriodicTask> {
                 Ok(n) => tracing::info!(rows = n, provider = "codex", "token-ledger indexed"),
                 Err(e) => tracing::warn!(error = %e, provider = "codex", "token-ledger index failed"),
             }
+            // AMUX-4679, the same shape a third time. The gemini ADAPTER
+            // declares it reports no usage, which is true of the provider
+            // interface and says nothing about the CLI, which writes per-turn
+            // counts to ~/.gemini/tmp/<project>/chats. Counted separately for
+            // the reason codex is: "0 gemini rows" has to be readable as a
+            // state rather than as an absent provider.
+            match super::gemini_ledger::index_once(&store, &home).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(rows = n, provider = "gemini", "token-ledger indexed"),
+                Err(e) => {
+                    tracing::warn!(error = %e, provider = "gemini", "token-ledger index failed")
+                }
+            }
         }
     }))
 }
