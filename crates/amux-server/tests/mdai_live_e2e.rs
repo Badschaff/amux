@@ -75,6 +75,54 @@ fn probe_answered(reply: &str) -> bool {
     reply.to_lowercase().contains("ok")
 }
 
+/// Every test in this file that calls a real model must stay out of the default
+/// suite. Checked against the SOURCE, because that is where the property lives:
+/// a test that only ran the suite would pass on the day somebody deletes an
+/// `#[ignore]`, since the deleted-from test would then simply run and probably
+/// pass. This is the same reason the claude-scratch report greps itself for a
+/// delete path (AMUX-4720).
+///
+/// The list is written out rather than discovered, so ADDING a live-model test
+/// without ignoring it fails here too: a loop that discovered its own subjects
+/// from the same attributes it is checking would have nothing to say about a
+/// test that carries neither.
+#[test]
+fn live_model_tests_stay_out_of_the_default_suite() {
+    let src = include_str!("mdai_live_e2e.rs");
+    let live = ["mdai_live_e2e_real_files_real_model", "mdai_live_connect_then_run"];
+    for name in live {
+        let at = src
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("{name} is gone; update this list or the guard covers nothing"));
+        let head = &src[..at];
+        let attr_start = head
+            .rfind("#[test]")
+            .unwrap_or_else(|| panic!("{name} has no #[test] above it"));
+        assert!(
+            head[attr_start..].contains("#[ignore"),
+            "{name} calls a real model and must carry #[ignore]: every lane is told to run \
+             this suite before pushing, and a model that declines the task turns that gate \
+             into a coin flip (AMUX-4720)"
+        );
+    }
+    // POSITIVE CONTROL: the pure probe test must NOT be ignored, or this guard
+    // would pass just as well for a file where everything is switched off.
+    //
+    // Built with format! for the same reason the names above are, and this cell
+    // is why: spelled as a literal `fn <name>(`, `src.find` matched THIS
+    // FUNCTION'S OWN SOURCE rather than the definition, and the control failed
+    // against a file that was correct. A test that reads its own file can
+    // always match itself.
+    let probe = "the_probe_reads_the_answer_rather_than_its_length";
+    let at = src.find(&format!("fn {probe}(")).unwrap();
+    let head = &src[..at];
+    let attr_start = head.rfind("#[test]").unwrap();
+    assert!(
+        !head[attr_start..].contains("#[ignore"),
+        "the pure probe test needs no model and must keep running in the default suite"
+    );
+}
+
 #[test]
 fn the_probe_reads_the_answer_rather_than_its_length() {
     // THE SPECIMEN, verbatim from the failing run on 2026-09-02. Non-empty, so
@@ -105,7 +153,33 @@ fn lower(s: &str) -> String {
     s.to_lowercase()
 }
 
+// OUT OF THE DEFAULT SUITE, DELIBERATELY (AMUX-4720).
+//
+// CLAUDE.md tells every lane to run `scripts/test-contended.sh -p amux-server`
+// before pushing, and this test called a real model and asserted on its free
+// text. On 2026-09-16 it failed while gating an unrelated search migration: the
+// model declined and asked for the files instead of reading them, so the
+// three-way OR looking for "zephyr"/"72"/"marlow" matched nothing. The same
+// test had passed 40 minutes earlier on the same code.
+//
+// The assertion is not the weak part. It is already about as forgiving as an
+// assertion on free text can be, and no amount of loosening helps, because a
+// refusal contains none of the tokens by construction. What cannot be fixed by
+// a better matcher is that the model's WILLINGNESS is an input the test does
+// not control.
+//
+// `model_available()` is kept: an opt-in run on a box with no model still skips
+// with a printed reason rather than failing. It cannot carry this on its own,
+// because it probes with "reply with ok" and a model can answer that and then
+// decline the real task, which is exactly what happened.
+//
+// NOT TAKEN: classifying a refusal in the task output as a skip. That is a
+// matcher over model free text competing with a moving target, and it would
+// keep a live model call in the push path to do it. Once the test is out of
+// that path a refusal costs nobody a wrong diagnosis, so the cheap fix and the
+// robust one are the same fix here.
 #[test]
+#[ignore = "calls a real model; opt in with `cargo test -- --ignored` (AMUX-4720)"]
 fn mdai_live_e2e_real_files_real_model() {
     if !model_available() {
         return; // skipped cleanly; reason printed by model_available()
@@ -228,6 +302,7 @@ fn mdai_live_e2e_real_files_real_model() {
 /// frontmatter a subsequent run can resolve. Gated the same way (writing a file
 /// is free, but running the resulting graph needs the model).
 #[test]
+#[ignore = "calls a real model; opt in with `cargo test -- --ignored` (AMUX-4720)"]
 fn mdai_live_connect_then_run() {
     if !model_available() {
         return;
