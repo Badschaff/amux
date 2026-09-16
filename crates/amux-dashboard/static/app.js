@@ -11183,7 +11183,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.969';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.970';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -19677,7 +19677,8 @@ function _renderFileBody(data, mode) {
     _bindReadPosDiv(body, data.path);
   } else if (data.is_markdown) {
     body.className = 'file-overlay-body markdown md-content';
-    body.innerHTML = renderMarkdown(data.content, data.path);
+    const fm = _parseFrontmatter(data.content);
+    body.innerHTML = _renderFrontmatterBlock(fm.meta) + renderMarkdown(fm.body, data.path);
     _bindMdFileLinks(body);
     _fileBindAnchors(body);
     _bindReadPosDiv(body, data.path);
@@ -27866,6 +27867,30 @@ function _bindMdFileLinks(container) {
       openFilePreview(a.dataset.file);
     }
   });
+}
+
+function _parseFrontmatter(raw) {
+  if (!raw || !raw.startsWith('---')) return { meta: null, body: raw };
+  const end = raw.indexOf('\n---', 3);
+  if (end < 0) return { meta: null, body: raw };
+  const yaml = raw.substring(4, end).trim();
+  const body = raw.substring(end + 4).replace(/^\n/, '');
+  const entries = [];
+  for (const line of yaml.split('\n')) {
+    const m = line.match(/^(\s*)([^:#\n]+?)\s*:\s*(.*)/);
+    if (m && m[1].length === 0) entries.push([m[2].trim(), m[3].trim()]);
+  }
+  return { meta: entries.length ? entries : null, body };
+}
+
+function _renderFrontmatterBlock(entries) {
+  if (!entries || !entries.length) return '';
+  const rows = entries.map(([k, v]) =>
+    '<tr><td style="padding:3px 10px 3px 0;color:var(--dim);font-size:0.72rem;white-space:nowrap;vertical-align:top;">' + esc(k) + '</td>'
+    + '<td style="padding:3px 0;font-size:0.78rem;word-break:break-word;">' + esc(v) + '</td></tr>'
+  ).join('');
+  return '<details class="file-frontmatter" open><summary style="font-size:0.72rem;color:var(--dim);cursor:pointer;padding:4px 0;user-select:none;">Metadata</summary>'
+    + '<table style="border-collapse:collapse;margin:4px 0 12px;">' + rows + '</table></details>';
 }
 
 function renderMarkdown(raw, basePath) {

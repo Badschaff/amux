@@ -3037,21 +3037,21 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <h2 id="file-title">file</h2>
       <div id="file-subpath" class="file-subpath"></div>
     </div>
-    <button class="file-menu-btn" id="file-menu-btn" onclick="_toggleFileMenu(event)" title="Actions" aria-label="Actions">&#x22EE;</button>
-    <div class="file-actions" id="file-actions">
     <div class="file-view-tabs" id="file-view-tabs" style="display:none;">
       <button class="file-view-tab active" id="file-tab-preview" onclick="setFileViewMode('preview')">Preview</button>
-      <button class="file-view-tab" id="file-tab-edit" onclick="setFileViewMode('edit')" style="display:none;">Edit</button>
       <button class="file-view-tab" id="file-tab-raw" onclick="setFileViewMode('raw')">Raw</button>
+    </div>
+    <button id="file-save-btn" onclick="_fileSave()" style="display:none;">Save</button>
+    <button class="file-menu-btn" id="file-menu-btn" onclick="_toggleFileMenu(event)" title="More actions" aria-label="More actions">&#x22EF;</button>
+    <div class="file-actions" id="file-actions">
+      <button class="file-view-tab" id="file-tab-edit" onclick="setFileViewMode('edit')" style="display:none;">Edit</button>
       <button class="file-view-tab" id="file-tab-teleprompter" onclick="_filesOpenTeleprompter()" title="Teleprompter mode" style="display:none;">&#x25B6; Teleprompter</button>
       <button class="file-view-tab" id="file-tab-search" onclick="_mdSearchToggle()" title="Find in markdown" style="display:none;">&#x1F50D; Find</button>
       <button class="file-view-tab" id="file-tab-readaloud" onclick="_ttsSpeak(_mdToSpeech(_fileData&&_fileData.content),this)" title="Read aloud" style="display:none;">&#x1F50A; Read Aloud</button>
       <button class="file-view-tab" id="file-tab-copy" onclick="copyFileContent()" title="Copy to clipboard">Copy</button>
       <button class="file-view-tab" id="file-tab-copypath" onclick="_copyFilePath(_fileData&&_fileData.path||'')" title="Copy relative path">Path</button>
       <button class="file-view-tab" id="file-tab-link" onclick="_copyFileDeeplink(_fileData&&_fileData.path||'')" title="Copy deep link">Link</button>
-    </div>
-    <button id="file-save-btn" onclick="_fileSave()" style="display:none;">Save</button>
-    <button id="file-download-btn" onclick="_fileDownload()" style="display:none;font-size:0.72rem;padding:3px 10px;border:1px solid var(--border);border-radius:6px;color:var(--accent);background:transparent;cursor:pointer;white-space:nowrap;flex-shrink:0;">&#x2B07; Download</button>
+      <button class="file-view-tab" id="file-download-btn" onclick="_fileDownload()" style="display:none;">&#x2B07; Download</button>
     </div><!-- /file-actions -->
     <button class="btn" onclick="closeFilePreview()" style="flex-shrink:0;">&#x2715;</button>
   </div>

@@ -989,7 +989,7 @@
   .file-overlay.active { display: flex; }
   .file-overlay-header {
     display: flex; justify-content: space-between; align-items: center;
-    margin-bottom: 8px; flex-shrink: 0;
+    margin-bottom: 8px; flex-shrink: 0; position: relative;
   }
   /* Title bar: file name on top, its folder path underneath, like a file manager. */
   .file-title-wrap { flex: 1; min-width: 0; margin-right: 8px; display: flex; flex-direction: column; justify-content: center; overflow: hidden; }
@@ -1003,9 +1003,12 @@
   .file-subpath.clickable { cursor: pointer; text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 2px; }
   .file-subpath.clickable:hover { color: var(--accent); }
   @media (max-width: 600px) { .file-subpath.clickable { min-height: 44px; display: flex; align-items: center; } }
-  /* Desktop: actions lay out inline in the header; the ⋮ menu button is mobile-only. */
-  .file-actions { display: contents; }
-  .file-menu-btn { display: none; background: none; border: none; color: var(--text); cursor: pointer; font-size: 1.25rem; line-height: 1; padding: 4px 8px; flex-shrink: 0; }
+  .file-actions { display: none; position: absolute; top: calc(100% + 4px); right: 6px; flex-direction: column; align-items: stretch; gap: 2px;
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 10px 28px rgba(0,0,0,0.45);
+    padding: 6px; z-index: 60; min-width: 170px; max-width: 78vw; max-height: 70vh; overflow-y: auto; }
+  .file-actions.open { display: flex; }
+  .file-actions .file-view-tab { width: 100%; justify-content: flex-start; text-align: left; border-radius: 8px; font-size: 0.82rem; padding: 7px 14px; flex-shrink: 0; }
+  .file-menu-btn { display: inline-flex; align-items: center; justify-content: center; background: none; border: 1px solid var(--border); border-radius: 6px; color: var(--text); cursor: pointer; font-size: 1.15rem; line-height: 1; padding: 4px 8px; flex-shrink: 0; }
   .file-overlay-body {
     flex: 1; overflow: auto; background: #010409; border: 1px solid var(--border); border-radius: 8px;
     padding: 14px; font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
@@ -1017,6 +1020,7 @@
     background: none; color: var(--dim); font-size: 0.78rem; cursor: pointer;
     -webkit-tap-highlight-color: transparent; transition: all 0.15s; }
   .file-view-tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .file-frontmatter { border-bottom: 1px solid var(--border); padding-bottom: 8px; margin-bottom: 12px; }
   .file-overlay-body.file-raw { white-space: pre-wrap; word-break: break-word; }
   /* Syntax-highlighted code preview (highlight.js). The theme stylesheet colors
      .hljs; we own layout + fill. */
@@ -1164,22 +1168,12 @@
        would shrink. The h2 and the chip carry inline styles that outrank a
        plain rule, hence !important on exactly these. */
     #peek-model-badge { flex-shrink: 1 !important; min-width: 0; max-width: 34% !important; }
-    .file-overlay-header { flex-wrap: nowrap; gap: 6px; align-items: center; position: relative; }
-    /* Full title (no more 32vw cutoff) — actions move into the ⋮ menu. */
+    .file-overlay-header { flex-wrap: nowrap; gap: 6px; }
     .file-overlay-header .file-title-wrap { flex: 1 1 auto; min-width: 0; max-width: none; margin-right: 4px; }
     .file-overlay-header h2 { font-size: 0.9rem; min-width: 0; max-width: none; }
     .file-overlay-header .btn { min-width: 40px; min-height: 40px; font-size: 0.95rem; padding: 6px 10px; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
-    .file-menu-btn { display: inline-flex; align-items: center; justify-content: center; min-width: 40px; min-height: 40px; font-size: 1.35rem; }
-    /* Actions become a dropdown anchored under the ⋮ button. */
-    .file-actions { display: none; position: absolute; top: calc(100% + 4px); right: 6px; flex-direction: column; align-items: stretch; gap: 2px;
-      background: var(--card); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 10px 28px rgba(0,0,0,0.45);
-      padding: 6px; z-index: 60; min-width: 190px; max-width: 78vw; max-height: 70vh; overflow-y: auto; }
-    .file-actions.open { display: flex; }
-    .file-actions .file-view-tabs { flex-direction: column; align-items: stretch; width: 100%; overflow: visible; gap: 2px; padding: 0; }
-    .file-actions .file-view-tab,
-    .file-actions #file-save-btn,
-    .file-actions #file-download-btn {
-      width: 100%; justify-content: flex-start; text-align: left; min-height: 44px; border-radius: 8px; font-size: 0.9rem; padding: 8px 14px; flex-shrink: 0; }
+    .file-menu-btn { min-width: 40px; min-height: 40px; font-size: 1.35rem; }
+    .file-actions .file-view-tab { min-height: 44px; font-size: 0.9rem; padding: 8px 14px; }
     #md-search-row { padding: 8px 4px; }
     #md-search-input { font-size: 16px; min-height: 40px; }
     #md-search-row .btn { min-width: 40px; min-height: 40px; }
