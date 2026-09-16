@@ -562,6 +562,7 @@ mod tests {
     /// until the browser signal boundary began rejecting it (ATE-44).
     #[tokio::test]
     async fn a_reap_actually_enqueues_the_notice_for_the_owning_lane() {
+        let _reg = crate::integrations::browser::TEST_REGISTRY.lock().await;
         let home = tempfile::tempdir().unwrap();
         let db = tempfile::tempdir().unwrap();
         let store: crate::db::SharedStore =

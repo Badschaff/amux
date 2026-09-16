@@ -3804,6 +3804,7 @@ mod tests {
     /// and falls back to the only running one, so silence is genuinely ambiguous.
     #[tokio::test(flavor = "current_thread")]
     async fn keepalive_resets_the_activity_clock_and_names_what_it_touched() {
+        let _reg = crate::integrations::browser::TEST_REGISTRY.lock().await;
         crate::integrations::browser::test_clear_running();
         crate::integrations::browser::test_seed_running("hubspot", "lane-a", 4242);
         let app = app();
@@ -4628,6 +4629,7 @@ mod tests {
 
     #[tokio::test]
     async fn cross_session_start_refuses_without_takeover_naming_the_owner() {
+        let _reg = crate::integrations::browser::TEST_REGISTRY.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let _home = crate::api::settings::test_env::set_home(dir.path());
 
@@ -4801,6 +4803,11 @@ mod tests {
     /// than theatre.
     #[tokio::test]
     async fn driver_verbs_answer_natively_never_proxy() {
+        // AMUX-4718: this test SEEDS NOTHING and still races. It asserts a 409
+        // for "no browser running", so a peer test's seed turns it into a 200.
+        // The HomeGuard below is not enough, because `RUNNING` is a process
+        // global and is not keyed by home.
+        let _reg = crate::integrations::browser::TEST_REGISTRY.lock().await;
         // AF-109: this test asserts 409-when-not-running, but connect_session
         // deliberately runs adopt_if_orphaned(&amux_home()) first (AC-325),
         // and with no home guard that probe reaches the DEVELOPER'S REAL

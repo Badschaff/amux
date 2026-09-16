@@ -1211,6 +1211,33 @@ async fn reconcile_orphan_before_launch(home: &Path, target_dir: &Path) {
 pub static RUNNING: LazyLock<Mutex<std::collections::HashMap<String, RunningBrowser>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
+/// Serialises every TEST that reads or writes `RUNNING` (AMUX-4718).
+///
+/// `RUNNING`'s own `Mutex` makes each access atomic and does nothing for the
+/// property tests need, which is that the map does not change BETWEEN a test's
+/// seed and its assertion. Four tests across three modules call
+/// `test_clear_running`, cargo runs them on parallel threads in one binary, and
+/// a `clear()` landing inside another test's window empties the registry under
+/// it.
+///
+/// Measured 2026-09-16 before this lock existed: `cargo test -p amux-server
+/// --lib browser` failed 4 runs of 4, with 1, 3, 3 and 2 failures, always from
+/// the same three names. Each of those passes 6 of 6 alone. The FULL suite
+/// failed 1 run in 5, which is why this went unfixed: the instrument most
+/// people run is the weak one, and a green there means very little.
+///
+/// READERS TAKE IT TOO, and that is the half a writer-only lock would miss.
+/// `driver_verbs_answer_natively_never_proxy` seeds nothing and asserts a 409
+/// for "no browser running"; a peer's seed turns that into a 200. It was one of
+/// the three.
+///
+/// `tokio::sync::Mutex`, not `std`: the guard is held across `.await` in every
+/// one of these tests, which is a clippy deny and a real hazard on a
+/// multi-threaded runtime. Same reason as `commit_nudge`'s `REVIVED_ENV`
+/// (AMUX-4713), which is the same defect in a different global.
+#[cfg(test)]
+pub static TEST_REGISTRY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Locate a Chrome/Chromium binary. None is an honest answer the API
 /// surfaces as 501 — not a fallback to some other browser.
 pub fn chrome_binary() -> Option<PathBuf> {
@@ -3005,8 +3032,19 @@ mod multi_browser_tests {
     /// clobber each other's seeds — which is exactly how the first draft of
     /// this failed: "two profiles must coexist" saw three, and "a profile is a
     /// slot" saw a neighbour's entry. Serial by construction beats a flake.
+    ///
+    /// THAT REASONING WAS RIGHT AND ITS REMEDY WAS LOCAL (AMUX-4718). Merging
+    /// two tests stops THESE two racing and does nothing about the three in
+    /// `api::browser::tests` and one in `runtime_jobs::browser_reaper` that
+    /// share the same global. Those failed 4 runs of 4 under `--lib browser`.
+    /// The lock is the general form of what this comment already knew.
+    ///
+    /// `blocking_lock` because this is a plain `#[test]` with no runtime, where
+    /// it is the correct call. Inside an async test it would panic, which is
+    /// why the others `.await` it.
     #[test]
     fn multiple_workers_can_use_same_and_different_browsers() {
+        let _reg = TEST_REGISTRY.blocking_lock();
         test_clear_running();
         test_seed_running_port("alpha", "worker-a", 111, 9001);
         test_seed_running_port("beta", "worker-b", 222, 9002);
