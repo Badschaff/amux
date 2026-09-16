@@ -5015,7 +5015,7 @@ function _renderBoardActivity(host, workerName) {
     strip.id = id;
     strip.className = 'board-activity';
     strip.setAttribute('aria-label', 'Current worker activity');
-    host.parentNode.insertBefore(strip, host);
+    host.insertBefore(strip, host.firstChild);
   }
   const entries = _boardActivityEntries(workerName);
   strip.hidden = !entries.length;
@@ -11183,7 +11183,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.968';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.969';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
