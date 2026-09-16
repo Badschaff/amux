@@ -1306,10 +1306,11 @@ async fn get_contract(
             "wrong_type": "If the item has no code, set its type first — the gate is DERIVED                            from the type. CLI: `amux board type <id> <type>`. API: PATCH                            /api/board/<id> with {\"type\": \"investigation\"} — the field is                            `type`, NOT `item_type` (that one is ignored and reported in                            `ignored_fields`). Settable at creation too: POST /api/board with                            {\"title\": ..., \"type\": ...}.",
         },
         "worker_board_ownership": {
-            "rule": "an identified worker may create cards only on its own board; `session` must equal the verified X-Amux-Worker/X-Amux-Session identity",
+            "rule": "an identified worker may create cards only on its own board; `session` must equal the verified X-Amux-Worker/X-Amux-Session identity. The one exception is a ROUTED REQUEST (AMUX-4653): POST `request_to: \"<lane>\"` files the card on THAT lane's board, with `requested_by` forced to the verified caller and a completion callback armed to them",
             "peer_links": "cross-worker collaboration is represented without transferring board ownership: set `reviewer` or `shepherd` to the peer and use `depends_on` for cross-board task dependencies",
-            "cli": "amux board request <worker> <title> creates the card on the caller's board and links <worker> as reviewer",
-            "security": "a worker cannot create an unassigned card or place a new card directly on another worker's board; anonymous/human control-plane callers retain administrative placement",
+            "cli": "amux board request <worker> <title> files the card on <worker>'s board as a todo their dispatch offers them, with the caller as requester and a terminal callback armed back to the caller",
+            "request_to": "requires a verified caller; refused for your own lane (request_to_self), a lane that does not exist (unknown_lane), an archived one (archived_lane), an isolated one (isolated_lane), a `session` that disagrees with it (request_target_ambiguous), or a terminal status (request_created_terminal). `requested_by` is never read from the body. Each routed request logs marker=board_request_routed",
+            "security": "a worker cannot create an unassigned card, and cannot place a new card on another worker's board except through `request_to`, which records who asked and answers back to them; anonymous/human control-plane callers retain administrative placement",
         },
         "capture_decomposition": {
             "cli": "amux board decompose <capture-id> --stdin",
@@ -4514,7 +4515,104 @@ pub async fn create_item(
     } else {
         actor_name.clone()
     };
-    let session = if map.contains_key("session") {
+    // AMUX-4653: `request_to` routes a card onto ANOTHER lane's board.
+    //
+    // The rule this relaxes ("workers may create board items only on their own
+    // board") was already false of the delegation path the fleet actually uses:
+    // `amux send` to a peer files a card on the RECIPIENT's board every time,
+    // via associate_capture_card + arm_peer_callback. So the refusal below
+    // described the create verb alone, and `amux board request` obeyed it by
+    // parking the card on the SENDER's board with the target only as reviewer.
+    // Dispatch selects by session and the reviewer nudge fires only on
+    // review/done, so the target never saw it: 88 such cards were sitting in
+    // senders' backlogs on 2026-09-15, ten of them mixpeek-finances'
+    // (MF-1160..1167, 1169, 1174), draining back into their own pickup as churn.
+    //
+    // This branch does what the capture path already does, with the attribution
+    // a capture cannot carry: type, desc, depends_on and due survive, because
+    // mint_capture_card titles a card from the prompt text and drops the rest.
+    //
+    // Narrow on purpose. `requested_by` is taken from the verified header and
+    // never from the body, the callback is armed to that same caller, the card
+    // may not be created terminal, and a plain cross-board create is still
+    // refused below. Nothing is typed into the target's pane: dispatch offers
+    // the card at their turn boundary like any other.
+    let request_to = body_str(&map, "request_to").map(|s| s.trim().to_string());
+    if map.contains_key("request_to") && request_to.as_deref().unwrap_or("").is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "request_to is empty", "code": "request_to_empty"}),
+        );
+    }
+    let request_to = request_to.filter(|s| !s.is_empty());
+    if let Some(target) = request_to.as_deref() {
+        if hdr_session.is_empty() {
+            return err(
+                StatusCode::BAD_REQUEST,
+                json!({
+                    "error": "a routed request requires a verified X-Amux-Worker requester",
+                    "code": "request_requires_verified_caller",
+                }),
+            );
+        }
+        if target == hdr_session {
+            return err(
+                StatusCode::BAD_REQUEST,
+                json!({
+                    "error": "request_to names your own lane; create the card without it",
+                    "code": "request_to_self",
+                }),
+            );
+        }
+        // An explicit `session` that disagrees is an ambiguity, and picking
+        // either one silently would put the card somewhere the caller did not
+        // ask for.
+        if body_str(&map, "session")
+            .map(|s| s.trim().to_string())
+            .is_some_and(|s| !s.is_empty() && s != target)
+        {
+            return err(
+                StatusCode::BAD_REQUEST,
+                json!({
+                    "error": "session and request_to disagree about whose board this is",
+                    "code": "request_target_ambiguous",
+                    "session": body_str(&map, "session"),
+                    "request_to": target,
+                }),
+            );
+        }
+        if let Some(why) = super::session_verbs::request_target_refusal(target) {
+            let status = match why {
+                "unknown_lane" => StatusCode::NOT_FOUND,
+                "isolated_lane" => StatusCode::FORBIDDEN,
+                "archived_lane" => StatusCode::CONFLICT,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            tracing::warn!(
+                target: "amux::board",
+                marker = "board_request_target_refused",
+                requester = %hdr_session,
+                target_lane = %target,
+                verdict = why,
+                measured = true,
+                "routed board request refused: the target cannot receive one"
+            );
+            return err(
+                status,
+                json!({
+                    "error": "that lane cannot receive a routed request",
+                    "code": why,
+                    "request_to": target,
+                    "how_to_fix": "name a registered, non-archived, non-isolated lane, \
+                                   or file the card on your own board and link the peer",
+                }),
+            );
+        }
+    }
+
+    let session = if let Some(target) = request_to.clone() {
+        target
+    } else if map.contains_key("session") {
         body_str(&map, "session").unwrap_or_default().trim().to_string()
     } else {
         hdr_session.chars().take(64).collect()
@@ -4524,7 +4622,7 @@ pub async fn create_item(
             return scoped_board_forbidden(&scope, if session.is_empty() { "unassigned card" } else { &session });
         }
     }
-    if !hdr_session.is_empty() && session != hdr_session {
+    if request_to.is_none() && !hdr_session.is_empty() && session != hdr_session {
         tracing::warn!(
             caller = %hdr_session,
             requested_owner = %(if session.is_empty() { "(unassigned)" } else { session.as_str() }),
@@ -4537,7 +4635,12 @@ pub async fn create_item(
                 "code": "cross_board_create_forbidden",
                 "caller": hdr_session,
                 "requested_owner": if session.is_empty() { Value::Null } else { json!(session) },
-                "how_to_fix": "create the card on your own board and link the peer with reviewer, shepherd, or depends_on",
+                // AMUX-4653: name the verb that DOES route work, or this
+                // refusal sends every lane back to the reviewer link whose
+                // cards the target never sees.
+                "how_to_fix": "to hand work over, POST request_to: \"<lane>\" (or `amux board request <lane> <title>`), \
+                               which files the card on their board with you as requester and a callback armed to you; \
+                               to keep the card, create it on your own board and link the peer with reviewer, shepherd, or depends_on",
             }),
         );
     }
@@ -4748,10 +4851,31 @@ pub async fn create_item(
         );
     }
 
+    // AMUX-4653: a routed request ALWAYS returns to its requester, whether or
+    // not the caller thought to ask for a callback. The whole point of routing
+    // work to another board is that the requester learns how it ended, and a
+    // request created terminal would have nothing to report.
+    let (requested_by, callback_session, callback_prompt) = match request_to.as_ref() {
+        None => (None, callback_session, callback_prompt),
+        Some(_) => {
+            if bs::is_terminal_status(&status_raw) {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    json!({
+                        "error": "a routed request cannot be created in a terminal status",
+                        "code": "request_created_terminal",
+                        "status": status_raw,
+                    }),
+                );
+            }
+            (Some(hdr_session.clone()), Some(hdr_session.clone()), callback_prompt)
+        }
+    };
+
     let known_keys = [
         "title", "desc", "status", "session", "type", "depends_on", "tags", "creator",
         "reviewer", "shepherd", "gate", "owner_type", "due", "due_time", "callback",
-        "ask_actor", "ask_type", "ask_question", "ask_unblocks",
+        "ask_actor", "ask_type", "ask_question", "ask_unblocks", "request_to",
     ];
     let ignored: Vec<String> = map
         .keys()
@@ -4847,7 +4971,7 @@ pub async fn create_item(
         // AF-367: the HTTP create path — a real POST /api/board from a lane or
         // a human, as opposed to a card a daemon filed.
         source: Some("agent".into()),
-        requested_by: None,
+        requested_by,
         callback_session,
         callback_prompt,
     };
@@ -4866,6 +4990,15 @@ pub async fn create_item(
     let write = state
         .store
         .write_async(move |conn| {
+            // AMUX-4653: a routed request never reaches here. `plan_create`
+            // counts `request_to` as structured, so the semantic comparison is
+            // skipped and the request keeps its own record. The first cut of
+            // this change instead ARMED a folded request's callback here, and a
+            // mutation that deleted that block left the suite green: the fold
+            // needs a model client, which no test has, so the cell was asserting
+            // about the create path while claiming to cover the fold. Making the
+            // path unreachable is the better answer anyway, for the reason
+            // board_intake now carries.
             if let Some(row) = super::board_intake::apply(conn, &intake, &new.title, &new.desc, now_secs())? {
                 let event = ev_snap(&row, MutationKind::Updated);
                 return finish(&slot_w, Out::Created(Box::new(row), true), WriteOutcome {applied:true,events:vec![event]});
@@ -4995,6 +5128,25 @@ pub async fn create_item(
                 owner_session = %row.session.as_deref().unwrap_or("(none)"),
                 "board card created"
             );
+            // AMUX-4653: a ROUTED request gets its own verdict line, because
+            // "board card created" cannot say that this one crossed a board
+            // boundary, and a relaxation of the cross-board rule that leaves no
+            // trace is the audit trail ethos rule 6 warns about. `grep
+            // board_request_routed` is the index for who routed what to whom.
+            if request_to.is_some() {
+                tracing::info!(
+                    target: "amux::board",
+                    marker = "board_request_routed",
+                    card = %row.id,
+                    requester = %row.requested_by.as_deref().unwrap_or("(none)"),
+                    target_lane = %row.session.as_deref().unwrap_or("(none)"),
+                    callback = %row.callback_state.as_deref().unwrap_or("(none)"),
+                    folded = reused,
+                    status = %row.status,
+                    measured = true,
+                    "board request filed on the target lane's board"
+                );
+            }
             (if reused {StatusCode::OK} else {StatusCode::CREATED}, Json(v)).into_response()
         }
     }

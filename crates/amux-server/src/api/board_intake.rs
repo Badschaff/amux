@@ -89,8 +89,16 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Plan>,
 {
+    // `request_to` belongs on this list for the reason the whole list exists,
+    // and for one more (AMUX-4653). A routed request names a SPECIFIC lane and
+    // a specific ask, and it always arms a callback, so folding it would append
+    // one lane's delegation into whatever other card happened to be open on the
+    // target's board and answer the requester about that card instead. That is
+    // AF-616's auto-fold hazard with a requester attached: there, a capture was
+    // folded into an unrelated finding carded in the same minute, and the trail
+    // from the report to its fix ran through a card about something else.
     let structured = ["depends_on", "gate", "callback", "due", "due_time", "reviewer", "shepherd",
-        "ask_actor", "ask_type", "ask_question", "ask_unblocks", "tags"].iter()
+        "ask_actor", "ask_type", "ask_question", "ask_unblocks", "tags", "request_to"].iter()
         .any(|key| map.get(*key).is_some_and(|v| !v.is_null() && v != "" && v != &serde_json::json!([])))
         || matches!(item_type, "epic" | "watch" | "tripwire");
     if structured {

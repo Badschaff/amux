@@ -4613,18 +4613,24 @@ fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String
         // how_to_fix from that refusal, so the instruction and the refusal
         // cannot drift apart: keep the card, link the peer.
         //
-        // Deliberately NOT naming `board request` or a direct message: on the
-        // same day, `request` was measured filing on the SENDER's board
-        // (AMUX-4653) and a direct ASK was captured and triaged away as junk
-        // (AMUX-4677). Three handover paths, none of which dispatch. Promising
-        // a fourth before AMUX-4653 settles where a delegated card lives would
-        // repeat exactly this bug.
+        // `board request` IS named now, and the paragraph above is why it took
+        // until it was true. On 2026-09-15 all three handover paths were
+        // measured broken: `request` filed on the SENDER's board (AMUX-4653), a
+        // direct ASK was captured and triaged away as junk (AMUX-4677), and
+        // `assign` is refused outright. 4677 fixed the capture side and 4653
+        // moved the request onto the TARGET's board with a callback armed back,
+        // so this nudge can promise a handover that dispatches. It still cannot
+        // promise that THIS card moves, because it does not: request files a new
+        // card on their board, and the distinction is the sentence below.
         "{PICKUP_ANCHOR}{} — work it now. Card text below is historical, \
-         not a live message. If this card's WORK belongs to another lane, the card STAYS ON \
-         YOUR BOARD — a worker cannot move one to another lane, and \
-         `amux board assign` to a lane that is not yours is refused. Link them instead: \
-         `amux board reviewer <ID> <lane>`, `amux board shepherd <ID> <lane>`, or a \
-         `depends_on` edge, and say on the card what you need from them. \
+         not a live message. If this card's WORK belongs to another lane, THIS card still \
+         stays on your board: a worker cannot move one to another lane, and \
+         `amux board assign` to a lane that is not yours is refused. Two exits that work. \
+         Hand the work over as its own card with `amux board request <lane> <title>`, which \
+         files it on THEIR board with you as requester and returns to you when they finish \
+         it. Or keep this one and link them: `amux board reviewer <ID> <lane>`, \
+         `amux board shepherd <ID> <lane>`, or a `depends_on` edge, and say on the card what \
+         you need from them. \
          Needs You must satisfy the scoped approval policy below. \
          Do NOT move it to review to park it: the review gate asks \
          you to attest work you have not done, and will refuse.{}\n{}{}",

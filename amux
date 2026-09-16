@@ -2456,11 +2456,16 @@ _board_request_usage() {
 Usage: amux board request <worker> <title>
        amux board request <worker> --stdin | --file <path>
 
-Creates a backlog card on the verified requester's own board and links the named
-worker as its reviewer. Workers cannot place new cards directly on another
-worker's board; use reviewer/shepherd and depends_on links for peer coordination.
-The requester is notified back on THIS card's own resolution — that path is
-separate from anything a --depends-on link does (see below).
+Files the card on the NAMED WORKER'S board, as a todo their dispatch offers them
+at their next turn boundary, with you recorded as its requester and a callback
+armed back to you. You are notified when THAT card reaches a terminal status.
+That path is separate from anything a --depends-on link does (see below).
+
+Until AMUX-4653 this created a backlog card on your OWN board with the worker as
+reviewer, and dispatch selects by session, so the named worker was never offered
+it: 88 such cards were sitting in senders' backlogs on 2026-09-15. A plain
+cross-board create is still refused; this verb is the sanctioned way to hand work
+over. Use reviewer/shepherd and depends_on when the card stays yours.
 
 Optional:
   --desc <text> | --desc-stdin | --desc-file <path>
@@ -3530,7 +3535,7 @@ else:
       local _deps_joined="" body result
       [[ ${#deps[@]} -gt 0 ]] && _deps_joined=$(printf '%s\n' "${deps[@]}")
       body=$(T="$title" R="$target" D="$desc" TY="$itype" DEP="$_deps_joined" DUE="$due" python3 -c 'import json,os
-b={"title":os.environ["T"].strip(),"status":"backlog","reviewer":os.environ["R"].strip()}
+b={"title":os.environ["T"].strip(),"request_to":os.environ["R"].strip()}
 for env,key in (("D","desc"),("TY","type"),("DUE","due")):
     v=os.environ.get(env,"").strip()
     if v: b[key]=v
@@ -4176,7 +4181,7 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
   amux board ls [--all]            List open issues (--all includes archived)
   amux board show <ID>             Print one card in full (title, desc, gate, history)
   amux board add <title>           Create a new todo issue
-  amux board request <worker> <title>  Own-board card with peer reviewer link
+  amux board request <worker> <title>  File a card on THEIR board, callback to you
   amux board callback <ID>        Arm/clear a terminal callback on any task
     --type T                       set the type at create time (the GATE is derived from it)
     --desc/--desc-stdin/--desc-file  give the card a body in the same write
@@ -4846,7 +4851,7 @@ ${BOLD}CRM:${RESET}
 ${BOLD}Board:${RESET}
   amux board ls                  List all board issues
   amux board add <title>         Create a new issue (--type/--desc*; see \`amux board\`)
-  amux board request <worker> <title>  Own-board card with peer reviewer link
+  amux board request <worker> <title>  File a card on THEIR board, callback to you
   amux board callback <ID>      Arm/clear a terminal callback on any task
   amux board done <ID>           Mark issue as done
   amux board doing <ID>          Mark issue as in progress

@@ -503,6 +503,11 @@ jobs:
       # needs:you tag, because the server refuses that tag before the status.
       - name: CLI board needsyou moves before it tags
         run: ./scripts/test-board-needsyou-order.sh
+      # AMUX-4653: board request posts request_to, so the card lands on the
+      # TARGET's board. Its own step because the server half passes on its own
+      # while a CLI still sending `reviewer` leaves the feature dead.
+      - name: CLI board request routes to the target
+        run: ./scripts/test-board-request-routes-to-target.sh
       # AMUX-3891. The CLI is symlinked straight into the working tree and ~50
       # lanes invoke it while it is being edited, so it MUST be parseable in one
       # read: bash holds a byte offset, and a rewrite mid-invocation resumes it

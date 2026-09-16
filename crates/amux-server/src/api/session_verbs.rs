@@ -11175,7 +11175,9 @@ const FLEET_ROSTER_HEADER: &str = "\n## Fleet — who else is running (auto-gene
      $AMUX_SESSION.\n\n\
      Reach any of them with `amux send <name> --stdin` (origin-stamped), or make \
      durable delegated work with `amux board request <name> <title>`. \
-     The latter keeps the request, gates, assets and terminal return on one card.\n\n\
+     The latter files the card on THEIR board as a todo their dispatch offers them, \
+     with you as its requester and a callback back to you when it reaches a terminal \
+     status, and keeps the gates, assets and that return on one card (AMUX-4653).\n\n\
      | worker | groups | description | provider / model | workspace / branch |\n|---|---|---|---|---|\n";
 
 /// The fleet roster every worker gets, regenerated on each write.
@@ -16322,6 +16324,38 @@ pub(crate) fn env_flag_on(v: Option<&str>) -> bool {
 /// exemptions as much as to features.
 pub(crate) fn session_is_isolated(name: &str) -> bool {
     env_flag_on(parse_env(name).get("CC_ISOLATED"))
+}
+
+/// Why a lane cannot receive a ROUTED board request, or `None` when it can
+/// (AMUX-4653).
+///
+/// The name is checked before anything builds a path from it, which is the
+/// ordering `a_stored_display_name_cannot_escape_the_sessions_dir` pins for the
+/// send route and the same hazard here: these paths are built by concatenating
+/// the name into `sessions/`.
+///
+/// A PAUSED lane is a legitimate target and an ARCHIVED one is not. A pause
+/// ends, and paused lanes already hold cards (AMUX-4663 is four of them), so a
+/// request that waits for a resume is doing its job. That is why this does not
+/// reuse `all_lane_names`, which drops paused and archived together.
+///
+/// An isolated lane is refused because isolation is the explicit opt-out from
+/// peer interaction, and a card landing on its board is peer interaction that
+/// also arms a callback back out.
+pub(crate) fn request_target_refusal(name: &str) -> Option<&'static str> {
+    if !valid_session_name(name) {
+        return Some("invalid_lane_name");
+    }
+    if !env_path(name).exists() {
+        return Some("unknown_lane");
+    }
+    if parse_env(name).get("CC_ARCHIVED") == Some("1") {
+        return Some("archived_lane");
+    }
+    if session_is_isolated(name) {
+        return Some("isolated_lane");
+    }
+    None
 }
 
 /// The lifecycle label for a tmux lane: archived beats paused beats active.
