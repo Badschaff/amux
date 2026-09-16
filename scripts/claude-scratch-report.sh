@@ -118,7 +118,10 @@ for cdir in "$ROOT"/*/*/; do
 
   tx="$PROJ/$proj/$conv.jsonl"
   if [ -f "$tx" ]; then
-    mt=$(stat -f %m "$tx" 2>/dev/null || echo 0)
+    # GNU `stat -c %Y` and BSD `stat -f %m`. Without the GNU arm every
+    # transcript reads as mtime 0 on Linux, which would silently classify the
+    # whole fleet as DEAD: the wrong answer in the dangerous direction.
+    mt=$(stat -c %Y "$tx" 2>/dev/null || stat -f %m "$tx" 2>/dev/null || echo 0)
     age=$(awk -v n="$now" -v m="$mt" 'BEGIN{d=(n-m)/86400; printf "%.1f", (d<0?0:d)}')
     if awk -v a="$age" -v d="$DEAD_DAYS" 'BEGIN{exit !(a>=d)}'; then cls=DEAD; else cls=LIVE; fi
     agestr="${age}d"

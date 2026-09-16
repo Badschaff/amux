@@ -22,7 +22,10 @@ cell() { # name expected actual
   else echo "FAIL $1: expected '$2' got '$3'"; FAIL=$((FAIL+1)); fi
 }
 
-T=$(mktemp -d -t csr)
+# `mktemp -d -t csr` is BSD. GNU reads -t's argument as a TEMPLATE and rejects
+# it with "too few X's in template", which is how this passed on the macOS dev
+# box and failed on the Linux runner. An explicit template works on both.
+T=$(mktemp -d "${TMPDIR:-/tmp}/csr.XXXXXX")
 trap 'rm -rf "$T"' EXIT
 ROOT="$T/scratch"; PROJS="$T/projects"; SESS="$T/sessions"
 mkdir -p "$ROOT" "$PROJS" "$SESS"
@@ -36,11 +39,17 @@ mkdir -p "$PROJS/$P"
 mk() { # conv  transcript_age_days|none  size_mb
   local c=$1 age=$2 mb=$3
   mkdir -p "$ROOT/$P/$c"
-  mkfile() { dd if=/dev/zero of="$ROOT/$P/$c/blob" bs=1m count="$mb" 2>/dev/null; }
+  # bs in BYTES, not `1m`. BSD dd accepts a lowercase m suffix and GNU dd does
+  # not (its suffixes are case-sensitive, M=1048576), so `bs=1m` is a third way
+  # this harness would have passed here and failed on the runner.
+  mkfile() { dd if=/dev/zero of="$ROOT/$P/$c/blob" bs=1048576 count="$mb" 2>/dev/null; }
   mkfile
   if [ "$age" != none ]; then
     printf '{"sessionId":"%s"}\n' "$c" > "$PROJS/$P/$c.jsonl"
-    touch -t "$(date -v-"${age}"d +%Y%m%d%H%M)" "$PROJS/$P/$c.jsonl"
+    # BSD `date -v-Nd` and GNU `date -d "-N days"` are both needed: this runs
+    # on the macOS dev box and on the Linux runner.
+    stamp=$(date -v-"${age}"d +%Y%m%d%H%M 2>/dev/null || date -d "-${age} days" +%Y%m%d%H%M)
+    touch -t "$stamp" "$PROJS/$P/$c.jsonl"
   fi
 }
 
