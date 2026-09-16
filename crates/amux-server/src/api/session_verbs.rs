@@ -3828,6 +3828,73 @@ fn default_model_for_provider(provider: &str) -> String {
     }
 }
 
+/// WHICH ENV KEY a provider's model lives in. One decision, so a reader and a
+/// writer cannot pick different keys for the same fact.
+///
+/// Agent CLIs (claude/codex/gemini) take `--model X` on their command line, so
+/// the model rides in CC_FLAGS. Ollama launches as
+/// `codex --oss --local-provider ollama --model <CC_MODEL>` and never appends
+/// CC_FLAGS at all, so its model lives in CC_MODEL and a `--model` sitting in
+/// CC_FLAGS is inert — the ollama launch arm WARNs about exactly that shape.
+///
+/// `worker_model_env` (sessions_legacy.rs, AMUX-3182) already encodes this
+/// convention for the CREATE path and has a positive-control test for it. This
+/// is the same fact, reachable from the paths that EDIT an existing worker.
+fn model_lives_in_cc_model(provider: &str) -> bool {
+    provider == "ollama"
+}
+
+/// The model a worker is configured for, read from wherever its provider keeps
+/// it, falling back to the provider default.
+///
+/// THE VIEW AND THE LAUNCH MUST BOTH CALL THIS (ethos rule 1: a view shares the
+/// predicate of the mechanism it describes). They did not, and for ollama they
+/// disagreed in the silent direction: `configured_model` came from
+/// `extract_model_from_flags(CC_FLAGS)` while the launch read CC_MODEL, so a
+/// worker created the correct way — CC_MODEL set, no `--model` in CC_FLAGS —
+/// ran its chosen model and reported the provider DEFAULT on its own row, with
+/// nothing erroring (AMUX-4607).
+fn configured_model_for(provider: &str, cfg: &EnvFile) -> String {
+    let raw = if model_lives_in_cc_model(provider) {
+        cfg.get_or("CC_MODEL", "").trim().to_string()
+    } else {
+        extract_model_from_flags(cfg.get_or("CC_FLAGS", ""))
+    };
+    if raw.is_empty() { default_model_for_provider(provider) } else { raw }
+}
+
+/// Route `model` into the env key `provider` actually launches from, clearing
+/// the other one, and return the CC_FLAGS value to store.
+///
+/// `flags_no_model` must already have any `--model` stripped; everything else
+/// in it (effort, yolo, caller flags) is preserved verbatim.
+///
+/// The CLEAR is half the job, not tidying. A worker swapped ollama -> claude
+/// that kept its CC_MODEL would render as `claude / qwen3-coder:30b` in the
+/// fleet table, which reads CC_MODEL with no provider test; and a worker
+/// swapped INTO ollama that kept `--model` in CC_FLAGS would hit the inert-flag
+/// WARN on every launch. One key set, one key cleared, decided in one place.
+fn route_model_to_env(cfg: &mut EnvFile, provider: &str, model: &str, flags_no_model: &str) -> String {
+    if model_lives_in_cc_model(provider) {
+        cfg.set("CC_MODEL", model);
+        return flags_no_model.to_string();
+    }
+    // Guarded, because `EnvFile::write` REPLAYS dirty keys onto a freshly
+    // re-read file: an unconditional remove would record a deletion for a key
+    // this session never had, and replay it over a value a concurrent writer
+    // had set in between.
+    if cfg.get("CC_MODEL").is_some() {
+        cfg.remove("CC_MODEL");
+    }
+    if model.is_empty() {
+        flags_no_model.to_string()
+    } else if flags_no_model.is_empty() {
+        format!("--model {model}")
+    } else {
+        format!("--model {model} {flags_no_model}")
+    }
+}
+
 /// The base binary the LAUNCH BUILDER invokes for a provider — the first token
 /// of the command the launch match below emits. This is the SINGLE SOURCE: the
 /// launch arms build their command from it, and the `provider.launch_matches_adapter`
@@ -8979,10 +9046,9 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
             // events) instead of a bare `ollama run` REPL. (RR-0043 / AMUX-3153)
             // Model comes from CC_MODEL (env_config.rs routes the worker's model
             // field there); falls back to the provider default (qwen3.8:27b).
-            let model = {
-                let m = cfg.get_or("CC_MODEL", "").trim().to_string();
-                if m.is_empty() { default_model_for_provider("ollama") } else { m }
-            };
+            // Read through the SHARED resolver so the worker's own row cannot
+            // report a different model than this launch uses (AMUX-4607).
+            let model = configured_model_for("ollama", &cfg);
             // An ollama worker's model belongs in CC_MODEL (read just above); a
             // `--model` in CC_FLAGS is inert here — this arm launches with
             // CC_MODEL and never appends CC_FLAGS, so that flag is silently
@@ -15426,10 +15492,7 @@ async fn get_dispatch(
             if !out.contains_key("creator") {
                 out.insert("creator".into(), json!(cfg.get_or("CC_CREATOR", "")));
             }
-            let configured = {
-                let m = extract_model_from_flags(flags);
-                if m.is_empty() { default_model_for_provider(&provider) } else { m }
-            };
+            let configured = configured_model_for(&provider, &cfg);
             out.insert("name".into(), json!(name));
             out.insert("dir".into(), json!(cfg.get_or("CC_DIR", "")));
             out.insert("provider".into(), json!(provider));
@@ -20913,9 +20976,13 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
         };
         let provider_val = pv.trim().to_lowercase();
         if !SESSION_PROVIDERS.contains(&provider_val.as_str()) {
+            // Listed FROM the constant being tested. The literal that used to
+            // sit here named three providers while the check accepted five, so
+            // a caller refused for a typo was told `ollama` was not a provider
+            // — a refusal cannot advertise a different set than it enforces.
             return jresp(
                 StatusCode::BAD_REQUEST,
-                json!({"error": "provider must be 'claude', 'codex', or 'gemini'"}),
+                json!({"error": format!("provider must be one of: {}", SESSION_PROVIDERS.join(", "))}),
             );
         }
         let old_provider = provider_of(&cfg);
@@ -20932,11 +20999,11 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
         let was_yolo = is_yolo_enabled(&current_flags, &cfg);
         let flags_no_yolo = strip_provider_yolo_flags(&flags_no_model);
         let default_model = default_model_for_provider(&provider_val);
-        let mut flags = if flags_no_yolo.is_empty() {
-            format!("--model {default_model}")
-        } else {
-            format!("--model {default_model} {flags_no_yolo}")
-        };
+        // Route the new provider's default to the key that provider LAUNCHES
+        // from. Writing `--model` into CC_FLAGS unconditionally is what made a
+        // swap to ollama inert: that arm reads CC_MODEL, so the worker came up
+        // on the ollama default no matter what this wrote (AMUX-4607).
+        let mut flags = route_model_to_env(&mut cfg, &provider_val, &default_model, &flags_no_yolo);
         if was_yolo {
             flags = format!("{flags} {}", provider_yolo_flag(&provider_val)).trim().to_string();
             cfg.set("CC_AUTO_CONTINUE", "1");
@@ -20971,13 +21038,15 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
             }
         };
         let old_effort = flag_value(cfg.get_or("CC_FLAGS", ""), "--effort");
-        let mut flags = if model_val.is_empty() {
-            flags_no_model
-        } else if flags_no_model.is_empty() {
-            format!("--model {model_val}")
-        } else {
-            format!("--model {model_val} {flags_no_model}")
-        };
+        // Resolved BEFORE the write, because where the model goes depends on
+        // it. This branch never changes CC_PROVIDER, so reading it here is the
+        // same answer the post-write read used to give.
+        let current_provider = provider_of(&cfg);
+        // Give an EXISTING session an ollama model. Pre-fix this always built
+        // `--model X` into CC_FLAGS, which the ollama launch arm ignores, so
+        // the PATCH reported success and the worker relaunched on the same
+        // model it was already running (AMUX-4607).
+        let mut flags = route_model_to_env(&mut cfg, &current_provider, &model_val, &flags_no_model);
         // The slash commands this change needs the LIVE agent to run, in
         // delivery order. `expressible` goes false the moment any part of the
         // change is a reset-to-default, which has no argument form.
@@ -21011,7 +21080,6 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
             }
         }
         cfg.set("CC_FLAGS", &flags);
-        let current_provider = provider_of(&cfg);
         let was_running = running;
         // Python also clears its in-memory credit-limit flag here (AF-14) —
         // process state this origin does not hold.
@@ -27056,6 +27124,105 @@ CLAUDE-POSTFIX-COMPLETE
         assert_eq!(body["history"], "");
         assert_eq!(body["history_lines"], 0);
         assert!(body["live"].is_string());
+    }
+
+    /// AMUX-4607: the model must be written to, and read from, the key its
+    /// provider actually launches with — and only that key.
+    ///
+    /// Every cell here hits the SHIPPED route, then reads the env file the
+    /// launch arm would read. Asserting on `route_model_to_env` directly would
+    /// pass whether or not `config_patch` calls it.
+    #[tokio::test]
+    async fn model_is_routed_to_the_key_the_provider_launches_from() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        // The shape the CREATE path produces for ollama (worker_model_env):
+        // model in CC_MODEL, and no `--model` in CC_FLAGS.
+        std::fs::write(
+            home.path().join("sessions/olla.env"),
+            "CC_DIR=\"/tmp\"\nCC_PROVIDER=\"ollama\"\nCC_MODEL=\"qwen3-coder:30b-65k\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join("sessions/clod.env"),
+            "CC_DIR=\"/tmp\"\nCC_FLAGS=\"--model sonnet\"\n",
+        )
+        .unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (state, _dir) = state();
+        let app: Router = routes().with_state(state);
+        let envf = |n: &str| std::fs::read_to_string(home.path().join(format!("sessions/{n}.env"))).unwrap();
+
+        // THE VIEW. Pre-fix `configured_model` came from CC_FLAGS, which is
+        // empty here, so the row reported the ollama DEFAULT while the launch
+        // arm ran the model below. Nothing errored; the row was just wrong.
+        let (st, v) = call(&app, "GET", "/api/sessions/olla/meta", None).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["configured_model"], json!("qwen3-coder:30b-65k"), "view must read CC_MODEL for ollama");
+        assert_ne!(
+            v["configured_model"],
+            json!(crate::provider::static_providers::ollama_default_model()),
+            "reporting the provider default IS the pre-fix bug — this cell is vacuous if they coincide"
+        );
+
+        // THE WRITE. This is the card's headline: a model PATCH on an ollama
+        // session used to build `--model X` into CC_FLAGS, which that launch
+        // arm never appends, so the PATCH returned ok and changed nothing the
+        // worker would run.
+        let (st, v) = call(&app, "PATCH", "/api/sessions/olla/config", Some(json!({"model": "qwen3:4b"}))).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let e = envf("olla");
+        assert!(e.contains("CC_MODEL=\"qwen3:4b\""), "ollama model belongs in CC_MODEL, got:\n{e}");
+        assert!(!e.contains("--model"), "a --model in CC_FLAGS is inert for ollama, got:\n{e}");
+        // The view now agrees with what the launch arm would use.
+        let (_, v) = call(&app, "GET", "/api/sessions/olla/meta", None).await;
+        assert_eq!(v["configured_model"], json!("qwen3:4b"));
+
+        // POSITIVE CONTROL: identical PATCH, claude session. The model rides in
+        // CC_FLAGS and CC_MODEL is never invented. Without this the cells above
+        // pass for a fix that routed EVERY provider to CC_MODEL.
+        let (st, v) = call(&app, "PATCH", "/api/sessions/clod/config", Some(json!({"model": "opus"}))).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let e = envf("clod");
+        assert!(e.contains("--model opus"), "agent CLIs take --model in CC_FLAGS, got:\n{e}");
+        assert!(!e.contains("CC_MODEL"), "a claude session has no CC_MODEL, got:\n{e}");
+
+        // SWAP IN: claude -> ollama moves the model across keys.
+        let (st, v) = call(&app, "PATCH", "/api/sessions/clod/config", Some(json!({"provider": "ollama"}))).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let e = envf("clod");
+        assert!(
+            e.contains(&format!("CC_MODEL=\"{}\"", crate::provider::static_providers::ollama_default_model())),
+            "swapping to ollama must seed CC_MODEL, got:\n{e}"
+        );
+        assert!(!e.contains("--model"), "swapping to ollama must not leave an inert --model, got:\n{e}");
+
+        // SWAP OUT: ollama -> claude CLEARS CC_MODEL. Left behind, it renders
+        // as `claude / qwen3-coder:30b` in the fleet table, which reads
+        // CC_MODEL with no provider test.
+        let (st, v) = call(&app, "PATCH", "/api/sessions/olla/config", Some(json!({"provider": "claude"}))).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let e = envf("olla");
+        assert!(!e.contains("CC_MODEL"), "swapping off ollama must clear CC_MODEL, got:\n{e}");
+        assert!(e.contains("--model"), "claude takes its model in CC_FLAGS, got:\n{e}");
+    }
+
+    /// The refusal must advertise the set it enforces, not a stale subset.
+    #[tokio::test]
+    async fn provider_refusal_names_every_accepted_provider() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        std::fs::write(home.path().join("sessions/probe.env"), "CC_DIR=\"/tmp\"\n").unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (state, _dir) = state();
+        let app: Router = routes().with_state(state);
+        let (st, v) =
+            call(&app, "PATCH", "/api/sessions/probe/config", Some(json!({"provider": "not-a-provider"}))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        let msg = v["error"].as_str().unwrap_or_default().to_string();
+        for p in SESSION_PROVIDERS {
+            assert!(msg.contains(p), "refusal omits accepted provider {p:?}: {msg}");
+        }
     }
 
     #[tokio::test]
