@@ -215,6 +215,31 @@ pub async fn plan(store: &Store, session: &str, owner: &str, title: &str, descri
     plan
 }
 
+/// The size past which a semantic append is refused and the request becomes its
+/// own card instead.
+///
+/// CHOSEN FROM THE BOARD, not from taste. Measured 2026-09-16 over all 21,524
+/// issues, banding every card by `length(desc)` and asking what share are still
+/// non-terminal, which is the closest available proxy for "nobody could finish
+/// this":
+///
+///   <5k      17946 cards   12.5% still live   <- baseline
+///   5-10k     2262          15.7%
+///   10-25k    1111          19.2%
+///   25-50k     166          33.1%             <- the knee
+///   50-100k     31          45.2%
+///   >=100k       8          75.0%
+///
+/// The share rises monotonically with size, 6x from baseline to the top band,
+/// so size does predict unfinishability rather than merely correlating with
+/// busy cards. The jump is between 10-25k and 25-50k, which is where this sits.
+///
+/// 25k refuses further growth on ~1% of the board (205 cards) rather than the
+/// ~6% a 10k ceiling would catch. It needs NO MIGRATION: the ceiling bounds the
+/// next append, so an already-oversized card simply starts splitting from here
+/// rather than being rewritten.
+pub const MAX_INTAKE_DESC_CHARS: usize = 25_000;
+
 /// Apply only to the exact candidate version the model saw. No blind overwrite,
 /// status change, cross-owner merge, or destruction of original task text.
 pub fn apply(conn: &rusqlite::Connection, plan: &Plan, title: &str, description: &str, now: i64) -> rusqlite::Result<Option<bs::IssueRow>> {
@@ -227,6 +252,24 @@ pub fn apply(conn: &rusqlite::Connection, plan: &Plan, title: &str, description:
     }
     let content = if description.trim().is_empty() { title.to_string() } else { format!("{title}\n\n{description}") };
     if !row.desc.contains(&content) {
+        // CEILING (AMUX-4722). Appending is designed and usually right, and
+        // nothing bounded the total, so a ledger card grew to 568,927 chars.
+        // The cost is not storage: a card that large stops being a unit of work
+        // anyone can honestly finish, so it gets handed out, looked at and put
+        // back. TUBES-2459 (359,637) is the worst live repeat-offer pair on the
+        // board, re-claimed 25 times from backlog.
+        //
+        // Refused rather than warned-and-appended: returning None drops into the
+        // caller's existing create path, so the request becomes its own card
+        // instead of growing this one. That path is already here, three lines
+        // up, for a candidate that changed under the model.
+        if row.desc.chars().count() + content.chars().count() > MAX_INTAKE_DESC_CHARS {
+            tracing::warn!(target:"amux::board_intake", card=id,
+                desc_chars = row.desc.chars().count(), add_chars = content.chars().count(),
+                ceiling = MAX_INTAKE_DESC_CHARS,
+                "semantic append refused: card is at the size where cards stop getting finished; creating a separate card (AMUX-4722)");
+            return Ok(None);
+        }
         row.desc.push_str(&format!("\n\n### {} request\n{}", if plan.decision.action == "update" {"Updated"} else {"Additional"}, content));
     }
     if plan.decision.action == "update" {
@@ -337,6 +380,51 @@ mod tests {
         assert!(plan.log_line().contains(" model_ms=21697 "), "{}", plan.log_line());
         let body = serde_json::to_value(&plan).unwrap();
         assert_eq!(body["model_ms"], serde_json::json!(21_697), "the create response carries it: {body}");
+    }
+
+    /// AMUX-4722. Appending is designed and usually right; nothing bounded the
+    /// total, and a ledger card reached 568,927 chars. A card that large stops
+    /// being a unit of work anyone can finish, so it gets handed out and put
+    /// back: the 359,637-char TUBES-2459 is the worst live repeat-offer pair on
+    /// the board, re-claimed 25 times from backlog.
+    #[test]
+    fn an_append_that_would_pass_the_ceiling_becomes_its_own_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("ceiling.db")).unwrap();
+        store.write(|conn| {
+            let mk = |desc: String| bs::NewIssue {
+                title:"Ledger".into(), desc, status:"backlog".into(),
+                session:Some("owner".into()), item_type:"chore".into(), creator:"test".into(), owner_type:"agent".into(),
+                due:None, due_time:None, reviewer:None, shepherd:None, gate:vec![],
+                depends_on:vec![], tags:vec![], ask_type:None, ask_question:None, ask_unblocks:None,
+                ask_actor:None, source:Some("test".into()), requested_by:None, callback_session:None, callback_prompt:None,
+            };
+            let plan_for = |row: &bs::IssueRow| {
+                let mut p = Plan::create("test", vec![Candidate{id:row.id.clone(), title:row.title.clone(), description:row.desc.clone(), rev:row.rev}], 1, true);
+                p.decision = Decision {action:"append".into(), task_id:Some(row.id.clone()), reason:"same work".into(), title:None, confidence:0.97};
+                p
+            };
+
+            // AT the ceiling: the append lands, so this is a ceiling rather than
+            // a ban on appending.
+            let small = bs::create_issue(conn, &mk("x".repeat(100)), 1)?;
+            let merged = apply(conn, &plan_for(&small), "more", "context", 2)?
+                .expect("an append well under the ceiling must still fold");
+            assert!(merged.desc.contains("context"));
+
+            // PAST it: refused, and the card is left exactly as it was. Returning
+            // None is what drops the caller into its create path, so the request
+            // becomes its own card rather than growing this one.
+            let big = bs::create_issue(conn, &mk("y".repeat(MAX_INTAKE_DESC_CHARS - 10)), 3)?;
+            let before = big.desc.clone();
+            let refused = apply(conn, &plan_for(&big), "a title that pushes it over", "and a body too", 4)?;
+            assert!(refused.is_none(), "an append past the ceiling must be refused, not truncated");
+            assert_eq!(
+                bs::get_issue(conn, &big.id)?.unwrap().desc, before,
+                "a refused append must leave the card untouched"
+            );
+            Ok(crate::db::WriteOutcome {applied:true, events:vec![]})
+        }).unwrap();
     }
 
     #[test]
