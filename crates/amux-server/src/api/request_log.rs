@@ -2180,7 +2180,8 @@ async fn analyze(
                         "you_sent": sent, "gate_required": gate, "count": n,
                     });
                     v["distinct_rejected_acks"] = json!(g.rejected_acks.len());
-                    if *n >= 5 && *n * 2 > g.count {
+                    let wedged = *n >= 5 && *n * 2 > g.count;
+                    if wedged {
                         let who = if sess.is_empty() { "(unattributed)" } else { sess.as_str() };
                         let reading = if sent == "null" {
                             "the caller is not acknowledging the gate at all"
@@ -2201,6 +2202,56 @@ async fn analyze(
                             g.method, target, n, g.count, who, attempted, reading, sent, gate,
                         ));
                     }
+                    // AMUX-4591: SAY THAT A GATE 409 IS BY DESIGN, on the GROUP
+                    // rather than in `verdicts`.
+                    //
+                    // `verdicts` means ANOMALY — the branch above names a caller
+                    // wedged in a loop, and the test one screen down asserts that
+                    // a diffuse group stays out of that list ("the control group
+                    // must be silent"). That is right and this does not change it.
+                    //
+                    // What was missing is that silence has two readings. Measured
+                    // 2026-09-16: the largest 409 group on this box is 205
+                    // refusals over 57 distinct (session, acknowledgement) pairs,
+                    // with no verdict, and a sweep reading the endpoint filed it
+                    // as 68 unexplained errors in an hour (AMUX-4591). The group
+                    // carried `distinct_rejected_acks` the whole time; nothing
+                    // said what the number MEANT.
+                    //
+                    // A gate 409 is the discovery step, not a failure: the move
+                    // is sent, the refusal names the card's resolved criteria,
+                    // the caller re-sends the ones that are true. It cannot be
+                    // removed by sending the acknowledgement up front, because
+                    // the acknowledgement is an attestation the caller has to
+                    // make.
+                    //
+                    // States the shape and names what would look different, so a
+                    // reader is not told to stop looking: a fleet-wide regression
+                    // is also diffuse.
+                    // `designed` MIRRORS THE DOMINANCE TEST, and the first
+                    // version of this did not — it said `true` for every gate
+                    // 409, so a wedged-caller group carried the verdict above
+                    // calling it a fault AND a field calling it by design, in
+                    // one payload. A reader believes whichever they read first.
+                    v["refusal_shape"] = json!({
+                        "designed": !wedged,
+                        "what": if wedged {
+                            "NOT the ordinary shape: one caller is carrying most of this group. \
+                             See the verdict for who and what they sent."
+                        } else {
+                            "a gate refusal: the board names the card's resolved criteria and \
+                             the caller re-sends with the ones that are true. The round trip IS \
+                             the mechanism — an acknowledgement is an attestation, so it cannot \
+                             be pre-filled by the CLI without bypassing the gate."
+                        },
+                        "distinct_callers": g.rejected_acks.len(),
+                        "per_caller": if g.rejected_acks.is_empty() { 0.0 }
+                                      else { (g.count as f64 / g.rejected_acks.len() as f64 * 10.0).round() / 10.0 },
+                        "what_would_be_a_fault": "one (session, acknowledgement) pair carrying most \
+                                 of the group, which gets its own verdict above; or this count \
+                                 climbing while distinct_callers stays flat, which is one caller \
+                                 re-wedging under different cards.",
+                    });
                 }
             }
             if g.status == 404 || g.status == 405 {
@@ -4323,6 +4374,33 @@ mod tests {
             .expect("the 409 board group");
         assert_eq!(grp["top_rejected_ack"]["session"], "mvs-infra", "{grp}");
         assert_eq!(grp["top_rejected_ack"]["count"], 8, "{grp}");
+
+        // AMUX-4591. SILENCE HAS TWO READINGS AND THE GROUP NOW SAYS WHICH.
+        //
+        // `verdicts` is the anomaly list and the assertion above keeps the
+        // diffuse group out of it, correctly. What that left is a group with a
+        // count, a client tally and nothing saying whether the count is a
+        // problem. Measured 2026-09-16: the largest 409 group on this box was
+        // 205 refusals over 57 distinct acknowledgements with no verdict, and a
+        // sweep reading this endpoint filed it as unexplained errors.
+        //
+        // The two groups in this fixture are the two readings, so one cell
+        // pins both and neither can pass by accident.
+        let diffuse = v["groups"].as_array().unwrap().iter()
+            .find(|g| g["target"] == "/api/schedules/{id}" && g["status"] == 409)
+            .expect("the diffuse 409 group");
+        assert_eq!(diffuse["refusal_shape"]["designed"], serde_json::json!(true),
+                   "six callers with six different acks is the gate working: {diffuse}");
+        assert_eq!(diffuse["refusal_shape"]["distinct_callers"], serde_json::json!(6), "{diffuse}");
+
+        // THE CONTROL, and the half the first version of this field got wrong.
+        // It set `designed: true` unconditionally, so the wedged group carried
+        // the verdict calling it a fault AND a field calling it by design. A
+        // payload that contradicts itself is worse than one that says nothing.
+        assert_eq!(grp["refusal_shape"]["designed"], serde_json::json!(false),
+                   "a caller wedged in a loop is NOT the designed shape: {grp}");
+        assert!(grp["refusal_shape"]["what"].as_str().unwrap_or_default().contains("NOT the ordinary shape"),
+                "and it must say so in words, not only in a bool: {grp}");
     }
 
     #[tokio::test]
