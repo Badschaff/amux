@@ -7088,6 +7088,30 @@ fn possible_codex_footer_chrome(raw: &str) -> bool {
         && !codex_model_footer_chrome(raw, &stripped)
 }
 
+/// A row of Muse Code's `/` command popup (`/clear   Clear terminal and start a fresh
+/// session`) or of its numbered picker (`1. Allow this stage once (y)`). Both are drawn
+/// under the prompt and above the divider, exactly where typed continuation lines
+/// would be, and neither is SGR-dim. Real multi-line input does not start with a
+/// slash-command followed by two or more spaces, nor with `N. ` — and a picker is a
+/// question for a human, which is `waiting`, never "unsubmitted text".
+fn muse_popup_row(t: &str) -> bool {
+    let help = t.starts_with('/')
+        && t[1..].split_whitespace().next().is_some_and(|w| !w.is_empty() && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        && t.contains("  ");
+    let more = t.starts_with('\u{2193}') && t.contains("more");
+    let picker = t.split_once(". ").is_some_and(|(n, rest)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) && !rest.is_empty());
+    help || more || picker
+}
+
+/// Muse's empty-composer hint, painted grey rather than dim: `❯ Start a message with !
+/// to run a shell command yourself`. Enter here submits nothing; there is nothing stuck.
+fn muse_prompt_hint(prompt_line: &str) -> bool {
+    prompt_line
+        .trim()
+        .trim_start_matches(['\u{276f}', ' ', '\u{a0}'])
+        .starts_with("Start a message with")
+}
+
 pub(crate) fn composer_state(raw_frame: &str) -> ComposerState {
     let clean = strip_ansi(raw_frame);
     // The manager view owns the keyboard: its own status bar says so. Positive
@@ -7138,11 +7162,27 @@ pub(crate) fn composer_state(raw_frame: &str) -> ComposerState {
     else {
         return ComposerState::NotVisible;
     };
+    // MUSE CODE draws Claude's `❯` glyph but different chrome around it, and paints
+    // that chrome in a grey COLOUR rather than SGR dim — so the dim mask, which is
+    // how Claude's placeholder is told from input, sees plain text. Two shapes
+    // measured on a live fleet (2026-09-16), each stamped "unsubmitted text" with
+    // the chrome as the preview: the `/` command popup (rows of `/name   description`
+    // under the prompt, previews like `/tasksshowsworkflows...`) and the empty-
+    // composer hint (`❯ Start a message with ! to run a shell command yourself`).
+    // The frame is identified by muse's own composer header, never by the model
+    // name, so a rename cannot take the check with it.
+    let is_muse = stripped[..idx].iter().any(|l| l.contains("Voice input ("));
+    if is_muse && muse_prompt_hint(&stripped[idx]) {
+        return ComposerState::Placeholder(
+            stripped[idx].trim().trim_start_matches(['\u{276f}', ' ', '\u{a0}']).split_whitespace().collect(),
+        );
+    }
     let mut block: Vec<&str> = vec![raw_lines[idx]];
     for (i, s) in stripped.iter().enumerate().skip(idx + 1) {
         let t = s.trim();
         if matches!(t.chars().next(), Some('\u{2500}') | Some('\u{23f5}'))
             || codex_model_footer_chrome(raw_lines[i], s)
+            || (is_muse && muse_popup_row(t))
         {
             break;
         }
@@ -31843,6 +31883,40 @@ mod composer_state_tests {
             Some("continuewiththequeue"),
             "a pre-stripped frame re-creates the blindness — callers MUST pass the raw capture"
         );
+    }
+
+
+    /// Muse Code 1.3.0, captured 2026-09-16 with `/` typed: the command popup draws
+    /// under the prompt in grey, not dim. The composer holds exactly `/`; the popup
+    /// rows are chrome. Before this, the preview read `/clearClearterminal...`.
+    const LIVE_MUSE_SLASH_POPUP: &str = "\u{1b}[2m\u{1b}[38;2;103;108;116m── \u{1b}[0m\u{1b}[38;2;138;144;152mVoice input (⌥ + v to start)\u{1b}[2m\u{1b}[38;2;103;108;116m ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n\u{1b}[0m\u{1b}[38;2;90;160;255m❯ \u{1b}[38;2;204;211;219m/\u{1b}[39m\n\u{1b}[38;2;103;108;116m  \u{1b}[1m\u{1b}[38;2;90;160;255m/clear\u{1b}[0m\u{1b}[38;2;103;108;116m                                       \u{1b}[38;2;138;144;152mClear terminal and start a fresh session\u{1b}[39m\n\u{1b}[38;2;103;108;116m  \u{1b}[38;2;204;211;219m/compact\u{1b}[38;2;103;108;116m                                     \u{1b}[38;2;138;144;152mSummarize the conversation to free up context\u{1b}[39m\n\u{1b}[38;2;103;108;116m  \u{1b}[38;2;204;211;219m/copy\u{1b}[38;2;103;108;116m                                        \u{1b}[38;2;138;144;152mCopy the last response to the clipboard\u{1b}[39m\n\u{1b}[38;2;103;108;116m  \u{1b}[38;2;204;211;219m/deep-research\u{1b}[38;2;103;108;116m                               \u{1b}[38;2;138;144;152mResearch a question across sources with cross-checking and citations\u{1b}[39m\n\u{1b}[38;2;103;108;116m  \u{1b}[38;2;204;211;219m/effort\u{1b}[38;2;103;108;116m                                      \u{1b}[38;2;138;144;152mSet the model's effort level\u{1b}[39m\n\u{1b}[38;2;103;108;116m  \u{1b}[38;2;204;211;219m/export\u{1b}[38;2;103;108;116m                                      \u{1b}[38;2;138;144;152mSave the conversation, or the full session log\u{1b}[39m\n\u{1b}[38;2;103;108;116m  \u{1b}[38;2;204;211;219m/feedback\u{1b}[38;2;103;108;116m                                    \u{1b}[38;2;138;144;152mSend quick feedback to the team\u{1b}[39m\n\u{1b}[38;2;103;108;116m  \u{1b}[2m↓ 38 more\u{1b}[0m\n\u{1b}[2m\u{1b}[38;2;103;108;116m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n\u{1b}[0m\u{1b}[38;2;103;108;116m  \u{1b}[38;2;90;160;255mmuse-spark-1.3-contributor\u{1b}[38;2;138;144;152m · \u{1b}[38;2;90;160;255mhigh\u{1b}[38;2;138;144;152m · ~/.claude/jobs/d9c47e72/tmp/muse-probe/ws\u{1b}[39m\n";
+
+    /// Same session after a turn: the empty-composer hint, grey not dim.
+    const LIVE_MUSE_PROMPT_HINT: &str = "\u{1b}[1m\u{1b}[38;2;204;211;219m◆ \u{1b}[0m\u{1b}[38;2;204;211;219mREADME.md\u{1b}[39m\n\u{1b}[2m\u{1b}[38;2;103;108;116m── \u{1b}[0m\u{1b}[38;2;138;144;152mVoice input (⌥ + v to start)\u{1b}[2m\u{1b}[38;2;103;108;116m ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n\u{1b}[0m\u{1b}[38;2;90;160;255m❯ \u{1b}[38;2;103;108;116mStart a message with ! to run a shell command yourself\u{1b}[39m\n\u{1b}[2m\u{1b}[38;2;103;108;116m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n\u{1b}[0m\u{1b}[38;2;103;108;116m  \u{1b}[38;2;90;160;255mmuse-spark-1.3-contributor\u{1b}[38;2;138;144;152m · \u{1b}[38;2;90;160;255mhigh\u{1b}[38;2;138;144;152m · ~/.claude/jobs/d9c47e72/tmp/muse-probe/ws\u{1b}[39m\n";
+
+    #[test]
+    fn a_muse_command_popup_is_chrome_not_typed_text() {
+        let state = composer_state(LIVE_MUSE_SLASH_POPUP);
+        assert_eq!(state.typed(), Some("/"), "only the slash the user typed is input: {state:?}");
+    }
+
+    #[test]
+    fn a_muse_prompt_hint_is_a_placeholder_not_stuck_text() {
+        let state = composer_state(LIVE_MUSE_PROMPT_HINT);
+        assert!(matches!(state, ComposerState::Placeholder(_)), "{state:?}");
+        assert_eq!(state.typed(), None);
+        // With real input in place of the hint, the same frame is pending input.
+        let typed = LIVE_MUSE_PROMPT_HINT.replace("Start a message with ! to run a shell command yourself", "ship it");
+        assert_eq!(composer_state(&typed).typed(), Some("shipit"));
+    }
+
+    /// RECONSTRUCTED from the sweep's own preview (`1.Allowthisstageonce(y)2.Abortt...`),
+    /// not a raw capture: the approval gate would not fire under a probe. Shape only —
+    /// numbered rows under the prompt inside muse's frame.
+    #[test]
+    fn a_muse_numbered_picker_is_not_typed_text() {
+        let frame = "── Voice input (⌥ + v to start) ──────\n\u{276f} \n  1. Allow this stage once (y)\n  2. Abort the stage\n──────────\n  muse-spark-1.3-contributor · high · ~/w\n";
+        assert_eq!(composer_state(frame).typed(), None, "a picker is a question, not stuck input");
     }
 
     #[test]
