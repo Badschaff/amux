@@ -11,6 +11,10 @@
 //! Its own process, so `AMUX_HOME` can point at a fixture fleet. The lanes this
 //! suite routes to are FILES under `sessions/`, because that is what the server
 //! reads to decide whether a lane exists, is archived, or is isolated.
+//!
+//! It covers BOTH surfaces that hand work to a peer, `request_to` and the review
+//! handoff (AMUX-4662), because they answer to the same reachability resolver and
+//! a second fixture fleet would be a second thing to keep in step.
 
 use amux_server::api::{router, AppState};
 use amux_server::db::Store;
@@ -68,6 +72,21 @@ async fn post_as(app: &axum::Router, worker: &str, body: Value) -> (StatusCode, 
     let req = Request::builder()
         .method("POST")
         .uri("/api/board")
+        .header("X-Amux-Worker", worker)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let status = res.status();
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, v)
+}
+
+async fn patch_as(app: &axum::Router, worker: &str, id: &str, body: Value) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("PATCH")
+        .uri(format!("/api/board/{id}"))
         .header("X-Amux-Worker", worker)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body.to_string()))
@@ -348,4 +367,69 @@ async fn a_routed_request_keeps_its_own_record_rather_than_folding() {
     // twice is answered twice rather than silently once.
     assert_eq!(again["requested_by"], json!("lane-a"), "{again}");
     assert_eq!(again["callback"]["state"], json!("armed"), "{again}");
+}
+
+/// A review handoff names a reviewer who cannot be told, ON THE CARD (AMUX-4662).
+///
+/// `reviewer_unreachable_reason` has answered this correctly since AMUX-3771 and
+/// the response says so in `reviewer_notify_reason`. A response field lives as
+/// long as the shell scrollback, and this defect's own scenario is discovering it
+/// DAYS later, when the card is the only thing left to read. Measured 2026-09-15:
+/// four real cards were handed to paused amux-testing over five hours, and their
+/// logs read `reviewer -> amux-testing` then `todo -> review` with no trace.
+///
+/// Reported, never refused: a reviewer link keeps the card on the author's own
+/// board, so it is not a placement the way `request_to` is.
+#[tokio::test]
+async fn a_review_handoff_records_a_reviewer_it_cannot_reach() {
+    let (app, _store, _dir) = app();
+    let gate = json!([
+        "Implemented and self-tested",
+        "Diff / PR is up",
+        "Ready for another set of eyes"
+    ]);
+
+    // UNREACHABLE: a paused lane receives nothing (AMUX-4566).
+    let (st, card) = post_as(&app, "lane-a", json!({"title": "hand to a paused reviewer"})).await;
+    assert_eq!(st, StatusCode::CREATED, "{card}");
+    let id = card["id"].as_str().expect("id").to_string();
+    let (st, v) = patch_as(
+        &app,
+        "lane-a",
+        &id,
+        json!({"status": "review", "reviewer": "lane-paused", "gate_checked": gate}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], json!("review"), "the move still happens: {v}");
+    assert_eq!(v["reviewer_notified"], json!(false), "{v}");
+
+    // THE HALF THAT SURVIVES THE TURN. Without this the only record of the
+    // refusal is a response field the author has already scrolled past.
+    let log = v["log"].as_str().unwrap_or_default().to_string();
+    assert!(
+        log.contains("REVIEWER NOT REACHED"),
+        "the card must carry it, not just the response: {log}"
+    );
+    assert!(log.contains("lane-paused"), "and name who: {log}");
+    assert!(log.contains("paused"), "and why: {log}");
+
+    // THE DISCRIMINATION. A reachable reviewer gets no such line, and without
+    // this cell the log entry could fire on every review and still look right.
+    let (st, card2) = post_as(&app, "lane-a", json!({"title": "hand to a live reviewer"})).await;
+    assert_eq!(st, StatusCode::CREATED, "{card2}");
+    let id2 = card2["id"].as_str().expect("id").to_string();
+    let (st, v2) = patch_as(
+        &app,
+        "lane-a",
+        &id2,
+        json!({"status": "review", "reviewer": "lane-b", "gate_checked": gate}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v2}");
+    let log2 = v2["log"].as_str().unwrap_or_default().to_string();
+    assert!(
+        !log2.contains("REVIEWER NOT REACHED"),
+        "lane-b is active and same-policy; nothing is unreachable: {log2}"
+    );
 }

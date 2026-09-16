@@ -134,6 +134,79 @@ case "$help_text" in
   *) PASS=$((PASS+1)) ;;
 esac
 
+# ---------------------------------------------------------------------------
+# AMUX-4662: a review handoff the reviewer cannot receive must SAY SO.
+#
+# The server has answered reviewer_notified false, with a full reason, since
+# AMUX-3771, and the CLI threw it away. Measured 2026-09-15 on a throwaway card
+# against paused amux-testing: the API named the refusal, `amux board review`
+# printed one line, "AMUX-4707 -> review". Four real cards went to that same
+# paused lane over five hours with nobody told.
+#
+# The recorder answers with the unreachable shape so this cell tests the CLI's
+# handling of it, which is the half no server test can see.
+# ---------------------------------------------------------------------------
+cat > "$TMP/recorder2.py" <<'PY2'
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class H(BaseHTTPRequestHandler):
+    def do_PATCH(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        self.rfile.read(n)
+        body = json.dumps({
+            "id": "LB-9", "status": "review", "reviewer": "lane-paused",
+            "reviewer_notified": False,
+            "reviewer_notify_reason": "the note is on the card, but reviewer 'lane-paused' could NOT be told: interaction refused: 'lane-paused' is paused.",
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+
+srv = HTTPServer(("127.0.0.1", 0), H)
+print(srv.server_address[1], flush=True)
+srv.serve_forever()
+PY2
+python3 "$TMP/recorder2.py" > "$TMP/port2" 2>"$TMP/rec2.err" &
+REC2_PID=$!
+# Drop it from the job table, or bash prints "Terminated" into the verdict output
+# when the kill below reaps it. Noise in a harness that prints a verdict is how a
+# real failure line gets scrolled past.
+disown %% 2>/dev/null || true
+PORT2=""
+for _ in $(seq 1 100); do
+  PORT2=$(head -1 "$TMP/port2" 2>/dev/null || true)
+  [ -n "$PORT2" ] && break
+  sleep 0.05
+done
+if [ -z "$PORT2" ]; then
+  echo "  FAIL  the review recorder never reported a port"
+  FAIL=$((FAIL+1))
+else
+  AMUX_API="http://127.0.0.1:$PORT2" AMUX_URL="http://127.0.0.1:$PORT2" HOME="$TMP" \
+    "$AMUX_BIN" board review LB-9 --reviewer lane-paused \
+      --checked "Implemented and self-tested" "Diff / PR is up" "Ready for another set of eyes" \
+      >"$TMP/rv.out" 2>"$TMP/rv.err" || true
+  kill "$REC2_PID" 2>/dev/null || true
+  if grep -q "REVIEWER WAS NOT TOLD" "$TMP/rv.err"; then PASS=$((PASS+1)); else
+    FAIL=$((FAIL+1)); echo "  FAIL  the CLI swallowed reviewer_notified=false"
+    echo "    stdout: $(head -2 "$TMP/rv.out" 2>/dev/null)"
+    echo "    stderr: $(head -2 "$TMP/rv.err" 2>/dev/null)"
+  fi
+  if grep -q "lane-paused" "$TMP/rv.err"; then PASS=$((PASS+1)); else
+    FAIL=$((FAIL+1)); echo "  FAIL  the warning does not name the reviewer"
+  fi
+  # THE MOVE SUCCEEDED, so the success line must still be on stdout and the
+  # warning must be on stderr. A caller parsing stdout must not see a failure.
+  if grep -q "LB-9" "$TMP/rv.out"; then PASS=$((PASS+1)); else
+    FAIL=$((FAIL+1)); echo "  FAIL  the transition line left stdout"
+  fi
+fi
+
 echo
 echo "  population: $((PASS + FAIL)) cells, $FAIL failing"
 if [ "$FAIL" -gt 0 ]; then

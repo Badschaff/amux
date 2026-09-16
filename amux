@@ -2617,6 +2617,32 @@ if ok:
                (dv.get("landed_in") or "?").upper(),
                dv.get("field") or "?",
                dv.get("why") or "no reason given"))
+    # A REVIEW HANDOFF THE REVIEWER CANNOT RECEIVE (AMUX-4662).
+    #
+    # The server has answered reviewer_notified false, with a full reason, since
+    # AMUX-3771, and this function threw it away. So the sanctioned command
+    # printed one line and the author learned days later that nobody was ever
+    # asked. Measured 2026-09-15 on a throwaway card against PAUSED
+    # amux-testing: the API named the refusal in reviewer_notify_reason, the CLI
+    # said only "AMUX-4707 -> review". Before that, four real cards were handed
+    # to that same paused lane over five hours with no word.
+    #
+    # NO APOSTROPHE OR SINGLE QUOTE IN THIS BLOCK, per the warning above: the
+    # whole function is a python3 -c argument delimited by single quotes.
+    #
+    # stderr and exit 0, deliberately. The transition DID happen and the card is
+    # in review; what did not happen is the notification. A nonzero exit here
+    # would tell every caller the move failed, which is a different and false
+    # claim, and would break scripts that check the status code of a move that
+    # worked.
+    if d.get("reviewer_notified") is False:
+        sys.stderr.write(
+            "warning: the card moved to review, but the REVIEWER WAS NOT TOLD. %s\n"
+            % (d.get("reviewer_notify_reason") or "no reason given"))
+        sys.stderr.write(
+            "  Nothing will reach them until that is resolved. Name a reachable "
+            "reviewer with `amux board reviewer %s <lane>`, or resume the lane.\n"
+            % (d.get("id") or "<ID>"))
     # A 200 does not mean the server applied everything you sent. Reported by
     # mixpeek-frustrations: `board backlog --trigger` stored source_ref but
     # silently dropped last_verified_at, so the card parked with a good trigger

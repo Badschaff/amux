@@ -11532,6 +11532,50 @@ pub async fn patch_item(
                             // the permissive case the invisible case.
                             next.log =
                                 Some(bs::append_log(next.log.as_deref(), &stamp, &authz_line));
+                            // A REVIEW HANDOFF NOBODY CAN RECEIVE, ON THE CARD
+                            // (AMUX-4662).
+                            //
+                            // `reviewer_unreachable_reason` has answered this
+                            // correctly since AMUX-3771, and the response says so
+                            // in `reviewer_notify_reason`. A response field lives
+                            // as long as the shell scrollback, and this card's own
+                            // scenario is discovering it DAYS later, when the card
+                            // is the only thing left to read. Measured
+                            // 2026-09-15: four cards handed to paused
+                            // amux-testing over five hours, and their logs say
+                            // `reviewer -> amux-testing` and `todo -> review`
+                            // with no trace of the refusal.
+                            //
+                            // Reported, never refused. A reviewer link keeps the
+                            // card on the author's own board, so it is not a
+                            // placement on the reviewer's board the way
+                            // `request_to` is, and the auto-pickup nudge points
+                            // every lane at `amux board reviewer <ID> <lane>` as
+                            // the exit that works. AMUX-4566 governs DELIVERY,
+                            // which is already refused; what was missing is that
+                            // the author is told.
+                            if target_raw == "review" {
+                                let reviewer =
+                                    next.reviewer.as_deref().unwrap_or("").trim().to_string();
+                                let owner =
+                                    next.session.as_deref().unwrap_or("").trim().to_string();
+                                if !reviewer.is_empty() {
+                                    if let Some(why) =
+                                        crate::api::session_verbs::reviewer_unreachable_reason(
+                                            &owner, &reviewer,
+                                        )
+                                    {
+                                        next.log = Some(bs::append_log(
+                                            next.log.as_deref(),
+                                            &stamp,
+                                            &format!(
+                                                "REVIEWER NOT REACHED: {reviewer} was named but \
+                                                 cannot be told. {why}"
+                                            ),
+                                        ));
+                                    }
+                                }
+                            }
                             // Gap 4: waiting_on side effects before status change.
                             crate::db::advance::apply_status_side_effects(&mut next, &target_raw);
                             next.status = target_raw.clone();
