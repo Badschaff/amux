@@ -438,6 +438,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0076_cmd_history_session_ts_index",
         sql: include_str!("../../migrations/0076_cmd_history_session_ts_index.sql"),
     },
+    Migration {
+        version: 77,
+        name: "0077_search_docs_prompt_seconds",
+        sql: include_str!("../../migrations/0077_search_docs_prompt_seconds.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.

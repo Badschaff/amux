@@ -572,7 +572,13 @@ pub const BACKFILL_SQL: &[(&str, &str)] = &[
                 substr(replace(text, char(10), ' '), 1, 80), text,
                 session, card_id, session, '#history/'||id,
                 json_object('session', session, 'origin', origin, 'card_id', card_id),
-                ts
+                -- ts/1000: cmd_history.ts is MILLISECONDS and every other
+                -- family here contributes seconds (AMUX-4548). Without the
+                -- divide this column holds two units at once, and 0056 put
+                -- 1,910 such rows in it. Must stay in step with the
+                -- `search_prompt_ai` trigger in migration 0077, or a reindex
+                -- and a live insert disagree about the same document.
+                ts/1000
          FROM cmd_history WHERE type = 'user'",
     ),
     (
@@ -643,6 +649,143 @@ async fn reindex(State(st): State<AppState>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 0077's REPAIR CLAUSE CONVERTS THE ROWS 0056 ALREADY WROTE, AND ONLY ONCE
+    /// (AMUX-4548).
+    ///
+    /// Written because the obvious coverage does not reach it. Every other cell
+    /// here runs against `test_memdb`, a fresh schema where no millisecond row
+    /// has ever existed, so deleting the repair entirely leaves them all green:
+    /// the clause is untestable from a fixture that has nothing to repair.
+    /// Measured, not assumed — mutating the UPDATE to `SELECT 1` passed 2 of 2
+    /// before this cell existed.
+    ///
+    /// So the fixture writes the damage first, straight into `search_docs` and
+    /// past the trigger, which is the shape the live database was actually in:
+    /// 1,910 millisecond rows among 21,465.
+    ///
+    /// The SQL comes from the migration file itself rather than a copy, so this
+    /// pins the bytes that ship.
+    #[test]
+    fn the_migration_repairs_already_written_millisecond_rows_and_is_idempotent() {
+        let conn = crate::db::migrate::test_memdb();
+        let ms: i64 = 1_789_559_556_000;
+        // Past the trigger deliberately: this is a row 0056 left behind, not
+        // one a fixed writer could produce.
+        conn.execute(
+            "INSERT INTO search_docs (doc_id, entity_type, entity_id, title, body, scope, \
+             task_id, worker_id, link, meta, updated_at) \
+             VALUES ('prompt:legacy', 'prompt', 'legacy', 't', 'b', 'amux', NULL, 'amux', \
+             '#history/legacy', '{}', ?1)",
+            [ms],
+        )
+        .expect("seed the damage");
+        // A seconds row of the same vintage, as the control: the repair must
+        // leave it alone, or it would divide the other six families too.
+        conn.execute(
+            "INSERT INTO search_docs (doc_id, entity_type, entity_id, title, body, scope, \
+             task_id, worker_id, link, meta, updated_at) \
+             VALUES ('task:control', 'task', 'control', 't', 'b', 'amux', 'control', NULL, \
+             '#board/control', '{}', ?1)",
+            [ms / 1000],
+        )
+        .unwrap();
+
+        let sql = include_str!("../../migrations/0077_search_docs_prompt_seconds.sql");
+        conn.execute_batch(sql).expect("0077 applies");
+        let after: i64 = conn
+            .query_row("SELECT updated_at FROM search_docs WHERE doc_id='prompt:legacy'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(after, ms / 1000, "the legacy millisecond row must be converted");
+
+        // IDEMPOTENT. The guard is on magnitude, so a second run must not
+        // divide again — a migration that re-runs on a repaired database would
+        // put these rows in 1970.
+        conn.execute_batch(sql).expect("0077 re-applies");
+        let twice: i64 = conn
+            .query_row("SELECT updated_at FROM search_docs WHERE doc_id='prompt:legacy'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(twice, after, "a second run must be a no-op, not a second division");
+
+        let control: i64 = conn
+            .query_row("SELECT updated_at FROM search_docs WHERE doc_id='task:control'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(control, ms / 1000, "a seconds row of another family must be untouched");
+    }
+
+    /// `search_docs.updated_at` HOLDS ONE UNIT, AND BOTH PROMPT WRITERS AGREE
+    /// (AMUX-4548).
+    ///
+    /// `cmd_history.ts` is milliseconds; every other source column feeding this
+    /// table is seconds. 0056 wired the prompt family straight through, so the
+    /// column held two units at once: measured on the live DB 2026-09-16, 1,910
+    /// of 21,465 rows were millisecond-shaped and `schema.timestamp_units_
+    /// declared` reported the column's MAX as 496,602,776 hours in the past.
+    ///
+    /// TWO WRITERS, ONE ASSERTION. The trigger is the live path and
+    /// `BACKFILL_SQL` is the reindex path, and nothing but a comment keeps them
+    /// in step. If they diverge, the same prompt has two different timestamps
+    /// depending on whether the index was rebuilt, which is worse than the
+    /// original bug and would show up as a puzzling inconsistency rather than
+    /// as an obviously wrong number. So this runs BOTH and requires them equal.
+    ///
+    /// Against the real migration chain, not a hand-made schema: the trigger
+    /// under test is created by a migration, and a fixture that builds its own
+    /// tables would not have it.
+    #[test]
+    fn a_prompt_is_indexed_in_seconds_by_the_trigger_and_by_the_backfill() {
+        let conn = crate::db::migrate::test_memdb();
+        let ms: i64 = 1_789_559_556_000;
+        let want: i64 = ms / 1000;
+        conn.execute(
+            "INSERT INTO cmd_history (id, text, type, session, ts, origin, card_id) \
+             VALUES (1, 'find the hubspot thread', 'user', 'amux', ?1, '', NULL)",
+            [ms],
+        )
+        .expect("insert a human prompt");
+
+        // 1. The TRIGGER path, which is what runs in production.
+        let via_trigger: i64 = conn
+            .query_row("SELECT updated_at FROM search_docs WHERE doc_id='prompt:1'", [], |r| r.get(0))
+            .expect("the trigger indexed it");
+        assert_eq!(
+            via_trigger, want,
+            "the trigger must store SECONDS; {via_trigger} is the raw millisecond value and puts \
+             this prompt tens of thousands of years from now"
+        );
+
+        // 2. The REINDEX path, over the same row.
+        conn.execute("DELETE FROM search_docs WHERE doc_id='prompt:1'", []).unwrap();
+        let sql = BACKFILL_SQL
+            .iter()
+            .find(|(etype, _)| *etype == "prompt")
+            .map(|(_, sql)| *sql)
+            .expect("the prompt family is in BACKFILL_SQL");
+        conn.execute(sql, []).expect("backfill runs");
+        let via_backfill: i64 = conn
+            .query_row("SELECT updated_at FROM search_docs WHERE doc_id='prompt:1'", [], |r| r.get(0))
+            .expect("the backfill indexed it");
+        assert_eq!(
+            via_backfill, via_trigger,
+            "a reindex and a live insert must agree about the same document"
+        );
+
+        // 3. The column-level property the invariant actually checks: nothing
+        //    in it is millisecond-shaped. Asserted over the whole table rather
+        //    than the one row, because the defect was one family among seven.
+        let ms_shaped: i64 = conn
+            .query_row("SELECT COUNT(*) FROM search_docs WHERE updated_at > 100000000000", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(ms_shaped, 0, "no row in search_docs.updated_at may be millisecond-shaped");
+    }
 
     /// AF-547. A `types=` value the index does not hold returns a clean 200 with
     /// zero hits, indistinguishable from "your query matched nothing". On the
