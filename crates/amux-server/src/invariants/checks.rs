@@ -2819,6 +2819,43 @@ pub struct DecompositionDetailRow {
     pub tags: Vec<String>,
     pub evidence: Option<String>,
     pub closed_at: Option<i64>,
+    /// When the card was created, against `ACCEPTANCE_REQUIRED_FROM`.
+    pub created: i64,
+    /// Registered artifacts (`amux board artifact <ID> <ref>`). A second,
+    /// SANCTIONED way to attach terminal evidence that this check used to be
+    /// blind to (AMUX-4538).
+    pub artifact_count: i64,
+}
+
+/// 366c1468 (2026-09-06 12:03) made acceptance criteria mandatory on decompose.
+///
+/// A row created before it was decomposed under a rule that did not exist, and a
+/// TERMINAL one cannot be brought into line without reopening closed work. This
+/// check would otherwise carry a permanent red no action can clear, which is
+/// ethos rule 3: a constraint with no truthful path forward.
+pub const ACCEPTANCE_REQUIRED_FROM: i64 = 1_788_710_637;
+
+/// The priority LEVEL a tag names, in either spelling the fleet actually uses.
+///
+/// Both are real and neither is a typo. Measured on the live board 2026-09-16:
+/// 131 bare (`p1` 67, `p0` 30, `p2` 29, `p3` 5) and 53 prefixed
+/// (`priority:P0` 34, `priority:P1` 9, `priority:P2` 8, `priority:P3` 2), so
+/// `priority:P0` is the second most common priority tag on the whole board. The
+/// check used to match the bare form exactly and case-sensitively, which
+/// reported 53 correctly-tagged cards as having no priority. That is the check
+/// being wrong about the world rather than the cards being wrong.
+///
+/// Returns the level so the caller counts DISTINCT levels: one card on this box
+/// carries both spellings, and counting tags would have read that as two
+/// priorities and failed it for the opposite reason.
+fn priority_level(tag: &str) -> Option<char> {
+    let t = tag.trim().to_ascii_lowercase();
+    let t = t.strip_prefix("priority:").unwrap_or(&t);
+    let mut cs = t.chars();
+    match (cs.next(), cs.next(), cs.next()) {
+        (Some('p'), Some(d @ ('0'..='3')), None) => Some(d),
+        _ => None,
+    }
 }
 
 fn concrete_sentence(text: &str) -> bool {
@@ -2858,6 +2895,7 @@ pub fn decomposed_tasks_have_comprehensive_details(
 ) -> Vec<InvariantResult> {
     const ID: &str = "board.decomposed_tasks_have_comprehensive_details";
     let mut incomplete = Vec::new();
+    let mut grandfathered = Vec::new();
     for row in rows {
         let mut gaps = Vec::new();
         if row.title.trim().is_empty() {
@@ -2893,16 +2931,22 @@ pub fn decomposed_tasks_have_comprehensive_details(
         if !plain_criteria_valid(row.acceptance_criteria.as_deref()) {
             gaps.push("acceptance_criteria");
         }
-        let priorities = row
-            .tags
-            .iter()
-            .filter(|tag| matches!(tag.as_str(), "p0" | "p1" | "p2" | "p3"))
-            .count();
-        if priorities != 1 {
+        let levels: std::collections::BTreeSet<char> =
+            row.tags.iter().filter_map(|tag| priority_level(tag)).collect();
+        if levels.len() != 1 {
             gaps.push("priority");
         }
         if matches!(row.status.as_str(), "done" | "verified") {
-            if row.evidence.as_deref().is_none_or(|v| v.trim().is_empty()) {
+            // EITHER sanctioned channel counts. The board takes terminal
+            // evidence two ways, the `evidence` field and
+            // `amux board artifact <ID> <ref>`, and the worker contract in
+            // CLAUDE.md INSTRUCTS every lane to use the second: "Register every
+            // file, URL, commit, PR, screenshot or test asset". Reading only the
+            // field reported cards as evidence-free that had done exactly what
+            // they were told. Measured: TUBES-2484 and TUBES-2493, each with an
+            // implementation artifact naming a path and a commit.
+            let no_field = row.evidence.as_deref().is_none_or(|v| v.trim().is_empty());
+            if no_field && row.artifact_count == 0 {
                 gaps.push("terminal_evidence");
             }
             if row.closed_at.is_none() {
@@ -2910,12 +2954,34 @@ pub fn decomposed_tasks_have_comprehensive_details(
             }
         }
         if !gaps.is_empty() {
-            incomplete.push(json!({
+            let entry = json!({
                 "id": row.id,
                 "status": row.status,
                 "session": row.session,
                 "gaps": gaps,
-            }));
+            });
+            // GRANDFATHERED, AND STILL COUNTED. A row created before
+            // 366c1468 AND already terminal cannot be brought into line: the
+            // rule did not exist when it was decomposed, and the work is
+            // closed. Failing forever on those is a red no action clears.
+            //
+            // A pre-rule row that is still LIVE is NOT exempt, which is the
+            // whole reason this is not a plain date cutoff: measured on the
+            // board 2026-09-16, 18 pre-rule rows are terminal and 6 are live,
+            // and a blanket date rule would have excused those 6 while they
+            // can still be fixed.
+            //
+            // They stay in the evidence under their own key, with the count and
+            // the cutoff, so the exemption is READ rather than inferred from an
+            // absence. An invariant that quietly shrinks its own population is
+            // the confident-zero shape this file exists to catch.
+            if row.created < ACCEPTANCE_REQUIRED_FROM
+                && crate::db::board_store::is_terminal_status(&row.status)
+            {
+                grandfathered.push(entry);
+            } else {
+                incomplete.push(entry);
+            }
         }
     }
     let evidence = json!({
@@ -2923,6 +2989,11 @@ pub fn decomposed_tasks_have_comprehensive_details(
         "incomplete": incomplete.len(),
         "sample": incomplete.iter().take(10).collect::<Vec<_>>(),
         "scope": "every live source=decomposition child, including terminal rows",
+        "grandfathered": grandfathered.len(),
+        "grandfathered_sample": grandfathered.iter().take(10).collect::<Vec<_>>(),
+        "grandfathered_rule": "created before 366c1468 (2026-09-06 12:03, which made acceptance \
+                               criteria mandatory on decompose) AND already terminal, so no action \
+                               can close the gap. A pre-rule row that is still live is NOT exempt.",
     });
     if incomplete.is_empty() {
         vec![InvariantResult::pass(ID).evidence(evidence)]
@@ -2962,7 +3033,129 @@ mod decomposition_detail_tests {
             tags: vec!["p0".into()],
             evidence: Some("crates/amux-server/tests/board_api.rs".into()),
             closed_at: Some(1),
+            // AFTER the rule, so the fixture is not silently grandfathered: a
+            // default of 0 would put every cell below on the exempt side and
+            // the gap assertions would pass by being skipped.
+            created: ACCEPTANCE_REQUIRED_FROM + 1,
+            artifact_count: 0,
         }
+    }
+
+    /// BOTH priority spellings count, because both are real (AMUX-4538).
+    ///
+    /// Measured on the live board 2026-09-16: 131 bare (`p1` 67, `p0` 30, `p2`
+    /// 29, `p3` 5) and 53 prefixed (`priority:P0` 34, `priority:P1` 9,
+    /// `priority:P2` 8, `priority:P3` 2). `priority:P0` is the second most
+    /// common priority tag on the whole board, so the check matching only the
+    /// bare lowercase form was reporting 53 correctly-tagged cards as having no
+    /// priority. The cards were right and the check was narrow.
+    #[test]
+    fn a_priority_tag_counts_in_either_spelling_the_fleet_uses() {
+        for tag in ["p1", "P1", "priority:P1", "priority:p1", " p1 "] {
+            let mut row = complete();
+            row.tags = vec![tag.into()];
+            let out = decomposed_tasks_have_comprehensive_details(&[row]);
+            assert_eq!(out[0].status, Status::Pass, "{tag:?} is a priority and must count");
+        }
+
+        // ONE CARD ON THIS BOX CARRIES BOTH SPELLINGS. Counting tags would read
+        // that as two priorities and fail it for the opposite reason, so the
+        // check counts distinct LEVELS.
+        let mut both = complete();
+        both.tags = vec!["p1".into(), "priority:P1".into()];
+        assert_eq!(
+            decomposed_tasks_have_comprehensive_details(&[both])[0].status,
+            Status::Pass,
+            "two spellings of the same level are one priority"
+        );
+
+        // THE DISCRIMINATION. Two DIFFERENT levels is still ambiguous, and no
+        // priority is still a gap; without these the rule could accept anything.
+        let mut two = complete();
+        two.tags = vec!["p1".into(), "priority:P2".into()];
+        assert_eq!(decomposed_tasks_have_comprehensive_details(&[two])[0].status, Status::Fail);
+        let mut none = complete();
+        none.tags = vec!["needs:you".into(), "p9".into(), "priority:high".into()];
+        assert_eq!(
+            decomposed_tasks_have_comprehensive_details(&[none])[0].status,
+            Status::Fail,
+            "p9 and priority:high name no level this board uses"
+        );
+    }
+
+    /// A REGISTERED ARTIFACT IS TERMINAL EVIDENCE (AMUX-4538).
+    ///
+    /// The board takes evidence two ways and CLAUDE.md's worker contract
+    /// instructs lanes to use the second: "Register every file, URL, commit,
+    /// PR, screenshot or test asset with `amux board artifact <ID> <ref>`".
+    /// Reading only the `evidence` field reported cards as evidence-free that
+    /// had done exactly what they were told. Measured: TUBES-2484 and
+    /// TUBES-2493, each carrying an implementation artifact naming a path and a
+    /// commit, both reported as missing terminal evidence.
+    #[test]
+    fn a_registered_artifact_satisfies_terminal_evidence() {
+        let mut row = complete();
+        row.evidence = None;
+        row.artifact_count = 1;
+        assert_eq!(
+            decomposed_tasks_have_comprehensive_details(&[row])[0].status,
+            Status::Pass,
+            "an artifact is evidence attached the way the contract asks for"
+        );
+
+        // NEITHER CHANNEL IS STILL A GAP, or this would accept every closed card.
+        let mut bare = complete();
+        bare.evidence = None;
+        bare.artifact_count = 0;
+        let out = decomposed_tasks_have_comprehensive_details(&[bare]);
+        assert_eq!(out[0].status, Status::Fail);
+        assert!(out[0].observed.contains("1 of 1"), "{:?}", out[0].observed);
+
+        // And a LIVE card is not asked for terminal evidence at all.
+        let mut live = complete();
+        live.status = "doing".into();
+        live.evidence = None;
+        live.closed_at = None;
+        assert_eq!(decomposed_tasks_have_comprehensive_details(&[live])[0].status, Status::Pass);
+    }
+
+    /// A pre-rule TERMINAL row is grandfathered, and still counted (AMUX-4538).
+    ///
+    /// 366c1468 made acceptance criteria mandatory on decompose. A row created
+    /// before it was decomposed under a rule that did not exist, and a closed
+    /// one cannot be brought into line without reopening finished work: failing
+    /// forever on those is a red no action clears (ethos rule 3).
+    ///
+    /// A pre-rule row that is still LIVE is NOT exempt, which is why this is not
+    /// a plain date cutoff. Measured 2026-09-16: 18 pre-rule rows are terminal
+    /// and 6 are live, so a blanket date rule would have excused those 6 while
+    /// they can still be fixed.
+    #[test]
+    fn a_closed_pre_rule_row_is_grandfathered_but_a_live_one_is_not() {
+        let mut legacy = complete();
+        legacy.id = "OLD-1".into();
+        legacy.created = ACCEPTANCE_REQUIRED_FROM - 1;
+        legacy.acceptance_criteria = None; // the gap the rule later introduced
+        let out = decomposed_tasks_have_comprehensive_details(&[legacy.clone()]);
+        assert_eq!(out[0].status, Status::Pass, "a closed pre-rule row cannot be fixed");
+
+        // COUNTED, NOT DISAPPEARED. An invariant that quietly shrinks its own
+        // population is the confident-zero shape this file exists to catch.
+        let ev = &out[0].evidence;
+        assert_eq!(ev["grandfathered"], serde_json::json!(1), "{ev}");
+        assert_eq!(ev["grandfathered_sample"][0]["id"], serde_json::json!("OLD-1"), "{ev}");
+        assert!(
+            ev["grandfathered_rule"].as_str().unwrap_or_default().contains("366c1468"),
+            "the exemption must name the commit that created it: {ev}"
+        );
+
+        // THE SAME ROW, STILL LIVE, STILL FAILS.
+        let mut live = legacy;
+        live.status = "doing".into();
+        live.closed_at = None;
+        let out = decomposed_tasks_have_comprehensive_details(&[live]);
+        assert_eq!(out[0].status, Status::Fail, "a pre-rule row that is still open can be fixed");
+        assert_eq!(out[0].evidence["grandfathered"], serde_json::json!(0));
     }
 
     #[test]

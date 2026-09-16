@@ -553,7 +553,8 @@ fn decomposition_detail_check(state: &AppState) -> Vec<InvariantResult> {
         "SELECT i.id,i.title,i.desc,i.status,i.session,i.creator,COALESCE(i.type,'code'),i.epic, \
                 i.depends_on,i.next_action,i.acceptance_criteria, \
                 (SELECT GROUP_CONCAT(t.tag) FROM issue_tags t WHERE t.issue_id=i.id), \
-                i.evidence,i.closed_at \
+                i.evidence,i.closed_at,COALESCE(i.created,0), \
+                (SELECT COUNT(*) FROM _amux_task_artifacts a WHERE a.task_id=i.id) \
          FROM issues i WHERE i.source='decomposition' AND i.deleted IS NULL \
               AND COALESCE(i.archived,0)=0 ORDER BY i.created,i.id",
     ) {
@@ -583,6 +584,8 @@ fn decomposition_detail_check(state: &AppState) -> Vec<InvariantResult> {
                     .collect(),
                 evidence: r.get(12)?,
                 closed_at: r.get(13)?,
+                created: r.get(14)?,
+                artifact_count: r.get(15)?,
             })
         })
         .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
