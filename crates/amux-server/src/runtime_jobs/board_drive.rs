@@ -1898,7 +1898,7 @@ fn backlog_by_type_count(conn: &Connection, session: &str) -> usize {
                AND i.owner_type='agent' AND i.deleted IS NULL AND COALESCE(i.archived,0)=0 \
                AND COALESCE(i.type,'') NOT IN ('tripwire','watch','epic') \
                AND NOT {}",
-            bs::CAPTURE_SHELL_SQL
+            bs::capture_shell_sql()
         ),
         rusqlite::params![session],
         |r| r.get::<_, i64>(0),
@@ -1932,7 +1932,7 @@ fn drainable_backlog_rows(conn: &Connection, session: &str, now: f64) -> rusqlit
            AND COALESCE(i.blocked_on,'') = '' \
            AND NOT (COALESCE(i.source,'')='capture' AND COALESCE(i.source_ref,'') <> '') \
          ORDER BY COALESCE(i.pinned,0) DESC, COALESCE(i.created,0) ASC, i.id ASC",
-                CAPTURE = bs::CAPTURE_SHELL_SQL),
+                CAPTURE = bs::capture_shell_sql()),
         )
         .and_then(|mut st| {
             st.query_map(rusqlite::params![session, reclaim_cut, verified_cut], |r| {
@@ -8168,10 +8168,23 @@ fn capture_shell_cost(conn: &rusqlite::Connection) -> Value {
             }
         })
     };
+    // AMUX-4677's carve-out, as a number a sweep can watch. A captured message
+    // whose FIRST LINE is an `ASK` naming a card is a delegation, so it stops
+    // being a shell: it holds a WIP slot, it drains from backlog, and its
+    // discard stops telling the sender nothing was asked of the lane. The pair
+    // is the signal: `captured_delegations` alone cannot tell "the carve-out
+    // selects nothing any more" from "nobody delegated this week", and
+    // `captured_envelopes` beside it can.
+    let envelopes =
+        q(&format!("SELECT COUNT(*) FROM issues i WHERE {}", bs::capture_envelope_sql()));
+    let delegations =
+        q(&format!("SELECT COUNT(*) FROM issues i WHERE {}", bs::capture_delegation_row_sql()));
     json!({
         "note": "one nudge per card ever (idem decompose:<id>), so `nudges` is the count of \
                  lanes woken to dispose of a card amux minted. Watch discarded_pct: it is the \
-                 share of those turns that reached a foregone conclusion.",
+                 share of those turns that reached a foregone conclusion. \
+                 captured_delegations is the subset of captured_envelopes whose first line is \
+                 an ASK naming a card: those are requests, not shells (AMUX-4677).",
         "nudges": nudges,
         "nudges_7d": nudges_7d,
         "outcome_discarded": discarded,
@@ -8180,6 +8193,8 @@ fn capture_shell_cost(conn: &rusqlite::Connection) -> Value {
         "discarded_pct": pct(discarded),
         "promoted_to_epic_pct": pct(epic),
         "still_open": (nudges >= 0 && resolved >= 0).then(|| nudges - resolved),
+        "captured_delegations": delegations,
+        "captured_envelopes": envelopes,
     })
 }
 
@@ -11795,6 +11810,38 @@ mod tests {
         }
     }
 
+    /// AMUX-4677: the carve-out has to reach the DRAIN, not only the summary.
+    ///
+    /// A capture shell is excluded from `drainable_backlog_rows` and from its
+    /// denominator, so a delegated hand-off that lands in backlog as a shell is
+    /// never dealt and never counted as parked either. This runs the SQL mirror
+    /// of `is_capture_shell` end to end, which the predicate-level cells in
+    /// `board_store` cannot: they compare the two, and agreeing wrongly is a
+    /// state they both pass.
+    #[test]
+    fn a_captured_delegation_is_dispatchable_and_captured_chatter_is_not() {
+        let conn = board_db();
+        add_card(&conn, "C-ASK", "lane", "backlog", "ASK: pick up MF-1165", concat!(
+            "**Prompt:** ASK (Ethan, resumed you for this): pick up MF-1165 on the finances ",
+            "board, WS5 of epic MF-1168.\nCard has full scope + acceptance."));
+        add_card(&conn, "C-CHAT", "lane", "backlog", "landed",
+            "**Prompt:** landed 3f79021a; say the word if you want me to ask about MF-1165 next");
+        conn.execute("UPDATE issues SET creator='amux' WHERE id IN ('C-ASK','C-CHAT')", [])
+            .expect("mint");
+
+        let dealt: Vec<String> = drainable_backlog_rows(&conn, "lane", now_f64())
+            .expect("drainable")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(dealt, vec!["C-ASK"], "the delegation is work; the status line is not");
+        assert_eq!(
+            backlog_by_type_count(&conn, "lane"),
+            1,
+            "and the denominator agrees, so 0 drainable stays distinguishable from no backlog"
+        );
+    }
+
     #[test]
     fn wip_capacity_uses_the_capture_predicate_and_rejects_an_unreadable_population() {
         let conn = board_db();
@@ -13533,6 +13580,18 @@ mod tests {
         assert!(render(1, 2001) < 0.05, "...and it is the exact value, not a rounded one");
         assert_eq!(render(0, 2001), 0.0, "a genuine ZERO still renders zero — the guard is \
                                           about nonzero counts, not about hiding zeros");
+
+        // AMUX-4677's pair, and it has to MOVE. `captured_delegations` on its
+        // own cannot separate "the carve-out stopped selecting anything" from
+        // "nobody delegated this week"; the denominator beside it can.
+        // These fixtures carry no creator, so amux minted none of them yet.
+        assert_eq!(m3["captured_envelopes"], 0, "{m3}");
+        assert_eq!(m3["captured_delegations"], 0, "{m3}");
+        add_card(&conn, "C-4", "lane", "backlog", "ASK", "**Prompt:** ASK (finances): pick up MF-1165");
+        conn.execute("UPDATE issues SET creator='amux'", []).expect("mint");
+        let m4 = capture_shell_cost(&conn);
+        assert_eq!(m4["captured_envelopes"], 4, "all four are capture envelopes now: {m4}");
+        assert_eq!(m4["captured_delegations"], 1, "and exactly one is a delegation: {m4}");
     }
 
     /// Distinct ids for the padding rows above. A counter, not randomness:

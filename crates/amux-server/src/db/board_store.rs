@@ -3108,7 +3108,8 @@ pub fn folded_into(log: Option<&str>) -> Option<String> {
 /// The predicate is `creator='amux'` plus the `**Prompt:**` desc marker, which
 /// is the same pair the fold query, the dispatch filters and board-drive already
 /// use inline in four places. Named here because AF-634 needs it in prose rather
-/// than in SQL.
+/// than in SQL. [`capture_is_delegated_ask`] then carves out the one captured
+/// shape that IS a unit of work, and says why.
 ///
 /// AF-634 (ts-gke, 19 cards and at least 21 notifications in one night): when a
 /// recipient correctly discards one of these, the terminal callback fires AT THE
@@ -3123,24 +3124,116 @@ pub fn folded_into(log: Option<&str>) -> Option<String> {
 /// sender at all is ts-gke's option 1 or 2 and is not one lane's call; this is
 /// their option 3, which changes only what the sentence says.
 pub fn is_capture_shell(row: &IssueRow) -> bool {
-    row.creator == "amux" && row.desc.trim_start().starts_with("**Prompt:**")
+    row.creator == "amux"
+        && row.desc.trim_start().starts_with("**Prompt:**")
+        && !capture_is_delegated_ask(&row.desc)
+}
+
+/// A captured message whose FIRST LINE opens with `ASK` and names a board id is
+/// a delegation, so it is a request rather than a shell (AMUX-4677).
+///
+/// Reported by mixpeek-finances with a receipt. MG-1786's prompt begins
+/// `ASK (Ethan, resumed you for this): pick up MF-1165`, mixpeek-general picked
+/// MF-1165 up and discarded the duplicate envelope, and the terminal callback
+/// told the sender "Nothing was requested of this lane and nothing is owed".
+/// [`terminal_summary`] asserts that sentence for every discarded shell and has
+/// no input capable of contradicting it. The sender read it as their hand-off being
+/// dropped. It also matters before the discard: a shell occupies no WIP slot and
+/// `drainable_backlog_rows` never dispatches one, so a delegation that lands in
+/// backlog as a shell sits there.
+///
+/// `amux board request <lane> <title>` parks the card on the SENDER's board
+/// (AMUX-4653), so a message is the fallback path for handing work over, and
+/// this is the most explicit form that message can take.
+///
+/// Deliberately narrow, because the risk is turning every message containing the
+/// word "ask" into a request: uppercase `ASK` at the start of the FIRST LINE of
+/// the prompt, plus a board id LATER on that same line. "let me know if you want
+/// me to ask about MS-1496" fails on both counts.
+///
+/// The board id test is two adjacent uppercase letters, a hyphen and a digit,
+/// which is looser than [`contains_card_ref`]'s tokenizer and deliberately so:
+/// this rule has a SQL mirror in [`capture_shell_sql`] and every clause here has
+/// to be one GLOB can express exactly. It does not check that the id names a row
+/// that exists: both this and the mirror answer from the row alone, and an
+/// `EXISTS` subquery per row over a 12k-row board is not a predicate you
+/// interpolate into a dispatch query. A well-formed id that names nothing keeps
+/// one extra card, which is the recoverable direction.
+pub fn capture_is_delegated_ask(desc: &str) -> bool {
+    let Some(first) = capture_prompt_first_line(desc) else { return false };
+    let Some(rest) = first.strip_prefix("ASK") else { return false };
+    rest.as_bytes().windows(4).any(|w| {
+        w[0].is_ascii_uppercase()
+            && w[1].is_ascii_uppercase()
+            && w[2] == b'-'
+            && w[3].is_ascii_digit()
+    })
+}
+
+/// The first line of a captured prompt, or `None` when `desc` is not a capture
+/// envelope.
+///
+/// Mirrors [`capture_shell_sql`]'s extraction step for step. After the
+/// `**Prompt:**` marker it strips SPACES ONLY: SQLite's `ltrim(x, ' ')` cannot
+/// strip a newline, and a `trim_start()` here would walk a prompt that begins
+/// with a blank line onto line two while the SQL stayed on line one.
+fn capture_prompt_first_line(desc: &str) -> Option<&str> {
+    let rest = desc.trim_start().strip_prefix("**Prompt:**")?.trim_start_matches(' ');
+    Some(rest.split('\n').next().unwrap_or(rest))
 }
 
 /// [`is_capture_shell`] as a SQL predicate, for the queries that select or
 /// count board rows without loading them (AMUX-4697).
 ///
-/// ONE definition, interpolated, rather than the same two clauses written into
-/// each query. Five call sites spelling a predicate by hand is how two of them
-/// come to disagree, and the disagreement is invisible until a count and a
-/// dispatch list differ by rows nobody can name.
+/// ONE definition, interpolated, rather than the same clauses written into each
+/// query. Five call sites spelling a predicate by hand is how two of them come
+/// to disagree, and the disagreement is invisible until a count and a dispatch
+/// list differ by rows nobody can name.
 ///
 /// Expects the `issues` row to be addressable as `i`. `ltrim` mirrors
 /// `trim_start`: SQLite's default `ltrim` strips spaces only, so the leading
 /// newline that `save_patched` can leave is handled explicitly. The test
 /// `the_sql_predicate_and_the_rust_one_select_the_same_rows` runs both over the
 /// same fixtures and fails if they ever part company.
-pub const CAPTURE_SHELL_SQL: &str =
-    "(i.creator = 'amux' AND ltrim(ltrim(i.desc, char(10) || char(13) || char(9)), ' ') LIKE '**Prompt:**%')";
+///
+/// Built rather than written as a const so the first-line extraction appears
+/// once here and reads the same as the Rust one. `GLOB` and not `LIKE` for the
+/// ask clause: LIKE is case-insensitive over ASCII in SQLite, so `LIKE 'ASK%'`
+/// would match "ask me later" and part company with `strip_prefix("ASK")` on the
+/// very first message anyone writes in lower case.
+pub fn capture_shell_sql() -> String {
+    format!("({} AND NOT {})", capture_envelope_sql(), capture_delegation_sql())
+}
+
+/// `creator='amux'` plus the `**Prompt:**` marker: amux minted this row from an
+/// inbound prompt, whatever the prompt turned out to say.
+pub fn capture_envelope_sql() -> String {
+    format!("(i.creator = 'amux' AND {} LIKE '**Prompt:**%')", capture_desc_trimmed())
+}
+
+/// [`capture_is_delegated_ask`] as SQL. Split out from [`capture_shell_sql`] so
+/// the diagnostic that COUNTS delegations and the predicate that EXEMPTS them
+/// read the same clause (AMUX-4677).
+fn capture_delegation_sql() -> String {
+    let prompt = format!("ltrim(substr({}, 12), ' ')", capture_desc_trimmed());
+    // Appending a newline makes `instr` always find one, which is the same
+    // answer as `split('\n').next()` and needs no CASE.
+    let first_line = format!("substr({prompt}, 1, instr({prompt} || char(10), char(10)) - 1)");
+    format!("({first_line} GLOB 'ASK*[A-Z][A-Z]-[0-9]*')")
+}
+
+/// An envelope that carries a delegation, for callers that want the population
+/// the carve-out rescued rather than the one it left behind.
+pub fn capture_delegation_row_sql() -> String {
+    format!("({} AND {})", capture_envelope_sql(), capture_delegation_sql())
+}
+
+/// `i.desc` with the leading whitespace `trim_start` removes. SQLite's default
+/// `ltrim` strips spaces only, so the newline `save_patched` can leave is named.
+/// '**Prompt:**' is 11 characters, so the prompt itself starts at offset 12.
+fn capture_desc_trimmed() -> String {
+    "ltrim(ltrim(i.desc, char(10) || char(13) || char(9)), ' ')".to_string()
+}
 
 /// The marker the SERVER appends when it chose the fold target itself.
 ///
@@ -5743,7 +5836,79 @@ column=silent type:code=outranked(2)"
         assert!(is_capture_shell(&cap("amux", "\n  **Prompt:** hi", "discarded")));
     }
 
-    /// AMUX-4697: `CAPTURE_SHELL_SQL` and `is_capture_shell` must select the
+    /// AMUX-4677: a captured message whose FIRST LINE is an `ASK` naming a card
+    /// is a delegation, so it stops being a shell and its sender stops being
+    /// told nothing was asked of the lane.
+    ///
+    /// Reported by mixpeek-finances with MG-1786, whose prompt opens
+    /// `ASK (Ethan, resumed you for this): pick up MF-1165`. mixpeek-general
+    /// picked MF-1165 up and discarded the duplicate envelope, and the terminal
+    /// callback still told the sender "Nothing was requested of this lane and
+    /// nothing is owed". AF-634 added that sentence for tidied chatter, and the
+    /// sender of a hand-off reads it as their request being dropped.
+    /// `amux board request` parks its card on the SENDER's board (AMUX-4653),
+    /// so a message is the path a lane actually has for handing work over.
+    ///
+    /// Both directions, because the risk here IS the fix: a lower-case "ask",
+    /// the word in a body, an id on the second line and an ask naming no card
+    /// all stay shells.
+    #[test]
+    fn a_first_line_ask_naming_a_card_is_a_request_not_a_shell() {
+        // The receipt, through its first newline.
+        const RECEIPT: &str = "**Prompt:** ASK (Ethan, resumed you for this): pick up MF-1165 on \
+the finances board, WS5 of epic MF-1168.\nThe bar Ethan set 2026-09-15: ONE COMMAND deploys \
+everything to a clean machine.";
+        assert!(capture_is_delegated_ask(RECEIPT), "the shape this card exists for");
+
+        for (desc, why) in [
+            ("**Prompt:** ask (ethan): pick up MF-1165", "lower-case ask is prose, not a marker"),
+            (
+                "**Prompt:** landed 3f79021a; say the word if you want me to ask about MF-1165",
+                "the word ask inside a body is the over-firing this must not do",
+            ),
+            (
+                "**Prompt:** ASK below\nthe card is MF-1165",
+                "the id has to be on the same line as the ask",
+            ),
+            ("**Prompt:** ASK: can you look at the retry loop", "an ask naming no card"),
+            ("**Prompt:** ASK (finances): pick up the docker bundle", "a subject but no id"),
+            ("ASK (finances): pick up MF-1165", "not a capture envelope at all"),
+        ] {
+            assert!(!capture_is_delegated_ask(desc), "{why}: {desc}");
+        }
+
+        // And the rendered sentence, which is what the sender actually read.
+        let mut conn = Connection::open_in_memory().expect("memdb");
+        crate::db::migrate::apply_all(&mut conn).expect("schema");
+        let add = |id: &str, desc: &str| {
+            conn.execute(
+                "INSERT INTO issues (id, title, status, type, created, updated, creator, \"desc\")
+                 VALUES (?1, ?2, 'discarded', 'code', ?3, ?3, 'amux', ?4)",
+                rusqlite::params![id, format!("t {id}"), 1_760_000_000.0_f64, desc],
+            )
+            .expect("insert");
+            get_issue(&conn, id).expect("read").expect("row")
+        };
+
+        let ask = add("C-ASK", RECEIPT);
+        assert!(!is_capture_shell(&ask), "a delegation is a unit of work");
+        let (text, _) = terminal_summary(&conn, &ask, "doing").expect("summary");
+        assert!(
+            !text.contains("nothing is owed"),
+            "the sentence mixpeek-finances read as their hand-off being dropped: {text}"
+        );
+        assert!(!text.contains("captured message"), "{text}");
+
+        // THE DISCRIMINATION. Tidied chatter keeps AF-634's sentence, and if it
+        // did not this cell would pass on a predicate that had simply stopped
+        // recognising captures at all.
+        let chatter = add("C-CHAT", "**Prompt:** landed 3f79021a, ask me if you want MF-1165 next");
+        assert!(is_capture_shell(&chatter), "chatter is still a shell");
+        let (chat_text, _) = terminal_summary(&conn, &chatter, "doing").expect("summary");
+        assert!(chat_text.contains("nothing is owed"), "{chat_text}");
+    }
+
+    /// AMUX-4697: `capture_shell_sql` and `is_capture_shell` must select the
     /// same rows, or a count and a dispatch list differ by rows nobody can name.
     ///
     /// Runs BOTH over the same fixtures rather than asserting each separately,
@@ -5769,6 +5934,15 @@ column=silent type:code=outranked(2)"
             ("C-7", "amux", "\r\n**Prompt:** crlf first"),
             ("C-8", "amux", "text then **Prompt:** later"),
             ("C-9", "amux", ""),
+            // AMUX-4677's carve-out, on both sides of every clause it added.
+            // Ids sort after C-9 on purpose: the comparison below is ordered,
+            // and SQLite's BINARY collation puts "C-10" between "C-1" and "C-2".
+            ("C-A1", "amux", "**Prompt:** ASK (Ethan, resumed you for this): pick up MF-1165 now\nmore"),
+            ("C-A2", "amux", "**Prompt:** ask me about MF-1165"),
+            ("C-A3", "amux", "**Prompt:** ASK below\nthe card is MF-1165"),
+            ("C-A4", "amux", "**Prompt:** ASK: look at the retry loop"),
+            ("C-A5", "amux", "**Prompt:**ASK (x): pick up MF-1165"),
+            ("C-A6", "amux", "\n  **Prompt:**   ASK (x): pick up MF-1165"),
         ];
         // Every NOT NULL column the real schema carries. The hand-rolled
         // four-column stand-in this replaced did not have them, which is the
@@ -5785,7 +5959,8 @@ column=silent type:code=outranked(2)"
         }
         let sql_says: Vec<String> = conn
             .prepare(&format!(
-                "SELECT i.id FROM issues i WHERE {CAPTURE_SHELL_SQL} ORDER BY i.id"
+                "SELECT i.id FROM issues i WHERE {} ORDER BY i.id",
+                capture_shell_sql()
             ))
             .expect("prepare")
             .query_map([], |r| r.get::<_, String>(0))
