@@ -9378,6 +9378,17 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
         poll_shell_prompt(name, 3000).await;
     } else {
         // Fresh tmux session hosting the user's login shell (py:24647).
+        //
+        // Guarded HERE, at the creation site, rather than at the top of
+        // start_session. The two tests that reach this function are both
+        // asserting that a PAUSED lane is refused, and a guard placed earlier
+        // would answer them with its own message and break an assertion that
+        // has nothing to do with tmux. Creating the session is also the step
+        // that did the damage; everything above this point either reads tmux or
+        // touches a session that already exists.
+        if let Err(error) = crate::backend::tmux_health::spawn_allowed_here() {
+            return (false, error);
+        }
         let create_server = match crate::backend::tmux_health::may_create_server().await {
             Ok(allowed) => allowed,
             Err(error) => return (false, error),
@@ -27223,6 +27234,48 @@ CLAUDE-POSTFIX-COMPLETE
         for p in SESSION_PROVIDERS {
             assert!(msg.contains(p), "refusal omits accepted provider {p:?}: {msg}");
         }
+    }
+
+    /// AMUX-4724, on the SHIPPED path. The unit cells in tmux_health prove the
+    /// RULE; this proves `start_session` actually consults it, which is the
+    /// half that would stay green if the call site were deleted.
+    ///
+    /// The lane here is deliberately NOT paused, so it walks past the guard
+    /// that stops the only two other tests which reach this function and gets
+    /// all the way to the branch that creates a tmux session. Before this
+    /// change that is exactly where `client-left-fixture` was born.
+    #[tokio::test]
+    async fn start_session_refuses_to_spawn_from_a_test_home() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        // No CC_PAUSED: this lane is startable as far as every other check is
+        // concerned, which is the whole point.
+        std::fs::write(
+            home.path().join("sessions/amux-4724-guard-probe.env"),
+            "CC_DIR=\"/tmp\"\n",
+        )
+        .unwrap();
+        let (state, _dir) = state();
+        let (ok, detail) = start_session(&state, "amux-4724-guard-probe", "", false).await;
+        assert!(!ok, "a spawn from a throwaway AMUX_HOME must be refused, got ok with: {detail}");
+        assert!(
+            detail.contains(crate::backend::tmux_health::SPAWN_OVERRIDE),
+            "the refusal must be the AMUX-4724 guard and must name its override, got: {detail}"
+        );
+        // And nothing was created. This is the assertion the incident needed:
+        // the test could not tell it had spawned, because from inside every
+        // call returned as though it worked.
+        let live = tokio::process::Command::new("tmux")
+            .args(["list-sessions", "-F", "#{session_name}"])
+            .output()
+            .await
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        assert!(
+            !live.contains("amux-4724-guard-probe"),
+            "the guard returned a refusal but a tmux session exists anyway:\n{live}"
+        );
     }
 
     #[tokio::test]

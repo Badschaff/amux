@@ -369,6 +369,70 @@ impl Observation {
     }
 }
 
+/// Env var a test sets to say it MEANS to spawn on a real tmux server.
+pub const SPAWN_OVERRIDE: &str = "AMUX_ALLOW_TMUX_SPAWN_FROM_TEST_HOME";
+
+/// Directory prefixes that mean "this AMUX_HOME is a throwaway".
+///
+/// `/tmp` and `/private/tmp` are the same volume on macOS and either spelling
+/// can reach the caller, so both are listed rather than resolved.
+const THROWAWAY_PREFIXES: &[&str] = &["/tmp/", "/private/tmp/", "/var/folders/", "/private/var/folders/"];
+
+/// Whether a worker may be spawned given the AMUX_HOME it would be spawned from.
+///
+/// `test_env::set_home` isolates AMUX_HOME and NOTHING ISOLATES TMUX, so any
+/// test whose path reaches `start_session` creates a real session on the
+/// machine's real tmux server, and the test cannot tell: from inside, every
+/// call returns as though it worked.
+///
+/// That is not hypothetical. A fixture lane called `client-left-fixture` was
+/// created this way, running Claude Code in /Users/ethan. The server adopted it
+/// ("re-armed pipe-pane"), the staged guard named it as a committer, and
+/// ba203699 permanently carries `Amux-Committer: client-left-fixture` for a
+/// lane that never existed (AMUX-4602, AMUX-4724).
+///
+/// PURE, so the rule can be tested without a tmux server: the whole class of
+/// bug here is code that only misbehaves when it reaches the real one.
+///
+/// This REFUSES rather than redirecting to a private socket. Measured over the
+/// full suite by instrumenting `start_session` itself: exactly 2 of ~2940 tests
+/// reach it, `pause_prevents_legacy_start_before_provider_launch` and
+/// `pause_legacy_failure_and_resume_failure_are_honest`, and BOTH are asserting
+/// that a paused lane is refused, so both return before any tmux call. Nothing
+/// exercises the spawn, so a private socket would be isolating a path no test
+/// travels. `SPAWN_OVERRIDE` keeps that door open for the test that one day
+/// wants it.
+pub(crate) fn spawn_allowed_from(home: &std::path::Path, override_on: bool) -> Result<(), String> {
+    if override_on {
+        return Ok(());
+    }
+    let h = home.to_string_lossy();
+    // Trailing separator matters: `/tmp/x` is a throwaway and a hypothetical
+    // `/tmpdata/amux` is not.
+    let h_slash = if h.ends_with('/') { h.to_string() } else { format!("{h}/") };
+    for p in THROWAWAY_PREFIXES {
+        if h_slash.starts_with(p) {
+            return Err(format!(
+                "refusing to spawn a worker: AMUX_HOME is {h}, a throwaway directory, so this is almost certainly a test. \
+                 Nothing isolates tmux from AMUX_HOME, so the spawn would land on the real tmux server and create a live \
+                 Claude Code session on this machine (AMUX-4724). Set {SPAWN_OVERRIDE}=1 if the spawn is genuinely intended."
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `spawn_allowed_from` against the live environment.
+pub(crate) fn spawn_allowed_here() -> Result<(), String> {
+    let on = std::env::var(SPAWN_OVERRIDE).map(|v| v == "1").unwrap_or(false);
+    let r = spawn_allowed_from(&crate::api::session_verbs::home(), on);
+    if let Err(error) = &r {
+        tracing::warn!(target: "amux::tmux", verdict = "spawn_refused_throwaway_home", %error,
+            "worker start refused before tmux could create a session from a test home");
+    }
+    r
+}
+
 /// Whether new-session may create a server. False means pass tmux's -N flag.
 pub async fn may_create_server() -> Result<bool, String> {
     let observation = observe().await;
@@ -384,6 +448,64 @@ pub async fn may_create_server() -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AMUX-4724. Nothing isolates tmux from AMUX_HOME, so a test that reaches
+    /// the spawn creates a real session on the operator's machine.
+    #[test]
+    fn a_throwaway_amux_home_may_not_spawn_a_worker() {
+        // Every throwaway prefix refuses, asserted one at a time rather than
+        // through a loop over the same constant the code reads: a loop over
+        // THROWAWAY_PREFIXES would pass for an empty list.
+        for h in [
+            "/tmp/amux-test-home",
+            "/private/tmp/claude-501/x/y/scratch",
+            "/var/folders/0x/abc/T/.tmpXYZ",
+            "/private/var/folders/0x/abc/T/.tmpXYZ",
+        ] {
+            assert!(
+                spawn_allowed_from(std::path::Path::new(h), false).is_err(),
+                "must refuse to spawn from throwaway home {h}"
+            );
+        }
+
+        // POSITIVE CONTROL: a real home still spawns. Without this the cell
+        // passes for a guard that refuses everything and stops the fleet.
+        assert!(
+            spawn_allowed_from(std::path::Path::new("/Users/ethan/.amux"), false).is_ok(),
+            "a real AMUX_HOME must still be allowed to spawn"
+        );
+
+        // PREFIX, NOT SUBSTRING. `/tmpdata` is not under `/tmp`, and a
+        // starts_with check without the separator would refuse it forever.
+        assert!(
+            spawn_allowed_from(std::path::Path::new("/tmpdata/amux"), false).is_ok(),
+            "/tmpdata is not a throwaway directory"
+        );
+
+        // THE THROWAWAY ROOT ITSELF, with no trailing separator. This cell
+        // exists because a mutation that deleted the normalization stayed GREEN:
+        // the assertion above is carried by the prefix's own trailing slash, so
+        // it tested nothing about the normalization. `"/tmp".starts_with("/tmp/")`
+        // is false, so without it an AMUX_HOME of exactly /tmp spawns.
+        for root in ["/tmp", "/private/tmp", "/var/folders"] {
+            assert!(
+                spawn_allowed_from(std::path::Path::new(root), false).is_err(),
+                "the throwaway root {root} itself must refuse, not just paths under it"
+            );
+        }
+
+        // The override is the documented way out, so a test that genuinely
+        // means to spawn is not left without a path (ethos rule 3).
+        assert!(
+            spawn_allowed_from(std::path::Path::new("/tmp/amux-test-home"), true).is_ok(),
+            "{SPAWN_OVERRIDE} must permit a deliberate spawn"
+        );
+
+        // And the refusal has to SAY so, or the next author reads it as a wall.
+        let msg = spawn_allowed_from(std::path::Path::new("/tmp/h"), false).unwrap_err();
+        assert!(msg.contains(SPAWN_OVERRIDE), "refusal must name its override: {msg}");
+        assert!(msg.contains("/tmp/h"), "refusal must name the home it refused: {msg}");
+    }
 
     #[test]
     fn tmux_host_evidence_ranks_cpu_and_memory_independently() {
