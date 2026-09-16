@@ -53,7 +53,7 @@
 
 use super::fs::{
     expanduser, is_dangerous_write, is_path_allowed, j, mtime_secs, not_found, parse_body,
-    parse_qs, pystr, qs_get,
+    parse_qs, pystr, qs_get, real_list_dirs, resolve_rel_candidates, resolve_rel_descend,
 };
 use super::AppState;
 use crate::db::WriteOutcome;
@@ -200,6 +200,44 @@ fn qpath(qs: &[(String, String)]) -> Result<PathBuf, Box<Response>> {
     }
 }
 
+/// A READ-ONLY fallback for `qpath`'s naive result, used by `view()` only.
+/// `qpath` itself stays exactly as it was: a PUT must land at the literal
+/// target the caller named, never a fuzzy-matched existing file elsewhere,
+/// so `put_file` (and every other write path) keeps calling bare `qpath`
+/// unchanged.
+///
+/// A worker's own terminal output often prints a WEB-ROOT-relative asset
+/// reference WITH a leading slash (Next.js and most static-site frameworks:
+/// `/templates/foo.png` in source means `public/templates/foo.png` on disk)
+/// or a bare relative path from a scaffold directory one level above where
+/// the worker actually works. `qpath` reads the former as a literal
+/// filesystem-absolute path (never exists anywhere) and the latter with no
+/// fallback at all if the single naive join misses. AMUX-4682, live: Ethan's
+/// screenshots showed exactly the first shape — mixpeek-homepage-claude
+/// printed `/templates/ux-session-analysis/session.webp`, the literal path
+/// never existed, and the real file sat under cwd's `public/` the whole
+/// time. Reuses the SAME ancestor-then-descend search `/api/fs/resolve`
+/// already does (AMUX-3511 / AMUX-4661 / AMUX-4682), so both surfaces agree
+/// on what "findable from cwd" means, and returns the ORIGINAL naive path
+/// unchanged when nothing is found — the "file not found" error the caller
+/// sees still names the path it actually asked for, not a phantom one.
+fn resolve_viewable_fallback(fpath: &str, cwd: &str, naive: &Path) -> PathBuf {
+    if naive.exists() || cwd.is_empty() {
+        return naive.to_path_buf();
+    }
+    let allowed_exists = |p: &Path| is_path_allowed(p) && p.exists();
+    let (resolved, found, _tried) = resolve_rel_candidates(cwd, fpath, &allowed_exists);
+    if found {
+        return PathBuf::from(resolved);
+    }
+    let root = PathBuf::from(cwd.trim_end_matches('/'));
+    let rel_clean = fpath.trim().trim_start_matches('/').trim_start_matches("./");
+    if let Some(found) = resolve_rel_descend(&root, rel_clean, &allowed_exists, &real_list_dirs) {
+        return found;
+    }
+    naive.to_path_buf()
+}
+
 /// `_IMG_INLINE_MAX` (py:20623): inline an image as base64 up to this size,
 /// stream anything larger via /api/file/raw. Config, not a constant — the
 /// hard 5MB refusal it replaced is the AMUX-2344 incident.
@@ -229,6 +267,10 @@ async fn view(req: Request) -> Response {
         Ok(p) => p,
         Err(r) => return *r,
     };
+    // AMUX-4682: this is the read-only fallback (see resolve_viewable_fallback's
+    // own doc) -- everything else in this handler is unchanged, so a path that
+    // already resolves correctly today behaves identically.
+    let p = resolve_viewable_fallback(qs_get(&qs, "path").unwrap_or(""), qs_get(&qs, "cwd").unwrap_or(""), &p);
     if !is_path_allowed(&p) {
         return j(403, json!({"error": "access denied"}));
     }
@@ -2052,6 +2094,48 @@ pub(crate) mod tests {
 
         // Directory → 404 file not found (python p.is_file()).
         let (status, v) = get(&app, &format!("/api/file?path={}", enc(dir.path().to_str().unwrap()))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
+        assert_eq!(v["error"], "file not found");
+    }
+
+    /// AMUX-4682, reproducing Ethan's screenshots exactly: a worker's terminal
+    /// prints a WEB-ROOT-relative asset reference with a leading slash
+    /// (Next.js/most static-site frameworks: `/templates/foo.png` in source
+    /// means `public/templates/foo.png` on disk). The naive `path=/x&cwd=Y`
+    /// join reads the leading slash as filesystem-absolute and never finds
+    /// it; the fallback must.
+    #[tokio::test]
+    async fn a_web_root_relative_terminal_reference_is_found_under_cwds_public_dir() {
+        let app = app();
+        let cwd = tempfile::tempdir().unwrap();
+        let asset_dir = cwd.path().join("public/templates/ux-session-analysis");
+        std::fs::create_dir_all(&asset_dir).unwrap();
+        std::fs::write(asset_dir.join("session.webp"), b"webp-bytes-here").unwrap();
+
+        let (status, v) = get(
+            &app,
+            &format!(
+                "/api/file?path={}&cwd={}",
+                enc("/templates/ux-session-analysis/session.webp"),
+                enc(cwd.path().to_str().unwrap())
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["path"], asset_dir.join("session.webp").to_str().unwrap());
+
+        // CONTROL: a leading-slash path that genuinely does not exist
+        // anywhere (not literally, not under cwd) must still 404 honestly —
+        // the fallback finds real files, it does not manufacture success.
+        let (status, v) = get(
+            &app,
+            &format!(
+                "/api/file?path={}&cwd={}",
+                enc("/templates/nothing-here/missing.webp"),
+                enc(cwd.path().to_str().unwrap())
+            ),
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
         assert_eq!(v["error"], "file not found");
     }

@@ -373,10 +373,13 @@ async fn resolve_rel(method: Method, RawQuery(q): RawQuery) -> Response {
     // actually works (dir=ai-for-smbs, real repo at
     // ai-for-smbs/smb-workspace), so a path printed from inside the nested
     // repo (backend/connectors/jobs.py) never resolved. Try downward too,
-    // once the ascent has already failed.
-    if !exists && !rel.trim().starts_with('/') {
+    // once the ascent has already failed. Strip a leading slash the same way
+    // `resolve_rel_candidates` now does (AMUX-4682) -- a web-root-relative
+    // asset reference is exactly as findable by descent as an ordinary
+    // relative one, once the literal-absolute interpretation has failed.
+    if !exists {
         let root = PathBuf::from(cwd.trim_end_matches('/'));
-        let rel_clean = rel.trim().trim_start_matches("./");
+        let rel_clean = rel.trim().trim_start_matches('/').trim_start_matches("./");
         if let Some(found) = resolve_rel_descend(&root, rel_clean, &allowed_exists, &real_list_dirs) {
             let s = found.display().to_string();
             tried.push(s.clone());
@@ -404,7 +407,7 @@ const DESCEND_SKIP: &[&str] = &[
     "node_modules", ".git", "target", "__pycache__", ".venv", "venv", ".next", "dist", "build",
 ];
 
-fn resolve_rel_descend(
+pub(crate) fn resolve_rel_descend(
     root: &Path,
     rel: &str,
     exists: &dyn Fn(&Path) -> bool,
@@ -440,7 +443,7 @@ fn resolve_rel_descend(
 /// Kept separate from the pure walk above so every cell of the walk itself
 /// is testable with an injected in-memory fake, the same split
 /// `resolve_rel_candidates` uses for `exists`.
-fn real_list_dirs(dir: &Path) -> Vec<PathBuf> {
+pub(crate) fn real_list_dirs(dir: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(dir)
         .map(|entries| entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect())
         .unwrap_or_default()
@@ -448,19 +451,35 @@ fn real_list_dirs(dir: &Path) -> Vec<PathBuf> {
 
 /// The candidate walk, pure over an injected existence probe so every cell —
 /// the doubled-segment specimen included — is testable without a live tree.
-fn resolve_rel_candidates(
+pub(crate) fn resolve_rel_candidates(
     cwd: &str,
     rel: &str,
     exists: &dyn Fn(&Path) -> bool,
 ) -> (String, bool, Vec<String>) {
     let rel = rel.trim();
-    if rel.starts_with('/') {
-        let p = PathBuf::from(rel);
-        let ok = exists(&p);
-        return (rel.to_string(), ok, vec![rel.to_string()]);
-    }
-    let rel_clean = rel.trim_start_matches("./");
     let mut tried: Vec<String> = Vec::new();
+    // A leading slash USUALLY means "this really is absolute" -- the common
+    // case, and the only one worth trying first: silently reinterpreting a
+    // genuinely absolute path as relative would paper over real bugs. But a
+    // worker's own terminal output just as often prints a WEB-ROOT-relative
+    // asset reference this way (Next.js and most static-site frameworks:
+    // `/templates/foo.png` in source means `public/templates/foo.png` on
+    // disk) -- AMUX-4682, live: mixpeek-homepage-claude's terminal printed
+    // exactly this shape and the literal path never existed anywhere; the
+    // real file sat under cwd's `public/` the whole time. So try the literal
+    // interpretation first (unchanged behavior when it's real); only on
+    // failure does the slash get stripped and treated as an ordinary
+    // relative rel, falling into the same ancestor walk below.
+    let rel_clean = if let Some(stripped) = rel.strip_prefix('/') {
+        let p = PathBuf::from(rel);
+        tried.push(rel.to_string());
+        if exists(&p) {
+            return (rel.to_string(), true, tried);
+        }
+        stripped
+    } else {
+        rel.trim_start_matches("./")
+    };
     let mut base = PathBuf::from(cwd.trim_end_matches('/'));
     for _ in 0..=4 {
         let cand = base.join(rel_clean);
@@ -2422,6 +2441,40 @@ mod tests {
         assert!(ok);
         assert_eq!(r, "/etc/hosts");
         assert_eq!(tried.len(), 1);
+    }
+
+    /// AMUX-4682: a leading slash on `rel` is tried literally first (a real
+    /// absolute path must never be silently reinterpreted), but when that
+    /// literal path does not exist anywhere, the walk now falls through to
+    /// the SAME cwd-relative ancestor search an ordinary relative rel gets —
+    /// this is what a worker's own web-root-relative asset reference
+    /// (`/templates/foo.png` meaning `public/templates/foo.png`) needs to be
+    /// findable at all.
+    #[test]
+    fn a_leading_slash_that_does_not_exist_literally_falls_through_to_the_ancestor_walk() {
+        let cwd = "/Users/ethan/Dev/mixpeek/homepage";
+        // Only the cwd-relative, slash-stripped spelling exists — the literal
+        // filesystem-root interpretation never does, and never will.
+        let exists = |p: &Path| {
+            p == Path::new("/Users/ethan/Dev/mixpeek/homepage/public/templates/ux-session-analysis/session.webp")
+        };
+        let (resolved, ok, tried) =
+            resolve_rel_candidates(cwd, "/public/templates/ux-session-analysis/session.webp", &exists);
+        assert!(ok, "the slash-stripped cwd join must be found: tried {tried:?}");
+        assert_eq!(
+            resolved,
+            "/Users/ethan/Dev/mixpeek/homepage/public/templates/ux-session-analysis/session.webp"
+        );
+        assert_eq!(tried[0], "/public/templates/ux-session-analysis/session.webp",
+            "the literal absolute interpretation must still be tried FIRST, not skipped");
+
+        // CONTROL — a genuinely absolute path that just happens not to exist
+        // must NOT be silently found somewhere else via a slash-stripped
+        // reinterpretation the caller never asked for.
+        let (r, ok, tried) = resolve_rel_candidates(cwd, "/etc/does-not-exist-anywhere", &|_| false);
+        assert!(!ok);
+        assert_eq!(r, "/etc/does-not-exist-anywhere", "the literal path is still the honest first answer");
+        assert!(tried.len() > 1, "it still walked cwd's ancestors looking, it just found nothing: {tried:?}");
     }
 
     /// AMUX-4661: the mirror-image case the ancestor walk cannot reach by
