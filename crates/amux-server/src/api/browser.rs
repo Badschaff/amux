@@ -91,6 +91,7 @@ pub fn routes() -> Router<AppState> {
         .route("/screenshot", get(screenshot))
         .route("/screenshot/file", get(screenshot_file))
         .route("/state", get(state_verb))
+        .route("/keepalive", post(keepalive))
         .route("/action", post(action))
         .route("/inspect", get(inspect))
         .route("/inspect/clear", post(inspect_clear))
@@ -2730,6 +2731,73 @@ async fn state_payload(cdp: &mut chrome::CdpClient, session: &str) -> Result<Val
     Ok(v)
 }
 
+/// POST /api/browser/keepalive: "I am driving this over raw CDP" (AMUX-4685).
+///
+/// The activity arm reaps a profile with no amux verb for
+/// `AMUX_BROWSER_ACTIVITY_REAP_S` (300 by default). A session driving the same
+/// tab over raw CDP, which is what `/chrome-cdp` and
+/// `skills/chrome-cdp/scripts/cdp.mjs` do, sends no verb, so a browser under
+/// continuous use reads as idle and is closed. Measured 2026-09-15: three kills
+/// while driving dashboard overlays for AMUX-4684, one mid-sweep with results
+/// half-collected.
+///
+/// THE REAPER CANNOT LEARN THIS BY LOOKING. The card's first proposal was to
+/// poll the profile's own cdp_port, and it does not work: Chrome's HTTP
+/// endpoints expose no attachment state. Verified on an isolated headless
+/// Chrome with a debugger attached AND executing `Runtime.evaluate`, `/json/list`
+/// still reports `webSocketDebuggerUrl` on the driven target and `/json/version`
+/// carries version strings only. Identical output attached and detached, so no
+/// polling interval would help.
+///
+/// So the driver has to say so, and this is the cheapest thing it can say. It
+/// touches the same `last_verb` the activity arm reads and answers with the
+/// seconds remaining, so a caller can see the window rather than guess it.
+///
+/// `cdp.mjs` sends this on EVERY command, best-effort. A keepalive a caller must
+/// remember is opt-in, and the population that needs it is every CDP driver
+/// (ethos rule 1). Nobody should have to know this route exists.
+async fn keepalive(headers: HeaderMap, Query(q): Query<SessionQuery>) -> Response {
+    let session = resolve_session(q.session.as_deref(), &headers);
+    crate::integrations::browser::touch_verb_for_session(&session);
+    // REPORT WHAT WAS ACTUALLY TOUCHED, never just "ok". `touch_verb_for_session`
+    // prefers the browser this session owns and falls back to the only running
+    // one; a bare 200 cannot tell "your browser is now safe" from "you have no
+    // browser and nothing happened", and those need different actions from the
+    // caller.
+    let window = crate::runtime_jobs::browser_reaper::activity_reap_s();
+    let now = crate::integrations::browser::now_secs_i64();
+    let touched: Vec<Value> = crate::integrations::browser::running_all()
+        .into_iter()
+        .filter(|(_, owner, _, _, _, last_verb)| {
+            (owner == &session || session.is_empty()) && now - last_verb <= 2
+        })
+        .map(|(profile, owner, _, _, _, last_verb)| {
+            json!({
+                "profile": profile,
+                "started_by": owner,
+                "seconds_since_verb": now - last_verb,
+                "reaped_in_s": if window == 0 { Value::Null } else { json!(window as i64 - (now - last_verb)) },
+            })
+        })
+        .collect();
+    Json(json!({
+        "ok": true,
+        "session": session,
+        "measured": true,
+        "n_considered": crate::integrations::browser::running_all().len(),
+        "touched": touched,
+        "activity_window_s": if window == 0 { Value::Null } else { json!(window) },
+        "note": if window == 0 {
+            "the activity arm is disabled (AMUX_BROWSER_ACTIVITY_REAP_S=0), so nothing reaps on inactivity"
+        } else if touched.is_empty() {
+            "NO BROWSER WAS TOUCHED: this session owns none and there is not exactly one running"
+        } else {
+            "the activity reaper's clock is reset for the browser(s) named above"
+        },
+    }))
+    .into_response()
+}
+
 async fn state_verb(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3588,6 +3656,7 @@ fn catalog_body(path: &str) -> Response {
                 "POST /api/browser/start (profile, url, session; viewport at launch via device or width+height)",
                 "POST /api/browser/navigate", "POST /api/browser/action",
                 "POST /api/browser/stop", "POST /api/browser/inspect/clear",
+                "POST /api/browser/keepalive (I am driving this over raw CDP; resets the activity reaper)",
                 "POST /api/browser/save-profile", "POST /api/browser/profile/create",
                 "DELETE /api/browser/profile/{name}",
                 "POST /api/browser/agent (answers 501 — the session's model drives the native verbs)",
@@ -3724,6 +3793,67 @@ mod tests {
         let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         (status, v, proxied)
+    }
+
+    /// `/keepalive` resets the activity clock, and SAYS WHICH BROWSER (AMUX-4685).
+    ///
+    /// A bare 200 here would be the worst possible answer: the two states a
+    /// caller must tell apart are "your browser is safe for another N seconds"
+    /// and "you have no browser and nothing happened", and they need different
+    /// actions. `touch_verb_for_session` prefers the browser this session owns
+    /// and falls back to the only running one, so silence is genuinely ambiguous.
+    #[tokio::test(flavor = "current_thread")]
+    async fn keepalive_resets_the_activity_clock_and_names_what_it_touched() {
+        crate::integrations::browser::test_clear_running();
+        crate::integrations::browser::test_seed_running("hubspot", "lane-a", 4242);
+        let app = app();
+
+        let (st, v, _) = send(&app, "POST", "/api/browser/keepalive?session=lane-a", None).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["ok"], json!(true), "{v}");
+        let touched = v["touched"].as_array().cloned().unwrap_or_default();
+        assert_eq!(touched.len(), 1, "it must name the browser it touched: {v}");
+        assert_eq!(touched[0]["profile"], json!("hubspot"), "{v}");
+        assert_eq!(touched[0]["started_by"], json!("lane-a"), "{v}");
+        // The seed stamps last_verb_at = 0, so a clock that did not move would
+        // report an age of ~now rather than ~0. This is the assertion that the
+        // route DID something.
+        let age = touched[0]["seconds_since_verb"].as_i64().unwrap_or(i64::MAX);
+        assert!(age <= 2, "the activity clock was not reset: age {age} in {v}");
+        assert!(v["n_considered"].as_u64().unwrap_or(0) >= 1, "{v}");
+
+        // A LANE WITH NO BROWSER MUST NOT READ AS PROTECTED. Two running
+        // browsers defeat the single-browser fallback, so this session owns
+        // neither and nothing should be claimed.
+        crate::integrations::browser::test_clear_running();
+        crate::integrations::browser::test_seed_running_port("a", "lane-a", 1, 1);
+        crate::integrations::browser::test_seed_running_port("b", "lane-b", 2, 2);
+        let (st, v, _) = send(&app, "POST", "/api/browser/keepalive?session=lane-z", None).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert!(
+            v["touched"].as_array().is_none_or(|t| t.is_empty()),
+            "lane-z owns no browser and there is not exactly one: {v}"
+        );
+        assert!(
+            v["note"].as_str().unwrap_or_default().contains("NO BROWSER WAS TOUCHED"),
+            "the answer must say nothing happened: {v}"
+        );
+        crate::integrations::browser::test_clear_running();
+    }
+
+    /// The route is in the catalog. An unknown /api/browser path answers with the
+    /// route list, and that list is the only place a caller who is not reading
+    /// source finds out this exists. A verb nobody can name is a verb nobody has.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_catalog_names_the_keepalive_verb() {
+        let app = app();
+        let (st, v, _) = send(&app, "GET", "/api/browser/definitely-not-a-route", None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+        let routes = v["routes"].as_array().cloned().unwrap_or_default();
+        assert!(
+            routes.iter().any(|r| r.as_str().unwrap_or_default().contains("/api/browser/keepalive")),
+            "the catalog must name it: {v}"
+        );
     }
 
     #[test]

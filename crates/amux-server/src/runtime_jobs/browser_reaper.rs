@@ -341,6 +341,11 @@ pub fn reap_notice(profile: &str, reason: ReapReason) -> String {
          survived.\n\n\
          Reopen it whenever you need it:\n\
          POST /api/browser/start {{\"profile\":\"{profile}\"}}\n\n\
+         IF YOU WERE DRIVING IT OVER RAW CDP, that is why: the activity arm counts \
+         amux browser verbs, and raw CDP traffic goes straight to Chrome where the \
+         reaper cannot see it. Send POST /api/browser/keepalive while you work and \
+         the clock resets; `skills/chrome-cdp/scripts/cdp.mjs` does this for you on \
+         every command (AMUX-4685).\n\n\
          To stop this happening mid-task, widen or disable the window: \
          AMUX_BROWSER_ACTIVITY_REAP_S, AMUX_BROWSER_TTL_S, AMUX_BROWSER_IDLE_REAP_S \
          (0 disables an arm) in ~/.amux/server.env.",
@@ -694,6 +699,32 @@ mod tests {
         assert!(a.contains("nothing had driven it"), "{a}");
         assert!(b.contains("hard age ceiling"), "{b}");
         assert!(c.contains("no page open"), "{c}");
+    }
+
+    /// THE REMEDY A CDP DRIVER CAN ACTUALLY USE (AMUX-4685).
+    ///
+    /// Before this, the only remedy the notice offered was editing
+    /// AMUX_BROWSER_ACTIVITY_REAP_S in ~/.amux/server.env, which needs a server
+    /// restart. So a lane on a ten-minute browser task had to choose between
+    /// restarting the fleet's server and being interrupted, and the notice said
+    /// nothing about the actual cause: raw CDP traffic goes straight to Chrome,
+    /// where the activity arm cannot see it.
+    ///
+    /// The reaper cannot close that gap by looking. Chrome's HTTP endpoints
+    /// expose no attachment state, verified with a debugger attached AND running
+    /// Runtime.evaluate: /json/list still reports webSocketDebuggerUrl on the
+    /// driven target and /json/version carries version strings only, byte for
+    /// byte what a detached browser answers. The driver has to say so.
+    #[test]
+    fn the_notice_names_the_keepalive_a_cdp_driver_can_send() {
+        let n = reap_notice("default", ReapReason::NoActivity { since_verb_s: 600, window_s: 600 });
+        assert!(n.contains("/api/browser/keepalive"), "the route is not named: {n}");
+        assert!(n.contains("raw CDP"), "nor the cause it addresses: {n}");
+        assert!(
+            n.contains("cdp.mjs"),
+            "nor that the sanctioned driver already sends it, which is the difference \
+             between a remedy you must remember and one you already have: {n}"
+        );
     }
 
     /// The knobs are named. Without them the only response to "amux closed my

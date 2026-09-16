@@ -853,11 +853,82 @@ const NEEDS_TARGET = new Set([
   'net','network','click','clickxy','type','loadall','evalraw',
 ]);
 
+// Tell amux this browser is being driven (AMUX-4685).
+//
+// The activity reaper counts amux browser VERBS and closes a profile with none
+// for AMUX_BROWSER_ACTIVITY_REAP_S (300 by default). Everything this file does
+// goes straight to Chrome over raw CDP, which the server cannot see, so a
+// browser under continuous use read as idle and was closed. Measured
+// 2026-09-15: three kills while driving dashboard overlays, one mid-sweep with
+// results half-collected.
+//
+// The reaper cannot learn this by looking. Chrome's HTTP endpoints expose no
+// attachment state: verified with a debugger attached AND executing
+// Runtime.evaluate, /json/list still reports webSocketDebuggerUrl on the driven
+// target and /json/version carries version strings only, identical to detached.
+// So the driver has to say so, and it says so HERE rather than in a doc,
+// because a keepalive a caller must remember is one nobody sends.
+//
+// Best-effort and never fatal, deliberately: a keepalive that fails must not
+// break the command it was protecting. No amux server, no AMUX_URL, a 404 on an
+// older build, a slow reply - all of them fall through silently and the CDP
+// command proceeds.
+//
+// NOT `fetch`, AND THAT IS THE WHOLE POINT. amux serves HTTPS with a SELF-SIGNED
+// certificate (every documented call in CLAUDE.md is `curl -sk`), and Node's
+// fetch rejects those: measured against the live server, it throws
+// DEPTH_ZERO_SELF_SIGNED_CERT. Combined with the best-effort catch above, the
+// first cut of this function was a silent no-op on every real amux server,
+// indistinguishable from working. Caught by running it rather than reading it.
+//
+// `rejectUnauthorized: false` is scoped to THIS request, never
+// NODE_TLS_REJECT_UNAUTHORIZED, which would disable verification for the whole
+// process including anything a page command later talks to.
+async function amuxKeepalive() {
+  const base = process.env.AMUX_URL || process.env.AMUX_API;
+  if (!base) return;
+  const session = process.env.AMUX_SESSION || process.env.AMUX_WORKER || '';
+  let url;
+  try {
+    url = new URL(`${base.replace(/\/+$/, '')}/api/browser/keepalive`);
+  } catch {
+    return; // a malformed AMUX_URL is not worth failing a browser command over
+  }
+  const mod = url.protocol === 'https:' ? await import('node:https') : await import('node:http');
+  await new Promise(resolve => {
+    let done = false;
+    const finish = () => { if (!done) { done = true; resolve(); } };
+    try {
+      const req = mod.request(
+        {
+          hostname: url.hostname,
+          port: url.port,
+          path: url.pathname + url.search,
+          method: 'POST',
+          rejectUnauthorized: false,
+          headers: { 'content-length': 0, ...(session ? { 'x-amux-session': session } : {}) },
+        },
+        res => { res.resume(); res.on('end', finish); res.on('error', finish); },
+      );
+      req.setTimeout(1500, () => { req.destroy(); finish(); });
+      req.on('error', finish);
+      req.end();
+    } catch {
+      finish();
+    }
+  });
+}
+
 async function main() {
   const [cmd, ...args] = process.argv.slice(2);
 
   // Daemon mode (internal)
   if (cmd === '_daemon') { await runDaemon(args[0]); return; }
+
+  // Every real command counts as driving. Placed after the daemon branch so the
+  // long-lived daemon does not send one per poll, and before the help/usage
+  // exits so a `help` invocation does not pretend a browser is in use.
+  if (cmd && !['help', '--help', '-h'].includes(cmd)) await amuxKeepalive();
 
   if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
     console.log(USAGE); process.exit(0);

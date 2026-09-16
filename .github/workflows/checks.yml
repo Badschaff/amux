@@ -513,6 +513,12 @@ jobs:
       # the title is a paragraph.
       - name: CLI piped brief splits into title and body
         run: ./scripts/test-board-piped-title-body.sh
+      # AMUX-4685: cdp.mjs tells amux it is driving, over a SELF-SIGNED cert.
+      # Its own step because the failure mode is a silent no-op: Node's fetch
+      # rejects amux's certificate, the best-effort catch swallows it, and the
+      # feature looks exactly like a working one.
+      - name: CDP keepalive reaches a self-signed amux
+        run: ./scripts/test-cdp-keepalive.sh
       # AMUX-3891. The CLI is symlinked straight into the working tree and ~50
       # lanes invoke it while it is being edited, so it MUST be parseable in one
       # read: bash holds a byte offset, and a rewrite mid-invocation resumes it

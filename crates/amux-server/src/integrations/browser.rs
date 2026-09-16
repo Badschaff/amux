@@ -644,14 +644,22 @@ pub fn running_all() -> Vec<(String, String, i64, u32, u16, i64)> {
     v
 }
 
+/// The clock `last_verb_at` is stamped with. Shared so a reader computing an age
+/// against it cannot use a different `now` (AMUX-4685: /keepalive reports the
+/// seconds remaining before the activity arm fires, which is only meaningful
+/// against the same clock the stamp used).
+pub fn now_secs_i64() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
 /// Stamp the current time as the last verb on a profile. Called by every
 /// driver verb (navigate, screenshot, action, state) so the reaper can tell
 /// "browser with open page but nobody driving it" from "browser in active use".
 pub fn touch_verb(profile: &str) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    let now = now_secs_i64();
     if let Ok(mut g) = RUNNING.lock() {
         if let Some(b) = g.get_mut(profile) {
             b.last_verb_at = now;
@@ -664,10 +672,7 @@ pub fn touch_verb(profile: &str) {
 /// one browser is running, that browser gets the stamp (it is the one being
 /// driven). Called from API verb handlers where we have the session name.
 pub fn touch_verb_for_session(session: &str) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    let now = now_secs_i64();
     if let Ok(mut g) = RUNNING.lock() {
         // Prefer the browser owned by this session.
         if !session.is_empty() {
