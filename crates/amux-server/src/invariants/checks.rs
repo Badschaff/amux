@@ -122,6 +122,10 @@ const MOUNTED_ANSWERS_BLIND_SPOTS: &[&str] = &[
     "a route whose CORRECT answer is a refusal (an authorization gate returning 4xx by \
      design) has 0% 2xx and is reported here as not answering — read the 4xx/5xx split \
      in the evidence before calling it broken",
+    "a 503 from a route fronting an OPTIONAL daemon is an ANSWER, not a failure. Those \
+     shapes are named in OPTIONAL_DEPENDENCY_ROUTES and appear under `dependency_down` \
+     in the evidence rather than as findings — the daemon being down is still true and \
+     still published, it is just not this invariant's business",
 ];
 
 /// One (method, route-shape) group from the request log. `shape` must come from
@@ -138,8 +142,50 @@ pub struct RouteOutcomeRow {
     /// 12 were 403s from the external-email gate doing exactly its job
     /// (`external_email_allowed` is false for all 132 sessions, deliberately).
     pub client_err: i64,
-    /// 5xx: the route FAILED. This is the half that is never correct-by-design.
+    /// 5xx: the route failed, EXCEPT for the case `unavailable` carves out.
+    ///
+    /// This used to read "the half that is never correct-by-design", and
+    /// AMUX-4545 is the counterexample that had been open for two days:
+    /// `GET /api/torrents` was 46 of 46 5xx, every one a 503 from
+    /// `aria2_down()` naming the daemon and handing back the command to start
+    /// it. The handler had no defect and unmounting a working route would have
+    /// been worse. A 5xx is not self-evidently a fault.
     pub server_err: i64,
+    /// 503 specifically, a SUBSET of `server_err`.
+    ///
+    /// Carried apart because 503 is the only status a handler picks to say "a
+    /// thing I depend on is not there", and because the distinction cannot be
+    /// recovered later: `server_err` alone cannot tell `aria2_down()` from a
+    /// panic. See `OPTIONAL_DEPENDENCY_ROUTES` for what is done with it, which
+    /// is deliberately narrow.
+    pub unavailable: i64,
+}
+
+/// Routes that front an OPTIONAL external process, with the process named.
+///
+/// A 503 here means the daemon is not running, which is a state this box is
+/// allowed to be in: nobody is required to run aria2c. The route answers, says
+/// exactly what is missing and how to start it, and there is no change to the
+/// handler that would make this invariant pass. That is ethos rule 3, a
+/// constraint with no truthful path, and the fix belongs in the instrument.
+///
+/// DELIBERATELY A LIST AND NOT A RULE ABOUT 503. amux returns 503 from 60-odd
+/// call sites across a dozen modules, and most of them ARE faults worth
+/// failing on: `board.rs` answering 503 means the store is unreachable. A
+/// blanket "503 is a refusal" would retire this check's whole 5xx half to fix
+/// one route.
+///
+/// The exemption is narrow in the other direction too. It applies only when
+/// EVERY 5xx on the shape is a 503; a declared route that starts returning 500
+/// still fails, which is the mutation that keeps this honest.
+const OPTIONAL_DEPENDENCY_ROUTES: &[(&str, &str, &str)] = &[("GET", "/api/torrents", "aria2c")];
+
+/// The daemon this shape depends on, if it is one of the declared few.
+fn optional_dependency_for(method: &str, shape: &str) -> Option<&'static str> {
+    OPTIONAL_DEPENDENCY_ROUTES
+        .iter()
+        .find(|(m, s, _)| *m == method && *s == shape)
+        .map(|(_, _, daemon)| *daemon)
 }
 
 /// Minimum calls before a shape is judged at all. Named rather than inlined so
@@ -170,6 +216,29 @@ pub fn mounted_routes_answer(
         .collect();
     // n_considered BESIDE the answer (ethos rule 4): a zero here is only
     // meaningful next to how many shapes cleared the threshold to produce it.
+    // EXEMPT AND PUBLISHED, in that order. Collected before the loop's verdict
+    // so both arms carry it: a daemon being down is a fact a reader wants
+    // whether or not anything else failed, and an exemption nobody can see is
+    // the confident-zero shape this file exists to stop.
+    let dependency_down: Vec<serde_json::Value> = judged
+        .iter()
+        .filter(|r| r.ok * 100 <= r.n * MOUNTED_ANSWERS_MAX_OK_PCT)
+        .filter_map(|r| {
+            let daemon = optional_dependency_for(&r.method, &r.shape)?;
+            (r.unavailable > 0 && r.server_err == r.unavailable).then(|| {
+                serde_json::json!({
+                    "route": format!("{} {}", r.method, r.shape),
+                    "daemon": daemon,
+                    "n": r.n,
+                    "unavailable_503": r.unavailable,
+                    "note": format!(
+                        "{daemon} is not running. The route ANSWERED, with a 503 naming the \
+                         daemon and the command to start it, so there is no route defect here."
+                    ),
+                })
+            })
+        })
+        .collect();
     let ev = |extra: serde_json::Value| -> serde_json::Value {
         serde_json::json!({
             "measured": true,
@@ -178,6 +247,7 @@ pub fn mounted_routes_answer(
             "min_n": MOUNTED_ANSWERS_MIN_N,
             "max_ok_pct": MOUNTED_ANSWERS_MAX_OK_PCT,
             "blind_spots": MOUNTED_ANSWERS_BLIND_SPOTS,
+            "dependency_down": dependency_down,
             "detail": extra,
         })
     };
@@ -191,6 +261,14 @@ pub fn mounted_routes_answer(
         // which /api/logs/analyze already reports as a 404 group with
         // nearest_routes. This check is only about routes that DO exist.
         if !matches!(match_route_full(mounted, &r.method, &r.shape), RouteMatch::Ok) {
+            continue;
+        }
+        // The declared optional-dependency case, and ONLY when every 5xx on the
+        // shape is a 503. A declared route returning a 500 still fails here.
+        if optional_dependency_for(&r.method, &r.shape).is_some()
+            && r.unavailable > 0
+            && r.server_err == r.unavailable
+        {
             continue;
         }
         failed += 1;
@@ -217,6 +295,7 @@ pub fn mounted_routes_answer(
                 "ok": r.ok,
                 "client_err_4xx": r.client_err,
                 "server_err_5xx": r.server_err,
+                "unavailable_503": r.unavailable,
                 "refusal_shaped": r.server_err == 0 && r.client_err > 0,
             }))),
         );
@@ -5505,7 +5584,7 @@ mod negative_controls {
     #[test]
     fn a_refusing_gate_and_a_dead_route_are_told_apart_in_the_evidence() {
         let mounted: Vec<(&str, &[&str])> =
-            vec![("/api/email/reply", &["POST"]), ("/api/torrents", &["GET"])];
+            vec![("/api/email/reply", &["POST"]), ("/api/sql/run", &["GET"])];
         let rows = vec![
             // A GATE doing its job: answered every time, refused every time.
             RouteOutcomeRow {
@@ -5515,15 +5594,24 @@ mod negative_controls {
                 ok: 0,
                 client_err: 12,
                 server_err: 0,
+                unavailable: 0,
             },
             // A route actually FAILING. Same 0% 2xx, opposite meaning.
+            //
+            // THIS ROW USED TO BE THE REAL `GET /api/torrents 0/44 (0 4xx, 44
+            // 5xx)`, cast as the dead route. It was never one: all 44 were 503s
+            // from `aria2_down()` naming the daemon and the command to start it
+            // (AMUX-4545). The fixture encoded the misreading it was written to
+            // illustrate, so the check kept filing that route and the suite kept
+            // agreeing with it. A non-503 5xx is the honest example.
             RouteOutcomeRow {
                 method: "GET".into(),
-                shape: "/api/torrents".into(),
+                shape: "/api/sql/run".into(),
                 n: 44,
                 ok: 0,
                 client_err: 0,
                 server_err: 44,
+                unavailable: 0,
             },
         ];
         let rs = mounted_routes_answer(&rows, &mounted);
@@ -5536,7 +5624,7 @@ mod negative_controls {
             .expect("the gate is reported");
         let dead = fails
             .iter()
-            .find(|r| r.entity_key == "GET /api/torrents")
+            .find(|r| r.entity_key == "GET /api/sql/run")
             .expect("the dead route is reported");
 
         // THE DISCRIMINATOR. Without the split both observed lines read "0/N 2xx"
@@ -5555,6 +5643,88 @@ mod negative_controls {
         assert_eq!(dead.evidence["detail"]["refusal_shaped"], serde_json::json!(false));
     }
 
+    /// A 503 FROM A DECLARED OPTIONAL DAEMON IS AN ANSWER (AMUX-4545).
+    ///
+    /// `GET /api/torrents` was filed three times over two days as a route that
+    /// does not answer, on 46 of 46 5xx. Every one was a 503 from
+    /// `aria2_down()`, which names the daemon and returns the exact command to
+    /// start it. There was no change to the handler that could have cleared the
+    /// invariant, and unmounting a working route to silence a check would have
+    /// been worse: ethos rule 3, so the instrument moved.
+    ///
+    /// Three cells, because the exemption has to be able to be WRONG. It is
+    /// scoped by route AND by status, and each half is pinned separately.
+    #[test]
+    fn a_declared_optional_daemon_being_down_is_not_a_route_failure() {
+        let mounted: Vec<(&str, &[&str])> =
+            vec![("/api/torrents", &["GET"]), ("/api/sql/run", &["GET"])];
+
+        // 1. The live specimen: declared route, every 5xx a 503. Not a finding.
+        let rs = mounted_routes_answer(
+            &[RouteOutcomeRow {
+                method: "GET".into(),
+                shape: "/api/torrents".into(),
+                n: 46,
+                ok: 0,
+                client_err: 0,
+                server_err: 46,
+                unavailable: 46,
+            }],
+            &mounted,
+        );
+        assert!(
+            !rs.iter().any(|r| r.status == Status::Fail),
+            "a daemon nobody is required to run must not red the fleet: {rs:?}"
+        );
+        // PUBLISHED, NOT SWALLOWED. An exemption a reader cannot see is the
+        // confident-zero shape this file exists to stop, so the pass arm has to
+        // carry the fact and name the daemon.
+        let dep = &rs[0].evidence["dependency_down"];
+        assert_eq!(dep[0]["route"], serde_json::json!("GET /api/torrents"), "{dep}");
+        assert_eq!(dep[0]["daemon"], serde_json::json!("aria2c"), "{dep}");
+        assert_eq!(dep[0]["unavailable_503"], serde_json::json!(46), "{dep}");
+
+        // 2. SCOPED BY STATUS. The same declared route returning 500s is a real
+        //    failure and must still be reported — otherwise the exemption is a
+        //    blanket amnesty for one path rather than a statement about 503.
+        let rs = mounted_routes_answer(
+            &[RouteOutcomeRow {
+                method: "GET".into(),
+                shape: "/api/torrents".into(),
+                n: 46,
+                ok: 0,
+                client_err: 0,
+                server_err: 46,
+                unavailable: 0,
+            }],
+            &mounted,
+        );
+        assert!(
+            rs.iter().any(|r| r.status == Status::Fail),
+            "a declared route can still BREAK, and a 500 is not a 503: {rs:?}"
+        );
+
+        // 3. SCOPED BY ROUTE. An undeclared route answering only 503 still
+        //    fails: `board.rs` returning 503 means the store is unreachable,
+        //    which is exactly the fault this invariant should keep catching.
+        let rs = mounted_routes_answer(
+            &[RouteOutcomeRow {
+                method: "GET".into(),
+                shape: "/api/sql/run".into(),
+                n: 46,
+                ok: 0,
+                client_err: 0,
+                server_err: 46,
+                unavailable: 46,
+            }],
+            &mounted,
+        );
+        assert!(
+            rs.iter().any(|r| r.status == Status::Fail),
+            "503 is not blanket-exempt, only declared optional daemons are: {rs:?}"
+        );
+    }
+
     #[test]
     fn a_mounted_route_that_never_answers_is_reported_and_a_healthy_one_is_not() {
         let mounted: Vec<(&str, &[&str])> = vec![
@@ -5563,16 +5733,16 @@ mod negative_controls {
         ];
         let rows = vec![
             // The live specimen: mounted, called 15 times, answered 0.
-            RouteOutcomeRow { method: "GET".into(), shape: "/api/workers/{id}".into(), n: 15, ok: 0, client_err: 15, server_err: 0 },
+            RouteOutcomeRow { method: "GET".into(), shape: "/api/workers/{id}".into(), n: 15, ok: 0, client_err: 15, server_err: 0, unavailable: 0 },
             // ARM 2 — a HEALTHY mounted route. Without this the check could
             // flag everything and still pass arm 1.
-            RouteOutcomeRow { method: "POST".into(), shape: "/api/workers/{id}/send".into(), n: 4368, ok: 4006, client_err: 300, server_err: 62 },
+            RouteOutcomeRow { method: "POST".into(), shape: "/api/workers/{id}/send".into(), n: 4368, ok: 4006, client_err: 300, server_err: 62, unavailable: 0 },
             // Below the threshold: judged on nothing, so reported as nothing.
-            RouteOutcomeRow { method: "GET".into(), shape: "/api/workers/{id}".into(), n: 0, ok: 0, client_err: 0, server_err: 0 },
+            RouteOutcomeRow { method: "GET".into(), shape: "/api/workers/{id}".into(), n: 0, ok: 0, client_err: 0, server_err: 0, unavailable: 0 },
             // UNMOUNTED and failing: a client guessing a URL. /api/logs/analyze
             // already reports these as 404 groups with nearest_routes, and this
             // check must not double-file them.
-            RouteOutcomeRow { method: "GET".into(), shape: "/api/stripe/status".into(), n: 430, ok: 0, client_err: 430, server_err: 0 },
+            RouteOutcomeRow { method: "GET".into(), shape: "/api/stripe/status".into(), n: 430, ok: 0, client_err: 430, server_err: 0, unavailable: 0 },
         ];
         let rs = mounted_routes_answer(&rows, &mounted);
         let fails: Vec<_> = rs.iter().filter(|r| r.status == Status::Fail).collect();
@@ -5589,7 +5759,7 @@ mod negative_controls {
         // means "nothing failed loudly enough, often enough, with a status",
         // and a reader who cannot see that will read it as "every route answers".
         let clean = mounted_routes_answer(
-            &[RouteOutcomeRow { method: "POST".into(), shape: "/api/workers/{id}/send".into(), n: 4368, ok: 4006, client_err: 300, server_err: 62 }],
+            &[RouteOutcomeRow { method: "POST".into(), shape: "/api/workers/{id}/send".into(), n: 4368, ok: 4006, client_err: 300, server_err: 62, unavailable: 0 }],
             &mounted,
         );
         assert_eq!(clean.len(), 1);
@@ -5599,14 +5769,23 @@ mod negative_controls {
         assert_eq!(ev["n_considered"], 1, "a zero finding is only readable beside its population");
         // The COUNT is pinned on purpose, so growing the list is a decision
         // somebody makes rather than a line that slips in. It grew to 5 when the
-        // refusal-shaped spot was added; this assertion is what made that
-        // visible instead of silent.
-        assert_eq!(ev["blind_spots"].as_array().map(|a| a.len()), Some(5),
-                   "all five blind spots ship with every result");
+        // refusal-shaped spot was added, and to 6 for the optional-daemon 503
+        // (AMUX-4545); this assertion is what made each one visible instead of
+        // silent, and it caught the sixth on the first run.
+        assert_eq!(ev["blind_spots"].as_array().map(|a| a.len()), Some(6),
+                   "all six blind spots ship with every result");
         assert!(ev["blind_spots"].to_string().contains("error body"),
                 "the status-only blind spot is the one most likely to be forgotten");
         assert!(ev["blind_spots"].to_string().contains("CORRECT answer is a refusal"),
                 "a working authorization gate reads as 0% 2xx and must be named as a blind spot");
+        assert!(ev["blind_spots"].to_string().contains("OPTIONAL daemon"),
+                "a 503 from a daemon nobody must run is an answer, and the exemption has to be \
+                 legible to whoever reads a pass");
+        // The exemption's OWN population, beside the pass. An empty list here
+        // and a missing key are different facts, and only one of them means
+        // "every declared daemon is up".
+        assert!(ev["dependency_down"].is_array(),
+                "the exemption must publish its population, including as an empty list: {ev}");
 
         // ARM 4 — an empty log is UNKNOWN, never a pass. This is the trap
         // route.callers_have_routes already guards: a probe that could not run

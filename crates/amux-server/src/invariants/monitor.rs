@@ -143,15 +143,33 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
         )),
         Ok(conn) => {
             let since = crate::config::now_f64() - 14.0 * 86400.0;
-            let mut acc: std::collections::HashMap<(String, String), (i64, i64, i64, i64)> =
+            // NAMED FIELDS, not a 5-tuple. clippy::type_complexity refuses the
+            // tuple, and it is right for a second reason: five bare i64s
+            // accumulated positionally (`e.0 += ok; e.1 += n; ...`) is a
+            // transposition waiting to happen, and a swapped pair here would
+            // surface as a wrong verdict rather than as a compile error.
+            #[derive(Default)]
+            struct Acc {
+                ok: i64,
+                n: i64,
+                client_err: i64,
+                server_err: i64,
+                unavailable: i64,
+            }
+            let mut acc: std::collections::HashMap<(String, String), Acc> =
                 std::collections::HashMap::new();
+            // 503 is summed APART from the rest of the 5xx band, because it is
+            // the only status a handler picks to say "something I depend on is
+            // not there" and `status >= 500` cannot be un-mixed afterwards
+            // (AMUX-4545).
             let rows = conn
                 .prepare(
                     "SELECT method, path, \
                             SUM(CASE WHEN status >= 200 AND status < 300 THEN 1 ELSE 0 END), \
                             COUNT(*), \
                             SUM(CASE WHEN status >= 400 AND status < 500 THEN 1 ELSE 0 END), \
-                            SUM(CASE WHEN status >= 500 THEN 1 ELSE 0 END) \
+                            SUM(CASE WHEN status >= 500 THEN 1 ELSE 0 END), \
+                            SUM(CASE WHEN status = 503 THEN 1 ELSE 0 END) \
                      FROM _amux_request_log WHERE ts >= ?1 GROUP BY method, path",
                 )
                 .and_then(|mut stmt| {
@@ -163,23 +181,31 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
                             r.get::<_, i64>(3)?,
                             r.get::<_, i64>(4)?,
                             r.get::<_, i64>(5)?,
+                            r.get::<_, i64>(6)?,
                         ))
                     })
                     .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
                 })
                 .unwrap_or_default();
-            for (method, path, ok, n, c4, c5) in rows {
+            for (method, path, ok, n, c4, c5, c503) in rows {
                 let shape = crate::api::request_log::normalize_target_verb(&path);
-                let e = acc.entry((method, shape)).or_insert((0, 0, 0, 0));
-                e.0 += ok;
-                e.1 += n;
-                e.2 += c4;
-                e.3 += c5;
+                let e = acc.entry((method, shape)).or_default();
+                e.ok += ok;
+                e.n += n;
+                e.client_err += c4;
+                e.server_err += c5;
+                e.unavailable += c503;
             }
             let groups: Vec<checks::RouteOutcomeRow> = acc
                 .into_iter()
-                .map(|((method, shape), (ok, n, client_err, server_err))| {
-                    checks::RouteOutcomeRow { method, shape, n, ok, client_err, server_err }
+                .map(|((method, shape), a)| checks::RouteOutcomeRow {
+                    method,
+                    shape,
+                    n: a.n,
+                    ok: a.ok,
+                    client_err: a.client_err,
+                    server_err: a.server_err,
+                    unavailable: a.unavailable,
                 })
                 .collect();
             out.extend(checks::mounted_routes_answer(&groups, &mounted));
