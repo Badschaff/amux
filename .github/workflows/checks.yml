@@ -508,6 +508,11 @@ jobs:
       # while a CLI still sending `reviewer` leaves the feature dead.
       - name: CLI board request routes to the target
         run: ./scripts/test-board-request-routes-to-target.sh
+      # AMUX-4705: a piped brief splits into a one-line title and a body. Its
+      # own step because the failure is silent: the card is created, exit 0, and
+      # the title is a paragraph.
+      - name: CLI piped brief splits into title and body
+        run: ./scripts/test-board-piped-title-body.sh
       # AMUX-3891. The CLI is symlinked straight into the working tree and ~50
       # lanes invoke it while it is being edited, so it MUST be parseable in one
       # read: bash holds a byte offset, and a rewrite mid-invocation resumes it

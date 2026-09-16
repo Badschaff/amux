@@ -2451,6 +2451,57 @@ before amux ever sees them (AMUX-1888).
 EOF
 }
 
+# A piped brief is a TITLE AND A BODY, the way a commit message is (AMUX-4705).
+#
+# `--stdin` and `--file` set the title, which is what their usage lines say and
+# is exactly the trap: the thing a caller actually pipes into a card verb is the
+# whole brief, and piping is the SANCTIONED way to pass text that must not be
+# shell-evaluated (AMUX-1888). So following the documented advice produced a card
+# whose title was a paragraph and whose description was empty.
+#
+# Measured 2026-09-15, two lanes inside one hour. mixpeek-finances hit it on all
+# six requests they re-issued onto the new routing (TG-3756 pre-repair: title
+# "Full scope, gates, evidence...", desc len 0) and repaired each by PATCH. I hit
+# it on AT-24, and compounded it by passing --stdin and --desc-stdin together,
+# which both call `cat`, so the second one read nothing.
+#
+# This is AEAB-17's shape on a different flag: there, `board add` folded unknown
+# flags into the title, and the fix was to reject them AND to accept --type and
+# --desc-* so the honest path became the easy path. Same remedy here, one layer
+# in. Sets _BT (title) and _BB (body); pure bash, because a command substitution
+# cannot carry the NUL a separator would need and strips trailing newlines.
+_board_split_piped() {
+  local raw="$1"
+  while [[ "$raw" == $'\n'* ]]; do raw="${raw#$'\n'}"; done
+  if [[ "$raw" == *$'\n'* ]]; then
+    _BT="${raw%%$'\n'*}"
+    _BB="${raw#*$'\n'}"
+    while [[ "$_BB" == $'\n'* ]]; do _BB="${_BB#$'\n'}"; done
+  else
+    _BT="$raw"
+    _BB=""
+  fi
+}
+
+# Apply the split to a verb's parsed $title/$desc. Says what it did on stderr,
+# because a silent reinterpretation of the caller's input is how they learn the
+# interface wrong twice.
+_board_apply_piped_split() {
+  local verb="$1"
+  _board_split_piped "$title"
+  # ONE RULE, deliberately. This began with a `[[ $title == *\n* ]] || return 0`
+  # early-out above as well, and mutation showed the pair was redundant: deleting
+  # EITHER one left every cell green, because the other also protects a
+  # single-line title. That is testing A-or-B, so the suite read strongest
+  # exactly where the rules duplicated and the cell would have survived somebody
+  # simplifying one away. The empty-body check is the load-bearing one: it also
+  # catches a brief that is a headline followed only by blank lines.
+  [[ -n "$_BB" ]] || { title="$_BT"; return 0; }
+  title="$_BT"
+  if [[ -n "$desc" ]]; then desc="$_BB"$'\n\n'"$desc"; else desc="$_BB"; fi
+  echo "note: $verb read a multi-line title; first line is the title, the rest became the description (use --desc-stdin to set only the body)." >&2
+}
+
 _board_request_usage() {
   cat <<EOF
 Usage: amux board request <worker> <title>
@@ -3531,6 +3582,7 @@ else:
           *)             title="${title:+$title }$1"; _src=1; shift ;;
         esac
       done
+      _board_apply_piped_split "board request"
       [[ -n "${title// }" ]] || die "$(_board_request_usage)"
       local _deps_joined="" body result
       [[ ${#deps[@]} -gt 0 ]] && _deps_joined=$(printf '%s\n' "${deps[@]}")
@@ -3619,6 +3671,7 @@ never-due rather than failing loudly."
           *)             title="${title:+$title }$1"; _src=1; shift ;;
         esac
       done
+      _board_apply_piped_split "board add"
       [[ -n "$title" ]] || die "$(_board_add_usage)"
       local body result
       local _deps_joined=""
