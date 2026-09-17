@@ -66,7 +66,27 @@ for (const outcome of ['refused', 'accepted', 'queued', 'unconfirmed'] as const)
       release();
       if (outcome === 'accepted') await expect.poll(async () => (await entries()).length).toBe(0);
       else {
-        await expect.poll(async () => (await entries())[0]?.attempts).toBe(1);
+        // AT LEAST ONE, NOT EXACTLY ONE. `attempts` is a monotonic counter the
+        // product is DESIGNED to increment: a pending entry is retried on the
+        // sync backoff, so this value moves during the very window the poll
+        // watches. `expect.poll` can only wait a value TOWARD its expectation,
+        // so once attempts passes 1 the assertion can never be satisfied and
+        // burns its full 5s timeout.
+        //
+        // MEASURED on this host by sampling the entry every 500ms after
+        // release(): queued goes 1 -> 2 at t=4000ms against a 5000ms poll, a
+        // margin of one second. That is the whole flake: a fast runner reads at
+        // ~0ms and passes, a loaded CI runner reads after 4s and fails with
+        // "Received: 2". Reproduced deterministically here by waiting 4.5s
+        // before the assertion, which turns the intermittent red into a certain
+        // one, and `refused` never fails because it settles to `blocked` and
+        // blocked entries are excluded from the pending set that gets retried.
+        //
+        // The subject of this test is that the entry persists locally and
+        // clears only after persistence; the no-double-send property is already
+        // pinned by `payloads.length` above. One attempt or two, the invariant
+        // is that the send was recorded and the entry survived.
+        await expect.poll(async () => (await entries())[0]?.attempts).toBeGreaterThanOrEqual(1);
         expect((await entries())[0].state).toBe(outcome === 'refused' ? 'blocked' : 'pending');
         if (outcome === 'unconfirmed') expect((await entries())[0].delivery_uncertain).toBe(true);
       }
