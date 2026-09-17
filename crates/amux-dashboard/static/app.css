@@ -2669,6 +2669,21 @@
   /* Kanban view of session issues: let the inner .board-columns scroll horizontally */
   .peek-tasks-list.peek-issues-kanban { overflow-y: auto; }
   .peek-tasks-list.peek-issues-kanban .board-columns { flex: 1; min-height: 0; }
+  /* THE ACTIVITY BANNER MUST SCROLL WITH THE BOARD (Ethan, 2026-09-16:
+     "I should be able to scroll this down. It should not be fixed.").
+     `_renderBoardActivity` inserts the strip as a SIBLING BEFORE its host, and
+     on this panel the host is `#peek-issues-list`, which is the element that
+     carries `overflow-y: auto`. So the banner landed in the non-scrolling flex
+     parent and stayed pinned while the cards scrolled underneath it, costing
+     fixed vertical space on a phone. Moving the strip inside the list instead
+     is not available: `renderPeekIssues` rewrites `list.innerHTML` at four
+     points across two functions with early returns between them, so a child
+     would be wiped on the next render.
+     Scoped to this panel by id. Other `.peek-tasks-panel` tabs set their own
+     inline `overflow-y: auto` and must keep scrolling themselves. */
+  #peek-issues-panel { overflow-y: auto; -webkit-overflow-scrolling: touch; }
+  #peek-issues-panel > .peek-tasks-list,
+  #peek-issues-panel > .peek-tasks-list.peek-issues-kanban { overflow-y: visible; flex: 0 0 auto; }
   .peek-issue-item { display: flex; flex-shrink: 0; align-items: flex-start; gap: 8px; padding: 8px 10px;
     border-radius: 8px; border: 1px solid var(--border); cursor: pointer; transition: background 0.15s; }
   .peek-issue-item:hover { background: var(--hover); border-color: var(--accent); }
