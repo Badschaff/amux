@@ -6463,11 +6463,18 @@ input.mdai-edge-path-input:focus { border-color: var(--accent); box-shadow: 0 0 
 .orch-worker { font-size:.72rem; color:var(--accent); cursor:pointer; }
 .orch-worker:hover { text-decoration:underline; }
 .orch-worker-plain { font-size:.72rem; color:var(--dim); }
+.orch-section { margin-bottom:16px; }
+.orch-section-header { display:flex; align-items:center; gap:8px; padding:8px 4px; cursor:pointer; user-select:none; min-height:36px; }
+.orch-section-header:hover { opacity:.8; }
+.orch-section-label { font-weight:600; font-size:.82rem; text-transform:uppercase; letter-spacing:.04em; color:var(--dim); }
+.orch-section-count { font-size:.72rem; color:var(--dim); background:var(--surface2); border-radius:10px; padding:2px 8px; }
+.orch-section-body { padding-left:4px; }
 @media (max-width:600px) {
   .orch-epic-header { padding:10px 12px; gap:8px; }
   .orch-child { gap:6px; }
   .orch-title { font-size:.82rem; }
   .orch-child-title { font-size:.8rem; }
+  .orch-section-header { min-height:44px; }
 }
 #board-view .board-toolbar { padding:10px 0 14px; }
 #board-view .board-columns { gap:16px; align-items:flex-start; }

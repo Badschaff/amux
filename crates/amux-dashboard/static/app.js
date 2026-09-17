@@ -11226,7 +11226,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.979';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.980';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -32150,61 +32150,95 @@ async function _orchLoad() {
     });
 
     if (!orchEpics.length) {
-      el.innerHTML = '<div style="color:var(--dim);padding:12px 0;font-size:.85rem;">No active orchestrations. Use the Launch bar on the Board tab to fan out priorities.</div>';
+      el.innerHTML = '<div style="color:var(--dim);padding:12px 0;font-size:.85rem;">No orchestrations yet. Use the Launch bar on the Board tab to fan out priorities.</div>';
       return;
     }
 
-    // Sort: active (doing) first, then by updated desc
-    orchEpics.sort((a, b) => {
-      if (a.status === 'doing' && b.status !== 'doing') return -1;
-      if (b.status === 'doing' && a.status !== 'doing') return 1;
-      return (b.updated || 0) - (a.updated || 0);
-    });
-
-    let html = '';
+    // Classify each epic into a group
+    const TERMINAL = new Set(['done', 'verified', 'discarded', 'cancelled']);
+    const groups = { active: [], paused: [], archived: [], expired: [] };
     orchEpics.forEach(epic => {
+      const st = epic.status || 'todo';
       const children = childByEpic[epic.id] || [];
-      const done = children.filter(c => c.status === 'done' || c.status === 'verified' || c.status === 'discarded').length;
+      const allChildrenTerminal = children.length > 0 && children.every(c => TERMINAL.has(c.status));
+      const hasEphChildren = children.some(ch => (ch.session || '').includes('-eph-') || (sessMap[ch.session || ''] || {}).ephemeral);
+      const hasLiveWorker = children.some(ch => {
+        const s = sessMap[ch.session || ''];
+        return s && (s.status === 'busy' || s.status === 'idle');
+      });
+      if (allChildrenTerminal && !hasLiveWorker && hasEphChildren) {
+        groups.expired.push(epic);
+      } else if (st === 'archived' || st === 'discarded') {
+        groups.archived.push(epic);
+      } else if (st === 'todo' || st === 'backlog') {
+        groups.paused.push(epic);
+      } else {
+        groups.active.push(epic);
+      }
+    });
+    // Sort within each group by updated desc
+    const byUpdated = (a, b) => (b.updated || 0) - (a.updated || 0);
+    Object.values(groups).forEach(arr => arr.sort(byUpdated));
+
+    function renderEpicCard(epic) {
+      const children = childByEpic[epic.id] || [];
+      const done = children.filter(c => TERMINAL.has(c.status)).length;
       const total = children.length;
       const pct = total > 0 ? Math.round((done / total) * 100) : 0;
       const epicStatus = epic.status || 'todo';
       const isActive = epicStatus === 'doing';
 
-      html += '<div class="orch-epic' + (isActive ? ' active' : '') + '">';
-      html += '<div class="orch-epic-header" onclick="_orchToggle(this)">';
-      html += '<span class="orch-caret">&#x25B6;</span>';
-      html += '<span class="orch-title">' + esc(epic.title) + '</span>';
-      html += '<span class="orch-progress">' + done + '/' + total + ' (' + pct + '%)</span>';
-      html += '<span class="status-badge ' + epicStatus + '">' + esc(epicStatus) + '</span>';
-      html += '</div>';
-
-      // Progress bar
-      html += '<div class="orch-progress-bar"><div class="orch-progress-fill" style="width:' + pct + '%;"></div></div>';
-
-      // Children (collapsed by default)
-      html += '<div class="orch-children" style="display:none;">';
+      let h = '<div class="orch-epic' + (isActive ? ' active' : '') + '">';
+      h += '<div class="orch-epic-header" onclick="_orchToggle(this)">';
+      h += '<span class="orch-caret">&#x25B6;</span>';
+      h += '<span class="orch-title">' + esc(epic.title) + '</span>';
+      h += '<span class="orch-progress">' + done + '/' + total + ' (' + pct + '%)</span>';
+      h += '<span class="status-badge ' + epicStatus + '">' + esc(epicStatus) + '</span>';
+      h += '</div>';
+      h += '<div class="orch-progress-bar"><div class="orch-progress-fill" style="width:' + pct + '%;"></div></div>';
+      h += '<div class="orch-children" style="display:none;">';
       children.forEach(child => {
         const sess = sessMap[child.session];
-        const isEph = sess && sess.ephemeral;
+        const isEph = (sess && sess.ephemeral) || (child.session || '').includes('-eph-');
         const workerStatus = sess ? (sess.status || 'stopped') : 'stopped';
         const childStatus = child.status || 'todo';
-        const statusCls = childStatus === 'done' || childStatus === 'verified' ? 'done'
-          : childStatus === 'doing' ? 'running' : 'pending';
+        const statusCls = TERMINAL.has(childStatus) ? 'done' : childStatus === 'doing' ? 'running' : 'pending';
 
-        html += '<div class="orch-child ' + statusCls + '">';
-        html += '<span class="orch-child-title" onclick="switchView(\'board\');setTimeout(function(){openBoardDetail(\'' + escJs(child.id) + '\')},300)">' + esc(child.title) + '</span>';
-        html += '<span class="status-badge ' + childStatus + '">' + esc(childStatus) + '</span>';
+        h += '<div class="orch-child ' + statusCls + '">';
+        h += '<span class="orch-child-title" onclick="switchView(\'board\');setTimeout(function(){openBoardDetail(\'' + escJs(child.id) + '\')},300)">' + esc(child.title) + '</span>';
+        h += '<span class="status-badge ' + childStatus + '">' + esc(childStatus) + '</span>';
         if (isEph) {
           const wsCls = workerStatus === 'busy' ? 'running' : (workerStatus === 'idle' ? 'idle' : 'stopped');
-          html += '<span class="bd-fanout-status ' + wsCls + '">' + esc(workerStatus) + '</span>';
-          html += '<span class="orch-worker" onclick="event.stopPropagation();showSession(\'' + escJs(child.session) + '\')">' + esc(child.session) + '</span>';
+          h += '<span class="bd-fanout-status ' + wsCls + '">' + esc(workerStatus) + '</span>';
+          h += '<span class="orch-worker" onclick="event.stopPropagation();showSession(\'' + escJs(child.session) + '\')">' + esc(child.session) + '</span>';
         } else if (child.session) {
-          html += '<span class="orch-worker-plain">' + esc(child.session) + '</span>';
+          h += '<span class="orch-worker-plain">' + esc(child.session) + '</span>';
         }
-        html += '</div>';
+        h += '</div>';
       });
-      html += '</div></div>';
-    });
+      h += '</div></div>';
+      return h;
+    }
+
+    function renderSection(key, label, items, startOpen) {
+      if (!items.length) return '';
+      let h = '<div class="orch-section">';
+      h += '<div class="orch-section-header" onclick="_orchToggleSection(this)">';
+      h += '<span class="orch-caret' + (startOpen ? ' open' : '') + '">&#x25B6;</span>';
+      h += '<span class="orch-section-label">' + label + '</span>';
+      h += '<span class="orch-section-count">' + items.length + '</span>';
+      h += '</div>';
+      h += '<div class="orch-section-body" style="' + (startOpen ? '' : 'display:none;') + '">';
+      items.forEach(e => { h += renderEpicCard(e); });
+      h += '</div></div>';
+      return h;
+    }
+
+    let html = '';
+    html += renderSection('active', 'Active', groups.active, true);
+    html += renderSection('paused', 'Paused', groups.paused, false);
+    html += renderSection('archived', 'Archived', groups.archived, false);
+    html += renderSection('expired', 'Expired', groups.expired, false);
     el.innerHTML = html;
   } catch (e) {
     el.innerHTML = '<div style="color:var(--error);padding:8px;">Error: ' + esc(e.message) + '</div>';
@@ -32223,6 +32257,15 @@ function _orchToggle(hdr) {
   if (!children) return;
   const open = children.style.display !== 'none';
   children.style.display = open ? 'none' : '';
+  if (caret) caret.classList.toggle('open', !open);
+}
+
+function _orchToggleSection(hdr) {
+  const body = hdr.parentElement.querySelector('.orch-section-body');
+  const caret = hdr.querySelector('.orch-caret');
+  if (!body) return;
+  const open = body.style.display !== 'none';
+  body.style.display = open ? 'none' : '';
   if (caret) caret.classList.toggle('open', !open);
 }
 
