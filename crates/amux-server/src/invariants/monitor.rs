@@ -1076,6 +1076,60 @@ pub fn undeclared_timestamp_columns(conn: &rusqlite::Connection) -> (Vec<String>
     (out, n_scanned)
 }
 
+/// Newest-N max for one declared timestamp column, with an unset 0 skipped.
+///
+/// Extracted so a test can call the SQL rather than a paraphrase of it: the
+/// defect this fixes lived in the query string, and a test asserting on
+/// hand-built `observed` tuples would have stayed green through it.
+///
+/// `NULLIF(col, 0)`: A ZERO IS AN UNSET SENTINEL, NOT A TIMESTAMP. Without it
+/// this check cannot PASS in the healthy state for any column that uses 0 for
+/// "not applicable". Measured on this box (AMUX-4673):
+/// `cmd_history.intake_called_at` and `.intake_retry_at` were the only 2
+/// failures out of 72 entities, and all 500 rows in the sample were 0 because
+/// that IS the correct value there. `board_lifecycle` writes it deliberately:
+/// on a successful intake it does `SET ... intake_retry_at=0`, meaning no retry
+/// is pending. So the check reported a permanent FAIL over a table behaving
+/// exactly as designed, and the detector kept filing cards about it.
+///
+/// Nothing is hidden by skipping zeros. This check exists to catch a
+/// SECONDS-vs-MILLISECONDS mixup, a factor of 1000, and 0 is the single value
+/// that carries no unit information at all: 0 seconds and 0 milliseconds are
+/// the same instant. An all-zero sample cannot tell you the unit, so the
+/// truthful answer is "no value to check against", which this check already
+/// has both wording and a code path for. This turns a false FAIL into a real
+/// UNKNOWN.
+fn sampled_timestamp_max(
+    conn: &rusqlite::Connection,
+    table: &str,
+    col: &str,
+    sample: usize,
+) -> Option<f64> {
+    // rowid order, not `col` order: ordering by the column being probed would
+    // need the index this exists to avoid needing.
+    let bounded = format!(
+        "SELECT MAX(NULLIF(\"{col}\", 0)) FROM \
+         (SELECT \"{col}\" FROM \"{table}\" ORDER BY rowid DESC LIMIT {sample})"
+    );
+    // FALL BACK RATHER THAN REPORT A NULL. A WITHOUT ROWID table has no rowid to
+    // order by and the bounded form errors; `.ok()` on it alone would turn that
+    // into "this column is empty", which the check reports as unknown and a
+    // reader reads as a schema fact. Two such tables exist in this database
+    // today (the FTS shadow tables), and the next declared column could live in
+    // one.
+    match conn.query_row(&bounded, [], |r| r.get(0)) {
+        Ok(v) => v,
+        Err(_) => conn
+            .query_row(
+                &format!("SELECT MAX(NULLIF(\"{col}\", 0)) FROM \"{table}\""),
+                [],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten(),
+    }
+}
+
 fn timestamp_units_check(state: &AppState) -> Vec<InvariantResult> {
     const ID: &str = "schema.timestamp_units_declared";
     let Ok(conn) = state.store.read() else {
@@ -1127,25 +1181,7 @@ fn timestamp_units_check(state: &AppState) -> Vec<InvariantResult> {
     const SAMPLE: usize = 500;
     let mut observed: Vec<(String, Option<f64>)> = Vec::new();
     for (t, c, _) in checks::TIMESTAMP_COLUMNS {
-        // rowid order, not `c` order: ordering by the column being probed would
-        // need the index this exists to avoid needing.
-        let bounded = format!(
-            "SELECT MAX(\"{c}\") FROM (SELECT \"{c}\" FROM \"{t}\" ORDER BY rowid DESC LIMIT {SAMPLE})"
-        );
-        // FALL BACK RATHER THAN REPORT A NULL. A WITHOUT ROWID table has no
-        // rowid to order by and the bounded form errors; `.ok()` on it alone
-        // would turn that into "this column is empty", which the check reports
-        // as unknown and a reader reads as a schema fact. Two such tables exist
-        // in this database today (the FTS shadow tables), and the next declared
-        // column could live in one.
-        let max: Option<f64> = match conn.query_row(&bounded, [], |r| r.get(0)) {
-            Ok(v) => v,
-            Err(_) => conn
-                .query_row(&format!("SELECT MAX(\"{c}\") FROM \"{t}\""), [], |r| r.get(0))
-                .ok()
-                .flatten(),
-        };
-        observed.push((format!("{t}.{c}"), max));
+        observed.push((format!("{t}.{c}"), sampled_timestamp_max(&conn, t, c, SAMPLE)));
     }
     let now = crate::runtime_jobs::registry::unix_now();
     checks::timestamp_units_are_what_readers_assume(&observed, &undeclared, now, SAMPLE)
@@ -2713,6 +2749,69 @@ pub async fn run(state: AppState) {
 
 #[cfg(test)]
 mod tests {
+
+    /// AMUX-4673: an all-zero sample must read as UNKNOWN, never as a FAIL.
+    ///
+    /// `cmd_history.intake_retry_at` holds 0 for "no retry pending", which
+    /// `board_lifecycle` writes on every successful intake. Before the fix,
+    /// `MAX(col)` over the newest rows returned 0, the unit check compared 0
+    /// against now, and the invariant failed permanently over a healthy table.
+    /// Measured live: 2 failures out of 72 entities, both this shape, with 500
+    /// of the 500 sampled rows holding the sentinel.
+    #[test]
+    fn an_all_zero_timestamp_sample_is_unknown_not_a_false_max() {
+        let conn = crate::db::migrate::test_memdb();
+        for i in 0..5i64 {
+            conn.execute(
+                "INSERT INTO cmd_history (text, type, session, ts, origin, \
+                 intake_called_at, intake_retry_at) \
+                 VALUES ('x', 'msg', 's', ?1, 'test', 0, 0)",
+                rusqlite::params![1_789_000_000i64 + i],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            super::sampled_timestamp_max(&conn, "cmd_history", "intake_retry_at", 500),
+            None,
+            "0 is an unset sentinel; reporting it as a max makes the unit check fail forever"
+        );
+
+        // POSITIVE CONTROL. Without it this passes just as happily against an
+        // empty table or a misspelled column, which would make it a test of the
+        // fixture rather than of the NULLIF.
+        assert_eq!(
+            super::sampled_timestamp_max(&conn, "cmd_history", "ts", 500),
+            Some(1_789_000_004.0),
+            "a real timestamp column must still report its max, or the NULLIF is eating data"
+        );
+    }
+
+    /// Skipping the sentinel must not skip the row carrying the unit evidence.
+    #[test]
+    fn one_real_timestamp_among_zeros_is_still_found() {
+        let conn = crate::db::migrate::test_memdb();
+        for i in 0..4i64 {
+            conn.execute(
+                "INSERT INTO cmd_history (text, type, session, ts, origin, intake_called_at) \
+                 VALUES ('x', 'msg', 's', ?1, 'test', 0)",
+                rusqlite::params![1_789_000_000i64 + i],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO cmd_history (text, type, session, ts, origin, intake_called_at) \
+             VALUES ('x', 'msg', 's', 9, 'test', ?1)",
+            rusqlite::params![1_789_499_020i64],
+        )
+        .unwrap();
+
+        assert_eq!(
+            super::sampled_timestamp_max(&conn, "cmd_history", "intake_called_at", 500),
+            Some(1_789_499_020.0),
+            "the one non-zero row is the only unit evidence there is; it must not be skipped"
+        );
+    }
     #[test]
     fn graph_invariant_distinguishes_corruption_from_an_unmeasured_probe() {
         let dir = tempfile::tempdir().unwrap();
@@ -3437,4 +3536,5 @@ mod section_timing_tests {
              whichever section happens to precede it"
         );
     }
+
 }
