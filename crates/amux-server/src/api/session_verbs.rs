@@ -7668,7 +7668,29 @@ pub(crate) async fn deliver_automated(
         // `from_steering = true` makes the callee REFUSE rather than type into a
         // turn that started between the gate and the send. A lost race then
         // falls through to the queue below instead of being reported as failed.
-        let (ok, msg) = send_text_inner(state, name, text, SendMode::drained(false, false)).await;
+        //
+        // NOT `SendMode::drained()` (Ethan, 2026-09-17: "do it" — closing the
+        // scheduler's isolation exemption). `drained()`'s `origin: Owner` is
+        // correct for an ACTUAL queue drain (`steer_enqueue`'s isolation gate
+        // already ran when the row was enqueued, so re-checking would be
+        // redundant) — but THIS branch never touches the queue at all, it is
+        // the scheduler's own "try it immediately, we're at a boundary" fast
+        // path. Reusing `drained()` here borrowed an "already vetted" origin
+        // for text that was never vetted, so a schedule firing on an isolated,
+        // running, at-a-boundary lane typed straight into its pane — the one
+        // path `isolation_refusal`'s general fix (AMUX-3764/3765) did not
+        // reach, because it looked like a queue drain from the inside. Both
+        // sibling `SendMode::drained()` call sites (session_verbs.rs's own
+        // steering-queue walk, and the idle-report drain) DO iterate real
+        // `steering_queue` rows and keep `origin: Owner` correctly.
+        let mode = SendMode {
+            defer_if_busy: false,
+            from_steering: true,
+            allow_mid_turn: false,
+            hook_confirmed_idle: false,
+            origin: SendOrigin::Automation,
+        };
+        let (ok, msg) = send_text_inner(state, name, text, mode).await;
         if ok {
             return classify(ok, msg);
         }
@@ -16735,12 +16757,29 @@ pub(crate) fn env_flag_on(v: Option<&str>) -> bool {
 ///   send. Gating delivery would let auto-pickup CLAIM a card for a lane it then
 ///   cannot reach, stranding it in `doing`, which is worse than the bug.
 ///
-/// THE SCHEDULER IS DELIBERATELY NOT FILTERED, and that is a decision rather
-/// than an omission. A schedule is a standing instruction a HUMAN created
-/// against that session by name; isolation is about amux's own automation not
-/// typing at a raw agent, not about silently cancelling configuration somebody
-/// set up (ethos rule 8). Owner peek/send are untouched for the same reason —
-/// that is the documented boundary.
+/// THE SCHEDULER USED TO BE DELIBERATELY NOT FILTERED — Ethan reversed that
+/// call on 2026-09-17 ("do it", after I asked): isolated now means isolated
+/// from a schedule too, not just from amux's own board/commit automation.
+/// This paragraph used to argue the opposite ("a schedule is a standing
+/// instruction a HUMAN created... not about silently cancelling configuration
+/// somebody set up") — that reasoning was sound for the DECISION as stated,
+/// and is kept here, struck by the owner's own later call, rather than
+/// deleted, so a future reader does not re-derive the same argument and
+/// re-revert this.
+///
+/// Mechanically, by the time of the reversal `deliver_automated` (the
+/// scheduler's one delivery entry point) was ALREADY isolation-safe on two of
+/// its three paths, as an emergent side effect of `isolation_refusal`
+/// (AMUX-3764/3765) rather than a deliberate scheduler carve-in: the
+/// stopped-lane auto-wake path passes `SendOrigin::Automation` directly, and
+/// the queued-fallback path passes a non-empty `guard`. Only the THIRD path —
+/// firing at an exact turn boundary — still got through, because it reused
+/// `SendMode::drained()` (built for draining an ALREADY-gated
+/// `steering_queue` row, where `origin: Owner` is correct) for a send that
+/// had never actually been queued or gated. Fixed at that one call site: same
+/// `from_steering`/boundary-race behavior, `origin: Automation` instead of
+/// borrowed `Owner`, so `isolation_refusal` now sees it too. Owner peek/send
+/// are still untouched — that remains the documented boundary.
 ///
 /// The lesson, since this list is what was wrong: audit an exemption against
 /// what still REACHES the thing, not against what the list already names.
@@ -23511,6 +23550,50 @@ mod tests {
         assert!(
             isolation_refusal("ordinary", SendOrigin::Automation).is_none(),
             "a non-isolated lane must be unaffected, or this gate is just 'turn the fleet off'"
+        );
+    }
+
+    /// THE THIRD PATH (Ethan, 2026-09-17: "do it" — closing the scheduler's
+    /// isolation exemption). The test above proves `isolation_refusal` refuses
+    /// `SendOrigin::Automation`; it does not prove `deliver_automated`'s
+    /// AT-BOUNDARY branch actually PASSES that origin — and until this fix it
+    /// did not, because it reused `SendMode::drained()` (built for an ALREADY
+    /// isolation-gated `steering_queue` row, where `origin: Owner` is right)
+    /// for a send that was never queued or gated at all.
+    ///
+    /// Reads the source, bounded to `deliver_automated`'s body, the same
+    /// shape `commit_nudge.rs`'s `the_sweep_labels_the_notice_with_the_repo_
+    /// root_not_the_lane_directory` uses and for the same reason: the
+    /// alternative is standing up a real turn-boundary signal (a reported-idle
+    /// row, a live pane) to reach one specific branch, purely to observe which
+    /// enum variant a local `SendMode` was built with — infrastructure this
+    /// module deliberately does not stand up (see the very next test).
+    #[test]
+    fn the_at_boundary_scheduler_path_no_longer_borrows_the_owners_origin() {
+        const SRC: &str = include_str!("session_verbs.rs");
+        let start = SRC.find("pub(crate) async fn deliver_automated(").expect("deliver_automated is gone");
+        let rest = &SRC[start..];
+        let end = rest[1..].find("\n}\n").map(|i| i + 3).expect("deliver_automated has no closing brace");
+        // CODE lines only. This function's own fix comment explains, in prose,
+        // exactly why NOT to call `SendMode::drained()` here -- a raw substring
+        // search over the whole body would trip on its own warning.
+        let code_only: String = rest[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = code_only.as_str();
+
+        assert!(
+            !body.contains("SendMode::drained("),
+            "deliver_automated must never reuse the queue-drain SendMode -- it does not drain a \
+             queue, and drained() hardcodes origin: Owner, which is how a schedule fired straight \
+             into an isolated lane's pane"
+        );
+        assert!(
+            body.contains("origin: SendOrigin::Automation"),
+            "the at-boundary fast path must construct its own SendMode with an Automation origin \
+             so isolation_refusal actually sees it"
         );
     }
 
