@@ -210,6 +210,17 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-claude-scratch-report.sh
+      # AMUX-4732. The report reaches each lane as a CARD now, because the
+      # 2026-09-14 attempt went out as peer MESSAGES and the two lanes that were
+      # down never received it: both grew ~6 GB more while the one that was up
+      # reclaimed 18.7 GB. The cell that matters is the ambiguous one. The report
+      # emits AMBIGUOUS:19-candidates for a workspace 19 lanes share, and
+      # delivering that is 18 wrong cards. Hermetic: a fixture TSV and a stub
+      # CLI, so CI files nothing on anyone's board.
+      - name: the scratch delivery never files a card it cannot address (AMUX-4732)
+        run: |
+          set -uo pipefail
+          ./scripts/test-claude-scratch-deliver.sh
       # AMUX-4661. The mac tripwire called `sysctl` bare; it lives in /usr/sbin,
       # which is NOT on the PATH the amux server runs under (measured on the box:
       # no /usr/sbin in the running process env), so two of its three thresholds
