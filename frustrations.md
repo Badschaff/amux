@@ -3190,3 +3190,34 @@ CARD: AF-915
 SYMPTOM: Studio's private-worktree resync repeatedly used rm -f "$WT/$f" after checking only existence on origin/main. Claude's native possibly-empty-path protection still prompts in bypass mode. The installed PreToolUse guard returned exit 0 with no corrective decision for the captured command, leaving the worker waiting for a person instead of revising it.
 COST: Four matching Bash tool calls took 3m10, 4m32, 10m35 and 12m29 to reach their tool results. Those intervals include execution as well as any approval wait; the final prompt was captured in Ethan's screenshot.
 FIX: Return a deterministic PreToolUse deny with repair instructions for unchecked variable directory prefixes in direct rm/rmdir calls. Require resolved, owned targets and exact content comparison before deleting landed copies; keep native checks and never auto-approve. Log a bounded measured correction event with a command hash. Install and replay the published hook, including all four captured commands; originator confirmation and a fresh live model retry remain unmeasured while Studio is rate-limited.
+
+## The pre-commit cargo gate crashes with a Python traceback and refuses a valid commit
+AREA: gates
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-17
+SESSION: amux
+CARD: AMUX-4758
+SYMPTOM: Committing at load average 121, `scripts/safe-cargo.sh` ->
+  `scripts/cargo-budget.py` failed inside its OWN instrumentation, not the build:
+  three `cargo_budget_unmeasured` events ("Command ['du','-sk',...] timed out
+  after 20 seconds"), then `cargo_budget_stopped ... reason: probe_failed`, then
+  `PermissionError: [Errno 1] Operation not permitted` from `os.killpg`, then
+  `subprocess.TimeoutExpired: Command ['ps','-A','-o','pgid=,stat='] timed out
+  after 5 seconds`, then a traceback out of `sys.exit(main())`. The commit was
+  refused and HEAD did not move. `cargo clippy --workspace --all-targets --
+  -D warnings` had passed clean on the same tree minutes earlier and passed
+  again on retry once load fell to 55.
+COST: One refused commit, ~11 minutes waiting for load to fall, one retry. No
+  wrong conclusion shipped only because a clean clippy run was already in hand.
+  The failure mode points the wrong way: a Python traceback out of the commit
+  gate reads as a broken toolchain, so the next lane may go looking for a Rust
+  problem that does not exist.
+FIX: The script already knows how to say it cannot measure — it emits
+  `cargo_budget_unmeasured` with `measured: false` three times before dying. Make
+  a failed self-probe degrade to unenforced-and-say-so rather than aborting the
+  supervised command, the way the staged-guard already does when it cannot reach
+  the server. The budget itself should stay: AMUX-70 is real, an OOM-killed cargo
+  in a shared pane scope takes the whole session down. The point is that a
+  supervisor which fails exactly when the box is loaded fails exactly when peers
+  are most active and a lane most needs its commit to land.
