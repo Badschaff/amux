@@ -2179,6 +2179,13 @@ fn detect_latency_with_scan_cap(
         return (out, suppressed);
     }
 
+    // WHAT AN OPEN ROLLUP HAS ALREADY REPORTED (AMUX-4717).
+    //
+    // Read ONCE, outside the loop: it is one query, and doing it per target
+    // would re-read the board up to `scan_cap` times for an answer that cannot
+    // change inside a scan.
+    let rollup_coverage = open_rollup_coverage(conn);
+
     for (
         (method, target),
         OutlierGroup {
@@ -2194,6 +2201,39 @@ fn detect_latency_with_scan_cap(
         // AMUX-3485: for long-by-design endpoints the effective threshold is
         // their design budget, not the global outlier floor.
         if worst <= design_budget_ms(&target) {
+            continue;
+        }
+        // ALREADY TOLD YOU, AS PART OF A WIDER FAULT (AMUX-4717).
+        //
+        // The rollup arm and this arm see the same rows through different
+        // windows. `autofix.rs`'s early return means no single scan emits both,
+        // and that is not the failure: what decays is the WINDOW. The rollup
+        // signature is keyed on its target SET on purpose, so it cannot
+        // recognise a narrowed version of itself. As rows age out the set
+        // shrinks, drops under the threshold, and the survivors arrive here —
+        // so a wide incident is filed once as a fault and again, hours later,
+        // as the individual endpoints the first card already argued were not
+        // the fault.
+        //
+        // Specimen: AMUX-4701 (rollup, 12 endpoints) filed 18:32:16 with
+        // last_seen 17:16:49. AMUX-4709 and AMUX-4710 filed 22:10:39 for
+        // occurrences at 16:10:38 and 17:16:49 — both inside the rollup's
+        // window, 3h38m later, with no link back.
+        if let Some(through) = covered_by_open_rollup(&rollup_coverage, &target, last_ts) {
+            suppressed.push(sup(
+                DetectorKind::Latency,
+                &format!("latency|outlier|{method}|{target}|{}", last_ts as i64),
+                &format!(
+                    "occurrence {} is at or before an OPEN outlier rollup that already \
+                     reported {target} as part of a wider slowdown (rollup filed {}). \
+                     Filing it per-endpoint now would name an endpoint that card already \
+                     argued was not the fault. A LATER occurrence on this target is not \
+                     suppressed: its timestamp is after the rollup, which is what makes \
+                     this expire on its own rather than on the card's status.",
+                    rl::local_when(last_ts),
+                    rl::local_when(through)
+                ),
+            ));
             continue;
         }
         // OCCURRENCE IDENTITY in the signature (AMUX-3472). An outlier report
@@ -6226,6 +6266,79 @@ fn fault_identity(signature: &str) -> Option<&str> {
 /// So the two rules divide cleanly: `already_filed` answers "have I filed THIS
 /// batch", and this answers "is the same fault already sitting in someone's
 /// queue". Only the second can see that eight cards are one fault.
+/// Targets an OPEN outlier rollup already reported, and through when (AMUX-4717).
+///
+/// The rollup's own signature carries its target list
+/// (`latency|outlier|ROLLUP|<comma-joined targets>`) and the card stores the
+/// whole signature in `source_ref`, so the set is recoverable without parsing
+/// the card body.
+///
+/// THE BOUND IS `created`, NOT THE `last_seen` IN THE CARD TEXT, and the
+/// difference does not matter here while the robustness does. `created` is an
+/// INTEGER column; `last_seen` is rendered prose inside the evidence blob. They
+/// agree in practice because a scan files the rollup immediately after reading
+/// its newest row, so there is no row between the two instants — if there were,
+/// the scan would have seen it and `last_seen` would be later.
+///
+/// Only cards a lane can still act on count, matching `open_card_for_fault`: a
+/// judged rollup stops covering, so a genuinely re-occurring wide slowdown
+/// files again.
+fn open_rollup_coverage(conn: &Connection) -> Vec<(std::collections::BTreeSet<String>, f64)> {
+    const PREFIX: &str = "|ROLLUP|";
+    let mut out = Vec::new();
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT source_ref, created FROM issues \
+          WHERE source_ref LIKE 'autofix:latency|outlier|ROLLUP|%' \
+            AND status NOT IN ('done','verified','discarded') \
+            AND archived = 0 AND deleted IS NULL",
+    ) else {
+        return out;
+    };
+    let Ok(rows) = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+    }) else {
+        return out;
+    };
+    for (source_ref, created) in rows.flatten() {
+        let Some(i) = source_ref.find(PREFIX) else { continue };
+        let targets: std::collections::BTreeSet<String> = source_ref[i + PREFIX.len()..]
+            .split(',')
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect();
+        // A rollup with no parsable targets covers nothing. Suppressing on it
+        // would be suppressing on an empty set, which is every target.
+        if targets.is_empty() {
+            continue;
+        }
+        out.push((targets, created as f64));
+    }
+    out
+}
+
+/// Has an open rollup already reported this occurrence? Returns when, for the
+/// suppression reason.
+///
+/// BOTH CONDITIONS ARE LOAD-BEARING and the timestamp is the one that keeps
+/// this honest. Matching on the target set alone would let a rollup nobody
+/// closes suppress every future outlier on those endpoints indefinitely, which
+/// trades a duplicate-card problem for a silent-blindness one. Requiring the
+/// occurrence to be at or before the rollup means a NEW slow request is never
+/// suppressed: it happened later, so it fails the comparison. The rule expires
+/// with the rollup's own window rather than with anyone remembering to close
+/// the card.
+fn covered_by_open_rollup(
+    coverage: &[(std::collections::BTreeSet<String>, f64)],
+    target: &str,
+    last_ts: f64,
+) -> Option<f64> {
+    coverage
+        .iter()
+        .filter(|(targets, through)| targets.contains(target) && last_ts <= *through)
+        .map(|(_, through)| *through)
+        .fold(None, |acc: Option<f64>, t| Some(acc.map_or(t, |a| a.max(t))))
+}
+
 fn open_card_for_fault(conn: &Connection, signature: &str) -> Option<String> {
     let ident = fault_identity(signature)?;
     conn.query_row(
@@ -14571,6 +14684,179 @@ mod tests {
         assert!(
             !f[0].signature.ends_with("|ROLLUP"),
             "one real breach is a per-entity card, not a rollup"
+        );
+    }
+
+    /// AMUX-4717: a wide slowdown must not be re-filed, hours later, as the
+    /// individual endpoints its own rollup already argued were not the fault.
+    ///
+    /// THE SPECIMEN, from the 2026-09-15 host-memory incident:
+    ///   AMUX-4701 (rollup, "12 endpoints slow at once")  filed 18:32:16
+    ///   AMUX-4709 (GET /api/sessions-git 12.1s)          filed 22:10:39
+    ///   AMUX-4710 (GET /api/usage/attribution 59.8s)     filed 22:10:39
+    /// The two occurrences (16:10:38, 17:16:49) both sit inside 4701's window
+    /// and 17:16:49 IS its last_seen. Same rows, two verdicts, 3h38m apart.
+    ///
+    /// The early return at the rollup arm is correct and is NOT the bug: no
+    /// single scan emits both. What decays is the WINDOW. The rollup key is its
+    /// target SET, so it cannot recognise a narrowed version of itself; as rows
+    /// age out the set shrinks below the threshold and the survivors fall
+    /// through to the per-endpoint arm.
+    #[tokio::test]
+    async fn a_narrowed_window_does_not_refile_what_an_open_rollup_already_reported() {
+        let insert = |st: &AppState, ts: f64, path: &'static str, ms: f64| {
+            st.store
+                .write(move |conn| {
+                    conn.execute(
+                        "INSERT INTO _amux_request_log (ts, method, path, family, status, \
+                         latency_ms, client_ip, user_agent, amux_session, worker, answered_by) \
+                         VALUES (?1,'GET',?2,?2,200,?3,'127.0.0.1','curl/8','','','native')",
+                        rusqlite::params![ts, path, ms],
+                    )?;
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                })
+                .unwrap();
+        };
+        let file_rollup = |st: &AppState, id: &'static str, status: &'static str,
+                           targets: String, created: i64| {
+            st.store
+                .write(move |conn| {
+                    conn.execute(
+                        "INSERT INTO issues (id, title, status, created, updated, \
+                         source_ref, archived, deleted) \
+                         VALUES (?1,'rollup',?2,?3,?3,?4,0,NULL)",
+                        rusqlite::params![
+                            id,
+                            status,
+                            created,
+                            format!("autofix:latency|outlier|ROLLUP|{targets}")
+                        ],
+                    )?;
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                })
+                .unwrap();
+        };
+
+        const A: &str = "/api/sessions-git";
+        const B: &str = "/api/usage/attribution";
+        let (st, _d) = state();
+        let now = unix_now();
+        // Two targets only, under the 3-distinct-target rollup threshold: this
+        // is the decayed window, after the wide incident narrowed.
+        let occ_a = now - 3600.0;
+        let occ_b = now - 3000.0;
+        insert(&st, occ_a, A, 12_100.0);
+        insert(&st, occ_b, B, 59_800.0);
+
+        // POSITIVE CONTROL FIRST. Without a rollup these MUST file, or the
+        // fixture never reaches the per-endpoint arm and every assertion below
+        // would pass on an empty result.
+        let (f, _) = detect_latency(&st.store.read().unwrap(), now);
+        let per_endpoint = |f: &[Finding]| -> Vec<String> {
+            f.iter()
+                .filter(|x| x.signature.starts_with("latency|outlier|")
+                    && !x.signature.contains("|ROLLUP|"))
+                .map(|x| x.signature.clone())
+                .collect()
+        };
+        let baseline = per_endpoint(&f);
+        assert_eq!(
+            baseline.len(),
+            2,
+            "fixture must produce two per-endpoint outliers before suppression; got {baseline:?}"
+        );
+
+        // Now the rollup that already reported both, filed AFTER them.
+        file_rollup(&st, "AMUX-T4701", "todo", format!("{A},{B}"), (now - 600.0) as i64);
+        let (f2, s2) = detect_latency(&st.store.read().unwrap(), now);
+        assert!(
+            per_endpoint(&f2).is_empty(),
+            "an open rollup already reported these occurrences; got {:?}",
+            per_endpoint(&f2)
+        );
+        // SUPPRESSED, NOT DROPPED. The debug surface must still carry them, or
+        // this trades duplicate cards for an invisible decision.
+        // Counted over MY suppressions, not the whole channel: the detector
+        // also emits an unrelated blindness-check entry every scan, and
+        // asserting on the total would couple this cell to that one.
+        let mine: Vec<&str> = s2
+            .iter()
+            .filter(|x| x.reason.contains("OPEN outlier rollup"))
+            .map(|x| x.reason.as_str())
+            .collect();
+        assert_eq!(
+            mine.len(),
+            2,
+            "both occurrences must be reported as suppressed, not silently dropped; \
+             whole channel was {:?}",
+            s2.iter().map(|x| x.reason.as_str()).collect::<Vec<_>>()
+        );
+        assert!(
+            mine.iter().any(|r| r.contains(A)) && mine.iter().any(|r| r.contains(B)),
+            "each suppression must name its own target: {mine:?}"
+        );
+
+        // A JUDGED ROLLUP STOPS COVERING, matching `open_card_for_fault`'s own
+        // rule. Once someone has read and closed the wide card, these rows are
+        // no longer "already in a queue" and the per-endpoint arm is the only
+        // thing left that would report them. Without this the status filter in
+        // the query is untested and could be deleted silently.
+        st.store
+            .write(|conn| {
+                conn.execute("UPDATE issues SET status='done' WHERE id='AMUX-T4701'", [])?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+        let (f3, _) = detect_latency(&st.store.read().unwrap(), now);
+        assert_eq!(
+            per_endpoint(&f3).len(),
+            2,
+            "a done rollup must not keep suppressing; got {:?}",
+            per_endpoint(&f3)
+        );
+    }
+
+    /// The three ways this must NOT suppress. Each is a separate failure mode
+    /// and the card named the first as the risk of its own proposed rule: "an
+    /// open rollup card that nobody closes suppresses every later outlier on
+    /// those endpoints indefinitely".
+    #[tokio::test]
+    async fn rollup_coverage_expires_with_the_window_not_with_the_card() {
+        const A: &str = "/api/sessions-git";
+        const OTHER: &str = "/api/usage/attribution";
+        let now = unix_now();
+
+        // 1. A LATER occurrence on a covered target still files. This is what
+        //    makes the rule self-expiring: a new slow request happened after
+        //    the rollup, so it fails the timestamp comparison however long the
+        //    card stays open.
+        let rollup_at = now - 3600.0;
+        let cov = vec![(
+            [A.to_string()].into_iter().collect::<std::collections::BTreeSet<_>>(),
+            rollup_at,
+        )];
+        assert!(
+            covered_by_open_rollup(&cov, A, now - 7200.0).is_some(),
+            "an occurrence before the rollup was already reported"
+        );
+        assert!(
+            covered_by_open_rollup(&cov, A, now - 60.0).is_none(),
+            "an occurrence AFTER the rollup is new work and must file, no matter how \
+             long the rollup card stays open"
+        );
+
+        // 2. A target the rollup never named is not covered by it.
+        assert!(
+            covered_by_open_rollup(&cov, OTHER, now - 7200.0).is_none(),
+            "the rollup listed only {A}; it says nothing about {OTHER}"
+        );
+
+        // 3. Exactly at the boundary counts as covered: the rollup's own
+        //    last_seen row is the one it reported, and in the specimen
+        //    AMUX-4710's occurrence IS AMUX-4701's last_seen.
+        assert!(
+            covered_by_open_rollup(&cov, A, rollup_at).is_some(),
+            "the boundary occurrence is the rollup's own newest row"
         );
     }
 
