@@ -5590,7 +5590,7 @@ function render() {
           ${!online ? '<span class="cached-badge">cached</span>' : ''}
         </div>` : ''}
       </div>
-      ${s.dir ? `<div class="card-dir"><span class="card-dir-path" title="${esc(s.dir)}">${esc(s.dir)}</span></div>` : ''}
+      ${s.dir ? `<div class="card-dir"><span class="card-dir-path" title="${esc(s.worktree_active ? '~/.amux/worktrees/' + s.name : s.dir)}">${esc(s.worktree_active ? '~/.amux/worktrees/' + s.name : s.dir)}</span></div>` : ''}
       ${s.creator ? `<div class="card-dir" style="font-size:0.72rem;">${esc(s.creator)}</div>` : ''}
       ${s.dir ? _renderBranchBadge(s.name, s.branch) : ''}
       ${isExp && s.desc ? `<div class="card-desc">${esc(s.desc)}</div>` : ''}
@@ -7034,11 +7034,12 @@ function _renderPausedSection() {
     html += '<div class="paused-body">';
     (q ? paused : allPaused).forEach(s => {
       const ago = s.last_activity ? timeAgo(s.last_activity) : '';
-      const dir = s.dir ? s.dir.replace(/^\/Users\/[^/]+/, '~') : '';
+      const rawDir = s.worktree_active ? '~/.amux/worktrees/' + s.name : (s.dir || '');
+      const dir = rawDir.replace(/^\/Users\/[^/]+/, '~');
       const model = s.active_model || sessionConfiguredModel(s) || '';
       const body = esc(s.task_name || s.preview || s.desc || '');
       const meta = [];
-      if (dir) meta.push(`<code title="${esc(s.dir)}">${esc(dir)}</code>`);
+      if (dir) meta.push(`<code title="${esc(rawDir)}">${esc(dir)}</code>`);
       if (ago) meta.push(`active ${ago}`);
       (s.tags || []).forEach(t => meta.push(`<span class="paused-card-tag">#${esc(t)}</span>`));
       html += `<div class="paused-card" data-session="${esc(s.name)}">
@@ -7096,7 +7097,8 @@ function _renderArchivedSection() {
     (q ? archived : allArchived).forEach(s => {
       const ago = s.last_activity ? timeAgo(s.last_activity) : '';
       const created = s.session_created ? new Date(s.session_created * 1000).toLocaleDateString([], {month:'short', day:'numeric', year:'2-digit'}) : '';
-      const dir = s.dir ? s.dir.replace(/^\/Users\/[^/]+/, '~') : '';
+      const rawDir2 = s.worktree_active ? '~/.amux/worktrees/' + s.name : (s.dir || '');
+      const dir = rawDir2.replace(/^\/Users\/[^/]+/, '~');
       const provider = s.provider && s.provider !== 'claude' ? s.provider : '';
       const model = s.active_model || '';
       const tokens = !s.tokens ? '' :
@@ -7104,7 +7106,7 @@ function _renderArchivedSection() {
         s.tokens >= 1000 ? (s.tokens/1000).toFixed(s.tokens >= 10000 ? 0 : 1) + 'k' : String(s.tokens);
       const body = esc(s.task_name || s.preview || s.desc || '');
       const meta = [];
-      if (dir) meta.push(`<code title="${esc(s.dir)}">${esc(dir)}</code>`);
+      if (dir) meta.push(`<code title="${esc(rawDir2)}">${esc(dir)}</code>`);
       if (s.branch) meta.push(`&#x2387; ${esc(s.branch)}`);
       if (s.worktree) meta.push(`worktree`);
       if (ago) meta.push(`active ${ago}`);
@@ -9196,7 +9198,7 @@ function _workerPrimaryConfigurationsHTML(name) {
     _workerConfigurationRow('groups', 'Groups', (s.tags || []).join(', '), 'Controls membership, inherited configuration, and default message reach.', edit('tags', (s.tags || []).join(', '))),
   ];
   const runtime = [
-    _workerConfigurationRow('directory', 'Working directory', s.dir || '', 'Changing it restarts a running worker in the new directory.', edit('dir', s.dir || '')),
+    _workerConfigurationRow('directory', 'Working directory', s.worktree_active ? '~/.amux/worktrees/' + name + ' (worktree)' : (s.dir || ''), 'Changing it restarts a running worker in the new directory.', edit('dir', s.dir || '')),
     _workerConfigurationRow('branch', 'Git branch', s.branch || '', 'Blank follows the detected branch; “none” explicitly uses the main checkout.', edit('branch', s.branch || '')),
     _workerConfigurationRow('provider', 'Model provider', providerLabel(provider), 'Provider swaps preserve durable board state and restart only when required.', edit('provider', provider)),
     _workerConfigurationRow('model', 'Model version', model || 'Provider default', 'A supported live switch keeps the conversation; restart fallback rehydrates from board state.', edit('model', model || '', provider)),
@@ -11226,7 +11228,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.980';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.981';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -32020,6 +32022,20 @@ async function _launchFanOut() {
   } finally {
     btn.disabled = false;
   }
+}
+
+function _peekFanOut() {
+  const sess = typeof peekSession !== 'undefined' ? peekSession : '';
+  switchView('board');
+  setTimeout(() => {
+    const body = document.getElementById('launch-body');
+    if (body && body.style.display === 'none') _toggleLaunchBar();
+    _populateLaunchSessions();
+    const sel = document.getElementById('launch-session');
+    if (sel && sess) sel.value = sess;
+    const input = document.getElementById('launch-input');
+    if (input) input.focus();
+  }, 200);
 }
 
 // ── Peek fan-out tab: show ephemeral children of peeked session ──

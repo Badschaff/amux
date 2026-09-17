@@ -2422,6 +2422,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
             <button type="button" onclick="_peekMoreClose();setPeekTab('dictation')">&#128220; Dictation history</button>
             <button type="button" onclick="_peekMoreClose();_readLatestMessage(peekSession)" title="Read the worker's most recent full message aloud">&#x1F50A; Read aloud latest</button>
             <button type="button" onclick="_peekMoreClose();setPeekTab('readalouds')">&#x1F50A; Read-aloud history</button>
+            <button type="button" onclick="_peekMoreClose();_peekFanOut()" title="Fan out priorities to ephemeral workers via this session">&#x1F680; Fan out</button>
             <!-- Last, and separated: the only DESTRUCTIVE entry in this menu.
                  Everything above opens something; this throws work away, so it
                  does not sit where a thumb lands by accident reaching for
