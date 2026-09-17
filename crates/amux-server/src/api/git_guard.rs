@@ -3227,9 +3227,8 @@ pub async fn staged_guard(
     staged_guard_inner(Some(state), headers, body).await
 }
 
-/// The verdict itself. `state` is `None` for INTERNAL callers, and that is the
-/// whole reason it is optional rather than threaded: `commit_nudge` calls this
-/// to ask "who owns these paths", which is a background probe and not a commit.
+/// The verdict itself. `state` is `None` for internal callers that need the
+/// ownership classification without being in a commit context.
 /// Notifying an owner from it would tell them their file was being swept every
 /// time a nudge tick ran — a notice that is false, repeated, and precisely the
 /// noise that gets a channel muted (ethos rule 5).
@@ -7727,60 +7726,6 @@ mod tests {
                 assert_eq!(v["unclaimed"].as_array().unwrap().len(), 1);
             }
         }
-    }
-
-    #[test]
-    fn own_observation_does_not_become_nudge_authorship() {
-        use crate::runtime_jobs::commit_nudge::{build, ownership_from_verdict, Freshness};
-        let paths = vec!["studio/server/routes/agentCredentials.ts".to_string()];
-        for dirty in [false, true] {
-            let mut inputs = GuardInputs::default();
-            let absolute = format!("/repo/{}", paths[0]);
-            if dirty { inputs.dirty.insert(absolute.clone()); }
-            apply_observed(&mut inputs, &HashMap::from([(absolute.clone(), 1900.0)]), &[], &[]);
-            let verdict = Envelope {
-                verdict: classify(&[pair(&paths[0])], 2000.0, 3600.0, &inputs),
-                ..Default::default()
-            }.json();
-            assert!(verdict["foreign"].as_array().unwrap().is_empty(), "unclaimed work remains committable");
-            let own = ownership_from_verdict("fixture-observer", &verdict, &paths).unwrap();
-            let fresh = Freshness { stale: paths.clone(), ..Default::default() };
-            let text = build("/repo", &paths, &own, &fresh, "test specimen").unwrap();
-            assert!(text.contains("NONE carries your edit record"), "{text}");
-            assert!(!text.contains("CONTESTED"), "observation invented a coauthor: {text}");
-
-            // A real edit record remains positive even alongside observations.
-            inputs.mine.insert(absolute.clone(), 1900.0);
-            inputs.mine_firsthand.insert(absolute);
-            let verdict = Envelope {
-                verdict: classify(&[pair(&paths[0])], 2000.0, 3600.0, &inputs),
-                ..Default::default()
-            }.json();
-            let own = ownership_from_verdict("fixture-observer", &verdict, &paths).unwrap();
-            let text = build("/repo", &paths, &own, &fresh, "test specimen").unwrap();
-            assert!(text.contains("of your dirty file(s)"), "{text}");
-        }
-    }
-
-    #[test]
-    fn incomplete_guard_verdict_cannot_become_nudge_authorship() {
-        use crate::runtime_jobs::commit_nudge::ownership_from_verdict;
-        let paths = vec!["first.rs".to_string(), "omitted.rs".to_string()];
-        let complete = Envelope {
-            verdict: classify(&[pair("first.rs"), pair("omitted.rs")], 2000.0, 3600.0, &GuardInputs::default()),
-            ..Default::default()
-        }.json();
-        assert!(ownership_from_verdict("fixture-observer", &complete, &paths).is_some());
-        for flag in ["undecided", "enabled"] {
-            let mut unavailable = complete.clone();
-            unavailable[flag] = json!(flag == "undecided");
-            assert!(ownership_from_verdict("fixture-observer", &unavailable, &paths).is_none(), "{flag}: {unavailable}");
-        }
-        let truncated = Envelope {
-            verdict: classify(&[pair("first.rs")], 2000.0, 3600.0, &GuardInputs::default()),
-            ..Default::default()
-        }.json();
-        assert!(ownership_from_verdict("fixture-observer", &truncated, &paths).is_none());
     }
 
     /// The envelope shape the installed hooks parse. Every key on every path,

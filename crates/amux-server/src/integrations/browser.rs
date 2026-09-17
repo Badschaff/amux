@@ -1233,8 +1233,7 @@ pub static RUNNING: LazyLock<Mutex<std::collections::HashMap<String, RunningBrow
 ///
 /// `tokio::sync::Mutex`, not `std`: the guard is held across `.await` in every
 /// one of these tests, which is a clippy deny and a real hazard on a
-/// multi-threaded runtime. Same reason as `commit_nudge`'s `REVIVED_ENV`
-/// (AMUX-4713), which is the same defect in a different global.
+/// multi-threaded runtime.
 #[cfg(test)]
 pub static TEST_REGISTRY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
