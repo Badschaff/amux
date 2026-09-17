@@ -16814,7 +16814,7 @@ pub(crate) fn env_flag_on(v: Option<&str>) -> bool {
 /// TOLD ABOUT or DISCOVERABLE BY. Measured that day: ZERO of the 15
 /// `runtime_jobs` consulted this function, and three of them steer text into
 /// sessions — so a lane marked "raw agent, no amux harness" was still receiving
-/// commit nudges and board auto-pickup claims. Now:
+/// board auto-pickup claims. Now:
 ///
 /// - `board_drive` filters them out of `lanes()` — at the SELECTION, not the
 ///   send. Gating delivery would let auto-pickup CLAIM a card for a lane it then
