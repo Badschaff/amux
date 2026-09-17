@@ -278,7 +278,12 @@ async fn record_receipt(
     Ok(id)
 }
 
-fn rate_limited(state: &AppState, decision: &CapabilityDecision) -> Result<bool, String> {
+/// The THIRD blocking acquire `enforce` used to make per write, and the only
+/// conditional one: it is skipped unless the matched rule carries a rate limit.
+/// That conditionality is why it is the easiest of the three to miss when
+/// reading, and why it still belongs on the blocking pool rather than the HTTP
+/// worker (AF-640 / AMUX-4744).
+async fn rate_limited(state: &AppState, decision: &CapabilityDecision) -> Result<bool, String> {
     let Some(limit) = decision.rate_limit else {
         return Ok(false);
     };
@@ -286,14 +291,18 @@ fn rate_limited(state: &AppState, decision: &CapabilityDecision) -> Result<bool,
         return Ok(false);
     };
     let cutoff = (Utc::now() - Duration::seconds(limit.window_secs as i64)).to_rfc3339();
-    let conn = state.store.read().map_err(|e| e.to_string())?;
-    let count: u32 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM _amux_policy_receipts
+    let rule = rule.to_string();
+    let count: u32 = state
+        .store
+        .read_async(move |conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM _amux_policy_receipts
              WHERE rule_id=?1 AND effect='allow' AND created_at>=?2",
-            rusqlite::params![rule, cutoff],
-            |r| r.get(0),
-        )
+                rusqlite::params![rule, cutoff],
+                |r| r.get(0),
+            )?)
+        })
+        .await
         .map_err(|e| e.to_string())?;
     Ok(count >= limit.max_per_window)
 }
@@ -434,12 +443,30 @@ pub async fn enforce(State(state): State<AppState>, mut req: Request, next: Next
         }
     };
     let actor_name = actor(req.headers());
-    let role = state
-        .store
-        .read()
-        .ok()
-        .and_then(|conn| crate::db::harness_store::planning_role_for_actor(&conn, &actor_name).ok())
-        .flatten();
+    // THE SECOND BLOCKING ACQUIRE ON THIS PATH, and the one that survives every
+    // short-circuit above it. 150acf5d converted `request_trust` and left this
+    // four lines below it, so writes still took a blocking read acquire on an
+    // HTTP worker and the asymmetry that commit set out to remove was only half
+    // removed.
+    //
+    // It is also why "anonymous callers short-circuit, so policy is not the
+    // stall" was a wrong elimination. That short-circuit is inside
+    // `request_trust` (actor == "api-anonymous" returns Trusted without a
+    // read). This lookup is unconditional: it runs for api-anonymous too, with
+    // that literal as the actor. An unauthenticated curl therefore skips the
+    // read I had checked and still pays for this one.
+    let role = {
+        let actor_name = actor_name.clone();
+        state
+            .store
+            .read_async(move |conn| {
+                Ok(crate::db::harness_store::planning_role_for_actor(conn, &actor_name).ok())
+            })
+            .await
+            .ok()
+            .flatten()
+            .flatten()
+    };
     let mut ctx = ActionContext {
         actor: actor_name,
         role,
@@ -487,7 +514,7 @@ pub async fn enforce(State(state): State<AppState>, mut req: Request, next: Next
         decision = policy.decide(&ctx);
         require_reconciliation_approval(req.method(), &request_path, &mut decision);
     }
-    match rate_limited(&state, &decision) {
+    match rate_limited(&state, &decision).await {
         Ok(true) => {
             decision.effect = CapabilityEffect::RateLimited;
             decision.rationale = "configured capability rate limit reached".into();
@@ -806,5 +833,104 @@ mod tests {
         ] {
             assert!(!reconciliation_requires_approval(&method, path), "{method} {path}");
         }
+    }
+
+    /// AMUX-4744: a WRITE must not pin an HTTP runtime worker inside the policy
+    /// gate, the way a GET on the same route never could.
+    ///
+    /// `enforce` returns early for `ActionClass::Read`, so every blocking
+    /// acquire it makes is paid by non-GET methods ONLY. That is the measured
+    /// asymmetry on the card: 194,046 reads at 0.013% slow against 9,732 writes
+    /// at 5.641%, same server, same 10s window.
+    ///
+    /// THE ROUTE IS CHOSEN, NOT INCIDENTAL. `/api/client-debug` is the card's
+    /// own reproducer and its handler touches no database at all: a
+    /// `tracing::info!` and a push onto an in-memory ring. So a stall measured
+    /// here cannot be the handler, which is exactly why reading the handler
+    /// found nothing and the middleware was never suspected.
+    ///
+    /// SINGLE-WORKER RUNTIME ON PURPOSE, so the cell cannot pass by finding a
+    /// spare worker, and every pooled connection is held first so an acquire
+    /// really must wait.
+    #[test]
+    fn a_write_through_the_policy_gate_does_not_pin_the_runtime_worker() {
+        use tower::ServiceExt;
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(crate::db::Store::open(&dir.path().join("pol.db")).unwrap());
+        let app = crate::api::router(AppState {
+            store: store.clone(),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        });
+
+        rt.block_on(async move {
+            // Hold EVERY read connection, so any blocking acquire must wait.
+            let held: Vec<_> = (0..store.read_pool.max_size())
+                .map(|_| store.read_pool.get().expect("prefill"))
+                .collect();
+
+            let call = tokio::spawn(async move {
+                app.oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/client-debug")
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"kind":"amux-4744-probe"}"#))
+                        .unwrap(),
+                )
+                .await
+            });
+
+            // THE POINT. While that write sits in the policy gate, the single
+            // runtime worker must still be free to poll something else. With a
+            // synchronous `store.read()` in `enforce` this task cannot be
+            // polled at all, because the blocked acquire owns the worker.
+            //
+            // THE BUDGET MUST SIT BELOW THE POOL'S OWN connection_timeout,
+            // which AF-640 set to 5s. A blocking acquire against a saturated
+            // pool releases the worker when that timeout expires, so a 5s
+            // budget here passed under mutation: the pin was real and ended
+            // one instant before the cell gave up. Measured, this run: 0.40s
+            // with `read_async`, 5.46s with the blocking read restored. 1s
+            // separates them by a factor of five in both directions.
+            let started = std::time::Instant::now();
+            let ticked = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                tokio::spawn(async { 42u8 }),
+            )
+            .await
+            .expect("the runtime worker was pinned by a blocking read inside the policy gate")
+            .expect("join");
+            assert_eq!(ticked, 42);
+            // Say the number, so a future timeout change cannot quietly turn
+            // this back into a test of the pool's timeout rather than of the
+            // gate. A pinned worker shows up here as ~5s, not as ~0s.
+            let waited = started.elapsed();
+            assert!(
+                waited < std::time::Duration::from_secs(1),
+                "an unrelated task waited {waited:?} to be polled while a write sat in the \
+                 policy gate; that is a blocking acquire pinning the HTTP worker"
+            );
+
+            drop(held);
+            let resp = call.await.expect("join").expect("response");
+            // A write that is merely REFUSED fast would also leave the worker
+            // free, so the cell would pass while proving nothing. Pin that the
+            // request actually reached the handler.
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "the beacon must still be served once connections free"
+            );
+        });
     }
 }

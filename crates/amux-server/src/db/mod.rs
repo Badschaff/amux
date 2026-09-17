@@ -106,7 +106,11 @@ pub struct WriteReply {
 #[derive(Clone)]
 pub struct Store {
     write_tx: mpsc::Sender<WriteRequest>,
-    read_pool: ReadPool,
+    /// `pub(crate)` so a test outside this module can put the pool under real
+    /// saturation. The property "a request path takes no blocking acquire" is
+    /// only testable by holding every connection, and the paths that must hold
+    /// it (`api::policy::enforce`) live in other modules.
+    pub(crate) read_pool: ReadPool,
     db_path: Arc<std::path::PathBuf>,
     pub(crate) health_probe: Arc<tokio::sync::Semaphore>,
     pub(crate) health_probe_started: Arc<std::sync::atomic::AtomicU64>,
