@@ -3157,3 +3157,25 @@ CARD: AMUX-4752
 SYMPTOM: This entry and yesterday's AF-640/AMUX-4739 entry both asserted "a daily 09:29 bulk migration job" discarding cards. `amux` (server-verified origin) corrected this: there is no script, scheduler or runtime job calling POST /api/board/bulk-migrate anywhere in the codebase (grepped). It is the dashboard's bulk-migrate control (app.js:29440), human-driven, behind a confirm() that names the count and warns there is no single undo. It records as `api-anonymous` because the browser sends no X-Amux-Session on that call, not because a daemon did it -- every dashboard bulk-migrate looks the same way. The 09:28-09:29 coincidence across two days was two separate human actions landing in the same minute, not a schedule: bursts also occurred at 04:47, 15:40-45 and 00:12, and the biggest (373 cards in one minute, 09-15 04:47) was all mixpeek-orchestrator cards -- one click on "migrate all cards from this column" against a retired lane's board, not a targeted sweep.
 COST: Would have sent whoever picked up "FIX: a bulk discard job should not fire on..." looking for a script or scheduler that does not exist. The underlying remedy (re-file cards whose substance a column migration swept) was correct and stays correct; only the mechanism description was wrong.
 FIX: The REAL defect, per `amux`'s finding: a 373-card destructive action with no attributable actor (`api-anonymous` on a bulk discard means nobody can answer "who cleared this column" afterward -- ethos rule 6, same unattributed-write class AMUX-1812 fixed for schedules). `amux` filed that separately. This entry exists only to correct the mechanism claim in the two prior entries; do not build or look for a scheduled-job fix, there is nothing to disable.
+
+## Finances highlights the board-drain command while concrete execution remains in backlog
+AREA: board
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-17
+SESSION: Ethan via Codex
+CARD: AF-913
+SYMPTOM: MF-1231 retained its captured Prompt envelope after status appends, yet generic structured-text classification treated it as executable work and spent three advance nudges instead of requesting disposition. Five existing epics had no children. MF-1209's real 409 was gate-not-acknowledged, which the worker misreported as WIP; the capture was correctly exempt from WIP.
+COST: The dashboard advertised an umbrella objective as Working now while the concrete tasks and an already-delivered cost report remained in backlog; three generic turns did not repair the state.
+FIX: Use the shared capture predicate for advancement and give its one durable disposition request precedence over generic cooldown/budget. Tell workers how to reuse existing epics/tasks and to inspect refusal bodies. Repair the existing finances graph and record the actual delivered report; leave originator confirmation pending.
+
+## Worker-owned boards regain cross-worker waits through alternate creation paths
+AREA: board
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-17
+SESSION: Ethan via Codex
+CARD: AF-914
+SYMPTOM: TubeScience TUBES-2461 acknowledged its Doing gate, then the next tick parked it against a Done census mis-typed as code. Old serial-order requirements survived in flat gate overrides and waiting fields after dependency edges had been removed. Active workers had 25 cross-board dependencies, including Studio waiting on paused backend work. Routed requests and peer-message capture bypassed the own-board create rule. Blocker-review identities included appended descriptions, so progress notes could rearm model turns.
+COST: Workers ran without a valid highlighted card, or waited for other workers and repeated reviews instead of completing their own outcomes.
+FIX: Make boards self-contained by default: refuse cross-board assignments/dependency writes, retain peer messages as coordination without minting tasks, and correct fleet guidance. Keep the explicit legacy cooperative opt-in separate from the default. Reject unready Doing transitions atomically using the pickup predicate. Suppress blocker-review repeats on note-only changes. Repair TubeScience's measured census type, preserve outcome requirements in acceptance criteria with per-column gates, and turn active workers' foreign waits into owned next actions while preserving real access, spend and customer-outbound restrictions. Originator confirmation remains pending.

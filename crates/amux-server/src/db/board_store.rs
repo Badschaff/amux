@@ -398,6 +398,31 @@ pub fn approval_type_allowed(session: Option<&str>, kind: &str) -> bool {
     allowed.iter().any(|s|s=="*" || s==&kind.trim().to_ascii_lowercase())
 }
 
+/// Boards are self-contained by default. Legacy cooperative workspaces can
+/// explicitly opt in through the same worker/group/global setting resolver.
+pub fn board_delegation_allowed(session: Option<&str>) -> bool {
+    let value = std::env::var("AMUX_BOARD_DELEGATION").ok()
+        .or_else(|| session.and_then(|s| crate::api::session_verbs::scoped_setting_in(
+            &crate::api::session_verbs::home(), s, "AMUX_BOARD_DELEGATION")));
+    value.is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"))
+}
+
+/// References to other boards are evidence, not scheduler dependencies.
+/// Validate in the writer so reassignment cannot race creation or a PATCH.
+pub fn foreign_dependencies(conn: &Connection, session: Option<&str>, deps: &[String]) -> rusqlite::Result<Vec<(String, String)>> {
+    let Some(session) = session.filter(|s| !s.is_empty()) else { return Ok(vec![]) };
+    if board_delegation_allowed(Some(session)) { return Ok(vec![]) }
+    let mut foreign = Vec::new();
+    for id in deps {
+        let owner = conn.query_row("SELECT session FROM issues WHERE id=?1 AND deleted IS NULL", [id],
+            |r| r.get::<_, Option<String>>(0)).optional()?.flatten();
+        if let Some(owner) = owner.filter(|s| !s.is_empty() && s != session) {
+            foreign.push((id.clone(), owner));
+        }
+    }
+    Ok(foreign)
+}
+
 /// Why a typed ask was refused, or that it was accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AskVerdict {

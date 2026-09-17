@@ -4750,6 +4750,9 @@ fn associate_capture_card(
     intake: &super::board_intake::Plan,
     from_peer: bool,
 ) -> rusqlite::Result<Option<CaptureAssociation>> {
+    if from_peer && !crate::db::board_store::board_delegation_allowed(Some(session_name)) {
+        return Ok(None);
+    }
     let mut live_owned = Vec::new();
     for id in prompt_card_refs(body) {
         let Some(row) = crate::db::board_store::get_issue(conn, &id)? else { continue };
@@ -4925,12 +4928,10 @@ async fn cmd_hist_record_with_id(
     let cap_ctype = ctype.clone();
     let cap_origin = origin.clone();
 
-    // Every producer which can hand substantive work to a worker participates
-    // in the same task ledger.  Treating only `user` as task-bearing made
-    // schedules and worker-to-worker requests invisible on the recipient's
-    // board—the exact opposite of the board-managed callback contract.  The
-    // semantic classifier below still exempts questions and control prompts,
-    // so widening the producer set does not card `/compact`, "status?", etc.
+    // Owner commands and schedules participate in the task ledger. Peer
+    // messages get an explicit coordination receipt unless the owner has
+    // opted into legacy board delegation. No semantic model call is needed
+    // to classify the producer; questions and control prompts remain exempt.
     let task_bearing = matches!(ctype.as_str(), "user" | "schedule" | "session");
     // Carry the recorded row id out of the write so auto-capture can link the card.
     let msg_row_id = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
@@ -4977,7 +4978,8 @@ async fn cmd_hist_record_with_id(
         _ if !landed => None,
         _ => Some(now_ms),
     };
-    let capture_pending = task_bearing && landed
+    let peer_coordination = ctype == "session" && !crate::db::board_store::board_delegation_allowed(Some(&session));
+    let capture_pending = task_bearing && landed && !peer_coordination
         && amux_core::board::title_from_prompt(&text).is_some()
         && !amux_core::board::is_informational_query(&text);
     let msg_row_id_w = msg_row_id.clone();
@@ -5070,9 +5072,8 @@ async fn cmd_hist_record_with_id(
     // card and link it to the message row. Separate write so a capture failure can never roll
     // back the message record — the message is the durable entity, the card its
     // consequence (CLAUDE.md: hang the consequence off the write that happened).
-    // Human, inter-session ("session") and scheduler ("schedule") work all
-    // belong to the recipient.  Questions/control messages still remain
-    // cardless via the semantic predicate, rather than a producer allow-list.
+    // Owner and scheduler work belong to the recipient. Peer messages remain
+    // coordination by default. Questions/control messages also stay cardless.
     // ISOLATED DOES NOT MEAN INVISIBLE WORK (AMUX-4159). Isolation controls
     // what amux injects into a worker and whether peers/automation can reach it;
     // it does not change the fact that an owner's delivered prompt is work in
@@ -5100,7 +5101,9 @@ async fn cmd_hist_record_with_id(
         }
     }
     if task_bearing && landed {
-        let cardless_reason = if amux_core::board::is_informational_query(&cap_text) {
+        let cardless_reason = if peer_coordination {
+            Some("peer-coordination")
+        } else if amux_core::board::is_informational_query(&cap_text) {
             Some("informational-query")
         } else if amux_core::board::title_from_prompt(&cap_text).is_none() {
             Some("control-prompt")
@@ -5162,11 +5165,6 @@ pub(crate) async fn capture_recorded_message(state: &AppState, row_id: i64) {
         }
     };
     let _intake_guard = super::board_intake::lock(&cap_session, "agent").await;
-    // One durable interpretation/decomposition replaces the old create-first
-    // classifier. A failed interpretation stays pending on the message.
-    if super::board_lifecycle::capture(state, row_id, &cap_session).await {
-        return;
-    }
     let loaded = (|| -> anyhow::Result<Option<(String, String, String, i64)>> {
         let conn = state.store.read()?;
         Ok(conn.query_row("SELECT text,type,origin,ts FROM cmd_history WHERE id=?1 AND capture_pending!=0 AND card_id IS NULL",
@@ -5181,6 +5179,29 @@ pub(crate) async fn capture_recorded_message(state: &AppState, row_id: i64) {
             return;
         }
     };
+    // Pending deliveries from an older build must not resurrect delegated
+    // tasks. This check precedes semantic intake, so coordination costs no
+    // interpretation tokens and stays in Messages with an explicit receipt.
+    if cap_ctype == "session" && !crate::db::board_store::board_delegation_allowed(Some(&cap_session)) {
+        let result = state.store.write_async(move |conn| {
+            conn.execute("UPDATE cmd_history SET capture_pending=0,intake_result=?2 WHERE id=?1 AND card_id IS NULL",
+                rusqlite::params![row_id, json!({"state":"coordination","reason":"worker_owns_board"}).to_string()])?;
+            Ok(crate::db::WriteOutcome { applied:true, events:vec![] })
+        }).await;
+        if let Err(error) = result {
+            tracing::warn!(marker="peer_coordination_pending", message_id=row_id, %error,
+                measured=false, n_considered=1, "coordination receipt remains pending for recovery");
+            return;
+        }
+        tracing::info!(marker="peer_coordination_not_assigned", message_id=row_id, session=%cap_session,
+            measured=true, n_considered=1, "peer message retained without creating board work");
+        return;
+    }
+    // One durable interpretation/decomposition replaces the old create-first
+    // classifier. A failed interpretation stays pending on the message.
+    if super::board_lifecycle::capture(state, row_id, &cap_session).await {
+        return;
+    }
     let cap_isolated = session_is_isolated(&cap_session);
     let cap_text_for_capture = cap_text.clone();
     let associated: std::sync::Arc<std::sync::Mutex<Option<CaptureAssociation>>> =
@@ -11421,11 +11442,11 @@ const FLEET_ROSTER_HEADER: &str = "\n## Fleet — who else is running (auto-gene
      Every live worker is listed, INCLUDING YOU — this file is shared by every lane in \
      this directory, so it cannot omit the reader. You are the one whose name matches \
      $AMUX_SESSION.\n\n\
-     Reach any of them with `amux send <name> --stdin` (origin-stamped), or make \
-     durable delegated work with `amux board request <name> <title>`. \
-     The latter files the card on THEIR board as a todo their dispatch offers them, \
-     with you as its requester and a callback back to you when it reaches a terminal \
-     status, and keeps the gates, assets and that return on one card (AMUX-4653).\n\n\
+     Use `amux send <name> --stdin` for coordination and existing evidence. \
+     Own the complete outcome on YOUR board, including missing components in other \
+     directories. Do not create assignments or depends_on edges on other workers' \
+     boards. Peer messages do not automatically become recipient tasks. Reuse \
+     artifacts without waiting for their author's availability.\n\n\
      | worker | groups | description | provider / model | workspace / branch |\n|---|---|---|---|---|\n";
 
 /// The fleet roster every worker gets, regenerated on each write.
@@ -12041,8 +12062,8 @@ fn inherited_instruction_files(work_dir: &str, names: &[String]) -> Vec<Value> {
 /// Returns None when there is nothing to disclose, so the field is absent
 /// rather than `false` on the ordinary path: a sender who did not ask for
 /// `no_board` should not have to read a line about it.
-fn no_board_refusal_notice(skip_board: bool, text: &str) -> Option<&'static str> {
-    if !skip_board {
+fn no_board_refusal_notice(skip_board: bool, text: &str, peer_coordination: bool) -> Option<&'static str> {
+    if !skip_board || peer_coordination {
         return None;
     }
     let substantive = amux_core::board::title_from_prompt(text).is_some()
@@ -13654,6 +13675,7 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
         // IDEMPOTENT: skip if this exact prompt was already carded (the enqueue path
         // may have minted at record time), so a queued message is never double-carded.
         if guard.is_empty()
+            && (sender.trim().is_empty() || crate::db::board_store::board_delegation_allowed(Some(&session)))
             && amux_core::board::title_from_prompt(&text).is_some()
             && !amux_core::board::is_informational_query(&text)
         {
@@ -16452,7 +16474,9 @@ pub(crate) async fn steer_mutate(
         // A refusal here is not reachable today (the archived pre-check above
         // catches the one case this path can hit), but it must not become a
         // silent 200 with a null id if that pre-check is ever removed.
-        let msg_id = match steer_enqueue(state, name, &text, guard, &hdr_worker(headers)).await {
+        let sender = if super::org::local_member_actor(headers).is_some() { String::new() } else { hdr_worker(headers) };
+        let peer_coordination = !sender.is_empty() && !crate::db::board_store::board_delegation_allowed(Some(name));
+        let msg_id = match steer_enqueue(state, name, &text, guard, &sender).await {
             Ok(id) => id,
             Err(reason) => {
                 send_dedup_forget(state,name,&dedup_id).await;
@@ -16470,6 +16494,8 @@ pub(crate) async fn steer_mutate(
         send_dedup_accept(state,name,&dedup_id,&msg_id).await;
         if body.get("record_history").map(py_truthy).unwrap_or(false) {
             let email = headers.get("x-amux-user-email").and_then(|v| v.to_str().ok()).unwrap_or("");
+            let history_type = if sender.is_empty() { "user" } else { "session" };
+            let history_origin = if sender.is_empty() { email } else { &sender };
             // QUEUED, not direct (AF-159). `steer_enqueue` above put this on the
             // steering queue; nothing has been submitted to the lane. Recording
             // it as `direct` with a blank verdict is what made 144 of 479
@@ -16477,7 +16503,7 @@ pub(crate) async fn steer_mutate(
             // value for a queued message and a hole for a direct one, and one
             // label made it mean both.
             cmd_hist_record_full(
-                state, name, &text, "user", email, skip_board,
+                state, name, &text, history_type, history_origin, skip_board,
                 DeliveryMeta::queued(now_i64() * 1000),
             )
             .await;
@@ -16498,7 +16524,7 @@ pub(crate) async fn steer_mutate(
                 Some(r) => block_reason_explain(r, name),
             },
             // Absent unless it applies (AMUX-4555).
-            "no_board_refused": no_board_refusal_notice(skip_board, &text),
+            "no_board_refused": no_board_refusal_notice(skip_board, &text, peer_coordination),
         }));
     }
     jresp(StatusCode::METHOD_NOT_ALLOWED, json!({"error": "method not allowed"}))
@@ -17487,6 +17513,8 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     } else {
         hdr_worker(headers).trim().chars().take(64).collect()
     };
+    let peer_coordination = !send_origin.is_empty()
+        && !crate::db::board_store::board_delegation_allowed(Some(name));
     if std::env::var("AMUX_GROUP_SEND_ENFORCE")
         .map(|v| !matches!(v.trim(), "0" | "false" | "no"))
         .unwrap_or(true)
@@ -17903,7 +17931,7 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     // THE FLAG THAT DID NOTHING SAYS SO (AMUX-4555). Set only when `no_board`
     // was asked for AND the text is substantive enough to be carded anyway;
     // otherwise the key is absent rather than false.
-    if let Some(notice) = no_board_refusal_notice(skip_board, &orig_text) {
+    if let Some(notice) = no_board_refusal_notice(skip_board, &orig_text, peer_coordination) {
         resp["no_board_refused"] = json!(notice);
     }
     // Python additionally reports recipient_gated from its in-memory
@@ -23080,6 +23108,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peer_steering_history_keeps_its_origin_and_does_not_capture_recipient_work() {
+        let (st, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        for name in ["peer-steer-caller", "peer-steer-recipient"] {
+            std::fs::write(sessions.join(format!("{name}.env")),
+                "CC_TAGS=alpha\nCC_AUTO_START=0\nAMUX_BOARD_DELEGATION=0\n").unwrap();
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amux-worker", "peer-steer-caller".parse().unwrap());
+        let response = steer_mutate(&st, "peer-steer-recipient", &Method::POST, &headers,
+            &json!({"text":"Rebuild the shard index for tenant 42 and report the residual count",
+                "record_history":true, "no_board":true})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert!(body["no_board_refused"].is_null(), "coordination does not promise a task: {body}");
+        let conn = st.store.read().unwrap();
+        let (kind, origin, pending, card): (String, String, i64, Option<String>) = conn.query_row(
+            "SELECT type, origin, capture_pending, card_id FROM cmd_history WHERE session='peer-steer-recipient'",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap();
+        assert_eq!((kind.as_str(), origin.as_str(), pending, card),
+            ("session", "peer-steer-caller", 0, None));
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM issues WHERE session='peer-steer-recipient'",
+            [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn isolated_peer_queue_refuses_before_history_or_dedupe_but_owner_retry_survives() {
         let (st, dir) = state();
         let _g = crate::api::settings::test_env::set_home(dir.path());
@@ -24218,7 +24275,7 @@ mod tests {
         // refusal branch is not the one under test.
         let work = "Rebuild the shard index for tenant 42 and report the residual count";
 
-        cmd_hist_record_full(&st, "lane-nb", work, "session", "peer-lane", true,
+        cmd_hist_record_full(&st, "lane-nb", work, "user", "owner", true,
                              DeliveryMeta::queued(11)).await;
         let asked = cardless_rejected_count(&st, "lane-nb");
         assert_eq!(
@@ -24227,7 +24284,7 @@ mod tests {
              0 here is the shape that made the live table empty for the life of the feature"
         );
 
-        cmd_hist_record_full(&st, "lane-plain", work, "session", "peer-lane", false,
+        cmd_hist_record_full(&st, "lane-plain", work, "user", "owner", false,
                              DeliveryMeta::queued(12)).await;
         assert_eq!(
             cardless_rejected_count(&st, "lane-plain"),
@@ -24235,6 +24292,26 @@ mod tests {
             "a send that did NOT ask for no_board must leave no refusal receipt — otherwise \
              the event says nothing about what the sender wanted"
         );
+        // Peer messages now stay coordination. Preserve the actual requested
+        // flag in that receipt, and do not falsely promise recipient tasks.
+        for requested in [true, false] {
+            let lane = format!("peer-no-board-{requested}");
+            cmd_hist_record_full(&st, &lane, work, "session", "peer-lane", requested,
+                                 DeliveryMeta::queued(13)).await;
+            assert_eq!(cardless_rejected_count(&st, &lane), 0);
+            let conn = st.store.read().unwrap();
+            let receipt: String = conn.query_row(
+                "SELECT data FROM session_events WHERE session=?1 AND type='task.cardless'",
+                [&lane], |r| r.get(0)).unwrap();
+            let receipt: Value = serde_json::from_str(&receipt).unwrap();
+            assert_eq!(receipt["reason"], "peer-coordination");
+            assert_eq!(receipt["requested_no_board"], requested);
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM issues WHERE session=?1",
+                [&lane], |r| r.get::<_, i64>(0)).unwrap(), 0);
+            assert!(no_board_refusal_notice(requested, work, true).is_none());
+        }
+        assert!(no_board_refusal_notice(true, work, false).is_some());
+        assert!(no_board_refusal_notice(false, work, false).is_none());
     }
 
     /// A NON-THINKING OLLAMA MODEL MUST NOT BE SENT `low` (AMUX-4611).
@@ -25018,72 +25095,32 @@ mod tests {
             "informational turns are the narrow cardless exception"
         );
 
-        // 6. A substantive inter-session request is recipient work and uses
-        //    the same linked board contract as a human or schedule command.
-        cmd_hist_record_full(
-            &st, "lane-x", "Coordinate the rollout with the other lane and report back",
-            "session", "peer-lane", false, DeliveryMeta::direct(),
-        )
-        .await;
-        let peer_card = q(
-            "SELECT card_id FROM cmd_history WHERE session=?1 ORDER BY id DESC LIMIT 1",
-            "lane-x",
-        )
-        .expect("substantive inter-session requests must be board-managed and linked");
-        let callback: (Option<String>, Option<String>, Option<String>) = st
-            .store
-            .read()
-            .unwrap()
-            .query_row(
-                "SELECT requested_by, callback_session, callback_state FROM issues \
-                 WHERE id=(SELECT card_id FROM cmd_history WHERE session='lane-x' ORDER BY id DESC LIMIT 1)",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(callback.0.as_deref(), Some("peer-lane"));
-        assert_eq!(callback.1.as_deref(), Some("peer-lane"));
-        assert_eq!(callback.2.as_deref(), Some("armed"));
+        // Peer messages are coordination, not assignments to this board.
+        for _ in 0..2 {
+            cmd_hist_record_full(&st, "lane-x", "Coordinate the rollout with the other lane and report back",
+                "session", "peer-lane", false, DeliveryMeta::direct()).await;
+        }
+        assert!(q("SELECT card_id FROM cmd_history WHERE session=?1 ORDER BY id DESC LIMIT 1", "lane-x").is_none());
+        let peer_tasks: i64 = st.store.read().unwrap().query_row(
+            "SELECT count(*) FROM issues WHERE session='lane-x'", [], |r|r.get(0)).unwrap();
+        assert_eq!(peer_tasks, 0, "peer delivery and retry must not create assignments or callbacks");
 
-        // A transport retry links to the one surviving task without rewinding
-        // a callback which has already entered the durable outbox.
-        let peer_card_w = peer_card.clone();
-        st.store
-            .write(move |conn| {
-                conn.execute(
-                    "UPDATE issues SET callback_state='pending' WHERE id=?1",
-                    [&peer_card_w],
-                )?;
-                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
-            })
-            .unwrap();
-        cmd_hist_record_full(
-            &st, "lane-x", "Coordinate the rollout with the other lane and report back",
-            "session", "peer-lane", false, DeliveryMeta::direct(),
-        )
-        .await;
-        assert_eq!(
-            q("SELECT card_id FROM cmd_history WHERE session=?1 ORDER BY id DESC LIMIT 1", "lane-x")
-                .as_deref(),
-            Some(peer_card.as_str()),
-            "the retrying source message must link to the surviving task"
-        );
-        let (peer_tasks, callback_state): (i64, Option<String>) = st
-            .store
-            .read()
-            .unwrap()
-            .query_row(
-                "SELECT COUNT(*), MAX(callback_state) FROM issues WHERE session='lane-x'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(peer_tasks, 1, "an identical retry must not duplicate its task");
-        assert_eq!(
-            callback_state.as_deref(),
-            Some("pending"),
-            "an identical retry must not re-arm and duplicate a pending callback"
-        );
+        // Recover a queued peer message recorded by the previous build. The
+        // restart path must also stop before semantic intake or task creation.
+        st.store.write(|conn| {
+            conn.execute("UPDATE cmd_history SET capture_pending=1 WHERE session='lane-x'", [])?;
+            Ok(crate::db::WriteOutcome { applied:true, events:vec![] })
+        }).unwrap();
+        let ids:Vec<i64> = {
+            let conn=st.store.read().unwrap();
+            let mut stmt=conn.prepare("SELECT id FROM cmd_history WHERE session='lane-x'").unwrap();
+            let rows=stmt.query_map([],|r|r.get(0)).unwrap();
+            rows.collect::<rusqlite::Result<_>>().unwrap()
+        };
+        for id in ids { capture_recorded_message(&st,id).await; }
+        let (pending,tasks):(i64,i64)=st.store.read().unwrap().query_row(
+            "SELECT (SELECT sum(capture_pending) FROM cmd_history WHERE session='lane-x'),(SELECT count(*) FROM issues WHERE session='lane-x')",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!((pending,tasks),(0,0));
 
         // 7. Schedules follow the same rule, while an informational scheduled
         //    check remains the narrow cardless case.

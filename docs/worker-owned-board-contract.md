@@ -1,0 +1,16 @@
+# Worker-owned board execution
+
+The default is one worker owning the complete outcome on its own board. A directory or component owned by another worker is not a reason to delegate the task or wait. Use an isolated checkout and reuse existing artifacts where appropriate.
+
+- New `depends_on` edges must stay on the same worker's board. Cross-board evidence belongs in the description or evidence field. POST and PATCH validate ownership inside the serialized writer and reject the entire mutation with `cross_board_dependency_forbidden`.
+- Workers cannot create assignments on another board using `request_to`. The refusal is `cross_board_delegation_forbidden`. Ordinary cross-board creation and reassignment remain forbidden.
+- Peer messages remain in Messages as coordination. Direct, queued and recovered deliveries do not automatically create recipient work or completion callbacks, and do not invoke semantic intake. Owner commands still receive board capture.
+- `Doing` must agree with pickup about unresolved dependencies and `blocked_on`. A gate acknowledgment cannot return success for a claim that the next board-drive tick would park. Missing prerequisites also block claims. Starting a parent does not require completed children; closing it does.
+- A captured umbrella command receives one durable disposition request before generic advancement budgets. Reuse existing tasks/epics, merge repeated context, or reshape a real deliverable rather than treating a progress note as decomposition.
+- Blocker recovery compares execution fields and input evidence. Description/log/revision-only churn cannot buy another model turn. Recovery remains bounded to one pending prompt per worker. Historical Needs You requests outside the configured approval categories receive one semantic review; actual approvals are never granted by this reconciliation.
+
+The existing worker/group/global setting `AMUX_APPROVAL_TYPES=budget,customer_outbound` confines Needs You to increased spend/budget and customer outbound without existing permission. A real credential or permission denial is still a real execution restriction; removing a worker dependency does not grant access. Complete independent preparation and record the exact remaining condition.
+
+`AMUX_BOARD_DELEGATION=1` explicitly opts a legacy cooperative workspace into routed tasks, peer capture and cross-board edges. It is off by default. Workers must not grant themselves this exception to evade the owner-selected policy. It does not bypass lifecycle, isolation, authentication or cross-group restrictions.
+
+TubeScience's September 17 repair keeps its import census as an evidence-only investigation and preserves its existing Done evidence. Validation cards retain outcome requirements as acceptance criteria and use the existing per-column/type gates; a final result is not falsely acknowledged merely to start work. No repair claims unperformed parity or production verification.

@@ -2485,7 +2485,7 @@ type TaskMarker = (f64, Option<String>, bool, String);
 pub(crate) fn cardless_event_allowed(data: &serde_json::Value) -> bool {
     matches!(
         data["reason"].as_str(),
-        Some("informational-query") | Some("control-prompt")
+        Some("informational-query") | Some("control-prompt") | Some("peer-coordination")
     )
 }
 
@@ -4944,6 +4944,7 @@ pub(crate) mod tests {
     fn transport_intent_cannot_classify_substantive_work_as_cardless() {
         assert!(cardless_event_allowed(&json!({"reason": "informational-query"})));
         assert!(cardless_event_allowed(&json!({"reason": "control-prompt"})));
+        assert!(cardless_event_allowed(&json!({"reason": "peer-coordination"})));
         for invalid in [
             json!({}),
             json!({"reason": "explicit-no-board"}),

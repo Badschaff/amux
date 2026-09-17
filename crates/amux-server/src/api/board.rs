@@ -1313,12 +1313,11 @@ async fn get_contract(
             "wrong_type": "If the item has no code, set its type first — the gate is DERIVED                            from the type. CLI: `amux board type <id> <type>`. API: PATCH                            /api/board/<id> with {\"type\": \"investigation\"} — the field is                            `type`, NOT `item_type` (that one is ignored and reported in                            `ignored_fields`). Settable at creation too: POST /api/board with                            {\"title\": ..., \"type\": ...}.",
         },
         "worker_board_ownership": {
-            "rule": "an identified worker may create cards only on its own board; `session` must equal the verified X-Amux-Worker/X-Amux-Session identity. The one exception is a ROUTED REQUEST (AMUX-4653): POST `request_to: \"<lane>\"` files the card on THAT lane's board, with `requested_by` forced to the verified caller and a completion callback armed to them",
-            "peer_links": "cross-worker collaboration is represented without transferring board ownership: set `reviewer` or `shepherd` to the peer and use `depends_on` for cross-board task dependencies",
-            "cli": "amux board request <worker> <title> files the card on <worker>'s board as a todo their dispatch offers them, with the caller as requester and a terminal callback armed back to the caller",
-            "request_to": "requires a verified caller; refused for your own lane (request_to_self), a lane that does not exist (unknown_lane), an unusable name (invalid_lane_name), a `session` that disagrees with it (request_target_ambiguous), or a terminal status (request_created_terminal). `requested_by` is never read from the body. Each routed request logs marker=board_request_routed",
-            "request_to_eligibility": "WHO may receive one is not decided here: it is `cross_group_send_ok`, the resolver every peer path shares, so a routed request refuses exactly what a direct send refuses (code peer_interaction_refused, 403, with the resolver's own message and a descriptive `target_lifecycle`). That covers lifecycle (AMUX-4566: active workers interact only with active workers, so a paused or archived lane on either end is refused), isolated targets, and the cross-group allow-list. A second predicate here would be a way around a gate messages cannot pass",
-            "security": "a worker cannot create an unassigned card, and cannot place a new card on another worker's board except through `request_to`, which records who asked and answers back to them; anonymous/human control-plane callers retain administrative placement",
+            "rule": "workers create and drain their own board; verified caller identity determines ownership",
+            "dependencies": "depends_on is limited to the same worker board; foreign artifacts belong in description/evidence, and the owner implements missing components",
+            "peer_messages": "coordination remains in Messages without automatically minting recipient tasks or callbacks",
+            "delegation": "request_to is refused by default (cross_board_delegation_forbidden); AMUX_BOARD_DELEGATION=1 is an explicit legacy cooperative-mode opt-in resolved by worker/group/global settings, not permission a worker should grant itself",
+            "security": "worker create and reassignment cannot place cards on peers; administrative callers retain placement, while dependency validation remains atomic"
         },
         "capture_decomposition": {
             "cli": "amux board decompose <capture-id> --stdin",
@@ -4083,6 +4082,14 @@ fn body_str_list(v: &Value) -> Result<Vec<String>, String> {
     }
 }
 
+fn foreign_dependency_refusal(deps: &[(String, String)]) -> Value {
+    tracing::warn!(marker="cross_board_dependency_refused", dependencies=?deps,
+        measured=true, n_considered=deps.len(), "foreign task cannot gate a self-contained board");
+    json!({"code":"cross_board_dependency_forbidden", "error":"dependencies must belong to the same worker board",
+        "dependencies":deps.iter().map(|(id,session)|json!({"id":id,"session":session})).collect::<Vec<_>>(),
+        "how_to_fix":"keep the required outcome on your own board and own its missing components; reference existing peer artifacts in the description or evidence instead of depends_on. Preserve real access, spend and customer-outbound restrictions."})
+}
+
 fn unknown_type_response(t: &str) -> Response {
     err(
         StatusCode::BAD_REQUEST,
@@ -4593,6 +4600,15 @@ pub async fn create_item(
                 }),
             );
         }
+        if !bs::board_delegation_allowed(Some(&hdr_session)) || !bs::board_delegation_allowed(Some(target)) {
+            tracing::warn!(marker="board_delegation_refused", requester=%hdr_session, target_lane=%target,
+                measured=true, n_considered=1, "worker owns its outcome; cross-board assignment refused");
+            return err(StatusCode::CONFLICT, json!({
+                "code":"cross_board_delegation_forbidden", "error":"workers manage their own boards",
+                "requester":hdr_session, "request_to":target,
+                "how_to_fix":"create or update the outcome on your own board; implement missing components yourself and reference peer evidence without assigning work or waiting on another worker"
+            }));
+        }
         if let Some((code, why)) =
             super::session_verbs::request_target_refusal(&hdr_session, target)
         {
@@ -4631,6 +4647,7 @@ pub async fn create_item(
             }
             return err(status, body);
         }
+
     }
 
     let session = if let Some(target) = request_to.clone() {
@@ -4658,12 +4675,9 @@ pub async fn create_item(
                 "code": "cross_board_create_forbidden",
                 "caller": hdr_session,
                 "requested_owner": if session.is_empty() { Value::Null } else { json!(session) },
-                // AMUX-4653: name the verb that DOES route work, or this
-                // refusal sends every lane back to the reviewer link whose
-                // cards the target never sees.
-                "how_to_fix": "to hand work over, POST request_to: \"<lane>\" (or `amux board request <lane> <title>`), \
-                               which files the card on their board with you as requester and a callback armed to you; \
-                               to keep the card, create it on your own board and link the peer with reviewer, shepherd, or depends_on",
+                // Keep the remedy on the same board, including when the
+                // requested peer is paused or otherwise unreachable.
+                "how_to_fix": "create or update the outcome on your own board; own missing components and reference peer evidence without delegating or creating cross-worker dependencies",
             }),
         );
     }
@@ -5044,6 +5058,7 @@ pub async fn create_item(
 
     enum Out {
         Cycle(Vec<String>),
+        ForeignDependencies(Vec<(String, String)>),
         WipLimit(String, i64, i64),
         Created(Box<IssueRow>, bool),
     }
@@ -5056,6 +5071,10 @@ pub async fn create_item(
     let write = state
         .store
         .write_async(move |conn| {
+            let foreign = bs::foreign_dependencies(conn, new.session.as_deref(), &new.depends_on)?;
+            if !foreign.is_empty() {
+                return finish(&slot_w, Out::ForeignDependencies(foreign), no_write());
+            }
             // AMUX-4653: a routed request never reaches here. `plan_create`
             // counts `request_to` as structured, so the semantic comparison is
             // skipped and the request keeps its own record. The first cut of
@@ -5144,6 +5163,7 @@ pub async fn create_item(
     match outcome {
         None => internal("create produced no outcome"),
         Some(Out::Cycle(cycle)) => cycle_response(&cycle),
+        Some(Out::ForeignDependencies(deps)) => err(StatusCode::CONFLICT, foreign_dependency_refusal(&deps)),
         Some(Out::WipLimit(session, held, limit)) => err(StatusCode::CONFLICT,
             json!({"ok":false,"code":"todo_wip_limit_reached","error":"todo queue is at its limit for this lane",
                 "session":session,"holding":held,"limit":limit,"how_to_fix":"create in backlog or finish existing todo work"})),
@@ -9085,7 +9105,7 @@ pub async fn patch_item(
                                 "code": "cross_board_reassignment_forbidden",
                                 "caller": caller_lane,
                                 "requested_owner": requested_owner,
-                                "how_to_fix": "keep the card on your own board and link the peer with reviewer, shepherd, or depends_on",
+                                "how_to_fix": "keep the outcome on your own board, implement missing components there, and reference peer evidence without creating a cross-worker dependency",
                             }),
                         ),
                         no_write(),
@@ -10001,6 +10021,13 @@ pub async fn patch_item(
                     changed.push("depends_on".into());
                 }
             }
+            if map.contains_key("depends_on") || map.contains_key("session") {
+                let foreign = bs::foreign_dependencies(conn, next.session.as_deref(), &next.depends_on)?;
+                if !foreign.is_empty() {
+                    return finish(&slot_w, PatchOut::Refused(StatusCode::CONFLICT,
+                        foreign_dependency_refusal(&foreign)), no_write());
+                }
+            }
             if let Some(v) = map.get("tags") {
                 let tags = match body_str_list(v) {
                     Ok(l) => l,
@@ -10512,8 +10539,21 @@ pub async fn patch_item(
                     // the same resolution rule dispatch uses
                     // (`bs::dependency_resolved`) and the same evidence verdict the
                     // done gate below uses. Force stays the audited override.
-                    if !force && matches!(target, TaskStatus::Review | TaskStatus::Done) {
+                    // Claims must use the same readiness rule as pickup and
+                    // auto-parking. Otherwise a gate ACK returns success, then
+                    // the next tick silently undoes it while the worker runs
+                    // (TubeScience TUBES-2461, 2026-09-17).
+                    if !force && matches!(target, TaskStatus::Doing | TaskStatus::Review | TaskStatus::Done) {
                         let mut missing: Vec<Value> = Vec::new();
+                        if target == TaskStatus::Doing {
+                            if let Some(reason) = next.blocked_on.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                                missing.push(json!({
+                                    "check": "blocked_on",
+                                    "reason": reason,
+                                    "fix": "resolve the recorded blocker, or clear it with evidence if it is obsolete; keep an independently executable next step on this card",
+                                }));
+                            }
+                        }
                         for dep in &next.depends_on {
                             // A dependency that names no card (deleted, or never
                             // existed) cannot be finished by anyone, so it is
@@ -10532,7 +10572,7 @@ pub async fn patch_item(
                             match dep_status {
                                 None => missing.push(json!({
                                     "check": "dependency_exists",
-                                    "blocking": false,
+                                    "blocking": target == TaskStatus::Doing,
                                     "card": dep,
                                     "fix": format!("{dep} names no card; remove it from depends_on with a reason"),
                                 })),
@@ -10545,7 +10585,11 @@ pub async fn patch_item(
                                 Some(_) => {}
                             }
                         }
-                        let open_children: Vec<(String, String)> = {
+                        let open_children: Vec<(String, String)> = if target == TaskStatus::Doing {
+                            // Starting a parent does not claim its children
+                            // are complete. Only its own required inputs gate it.
+                            Vec::new()
+                        } else {
                             let mut st = conn.prepare(
                                 "SELECT id, status FROM issues WHERE epic=?1 AND deleted IS NULL \
                                  AND COALESCE(archived,0)=0 \
@@ -10583,7 +10627,7 @@ pub async fn patch_item(
                                 caller = %caller_lane, missing = missing.len(), blocking,
                                 measured = true, n_considered = missing.len(),
                                 verdict = "acceptance_checks_failed",
-                                "board: review/done refused with the full list of unmet acceptance checks (AMUX-4526)"
+                                "board: transition refused with the full list of unmet readiness/acceptance checks"
                             );
                             return finish(
                                 &slot_w,
@@ -10597,7 +10641,11 @@ pub async fn patch_item(
                                         "item": next.id,
                                         "attempted_status": target_raw,
                                         "missing": missing,
-                                        "why": "review and done claim the work is complete; a card whose dependency or epic child is still open is not, so every unmet check is listed here in one answer",
+                                        "why": if target == TaskStatus::Doing {
+                                            "Doing requires available inputs and no recorded blocker, using the same rule as automatic pickup; resolve or correct the listed prerequisites before claiming so a successful claim is not immediately parked"
+                                        } else {
+                                            "review and done claim the work is complete; a card whose dependency or epic child is still open is not, so every unmet check is listed here in one answer"
+                                        },
                                         "override": "an explicit, attributed force with a reason still moves it, and is audited",
                                     }),
                                 ),

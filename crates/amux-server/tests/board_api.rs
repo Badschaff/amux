@@ -2733,6 +2733,10 @@ async fn python_shaped_row_round_trips_without_corruption() {
     assert_eq!(st, StatusCode::OK, "{v}");
     assert_eq!(v["status"], json!("needsyou"));
 
+    // Resolve the fixture's named prerequisite before claiming. Keeping the
+    // edge also checks that Python's JSON representation survives the move.
+    rusqlite::Connection::open(&db_path).unwrap().execute(
+        "INSERT INTO issues (id,title,desc,status,session,created,updated) VALUES ('ORCH-1','input','','verified','orch',1,1)", []).unwrap();
     // Status transition needsyou -> doing (core: Resume) with the type-
     // derived escalation gate acked, attributed via header.
     let (st, _, v) = send_with(
@@ -4796,7 +4800,7 @@ async fn status_update_refuses_cross_worker_blocked_dependency_wip_and_later_sta
     assert_eq!(body["claim_verdict"], json!("blocked"));
 
     let dep = create(&app, json!({
-        "title":"open dependency", "status":"backlog", "session":"dep-lane"
+        "title":"open dependency", "status":"backlog", "session":"dependent-lane"
     })).await;
     let dependent = create(&app, json!({
         "title":"dependent card", "status":"todo", "session":"dependent-lane",
@@ -6513,10 +6517,12 @@ async fn review_and_done_are_refused_with_every_unmet_check_listed_together() {
     assert_eq!(st, StatusCode::OK, "{v}");
     let (_, _, linked) = send_with(&app, "GET", &format!("/api/board/{child_id}"), None, &[]).await;
     assert_eq!(linked["epic"], json!(epic_id), "{linked}");
+    // Discover another required input after starting; completion must refuse
+    // it even though the earlier claim was ready when it was made.
+    move_as(&app, &epic_id, "doing", "lane-p").await;
     let (st, _, _) = send_with(&app, "PATCH", &format!("/api/board/{epic_id}"),
         Some(json!({ "depends_on": [dep_id] })), &[("X-Amux-Session", "lane-p")]).await;
     assert_eq!(st, StatusCode::OK);
-    move_as(&app, &epic_id, "doing", "lane-p").await;
 
     let (st, _, v) = send_with(&app, "PATCH", &format!("/api/board/{epic_id}"),
         Some(json!({ "status": "review" })), &[("X-Amux-Session", "lane-p")]).await;
@@ -6543,6 +6549,63 @@ async fn review_and_done_are_refused_with_every_unmet_check_listed_together() {
     assert_eq!(st, StatusCode::OK);
     let v = move_as(&app, &epic_id, "review", "lane-p").await;
     assert_eq!(v["status"], json!("review"), "{v}");
+}
+
+
+#[tokio::test]
+async fn doing_ack_cannot_bypass_readiness_and_repairs_are_atomic() {
+    let (app, store, _dir) = app_with_store();
+    let dep = create(&app, json!({"title":"Import census", "type":"code", "status":"backlog"})).await;
+    let dep_id = dep["id"].as_str().unwrap();
+    let dep_w = dep_id.to_string();
+    store.write(move |conn| {
+        conn.execute("UPDATE issues SET status='done' WHERE id=?1", [dep_w])?;
+        Ok(amux_server::db::WriteOutcome { applied:true, events:vec![] })
+    }).unwrap();
+    let card = create(&app, json!({"title":"Measure parity", "session":"parity", "type":"investigation",
+        "status":"backlog", "next_action":"Run the parity comparison", "acceptance_criteria":["Publish actual measurements"]})).await;
+    let id = card["id"].as_str().unwrap();
+    let path = format!("/api/board/{id}");
+    let (_,_,_) = send(&app,"PATCH",&path,Some(json!({"depends_on":[dep_id],"gate":["Input census is available"]}))).await;
+    let (_,_,before) = send(&app,"GET",&path,None).await;
+    let (status,_,refused) = send(&app,"PATCH",&path,Some(json!({"status":"doing",
+        "gate_checked":["Input census is available"], "desc_append":"Must not survive a refused claim"}))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["code"], "acceptance_checks_failed");
+    assert_eq!(refused["attempted_status"], "doing");
+    assert_eq!(refused["missing"][0]["card"], dep_id);
+    assert_eq!(refused["missing"][0]["status"], "done");
+    let (_,_,after) = send(&app,"GET",&path,None).await;
+    assert_eq!(after["status"], "backlog");
+    assert_eq!(after["rev"], before["rev"], "a rejected claim is not a write");
+    assert_eq!(after["desc"], before["desc"]);
+
+    // A missing input and a stored blocker also obey the parker's predicate.
+    for fields in [json!({"depends_on":["MISSING-999"]}), json!({"depends_on":[],"blocked_on":"required access absent"})] {
+        let (status,_,body) = send(&app,"PATCH",&path,Some(fields)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status,_,body) = send(&app,"PATCH",&path,Some(json!({"status":"doing","gate_checked":["Input census is available"]}))).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "acceptance_checks_failed");
+    }
+
+    // Correct a mis-typed evidence-only prerequisite, not its verification.
+    // Done investigations complete naturally. Clear the obsolete blocker in
+    // the SAME write as the claim; an open child does not prevent starting.
+    let dep_w = dep_id.to_string();
+    store.write(move |conn| {
+        conn.execute("UPDATE issues SET type='investigation' WHERE id=?1", [dep_w])?;
+        Ok(amux_server::db::WriteOutcome { applied:true, events:vec![] })
+    }).unwrap();
+    let child = create(&app, json!({"title":"Independent child", "type":"chore", "status":"backlog"})).await;
+    let (status,_,body) = send(&app,"PATCH",&format!("/api/board/{}",child["id"].as_str().unwrap()),Some(json!({"epic":id}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status,_,body) = send(&app,"PATCH",&path,Some(json!({"status":"doing","depends_on":[dep_id],
+        "blocked_on":null,"gate_checked":["Input census is available"]}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_,_,after) = send(&app,"GET",&path,None).await;
+    assert_eq!(after["status"], "doing");
+    assert!(after["blocked_on"].is_null());
 }
 
 

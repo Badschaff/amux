@@ -49,6 +49,8 @@ fn fleet_home() -> &'static std::path::Path {
         std::fs::write(sessions.join("lane-other.env"), "CC_DIR=/tmp\nCC_GROUPS=beta\n").expect("other");
         std::env::set_var("AMUX_HOME", dir.path());
         std::env::set_var("AMUX_APPROVAL_TYPES", "*");
+        // This suite pins the explicitly opted-in legacy delegation contract.
+        std::env::set_var("AMUX_BOARD_DELEGATION", "1");
         dir.path().to_path_buf()
     })
     .as_path()
@@ -164,10 +166,9 @@ async fn a_plain_cross_board_create_is_still_refused() {
     .await;
     assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
     assert_eq!(v["code"], json!("cross_board_create_forbidden"), "{v}");
-    // The refusal must name the verb that DOES route work, or it sends the
-    // caller back to the reviewer link whose cards nobody sees.
+    // The default remedy is to retain ownership, not to route around it.
     let how = v["how_to_fix"].as_str().unwrap_or_default();
-    assert!(how.contains("request_to"), "the refusal must point at the working path: {how}");
+    assert!(how.contains("own board"), "the refusal must preserve ownership: {how}");
 }
 
 /// `requested_by` comes from the verified header and NEVER from the body.

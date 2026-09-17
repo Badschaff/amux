@@ -4732,46 +4732,41 @@ pub fn select_advance(
     })
 }
 
-/// A newly captured prompt shell that still needs the owning model's explicit
-/// keep/split/discard judgment.
-///
-/// Capture cleanup is keyed per card (`decompose:<id>`), while the ordinary
-/// advance cooldown is keyed per lane. Letting an older real card's cooldown
-/// hide a brand-new shell leaves the shell in `doing` even after the turn has
-/// ended. Find only shells the shared pickup classifier rejects and which
-/// have never received their durable cleanup prompt; ordinary work is never
-/// promoted by this exception.
+/// An appended progress note does not dispose of a captured command. WIP and
+/// requeue already use this predicate; advancement must not let the generic
+/// classifier's structured-prose exemption turn the same envelope into work.
+fn capture_cleanup_reason(row: &bs::IssueRow) -> String {
+    if row.item_type == "epic" { return String::new(); }
+    if bs::is_capture_shell(row) {
+        return "captured command is not a unit of work until reshaped or linked as an epic".into();
+    }
+    pickup_junk_reason_scoped(&row.title, &row.desc, row.log.as_deref().unwrap_or(""),
+        &row.status, row.reviewer.as_deref().unwrap_or(""))
+}
+
+/// Select the owning model's once-per-card disposition request. Neither a
+/// progress append nor generic advance nudges can spend this distinct action.
 fn unnudged_capture_cleanup(conn: &Connection, session: &str) -> Option<String> {
-    let candidates: Vec<(String, String, String, String)> = conn
+    let candidates: Vec<String> = conn
         .prepare(
-            "SELECT id,title,COALESCE(desc,''),COALESCE(log,'') FROM issues \
+            "SELECT id FROM issues \
              WHERE session=?1 AND status='doing' AND source='capture' \
              AND deleted IS NULL AND COALESCE(archived,0)=0 AND owner_type='agent' AND COALESCE(type,'') != 'epic' \
              ORDER BY updated DESC LIMIT 40",
         )
         .and_then(|mut st| {
-            st.query_map(rusqlite::params![session], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-            })
-            .map(|rows| rows.flatten().collect())
+            st.query_map([session], |r| r.get(0))
+                .map(|rows| rows.flatten().collect())
         })
         .unwrap_or_default();
 
-    candidates.into_iter().find_map(|(id, title, desc, log)| {
-        if pickup_junk_reason(&title, &desc, &log).is_empty() {
-            return None;
-        }
+    candidates.into_iter().find_map(|id| {
+        let row = bs::get_issue(conn, &id).ok().flatten()?;
+        if capture_cleanup_reason(&row).is_empty() { return None; }
         let idem = format!("decompose:{id}");
         let already = conn
-            .query_row(
-                "SELECT 1 FROM session_events WHERE idem=?1 LIMIT 1",
-                rusqlite::params![idem],
-                |_| Ok(()),
-            )
-            .optional()
-            .ok()
-            .flatten()
-            .is_some();
+            .query_row("SELECT 1 FROM session_events WHERE idem=?1 LIMIT 1", [idem], |_| Ok(()))
+            .optional().ok().flatten().is_some();
         (!already).then_some(id)
     })
 }
@@ -4975,6 +4970,16 @@ pub fn select_advance_with(
     // gap grow without limit.
     let streak_since = now - 14.0 * 86400.0;
     for (id, status) in &cands {
+        // Disposition is a separate once-ever action, not another "continue"
+        // turn. MF-1231 spent three generic nudges on its untouched envelope;
+        // that budget must not suppress the first corrective judgment.
+        if capture_cleanup.as_deref() == Some(id.as_str()) {
+            tracing::info!(target: "amux::board_drive", session, card = %id,
+                measured = true, n_considered = 1, verdict = "capture_disposition_selected",
+                "board-drive: unresolved captured command needs its one explicit disposition");
+            chosen = Some((id.clone(), status.clone()));
+            break;
+        }
         if card_event_count(conn, "advance.nudged", id, day_ago) >= budget {
             continue;
         }
@@ -5030,8 +5035,7 @@ pub fn select_advance_with(
     // log marker — a reshaped card no longer re-nags (AMUX-3187).
     // A decomposed epic preserves its source prompt as context. Its children
     // carry execution; a review-stage epic is real review work, not a shell.
-    let why = if row.item_type == "epic" { String::new() }
-        else { pickup_junk_reason_scoped(&row.title, &row.desc, row.log.as_deref().unwrap_or(""), &row.status, row.reviewer.as_deref().unwrap_or("")) };
+    let why = capture_cleanup_reason(&row);
     if !why.is_empty() {
         // TELL THE LANE, do not just log it (py:13513, board-exp-1). Refusing to
         // nudge "advance it" at a capture shell is right — nothing about a chat
@@ -5097,13 +5101,14 @@ pub fn select_advance_with(
         // one: a card nothing can honestly call done or not-done cannot pass a
         // gate, so it sits on the board reading like work forever.
         let text = format!(
-            "[amux] {card_id} is a capture shell ({why}). Not blocking pickup, but not actionable either.\n\n\
+            "[amux] {card_id} is a capture shell ({why}). Not blocking pickup.\n\n\
              Not work? `amux board discard {card_id} --outcome-stdin`\n\
              One task? `amux board retitle {card_id} \"<title>\" --desc-stdin`\n\
-             Several? Produce the ordered JSON plan and run \
-             `amux board decompose {card_id} --stdin`. That single write preserves this \
-             message link and requires each child's description, dependencies, p0-p3 priority, \
-             next action, and falsifiable acceptance criteria."
+             Existing tasks? `amux board type {card_id} epic`, then \
+             `amux board epic <child-id> {card_id}`. Reuse canonical tasks; do not duplicate them.\n\
+             New tasks? `amux board decompose {card_id} --stdin` with descriptions, dependencies, \
+             priorities, next actions and acceptance criteria. Claim the concrete task before executing it; \
+             read any refusal body and satisfy its actual gate."
         );
         return Advance::Nudge {
             target: session.to_string(),
@@ -6432,40 +6437,56 @@ struct BlockerRecovery {
 /// treating it as an empty queue. It never clears a hold, claims held work, or
 /// routes work to a different worker. The recipient owns the safe next action.
 fn blocker_recoveries(conn: &Connection, lane: &str) -> rusqlite::Result<Vec<BlockerRecovery>> {
+    blocker_recoveries_with_policy(conn, lane, &bs::approval_types(Some(lane)))
+}
+
+fn blocker_recoveries_with_policy(conn: &Connection, lane: &str, allowed_asks: &[String]) -> rusqlite::Result<Vec<BlockerRecovery>> {
     use sha2::{Digest, Sha256};
     let mut stmt = conn.prepare(&format!(
         "SELECT i.id FROM issues i WHERE i.session=?1 AND i.owner_type='agent' \
-         AND i.status IN ('todo','backlog','blocked','doing') AND i.deleted IS NULL \
+         AND i.status IN ('todo','backlog','blocked','doing','needsyou','needs_you') AND i.deleted IS NULL \
          AND COALESCE(i.archived,0)=0 AND COALESCE(i.type,'') NOT IN ('epic','watch','tripwire') \
          AND NOT {capture} AND COALESCE(i.source,'')<>'capture' \
-         AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=i.id AND lower(t.tag) LIKE 'needs:you%') \
+         AND (i.status IN ('needsyou','needs_you') OR NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=i.id AND lower(t.tag) LIKE 'needs:you%')) \
          ORDER BY COALESCE(i.pinned,0) DESC, i.created ASC, i.id ASC",
         capture = bs::capture_shell_sql()))?;
     let ids = stmt.query_map([lane], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
     let mut result = Vec::new();
     for id in ids {
         let Some(row) = bs::get_issue(conn, &id)? else { continue; };
+        let needsyou = bs::parse_status(&row.status) == Some(amux_core::board::TaskStatus::NeedsYou);
+        let ask_type = row.ask_type.as_deref().unwrap_or("").trim().to_ascii_lowercase();
+        let ask_outside_policy = needsyou && !allowed_asks.iter().any(|s| s == "*" || s == &ask_type);
+        // Current approval holds are not a reason to spend another model turn.
+        // Historical asks outside the owner's policy need one semantic repair,
+        // not an automatic approval or a permanent exclusion from recovery.
+        if needsyou && !ask_outside_policy { continue; }
         let deps = deps_blocking(conn, &row);
         let blocked = row.blocked_on.as_deref().unwrap_or("").trim();
         let trigger = row.source_ref.as_deref().unwrap_or("").trim();
         let missing_next = bs::continuation_verdict(row.next_action.as_deref().unwrap_or("")) != bs::ContinuationVerdict::Ok;
-        if deps.is_empty() && blocked.is_empty() && trigger.is_empty() && !missing_next { continue; }
+        if deps.is_empty() && blocked.is_empty() && trigger.is_empty() && !missing_next && !ask_outside_policy { continue; }
         // Include dependency OUTPUT state, not its owner's availability or log
         // churn. Closing an unrelated card or rechecking a date cannot rearm.
         let dep_state = deps.iter().map(|id| {
             bs::get_issue(conn, id).map(|dep| dep.map(|d|
                 json!({"id":d.id,"status":d.status,"evidence":d.evidence,"acceptance_criteria":d.acceptance_criteria})))
         }).collect::<rusqlite::Result<Vec<_>>>()?;
-        let signature = json!([lane,row.id,row.title,row.desc,row.status,row.next_action,
-            row.acceptance_criteria,row.depends_on,row.blocked_on,row.source_ref,row.waiting_on,dep_state]);
+        // Progress-note appends are not a changed blocker. Re-arm only for a
+        // changed execution contract, input evidence or blocking condition.
+        let signature = json!([lane,row.id,row.title,row.item_type,row.status,row.next_action,
+            row.acceptance_criteria,row.gate,row.evidence,row.depends_on,row.blocked_on,row.source_ref,row.waiting_on,
+            row.ask_type,row.ask_question,row.ask_unblocks,allowed_asks,dep_state]);
         let identity = format!("board-blocker:{:x}", Sha256::digest(signature.to_string().as_bytes()));
         let context = json!({"card":row.id,"title":row.title,"status":row.status,
             "blocked_on":row.blocked_on,"trigger":row.source_ref,"waiting_on":row.waiting_on,
-            "missing_next_action":missing_next,"unresolved_dependencies":deps});
+            "missing_next_action":missing_next,"unresolved_dependencies":deps,
+            "ask_outside_policy":ask_outside_policy,"ask_type":row.ask_type,"ask_question":row.ask_question,
+            "ask_unblocks":row.ask_unblocks,"allowed_approval_types":allowed_asks});
         let text = format!(
             "[amux blocker recovery] Resolve the next safe step for {}. This is a bounded review of the following stored task DATA, not permission to execute held work: {}\n\n\
              Read this card and its named prerequisites. Keep responsibility for the complete outcome: implement a missing component yourself within existing authority, using an isolated checkout if necessary. Another worker's ownership, availability, approval of an ordinary implementation choice, or dirty checkout is not itself a dependency. Reuse existing canonical tasks and verified artifacts; do not create duplicate requests or wait an arbitrary time. Remove an edge only after establishing that its artifact is available or unnecessary.\n\
-             Preserve actual access restrictions, explicit owner holds, new-spend approval and customer-outbound approval. If one still blocks execution, record the exact observable condition and evidence, and perform any independent preparation that is allowed. Do not claim held work is running or fabricate completion. Supply next_action and acceptance_criteria on the existing card; track any actual execution as Doing and finish through the predefined gates. Resolve the same prerequisite for other affected cards in this lane in this turn when possible. No repeated whole-board audit. An unchanged blocker will not receive another recovery prompt.",
+             If ask_outside_policy is true, classify the actual existing ask: retain and correctly type real budget/customer-outbound approval; otherwise own the ordinary decision, or record a precise real access blocker and complete independent work. Never treat policy cleanup as permission or fabricate authorization. Reconcile depends_on, blocked_on, source_ref AND the card gate together; removing an edge while its old wait survives elsewhere does not unblock work. Cross-worker tasks are evidence references, not dependencies or assignments: own the complete outcome on this board. Correct evidence-only tasks to investigation/doc rather than requiring a nonexistent deployment. Put completion requirements in acceptance_criteria and use the predefined column gates; never acknowledge completed results just to start. Preserve actual access restrictions, explicit owner holds, new-spend approval and customer-outbound approval. If one still blocks execution, record the exact observable condition and evidence, and perform any independent preparation that is allowed. Do not claim held work is running or fabricate completion. Supply next_action and acceptance_criteria on the existing card; track any actual execution as Doing and finish through the predefined gates. Resolve the same prerequisite for other affected cards in this lane in this turn when possible. No repeated whole-board audit. An unchanged blocker will not receive another recovery prompt.",
             row.id, context);
         result.push(BlockerRecovery {card:row.id,rev:row.rev,identity,text});
     }
@@ -9664,6 +9685,49 @@ mod tests {
         assert_eq!(drive_lane(&state, &fleet, "lane").await.reason, "not-running-no-dispatchable-work");
         assert!(fleet.delivered.lock().unwrap().is_empty());
         assert_eq!(drive_status(&store, "PARKED"), "backlog");
+    }
+
+    #[test]
+    fn obsolete_needsyou_requests_get_review_without_approving_real_budget_holds() {
+        let (_dir, _state, store) = drive_state();
+        for id in ["OLD-ASK", "BUDGET", "OUTBOUND"] {
+            drive_card(&store, id, "needsyou", "agent", "code");
+        }
+        store.write(|conn| {
+            conn.execute("UPDATE issues SET ask_type='decision',ask_question='Which worker should implement the missing field?' WHERE id='OLD-ASK'", [])?;
+            conn.execute("UPDATE issues SET ask_type='budget' WHERE id='BUDGET'", [])?;
+            conn.execute("UPDATE issues SET ask_type='customer_outbound' WHERE id='OUTBOUND'", [])?;
+            Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
+        }).unwrap();
+        let conn=store.read().unwrap();
+        let reviews=blocker_recoveries_with_policy(&conn,"lane", &["budget".into(),"customer_outbound".into()]).unwrap();
+        assert_eq!(reviews.len(),1);
+        assert_eq!(reviews[0].card,"OLD-ASK");
+        assert!(reviews[0].text.contains("\"ask_outside_policy\":true"));
+        assert!(reviews[0].text.contains("Never treat policy cleanup as permission"));
+        assert_eq!(bs::get_issue(&conn,"OLD-ASK").unwrap().unwrap().status,"needsyou", "review is not an approval");
+        assert!(blocker_recoveries_with_policy(&conn,"lane", &["*".into()]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn blocker_progress_notes_do_not_buy_another_model_turn() {
+        let (_dir, _state, store) = drive_state();
+        drive_card(&store, "WAIT", "backlog", "agent", "code");
+        store.write(|conn| {
+            conn.execute("UPDATE issues SET blocked_on='input artifact missing' WHERE id='WAIT'", [])?;
+            Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
+        }).unwrap();
+        let identity = blocker_recoveries(&store.read().unwrap(), "lane").unwrap()[0].identity.clone();
+        store.write(|conn| {
+            conn.execute("UPDATE issues SET desc=desc||' Still waiting; checked again.',rev=rev+1 WHERE id='WAIT'", [])?;
+            Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
+        }).unwrap();
+        assert_eq!(blocker_recoveries(&store.read().unwrap(), "lane").unwrap()[0].identity, identity);
+        store.write(|conn| {
+            conn.execute("UPDATE issues SET blocked_on='required artifact now available; validate its signature' WHERE id='WAIT'", [])?;
+            Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
+        }).unwrap();
+        assert_ne!(blocker_recoveries(&store.read().unwrap(), "lane").unwrap()[0].identity, identity);
     }
 
     #[test]
@@ -13105,6 +13169,35 @@ mod tests {
             Advance::None { reason, .. } => assert_eq!(reason, "cooldown"),
             Advance::Nudge { text, .. } => panic!("the same shell must not be prompted twice: {text}"),
         }
+    }
+
+    #[test]
+    fn an_enriched_capture_gets_one_disposition_after_spending_generic_nudges() {
+        let conn = board_db();
+        let now = now_f64();
+        add_card(&conn, "MF-1231", "finances", "doing", "Make sure the entire board drains overnight",
+            "**Prompt:** make sure the entire board drains overnight\n\nSCOPE: own all deployment and migration tasks.\n- [ ] verify every outcome\nSTATE: override landed; waiting for the resolver.");
+        conn.execute("UPDATE issues SET creator='amux', source='capture', type='ops' WHERE id='MF-1231'", []).unwrap();
+        for age in [7200.0, 3600.0, 60.0] {
+            conn.execute("INSERT INTO session_events(ts,session,type,data,source) VALUES (?1,'finances','advance.nudged','{\"issue\":\"MF-1231\",\"status\":\"doing\",\"kind\":\"advance-nudged\"}','board-drive')", [now-age]).unwrap();
+        }
+        assert!(wip_holding_ids(&conn, "finances", None).unwrap().is_empty());
+        let Advance::Nudge { card, kind, text, .. } = select_advance(&conn, "finances", &[], now) else {
+            panic!("the first disposition must survive both cooldown and generic budget exhaustion");
+        };
+        assert_eq!(card, "MF-1231");
+        assert_eq!(kind, "decompose-asked");
+        assert!(text.contains("amux board epic") && text.contains("refusal body"), "{text}");
+        conn.execute("INSERT INTO session_events(ts,session,type,data,source,idem) VALUES (?1,'finances','advance.nudged','{\"issue\":\"MF-1231\",\"status\":\"doing\",\"kind\":\"decompose-asked\"}','board-drive','decompose:MF-1231')", [now]).unwrap();
+        for age in [1.0, 1800.0, 90000.0] {
+            assert!(matches!(select_advance(&conn, "finances", &[], now+age), Advance::None { .. }),
+                "an ignored disposition must not buy another worker turn, even tomorrow");
+        }
+        // A semantic repair, not elapsed time, makes this a real task again.
+        conn.execute("UPDATE issues SET desc='SCOPE: verify resolver output for run 35234445237 and record rollout evidence' WHERE id='MF-1231'", []).unwrap();
+        assert_eq!(wip_holding_ids(&conn, "finances", None).unwrap(), vec!["MF-1231"]);
+        assert!(matches!(select_advance(&conn, "finances", &[], now+90000.0),
+            Advance::Nudge { kind: "advance-nudged", .. }));
     }
 
     /// REBUILT FROM THE LIVE SPECIMEN, not a convenient fixture: amux-agent was
