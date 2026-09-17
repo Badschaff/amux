@@ -506,6 +506,25 @@ fn fd_health() -> Option<FdHealth> {
 pub struct StoreProbeProgress {
     pub last_success_age_ms: Option<u64>,
     pub in_flight_age_ms: Option<u64>,
+    /// Writes queued behind the single writer thread right now (AMUX-4744).
+    ///
+    /// Reads and writes take different paths and only writes queue here, which
+    /// is why a stalled POST sits beside a GET answering in 8ms and the server
+    /// looks healthy by every other field in this payload.
+    pub write_inflight: usize,
+    /// Longest write wait seen since process start, milliseconds. Rises only,
+    /// so a stall that has already cleared is still reportable afterwards; a
+    /// gauge that decayed would read zero exactly when someone came to look.
+    pub write_wait_max_ms: u64,
+    /// Longest wait for a `spawn_blocking` thread, milliseconds, rising only.
+    ///
+    /// READ THIS BESIDE `write_wait_max_ms`, because together they say WHICH
+    /// queue is the problem and either alone is misleading. Both `writer_slow`
+    /// and `write_wait_max_ms` are measured from a thread the task already
+    /// holds, so neither can see time spent waiting to GET that thread. A large
+    /// value here with a small `write_wait_max_ms` means the writer was never
+    /// the bottleneck and the blocking pool was.
+    pub blocking_dispatch_max_ms: u64,
 }
 
 // Monotonic, process-local timestamps: zero is reserved for "not measured".
@@ -592,6 +611,12 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>)
     let store_probe = StoreProbeProgress {
         last_success_age_ms: age(state.store.health_probe_last_success.load(std::sync::atomic::Ordering::Relaxed)),
         in_flight_age_ms: age(state.store.health_probe_started.load(std::sync::atomic::Ordering::Relaxed)),
+        write_inflight: state.store.write_inflight.load(std::sync::atomic::Ordering::Relaxed),
+        write_wait_max_ms: state.store.write_wait_max_ms.load(std::sync::atomic::Ordering::Relaxed),
+        blocking_dispatch_max_ms: state
+            .store
+            .blocking_dispatch_max_ms
+            .load(std::sync::atomic::Ordering::Relaxed),
     };
     let board_bad = board.measured && !board.ok;
     let fds = fd_health();

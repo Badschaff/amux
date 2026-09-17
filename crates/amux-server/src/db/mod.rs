@@ -117,8 +117,54 @@ pub struct Store {
     pub(crate) health_probe: Arc<tokio::sync::Semaphore>,
     pub(crate) health_probe_started: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) health_probe_last_success: Arc<std::sync::atomic::AtomicU64>,
+    /// Writes submitted to the writer thread and not yet answered (AMUX-4744).
+    ///
+    /// The writer is ONE thread behind an unbounded channel and `write_correlated`
+    /// waits on `recv()` with no timeout, so a slow write delays every write
+    /// behind it by an unbounded amount while reads are untouched. That
+    /// asymmetry is invisible today: nothing times the wait and nothing counts
+    /// the queue, so an 80s POST produces no log line at all.
+    pub(crate) write_inflight: Arc<std::sync::atomic::AtomicUsize>,
+    /// Longest write wait observed since start, in milliseconds. A gauge that
+    /// only rises, so a stall that has already ended is still reportable.
+    pub(crate) write_wait_max_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Longest wait for a `spawn_blocking` thread, milliseconds, rising only.
+    /// See `record_blocking_dispatch`: this is the one number on the write path
+    /// that is not measured from a thread we already hold.
+    pub(crate) blocking_dispatch_max_ms: Arc<std::sync::atomic::AtomicU64>,
     /// Broadcast of committed StateEvents for SSE fan-out.
     events_tx: tokio::sync::broadcast::Sender<StateEvent>,
+}
+
+/// A write wait past this is reported. A healthy write on this box is
+/// sub-millisecond; the stalls on AMUX-4744 were 62s to 84s. One second is far
+/// enough above normal contention to stay quiet and far enough below the
+/// observed failures to catch all of them.
+pub(crate) const WRITE_WAIT_WARN_MS: u64 = 1_000;
+
+/// Record how long a `spawn_blocking` task waited to be given a thread, and say
+/// so when it is long enough to be the reason a request is hanging.
+///
+/// Getting a blocking thread is normally instant. A large value here means the
+/// blocking pool is the bottleneck, which is a DIFFERENT fault from a slow
+/// query or a busy writer and has a different fix, so it gets its own verdict
+/// rather than being folded into `writer_slow`.
+pub(crate) fn record_blocking_dispatch(
+    gauge: &std::sync::atomic::AtomicU64,
+    waited: std::time::Duration,
+) {
+    let ms = waited.as_millis() as u64;
+    gauge.fetch_max(ms, std::sync::atomic::Ordering::Relaxed);
+    if ms >= WRITE_WAIT_WARN_MS {
+        tracing::warn!(
+            target: "store",
+            verdict = "blocking_pool_saturated",
+            waited_ms = ms,
+            measured = true,
+            n_considered = 1,
+            "a db task waited for a blocking thread; the pool, not the query, is the delay"
+        );
+    }
 }
 
 impl Store {
@@ -187,6 +233,9 @@ impl Store {
             health_probe: Arc::new(tokio::sync::Semaphore::new(1)),
             health_probe_started: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             health_probe_last_success: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            write_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            write_wait_max_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            blocking_dispatch_max_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             events_tx,
         })
     }
@@ -204,8 +253,12 @@ impl Store {
     where
         F: FnOnce(&Connection) -> rusqlite::Result<WriteOutcome> + Send + 'static,
     {
+        use std::sync::atomic::Ordering;
         let (reply_tx, reply_rx) = mpsc::channel();
-        self.write_tx
+        self.write_inflight.fetch_add(1, Ordering::Relaxed);
+        let started = std::time::Instant::now();
+        let sent = self
+            .write_tx
             .send(WriteRequest {
                 work: Box::new(f),
                 origin: std::any::type_name::<F>(),
@@ -213,8 +266,35 @@ impl Store {
                 interaction_id,
                 reply: reply_tx,
             })
-            .map_err(|_| anyhow::anyhow!("writer thread is gone"))?;
-        Ok(reply_rx.recv()??)
+            .map_err(|_| anyhow::anyhow!("writer thread is gone"));
+        let out = match sent {
+            Ok(()) => reply_rx
+                .recv()
+                .map_err(anyhow::Error::from)
+                .and_then(|r| r.map_err(anyhow::Error::from)),
+            Err(e) => Err(e),
+        };
+        self.write_inflight.fetch_sub(1, Ordering::Relaxed);
+
+        // THE GAUGE, NOT A SECOND WARNING (AMUX-4744). `recv()` above has no
+        // timeout, so an 80-second write used to produce exactly as much output
+        // as a fast one: none.
+        //
+        // The LOG half of that gap is already closed, by `writer_slow` in
+        // `writer_loop` (1f0cca3e, codex-board-execution-contract), which lands
+        // the same minute as this and is strictly better placed: it carries
+        // `origin`, the type name of the blocking closure, so it NAMES the slow
+        // mutation instead of only reporting that something was slow. A second
+        // warn here would fire on the same event with less information, and two
+        // lines per stall is how a verdict becomes noise a sweep learns to skip.
+        //
+        // What that warn cannot answer is "is it happening RIGHT NOW, and how
+        // deep", because a log line is a record of something already over.
+        // These two atomics are readable on /api/health at any instant, which
+        // is where someone looks while a POST is hanging in front of them.
+        let waited_ms = started.elapsed().as_millis() as u64;
+        self.write_wait_max_ms.fetch_max(waited_ms, Ordering::Relaxed);
+        out
     }
 
     /// Async wrapper: parks the wait on the blocking pool so an API handler
@@ -225,7 +305,25 @@ impl Store {
     {
         let this = self.clone();
         let interaction_id = interactions::current_id();
-        tokio::task::spawn_blocking(move || this.write_correlated(f, interaction_id)).await?
+        let dispatch = self.blocking_dispatch_max_ms.clone();
+        let queued = std::time::Instant::now();
+        tokio::task::spawn_blocking(move || {
+            // TIME SPENT WAITING FOR A BLOCKING THREAD, which every other
+            // instrument on this path is structurally blind to (AMUX-4744).
+            //
+            // `writer_slow` and `write_wait_max_ms` are both measured INSIDE
+            // `write_correlated`, which by then is already running on a blocking
+            // thread. Neither can see the wait to GET that thread. So if the
+            // blocking pool is saturated, a request stalls for a minute and
+            // every existing verdict stays silent and truthful.
+            //
+            // That makes this the discriminator rather than another counter:
+            // a 90s request with a small `queued_ms` and a large value here
+            // means the writer was never the problem.
+            record_blocking_dispatch(&dispatch, queued.elapsed());
+            this.write_correlated(f, interaction_id)
+        })
+        .await?
     }
 
     /// Run a read WITHOUT pinning a runtime worker (AF-640 / AMUX-4744).
@@ -259,7 +357,15 @@ impl Store {
         T: Send + 'static,
     {
         let this = self.clone();
+        let dispatch = self.blocking_dispatch_max_ms.clone();
+        let queued = std::time::Instant::now();
         tokio::task::spawn_blocking(move || {
+            // Same blind spot as `write_async`: everything below this line runs
+            // on a blocking thread, so nothing below can measure the wait to be
+            // GIVEN one. Reads only started paying this cost when `read_async`
+            // was introduced, so if the pool is the bottleneck, that change
+            // moved reads into the same queue as writes rather than out of it.
+            record_blocking_dispatch(&dispatch, queued.elapsed());
             let conn = this.read()?;
             f(&conn)
         })
@@ -559,6 +665,176 @@ fn apply_write(
 
 /// Shared handle used by API state.
 pub type SharedStore = Arc<Store>;
+
+#[cfg(test)]
+mod amux4744_write_queue_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// AMUX-4744: a write that waits behind the writer thread must be
+    /// MEASURABLE afterwards.
+    ///
+    /// The writer is one OS thread behind an unbounded channel, and
+    /// `write_correlated` waits on `recv()` with no timeout. So a slow write
+    /// delays every write behind it without bound while reads, which never
+    /// touch this path, keep answering at full speed. Measured live on build
+    /// 24716ccf: 20 paired samples gave POSTs of 81.4s and 83.8s while every
+    /// GET in the same loop returned in ~8ms.
+    ///
+    /// Before this the wait produced NO output at all. Nothing timed it and
+    /// nothing counted the queue, so the only instrument was a human holding a
+    /// stopwatch on the client, which is how the stall survived five rounds of
+    /// elimination.
+    ///
+    /// THE GAUGE MUST SURVIVE THE STALL IT RECORDS. `write_wait_max_ms` only
+    /// rises, because a decaying gauge reads zero exactly when someone arrives
+    /// to look at it, and a zero that means "recovered" is indistinguishable
+    /// from a zero that means "never happened" (ethos rule 4).
+    #[test]
+    fn a_write_that_queues_behind_a_slow_one_is_measurable_afterwards() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("wq.db")).unwrap();
+        assert_eq!(
+            store.write_wait_max_ms.load(Ordering::Relaxed),
+            0,
+            "a fresh store has recorded no wait; otherwise this cell cannot \
+             tell its own write from leftover state"
+        );
+
+        // Occupy the writer for longer than the warn threshold. This is the
+        // real writer thread and a real queued write, not a simulated delay.
+        let hold = std::time::Duration::from_millis(WRITE_WAIT_WARN_MS + 400);
+        let blocker = {
+            let s = store.clone();
+            std::thread::spawn(move || {
+                s.write(move |_conn| {
+                    std::thread::sleep(hold);
+                    Ok(WriteOutcome { applied: false, events: vec![] })
+                })
+            })
+        };
+        // Let the slow write reach the writer before queueing behind it.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        let started = std::time::Instant::now();
+        store
+            .write(|conn| {
+                conn.execute_batch("CREATE TABLE IF NOT EXISTS wq_probe (id INTEGER)")?;
+                Ok(WriteOutcome { applied: false, events: vec![] })
+            })
+            .expect("the queued write still completes");
+        let observed = started.elapsed();
+        blocker.join().expect("blocker joins").expect("blocker write");
+
+        assert!(
+            observed >= std::time::Duration::from_millis(WRITE_WAIT_WARN_MS),
+            "the second write did not actually queue ({observed:?}); the cell would \
+             then be asserting about a gauge nothing exercised"
+        );
+        let recorded = store.write_wait_max_ms.load(Ordering::Relaxed);
+        assert!(
+            recorded >= WRITE_WAIT_WARN_MS,
+            "a write waited {observed:?} and the store reports a maximum of \
+             {recorded}ms; the wait is still invisible"
+        );
+        // The queue drains: a gauge that pinned in-flight high would report a
+        // permanent stall on a healthy server.
+        assert_eq!(
+            store.write_inflight.load(Ordering::Relaxed),
+            0,
+            "in-flight must return to zero once writes are answered"
+        );
+    }
+
+    /// The DIAGNOSTIC half. The gauge test above stays green if the warn is
+    /// deleted, because an atomic and a log line are independent, and amux's
+    /// two-fix rule asks for the log signal specifically: a fix with no
+    /// counter, WARN or verdict field cannot announce its own regression.
+    ///
+    /// THIS PINS A PEER'S WARN, NOT ONE OF MY OWN, deliberately. `writer_slow`
+    /// (1f0cca3e, codex-board-execution-contract) landed on this path the same
+    /// minute as these gauges and is better placed than a caller-side warn:
+    /// it carries `origin`, the type name of the blocking closure, so it names
+    /// WHICH mutation held the writer. I dropped my duplicate rather than emit
+    /// two lines per stall, which leaves these gauges depending on a verdict I
+    /// do not own. Hence a test: nothing else here would notice if a later edit
+    /// dropped `origin` and left a bare "something was slow".
+    #[test]
+    fn a_slow_write_reports_itself_under_a_greppable_verdict() {
+        let src = include_str!("mod.rs");
+        let body = src
+            .split_once("\nfn writer_loop(")
+            .expect("writer_loop exists")
+            .1;
+        // BOUND IT. An unbounded window sweeps past the function into the test
+        // module below, which contains these same literals in its own asserts
+        // and doc comments, and the scan then passes by matching itself. That
+        // trap fired three separate times in one day across two repos.
+        let body = body.split_once("\n}\n").expect("its closing brace").0;
+
+        // STRIP COMMENTS BEFORE ASSERTING ANYTHING. A source scan that reads
+        // prose passes on the description of the code instead of the code, and
+        // it is invisible because the description is usually accurate.
+        //
+        // Measured, this cell, today: asserting `body.contains("origin")`
+        // survived a mutation that deleted `origin = req.origin` outright,
+        // because the line's own comment says "origin identifies the blocking
+        // mutation". The scan matched the sentence explaining the field while
+        // the field was gone. That is the fourth variant of this trap in a day
+        // (AMUX-4720, an ugrep window, a 3000-char sweep, this), so it is
+        // handled structurally here rather than by picking better literals.
+        let body: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // LANDMARK FIRST: prove the window is the function, not some other
+        // region that happens to mention the same words. Two of them, because
+        // the first landmark I picked ("reply_rx.recv()") stopped existing the
+        // moment the expression was split across lines, and a landmark that
+        // breaks on formatting gets deleted as flaky rather than trusted.
+        assert!(
+            body.contains("rx.recv()") && body.contains("catch_unwind"),
+            "the scan is not reading writer_loop; it has {} chars of something else",
+            body.len()
+        );
+        assert!(
+            body.contains("writer_slow"),
+            "a delayed serialized write must report a greppable verdict; \
+             writer_loop no longer names writer_slow"
+        );
+        // A verdict with no numbers says something was slow and not how slow,
+        // and without `origin` it cannot say WHAT was slow, which is the field
+        // that turns this line into a lead instead of a notification.
+        for field in ["queued_ms", "work_ms", "origin = req.origin"] {
+            assert!(
+                body.contains(field),
+                "the writer_slow verdict must carry `{field}`; without it the line \
+                 reports that a stall happened and not what caused it"
+            );
+        }
+    }
+
+    /// The threshold has to be crossable in the direction that matters. A warn
+    /// that fires on every write is noise a sweep learns to ignore.
+    #[test]
+    fn a_fast_write_reports_no_wait_and_no_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("wq2.db")).unwrap();
+        for _ in 0..20 {
+            store
+                .write(|_conn| Ok(WriteOutcome { applied: false, events: vec![] }))
+                .expect("write");
+        }
+        let recorded = store.write_wait_max_ms.load(Ordering::Relaxed);
+        assert!(
+            recorded < WRITE_WAIT_WARN_MS,
+            "20 trivial writes recorded a {recorded}ms maximum, at or above the \
+             {WRITE_WAIT_WARN_MS}ms warn threshold; the signal would fire constantly"
+        );
+    }
+}
 
 #[cfg(test)]
 mod af640_read_pool_tests {
