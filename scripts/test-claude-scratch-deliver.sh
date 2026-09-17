@@ -34,7 +34,18 @@ cat > "$T/rows.tsv" <<'TSV'
 9.64	0.0d	LIVE	reachable-via-candidates	AMBIGUOUS:10-candidates running=amux	-Users-ethan-Dev-amux/c25121f5
 4.42	2.5d	LIVE	no-owner	unattributed	-Users-ethan-Dev-mixpeek-server/b72fa321
 0.40	0.0d	LIVE	reachable	mixpeek-finances	-Users-ethan-Dev-tiny/eabcd09e
+7.10	0.0d	LIVE	reachable,escalated-09-14	mvs-pitr	-Users-ethan-Dev-mvs/aaaa1111
 TSV
+# The report prints a PROSE FOOTER even under --tsv (its summary block is not
+# inside the `if TSV != 1` guard), so these lines really do arrive on the same
+# stream. Appended verbatim from a live run.
+cat >> "$T/rows.tsv" <<'FOOTER'
+
+276 conversation(s), 118.9 GB total
+
+BY REACH (can the owner be told, right now)
+  reachable       80.2 GB over 9  ask the lane; it can act today
+FOOTER
 
 # ---- the stub CLI -------------------------------------------------------
 # Records every call, and can be told to refuse, which is the only way to reach
@@ -114,7 +125,12 @@ RC=$?
 set -e
 case "$OUT" in *REFUSED*cross_board_create_forbidden*) ok "a refused create is reported as refused" ;;
   *) bad "a refused create is reported as refused" "$OUT" ;; esac
-case "$OUT" in *"delivered=0"*"refused=2"*) ok "the summary counts refusals, not deliveries" ;;
+# THREE deliverable lanes in the fixture now (ops-server, homepage-claude, and
+# the comma-flagged mvs-pitr added for cell 5c), so all three refusals must be
+# counted. The number is spelled out rather than loosened to "non-zero": a
+# summary that undercounts refusals is the same lie as one that overcounts
+# deliveries.
+case "$OUT" in *"delivered=0"*"refused=3"*) ok "the summary counts refusals, not deliveries" ;;
   *) bad "the summary counts refusals, not deliveries" "$(printf '%s' "$OUT" | tail -2)" ;; esac
 [ "$RC" -ne 0 ] && ok "a run that reached nobody exits non-zero" || bad "a run that reached nobody exits non-zero" "exit $RC"
 
@@ -174,6 +190,36 @@ case "$CALLS" in *"board request mixpeek-homepage-claude"*) ok "a lane with no c
   *) bad "a lane with no card still gets one" "called: $CALLS" ;; esac
 case "$OUT" in *"updated=1"*) ok "the summary counts the update" ;;
   *) bad "the summary counts the update" "$(printf '%s' "$OUT" | tail -2)" ;; esac
+
+# ---- 5c. THE TWO DEFECTS THE FIRST LIVE RUN FOUND ------------------------
+# Both were invisible to a hermetic fixture until the fixture carried the live
+# shapes, which is the argument for running the plan against real data before
+# trusting any of this.
+run --apply
+
+# (a) REACH IS A FLAG SET. The live value on the biggest finding was
+# `reachable,escalated-09-14`, and an exact match on "reachable" dropped it. The
+# lane held 29.12 GB and is one of the two that never got the 2026-09-14
+# message, so the flag recording the escalation is what suppressed the next one.
+case "$CALLS" in *"board request mvs-pitr"*) ok "a comma-flagged reachable lane is still delivered" ;;
+  *) bad "a comma-flagged reachable lane is still delivered" "called: $CALLS" ;; esac
+# ...and the near-miss stays excluded: `reachable-via-candidates` contains
+# "reachable" as a SUBSTRING, so a loosened test that used a substring match
+# would sweep every ambiguous row back in.
+case "$CALLS" in *AMBIGUOUS*) bad "via-candidates is still excluded after the loosening" "called: $CALLS" ;;
+  *) ok "via-candidates is still excluded after the loosening" ;; esac
+
+# (b) THE PROSE FOOTER IS NOT A FINDING. The first live run counted 287 rows
+# against 276 real conversations and printed two footer lines as findings, with
+# a doubled unit ("118.9 GB totalGB") that is the tell.
+case "$OUT" in *"conversation(s)"*) bad "a footer line is never treated as a row" "$OUT" ;;
+  *) ok "a footer line is never treated as a row" ;; esac
+case "$OUT" in *"GBGB"*|*"totalGB"*) bad "no doubled unit from a misparsed footer" "$OUT" ;;
+  *) ok "no doubled unit from a misparsed footer" ;; esac
+# The denominator counts rows, not lines: 4 rows are >= 1.0 GB in the fixture
+# (29.12, 20.52, 15.83, 9.64, 4.42, 7.10 = 6), and the footer must not inflate it.
+case "$OUT" in *"6 row(s) at >= 1.0GB"*) ok "the row count excludes the footer" ;;
+  *) bad "the row count excludes the footer" "$(printf '%s' "$OUT" | head -1)" ;; esac
 
 # ---- 6. never a delete path, same promise as the report it reads ---------
 # A property of the SOURCE, not of any run: a test that only checked output

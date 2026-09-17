@@ -71,14 +71,41 @@ fi
 # ambiguous case wearing a reassuring word, and it is excluded here on purpose.
 # Everything else is counted and reported, never silently dropped.
 # ---------------------------------------------------------------------------
-deliverable=$(awk -F'\t' -v min="$MIN_GB" '
-  $1 + 0 >= min + 0 && $4 == "reachable" && $5 !~ /^AMBIGUOUS:/ && $5 != "unattributed" && $5 != "" { print }
-' "$TSV")
-skipped=$(awk -F'\t' -v min="$MIN_GB" '
-  $1 + 0 >= min + 0 && !($4 == "reachable" && $5 !~ /^AMBIGUOUS:/ && $5 != "unattributed" && $5 != "") { print }
-' "$TSV")
+# TWO THINGS THIS PREDICATE LEARNED FROM ITS FIRST LIVE RUN, both of which a
+# hermetic fixture had not shown:
+#
+# 1. THE REPORT PRINTS A PROSE FOOTER EVEN UNDER --tsv. Its summary block
+#    ("276 conversation(s), 118.9 GB total", the BY LIVENESS / BY REACH tables)
+#    is not inside the `if TSV != 1` guard, so those lines arrived as rows. The
+#    first run counted 287 rows against 276 real conversations and listed two
+#    footer lines as findings. A row is now required to have SIX tab-separated
+#    fields with a NUMERIC size, which prose cannot satisfy.
+#
+# 2. REACH IS A COMMA-SEPARATED FLAG SET, not a single word. The live value for
+#    the biggest finding was `reachable,escalated-09-14`, and an exact match on
+#    "reachable" dropped it. That lane was holding 29.12 GB and is one of the
+#    two that never received the 2026-09-14 message, so the flag recording the
+#    escalation is exactly what suppressed the next one. Tokenise and look for
+#    `reachable` as a WHOLE token: `reachable-via-candidates` is a different
+#    token and must still be excluded, which a substring test would not do.
+_awk_reach='
+  function deliverable_row(  i, n, parts) {
+    if (NF != 6) return 0
+    if ($1 !~ /^[0-9]+(\.[0-9]+)?$/) return 0
+    if ($1 + 0 < min + 0) return 0
+    if ($5 ~ /^AMBIGUOUS:/ || $5 == "unattributed" || $5 == "") return 0
+    n = split($4, parts, ",")
+    for (i = 1; i <= n; i++) if (parts[i] == "reachable") return 1
+    return 0
+  }
+  function is_row() { return NF == 6 && $1 ~ /^[0-9]+(\.[0-9]+)?$/ && $1 + 0 >= min + 0 }
+'
+deliverable=$(awk -F'\t' -v min="$MIN_GB" "$_awk_reach"' deliverable_row() { print }' "$TSV")
+skipped=$(awk -F'\t' -v min="$MIN_GB" "$_awk_reach"' is_row() && !deliverable_row() { print }' "$TSV")
 
-n_rows=$(grep -c . "$TSV" || true)
+# Count only real rows, for the same reason: a denominator that includes the
+# footer is a number that measures the parser rather than the tree.
+n_rows=$(awk -F'\t' -v min="$MIN_GB" "$_awk_reach"' is_row() { n++ } END { print n + 0 }' "$TSV")
 n_deliver=$(printf '%s' "$deliverable" | grep -c . || true)
 n_skip=$(printf '%s' "$skipped" | grep -c . || true)
 
