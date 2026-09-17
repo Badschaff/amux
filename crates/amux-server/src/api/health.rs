@@ -168,6 +168,26 @@ pub struct DiskHealth {
     pub total_gb: Option<f64>,
     /// "ok" | "warn" | "critical" | "unknown"
     pub state: &'static str,
+    /// WHICH filesystem this reading is about (AMUX-4746).
+    ///
+    /// `state: "ok"` reads as "the host has disk". It means "the one filesystem
+    /// containing this path has disk", and until now the payload never said
+    /// which path that was or that only one was measured.
+    ///
+    /// THE INCIDENT THAT NAMES THIS: a lane's watch script logged 16,280
+    /// consecutive "No space left on device" write failures, and nothing
+    /// reported it. This probe was not wrong. Measured afterwards from the
+    /// `host_metrics` series covering the failures, free space on the volume
+    /// holding both `~/.amux` and that lane's scratchpad never fell below
+    /// 251 GB, against a 1.8 TB total. `ok` was the correct answer to the
+    /// question this probe asks, and the question was narrower than the reader.
+    ///
+    /// It is also not always the path handed in: `statvfs` fails with ENOENT on
+    /// a path that does not exist, so the reader walks UP to the nearest
+    /// existing ancestor. On a fresh install that ancestor can sit on a
+    /// different volume than `~/.amux` eventually will. The number was always
+    /// for whatever this field now names.
+    pub measured_path: Option<String>,
 }
 
 /// Free space on the volume holding `~/.amux`, published for the same reason as
@@ -200,14 +220,17 @@ pub fn disk_health() -> DiskHealth {
     let free_total = statvfs_free_total(&crate::config::amux_home());
     let (critical_gb, warn_gb) = disk_thresholds();
     match free_total {
-        Some((free_gb, total_gb)) => DiskHealth {
+        Some((free_gb, total_gb, measured_path)) => DiskHealth {
             free_gb: Some(free_gb),
             total_gb: Some(total_gb),
             state: disk_state_with_thresholds(Some(free_gb), critical_gb, warn_gb),
+            measured_path: Some(measured_path),
         },
         // "unknown" and "ok" must never collapse: an unreadable disk is not a
         // healthy one, and reporting it as ok is how a silent probe gets trusted.
-        None => DiskHealth { free_gb: None, total_gb: None, state: disk_state_with_thresholds(None, critical_gb, warn_gb) },
+        // No path answered, so there is nothing to name. `None` here is
+        // honestly different from a path with no reading.
+        None => DiskHealth { free_gb: None, total_gb: None, state: disk_state_with_thresholds(None, critical_gb, warn_gb), measured_path: None },
     }
 }
 
@@ -267,11 +290,14 @@ pub(crate) fn disk_state_with_thresholds(free_gb: Option<f64>, critical_gb: f64,
 /// works (DESKT-21). The test asserted "readable on THIS host" and encoded my
 /// host's layout as the premise — the failure was real and the assertion was
 /// right to fire.
-fn statvfs_free_total(path: &std::path::Path) -> Option<(f64, f64)> {
+fn statvfs_free_total(path: &std::path::Path) -> Option<(f64, f64, String)> {
     let mut cur = Some(path);
     while let Some(p) = cur {
-        if let Some(v) = statvfs_exact(p) {
-            return Some(v);
+        if let Some((free, total)) = statvfs_exact(p) {
+            // The ancestor that ANSWERED, not the one asked about. Those differ
+            // exactly when the walk above did something, which is the case a
+            // reader cannot otherwise see (AMUX-4746).
+            return Some((free, total, p.display().to_string()));
         }
         cur = p.parent();
     }
@@ -993,6 +1019,80 @@ pub async fn debug_downtime(State(state): State<AppState>) -> axum::Json<serde_j
 mod disk_tests {
     use super::*;
 
+    /// AMUX-4746: the disk reading must name the filesystem it is about.
+    ///
+    /// A lane's watch script logged 16,280 consecutive "No space left on
+    /// device" write failures and nothing reported it. This probe was NOT
+    /// wrong: from the host_metrics series covering those failures, free space
+    /// on the volume holding both ~/.amux and that lane's scratchpad never fell
+    /// below 251 GB of 1.8 TB. `state: "ok"` was the right answer to the
+    /// question this probe asks, and the question is narrower than "does the
+    /// host have disk" — which is how a reader takes it.
+    ///
+    /// Naming the path is what separates those two readings.
+    #[test]
+    fn the_disk_reading_says_which_filesystem_it_measured() {
+        let h = disk_health();
+        assert!(
+            h.free_gb.is_some(),
+            "this host must be readable or the rest of the cell proves nothing"
+        );
+        let path = h
+            .measured_path
+            .as_deref()
+            .expect("a reading that succeeded must name the path it came from");
+        assert!(
+            std::path::Path::new(path).exists(),
+            "the named path must be one that actually answered statvfs: {path}"
+        );
+    }
+
+    /// THE FAULT TEST, run WITHOUT filling a real disk (the card asks for
+    /// exactly that): point the reader at a path that does not exist and prove
+    /// the walk-up is disclosed rather than silent.
+    ///
+    /// `statvfs` fails with ENOENT on a missing path, so the reader climbs to
+    /// the nearest existing ancestor. That ancestor can be a DIFFERENT volume
+    /// from the one the leaf will eventually live on, and before this the
+    /// payload reported its numbers with nothing to say so.
+    #[test]
+    fn a_reading_taken_from_an_ancestor_names_the_ancestor_not_the_leaf() {
+        let base = std::env::temp_dir();
+        let missing = base.join("amux-4746-does-not-exist").join("nor-this").join("nor-this-either");
+        assert!(!missing.exists(), "the fixture path must genuinely not exist");
+
+        let (free, total, named) =
+            statvfs_free_total(&missing).expect("the walk must reach an existing ancestor");
+        assert!(free >= 0.0 && total > 0.0, "the ancestor gave a real reading");
+        assert_ne!(
+            named,
+            missing.display().to_string(),
+            "the leaf does not exist, so the reading cannot be from it"
+        );
+        assert!(
+            std::path::Path::new(&named).exists(),
+            "the named path must exist: {named}"
+        );
+        assert!(
+            missing.starts_with(&named),
+            "the reading must come from an ANCESTOR of the requested path, not an \
+             unrelated one: asked {} got {named}",
+            missing.display()
+        );
+    }
+
+    /// The thresholds still decide the verdict, and a named path must not make
+    /// a full disk read as healthy. Synthetic values, so this needs no real
+    /// disk pressure to exercise the failing arm.
+    #[test]
+    fn naming_the_path_did_not_soften_the_verdict() {
+        let (crit, warn) = (5.0, 20.0);
+        assert_eq!(disk_state_with_thresholds(Some(1.0), crit, warn), "critical");
+        assert_eq!(disk_state_with_thresholds(Some(10.0), crit, warn), "warn");
+        assert_eq!(disk_state_with_thresholds(Some(500.0), crit, warn), "ok");
+        assert_eq!(disk_state_with_thresholds(None, crit, warn), "unknown");
+    }
+
     /// The NEGATIVE half: "could not read" must never render as healthy. An
     /// unreadable disk reported as `ok` is the silent probe that gets trusted.
     #[test]
@@ -1079,7 +1179,7 @@ mod disk_tests {
     /// tests the READER rather than my home directory's layout.
     #[test]
     fn a_real_volume_is_readable() {
-        let (free, total) = statvfs_free_total(std::path::Path::new("/"))
+        let (free, total, _named) = statvfs_free_total(std::path::Path::new("/"))
             .expect("statvfs on / must be readable on any host that can run this test");
         assert!(free > 0.0 && total > 0.0, "free {free} total {total}");
         assert!(free <= total, "free {free} cannot exceed total {total}");
@@ -1100,7 +1200,7 @@ mod disk_tests {
             statvfs_exact(missing).is_none(),
             "the non-walking reader must fail here, or the walk below proves nothing"
         );
-        let (free, total) = statvfs_free_total(missing)
+        let (free, total, _named) = statvfs_free_total(missing)
             .expect("the walk must reach / and report the volume anyway");
         assert!(free > 0.0 && total > 0.0);
         assert_ne!(disk_state(Some(free)), "unknown");
