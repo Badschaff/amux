@@ -6296,6 +6296,12 @@ async fn fan_out_item(
                 let eph_name = format!("{actor_w}-eph-{suffix}");
 
                 child.session = Some(eph_name.clone());
+                child.callback_session = Some(actor_w.clone());
+                child.callback_prompt = Some(format!(
+                    "ephemeral worker {eph_name} finished card {}. stop and clean up: amux stop {eph_name} && rm -f ~/.amux/sessions/{eph_name}.env",
+                    cid,
+                ));
+                child.callback_state = Some("armed".into());
                 if child.status == "backlog" {
                     child.status = "todo".into();
                 }

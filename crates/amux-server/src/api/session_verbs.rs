@@ -10025,7 +10025,7 @@ fn structured_resume_prompt(context: &StructuredResumeContext, reason: &str) -> 
 // for the shell, hard-kill on timeout. tmux stays alive.
 // ---------------------------------------------------------------------------
 
-pub(crate) async fn stop_session(state: &AppState, name: &str) -> (bool, String) {
+async fn stop_session(state: &AppState, name: &str) -> (bool, String) {
     if !valid_session_name(name) {
         return (false, "invalid session name".into());
     }
