@@ -54,6 +54,24 @@ def canonical(hook_path: str) -> dict[str, dict[str, Any]]:
         "UserPromptSubmit": group(f"{base} active prompt-hook"),
         "PostToolUse": group(f"{base} active tool-hook", ".*"),
         "Stop": group(f"{base} idle stop-hook"),
+        # THE MISSING PRODUCER FOR `blocked` (AMUX-4723). The server has
+        # accepted the state since sessions_legacy.rs:145 and carries a test for
+        # it, `lane_is_blocked()` reads it, and one caller refuses automation
+        # sends into a lane parked on a dialog with a 409. Nothing ever set it:
+        # 0 of 43,562 status reports, because a rejected call, a permission
+        # prompt and a finished turn all ended on `Stop` and reported `idle`.
+        #
+        # NO MATCHER ON PURPOSE. Notification covers several types and the hook
+        # discriminates on the payload's own `notification_type` instead, which
+        # is testable here and does not depend on matcher semantics for this
+        # event being what I assume. It costs a no-op hook run per non-permission
+        # notification and buys a filter whose behaviour is pinned by a test.
+        #
+        # THE CLEARING EDGES ALREADY EXIST, which is what makes this safe to set
+        # at all: an approval runs the tool and PostToolUse reports `active`; a
+        # rejection or an ended turn reports `idle` via Stop. Both are above and
+        # both predate this change.
+        "Notification": group(f"{base} blocked notification-hook"),
         "SubagentStart": group(f"{base} subagent-start subagent-start-hook"),
         "SubagentStop": group(f"{base} subagent-stop subagent-stop-hook"),
     }

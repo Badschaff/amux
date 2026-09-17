@@ -46,7 +46,7 @@ import json, sys
 v=json.load(open(sys.argv[1]))
 assert v["model"] == "keep-me"
 hooks=v["hooks"]
-required={"SessionStart","UserPromptSubmit","PostToolUse","Stop","SubagentStart","SubagentStop"}
+required={"SessionStart","UserPromptSubmit","PostToolUse","Stop","SubagentStart","SubagentStop","Notification"}
 assert required <= set(hooks)
 rows=[]
 for event, groups in hooks.items():
@@ -54,7 +54,10 @@ for event, groups in hooks.items():
         for hook in group.get("hooks", []):
             rows.append((event, group.get("matcher"), hook.get("command", "")))
 reports=[r for r in rows if "hook-report.sh" in r[2]]
-assert len(reports) == 6, reports
+assert len(reports) == 7, reports
+# Notification is the `blocked` producer (AMUX-4723). Named here, not just
+# counted: a bumped number would pass on any seventh hook at all.
+assert any(r[0]=="Notification" and " blocked " in r[2] for r in reports), reports
 assert len([r for r in reports if r[0] == "PostToolUse" and r[1] == ".*"]) == 1
 read_guards=[r for r in rows if "large-read-guard.py" in r[2]]
 assert sorted((r[0],r[1]) for r in read_guards)==[("PreToolUse","Bash"),("PreToolUse","Read")],read_guards
@@ -407,5 +410,56 @@ bad=[r for r in rows if r["path"]!=r["expected_path"]]
 assert not bad,bad
 print("ok   every captured hook request used its exact worker report path")
 PY
+
+# AMUX-4723: the missing producer for `blocked`, and the filter that keeps it
+# from being worse than the bug. Notification fires for several types; only
+# permission_prompt means a human is being asked. Reporting idle_prompt as
+# blocked would park every quiet lane behind the 409 automation guard for the
+# 24h `blocked` trust window.
+#
+# The two negatives are asserted against a BARRIER: the permission report is
+# sent last and waited for, so "no row appeared" is a real absence rather than
+# a race that had not finished yet.
+HOME="$TMP/home" AMUX_URL="$URL" AMUX_SESSION=probe \
+  bash scripts/hooks/hook-report.sh blocked notif-idle \
+  <<<'{"hook_event_name":"Notification","notification_type":"idle_prompt","message":"waiting"}'
+HOME="$TMP/home" AMUX_URL="$URL" AMUX_SESSION=probe \
+  bash scripts/hooks/hook-report.sh blocked notif-empty <<<'{}'
+HOME="$TMP/home" AMUX_URL="$URL" AMUX_SESSION=probe \
+  bash scripts/hooks/hook-report.sh blocked notif-perm \
+  <<<'{"hook_event_name":"Notification","notification_type":"permission_prompt","message":"Claude needs your permission to use Bash"}'
+wait_for 'any(r["body"].get("source")=="notif-perm" for r in rows)'
+/usr/bin/python3 - "$CAPTURE" <<'PY2'
+import json,sys
+rows=[json.loads(line)["body"] for line in open(sys.argv[1])]
+perm=[r for r in rows if r.get("source")=="notif-perm"]
+assert perm and all(r.get("state")=="blocked" for r in perm), perm
+print("ok   a permission_prompt Notification is the first thing to ever report blocked")
+idle=[r for r in rows if r.get("source")=="notif-idle"]
+assert not idle, f"idle_prompt must NOT report blocked, or every quiet lane is unreachable: {idle}"
+print("ok   an idle_prompt Notification reports nothing")
+empty=[r for r in rows if r.get("source")=="notif-empty"]
+assert not empty, f"an unreadable payload must fail CLOSED, not claim a human is waiting: {empty}"
+print("ok   an unrecognised payload reports nothing")
+PY2
+
+# The producer has to be installed, not merely supported. `blocked` was
+# accepted by the server, read by lane_is_blocked and covered by a test for the
+# whole life of the feature while nothing emitted it.
+/usr/bin/python3 - <<'PY2'
+import importlib.util,sys
+spec=importlib.util.spec_from_file_location("inst","scripts/hooks/install-claude-status-hooks.py")
+m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+c=m.canonical("/tmp/hook-report.sh")
+assert "Notification" in c, sorted(c)
+cmd=c["Notification"]["hooks"][0]["command"]
+assert " blocked " in cmd, cmd
+# Clearing edges must stay installed: an approval runs the tool (PostToolUse ->
+# active) and a rejection or ended turn reports idle (Stop). Without BOTH, a
+# blocked lane could never return.
+assert " active " in c["PostToolUse"]["hooks"][0]["command"], c["PostToolUse"]
+assert " idle " in c["Stop"]["hooks"][0]["command"], c["Stop"]
+print("ok   Notification is installed as the blocked producer, with both clearing edges intact")
+PY2
 
 echo "ok   all shipped status-hook durability regressions passed"

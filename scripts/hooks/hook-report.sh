@@ -274,6 +274,29 @@ REPORT_URL="$U/api/sessions/$AMUX_SESSION/report"
 # {"state":"subagent:start"}, the server would refuse it, and the only symptom
 # would be lanes reading WORKING for four minutes again.
 case "${MODE/subagent-/subagent:}" in
+  blocked)
+    # NOTIFICATION FIRES FOR SEVERAL THINGS AND ONLY ONE OF THEM IS "a human is
+    # being asked" (AMUX-4723). The event's own payload carries the
+    # discriminator: `hook_event_name:"Notification" ... notification_type:<t>`,
+    # where t is one of permission_prompt, idle_prompt, auth_success,
+    # elicitation_dialog, agent_needs_input, agent_completed and others
+    # (verified against the installed 2.1.274 bundle, not inferred).
+    #
+    # `idle_prompt` is the dangerous one: it fires ~60s after Claude finishes
+    # when nobody has typed. Reporting THAT as blocked would mark every quiet
+    # lane unreachable to automation for the 24h `blocked` trust window
+    # (sessions_legacy.rs:137), which is a far worse failure than the one this
+    # card fixes. So the state is claimed ONLY on the one type that means it.
+    #
+    # FAILS CLOSED, deliberately, and this is the direction that matters: an
+    # unrecognised or empty payload exits without reporting, leaving today's
+    # behaviour exactly as it is. Being unable to prove a human is waiting must
+    # never be reported as a human waiting.
+    case "$IN" in
+      *'"notification_type":"permission_prompt"'*|*'"notification_type": "permission_prompt"'*) ;;
+      *) exit 0 ;;
+    esac
+    ;;
   subagent:reset)
     # SessionStart fires for startup, resume AND compact, and only the first two
     # mean a NEW process. A compact keeps the same process, so its background
