@@ -180,8 +180,8 @@ if [[ "$FANOUT_OK" == "true" ]]; then
   echo "--- verify callbacks armed ---"
   for cid in "${CHILD_IDS[@]}"; do
     CARD=$(_curl "$AMUX_API/api/board/$cid")
-    CB_SESSION=$(echo "$CARD" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("callback_session",""))' 2>/dev/null)
-    CB_STATE=$(echo "$CARD" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("callback_state",""))' 2>/dev/null)
+    CB_SESSION=$(echo "$CARD" | python3 -c 'import json,sys; cb=json.load(sys.stdin).get("callback",{}); print((cb or {}).get("session",""))' 2>/dev/null)
+    CB_STATE=$(echo "$CARD" | python3 -c 'import json,sys; cb=json.load(sys.stdin).get("callback",{}); print((cb or {}).get("state",""))' 2>/dev/null)
     check "card $cid callback_session=test-fanout-parent" "$([ "$CB_SESSION" = "test-fanout-parent" ] && echo true || echo false)"
     check "card $cid callback_state=armed" "$([ "$CB_STATE" = "armed" ] && echo true || echo false)"
   done
