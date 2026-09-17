@@ -24,11 +24,22 @@
 # all, including the commit belonging to the lane that asked for consent. A
 # workspace clippy said nothing whatsoever about it, and "exit 0" looks total.
 #
-# Usage: scripts/push-consent.sh [<base>] [<tip>]     defaults: origin/main main
+# Usage: scripts/push-consent.sh [<base>] [<tip>]     defaults: origin/main HEAD
 set -uo pipefail
 
 BASE="${1:-origin/main}"
-TIP="${2:-main}"
+# THE TIP DEFAULTS TO HEAD, NOT `main`, AND THAT IS THE WHOLE POINT.
+#
+# CLAUDE.md tells every lane to run its gates on a DETACHED worktree, because a
+# check in the shared checkout reads peers' uncommitted files. On a detached
+# worktree `main` is a stale local branch ref that has nothing to do with the
+# commits you are about to push, so the old default silently answered about the
+# wrong range and printed "Nothing to push.", a FALSE CLEAR on the one gate
+# whose entire job is to stop a push that should have asked somebody first.
+# Measured 2026-09-16 on a worktree holding one unpushed commit: `commits 0`.
+#
+# HEAD is right in both shapes: on a checkout sitting on main, HEAD IS main.
+TIP="${2:-HEAD}"
 ME="${AMUX_SESSION:-}"
 API="${AMUX_URL:-}"
 
@@ -38,9 +49,21 @@ git rev-parse --verify --quiet "$TIP"  >/dev/null || { echo "no such ref: $TIP" 
 shas=$(git rev-list "$BASE..$TIP")
 total=$(printf '%s\n' "$shas" | grep -c . || true)
 
+tip_sha=$(git rev-parse --short "$TIP")
+on=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || echo "detached HEAD")
+
 echo "range        $BASE..$TIP"
+echo "tip          $tip_sha (on $on)"
 echo "commits      $total"
 echo "you          ${ME:-<AMUX_SESSION unset>}"
+# Say it when the old default would have answered about something else, so a
+# reader who remembers `main` is told which range this verdict covers.
+if git rev-parse --verify --quiet main >/dev/null 2>&1; then
+  main_sha=$(git rev-parse --short main)
+  if [ "$main_sha" != "$tip_sha" ]; then
+    echo "note         local 'main' is $main_sha, a DIFFERENT commit; this verdict is about $tip_sha"
+  fi
+fi
 echo
 
 if [ "$total" -eq 0 ]; then
