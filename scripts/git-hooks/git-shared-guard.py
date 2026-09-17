@@ -17,6 +17,11 @@ gives authorized cleanups a clean path instead of training reflog evasion.
 
 Configure guarded roots via AMUX_SHARED_CHECKOUTS (colon-separated; default
 ~/Dev/mixpeek). Fail-open: any error lets the command through.
+
+Managed workers also get corrective feedback for rm/rmdir operands with an
+unchecked variable directory prefix. Claude's native empty-path check otherwise
+opens an interactive prompt even in bypass mode. This denies the tool call; it
+never grants permission or executes/expands the proposed command.
 """
 import sys, json, os, re, time, pathlib
 
@@ -1666,6 +1671,133 @@ def _unwritten_targets(segments):
                     seen.append(target)
     return seen
 
+
+# Keep quotes on words: shlex.split alone loses the distinction between
+# '$WT/file' (literal) and "$WT/file" (expands). This is a bounded correction for
+# direct shell invocations, not a shell interpreter or a replacement safety gate.
+# Native permission checks still cover forms we cannot statically recognize.
+_REMOVE_TOKENS = re.compile(
+    r'''(?:'[^']*'|"(?:\\.|[^"\\])*"|\\[^\n]|[^\s;&|()<>"'\\])+|[;&|()<>]|\n'''
+)
+_REMOVE_PREFIX = re.compile(r'^\$(?:[A-Za-z_][A-Za-z_0-9]*|[0-9]|\{([^}]+)\})(?=[/*])')
+
+
+def _expanding_remove_word(raw):
+    """Unquote without expansion; mark literal dollars so they cannot match."""
+    out, quote, i = [], None, 0
+    while i < len(raw):
+        char = raw[i]
+        if char == "'" and quote != '"':
+            quote = None if quote == "'" else "'"
+        elif char == '"' and quote != "'":
+            quote = None if quote == '"' else '"'
+        elif char == "\\" and quote != "'" and i + 1 < len(raw):
+            i += 1
+            escaped = raw[i]
+            out.append("\0" if escaped == "$" else escaped)
+        else:
+            out.append("\0" if char == "$" and quote == "'" else char)
+        i += 1
+    return "".join(out)
+
+
+def _dynamic_remove_operands(command):
+    """Recognize unchecked variable directory prefixes in direct rm/rmdir calls.
+
+    Scan real command positions, including loops and common command wrappers.
+    Inert quoted arguments, comments and document heredocs are not invocations.
+    We deliberately do not evaluate variables, source scripts, or execute shell
+    substitutions. ${ROOT:?reason} is fail-closed on an empty root and is left to
+    Claude's native checks, as are literal paths (which are NOT declared safe).
+    """
+    import shlex
+    tokens = _REMOVE_TOKENS.findall(_strip_heredoc_bodies(command.replace("\\\n", "")))
+    start, removing, redirect, comment = True, False, False, False
+    matched, parents = [], []
+    for raw in tokens:
+        if raw == "\n":
+            start, removing, redirect, comment = True, False, False, False
+            continue
+        if comment:
+            continue
+        if raw.startswith("#"):
+            comment = True
+            continue
+        if raw == "(":
+            parents.append((start, removing, redirect))
+            start, removing, redirect = True, False, False
+            continue
+        if raw == ")":
+            start, removing, redirect = parents.pop() if parents else (True, False, False)
+            continue
+        if raw in (";", "&", "|"):
+            start, removing, redirect = True, False, False
+            continue
+        if redirect:
+            redirect = False
+            continue
+        if raw in ("<", ">"):
+            redirect = True
+            continue
+        if start:
+            try:
+                words = shlex.split(raw)
+            except ValueError:
+                start = False
+                continue
+            word = words[0] if len(words) == 1 else ""
+            if word in ("if", "then", "elif", "else", "do", "while", "until", "!", "{", "command", "exec", "env"):
+                continue
+            if re.match(r'^[A-Za-z_][A-Za-z_0-9]*=', word):
+                continue
+            if word == "--":
+                continue
+            removing = word in ("rm", "/bin/rm", "/usr/bin/rm", "rmdir", "/bin/rmdir", "/usr/bin/rmdir")
+            start = False
+            continue
+        if removing:
+            operand = _expanding_remove_word(raw)
+            match = _REMOVE_PREFIX.match(operand)
+            if match and not re.match(r'^[A-Za-z_][A-Za-z_0-9]*:\?', match.group(1) or ""):
+                matched.append(raw)
+    return matched
+
+
+def _remove_correction(command):
+    """Return a deny decision to the model before native interactive approval."""
+    worker = os.environ.get("AMUX_SESSION") or os.environ.get("AMUX_WORKER")
+    if not worker:
+        return None
+    operands = _dynamic_remove_operands(command)
+    if not operands:
+        return None
+    # Only hashes/counts reach the audit: commands and paths may contain secrets.
+    import hashlib
+    try:
+        log = pathlib.Path(os.environ.get("AMUX_HOME") or pathlib.Path.home() / ".amux") / "logs/tool-corrections.jsonl"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        if log.exists() and log.stat().st_size > 4 * 1024 * 1024:
+            log.replace(log.with_suffix(".jsonl.1"))
+        with log.open("a") as stream:
+            stream.write(json.dumps({"ts": time.time(), "event": "unsafe_remove_operand",
+                                    "session": worker, "verdict": "deny", "measured": True,
+                                    "n_considered": len(operands),
+                                    "command_sha256": hashlib.sha256(command.encode()).hexdigest()}) + "\n")
+    except OSError:
+        pass  # unavailable telemetry must not defeat the correction
+    return {"hookSpecificOutput": {
+        "hookEventName": "PreToolUse", "permissionDecision": "deny",
+        "permissionDecisionReason": (
+            "amux: rm/rmdir has an unchecked variable directory prefix (for example $WT/$f). "
+            "An empty prefix changes the deletion target; Claude may demand interactive approval even in bypass mode. "
+            "This entire Bash call was rejected before execution: none of its commands ran. "
+            "Inspect the resolved targets first, verify they stay inside your intended worktree and belong to this task, "
+            "then retry only necessary deletions with explicit literal paths. For already-landed files, compare exact "
+            "contents with the intended commit; git cat-file -e proves existence, not equality. Preserve differing or "
+            "peer-owned work, or use a fresh isolated worktree. Correct the command and continue; do not wait for "
+            "a human to approve this form or switch tools to evade the native deletion check."
+        )}}
+
 def main():
     data = json.load(sys.stdin)
     if data.get("tool_name") != "Bash":
@@ -1673,6 +1805,10 @@ def main():
     cmd = (data.get("tool_input") or {}).get("command", "") or ""
     global _LAST_CMD
     _LAST_CMD = cmd
+    correction = _remove_correction(cmd)
+    if correction:
+        print(json.dumps(correction))
+        return 0  # hook JSON deny cancels the call and feeds the reason to Claude
     scrubbed = _scrub(cmd)                       # match only real invocations
     cwd = data.get("cwd") or os.getcwd()
     shared = [os.path.realpath(os.path.expanduser(p)) for p in

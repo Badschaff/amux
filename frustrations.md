@@ -3179,3 +3179,14 @@ CARD: AF-914
 SYMPTOM: TubeScience TUBES-2461 acknowledged its Doing gate, then the next tick parked it against a Done census mis-typed as code. Old serial-order requirements survived in flat gate overrides and waiting fields after dependency edges had been removed. Active workers had 25 cross-board dependencies, including Studio waiting on paused backend work. Routed requests and peer-message capture bypassed the own-board create rule. Blocker-review identities included appended descriptions, so progress notes could rearm model turns.
 COST: Workers ran without a valid highlighted card, or waited for other workers and repeated reviews instead of completing their own outcomes.
 FIX: Make boards self-contained by default: refuse cross-board assignments/dependency writes, retain peer messages as coordination without minting tasks, and correct fleet guidance. Keep the explicit legacy cooperative opt-in separate from the default. Reject unready Doing transitions atomically using the pickup predicate. Suppress blocker-review repeats on note-only changes. Repair TubeScience's measured census type, preserve outcome requirements in acceptance criteria with per-column gates, and turn active workers' foreign waits into owned next actions while preserving real access, spend and customer-outbound restrictions. Originator confirmation remains pending.
+
+## Studio repeatedly waits for approval of the same variable-path cleanup pattern
+AREA: gates
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-17
+SESSION: Ethan via Codex (studio-plg screenshot)
+CARD: AF-915
+SYMPTOM: Studio's private-worktree resync repeatedly used rm -f "$WT/$f" after checking only existence on origin/main. Claude's native possibly-empty-path protection still prompts in bypass mode. The installed PreToolUse guard returned exit 0 with no corrective decision for the captured command, leaving the worker waiting for a person instead of revising it.
+COST: Four matching Bash tool calls took 3m10, 4m32, 10m35 and 12m29 to reach their tool results. Those intervals include execution as well as any approval wait; the final prompt was captured in Ethan's screenshot.
+FIX: Return a deterministic PreToolUse deny with repair instructions for unchecked variable directory prefixes in direct rm/rmdir calls. Require resolved, owned targets and exact content comparison before deleting landed copies; keep native checks and never auto-approve. Log a bounded measured correction event with a command hash. Install and replay the published hook, including all four captured commands; originator confirmation and a fresh live model retry remain unmeasured while Studio is rate-limited.
