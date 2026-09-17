@@ -92,6 +92,27 @@ if [ -n "$fixed" ]; then
 fi
 say "no baseline entry is already wired" "$([ -z "$fixed" ] && echo 0 || echo 1)"
 
+# EVERY EXEMPTION DECLARES WHETHER IT CAN BE VERIFIED (AMUX-4747).
+#
+# This gate asks whether an exemption is DECLARED. It never asked whether the
+# exempt file still WORKS, and those are different questions: of the 3 exempt
+# harnesses runnable on a dev box, 3 of 3 were broken on main when that was
+# first measured. scripts/harness-exempt-sweep.sh answers the second question,
+# and it can only do so for entries that say whether they are runnable.
+#
+# The tag lives in the baseline rather than in the sweep so there is ONE list.
+# A separate "which are runnable" file would be the same fact in two spellings,
+# which is exactly how AF-161 happened in this repo.
+untagged=$(grep -vE '^\s*(#|$)' "$BASELINE" | awk '$2 !~ /^\[.*\]$/ {print $1}')
+if [ -n "$untagged" ]; then
+  echo "  baseline entries with no verifiability tag (field 2):"
+  printf '%s\n' "$untagged" | sed 's/^/      /'
+  echo "      Add [local] if a sweep on a dev box can run it and get a real verdict,"
+  echo "      or [device]/[identity] if no automation we have can. The sweep refuses"
+  echo "      to guess, and it will not imply an untagged entry is green."
+fi
+say "every baseline entry declares whether it can be verified" "$([ -z "$untagged" ] && echo 0 || echo 1)"
+
 n_unwired=$(printf '%s\n' "$unwired" | sed '/^$/d' | grep -c . || true)
 echo ""
 echo "harness-wired: $n_unwired of $n_total harness(es) are invoked by nothing ($(printf '%s\n' "$known" | grep -c . || true) recorded)"

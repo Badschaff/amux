@@ -265,6 +265,10 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-harness-wired.sh
+          # AMUX-4747. Cheap by construction: synthetic baselines in a temp dir,
+          # no compile and no server, so it belongs in the push gate even though
+          # the harnesses it SWEEPS do not.
+          ./scripts/test-harness-exempt-sweep.sh
       # AF-791. The shared-target staleness notice in test-contended.sh. The
       # fixture is a dependency-free crate in a private temp target built with
       # --offline, so this costs two tiny compiles and no network. It only
