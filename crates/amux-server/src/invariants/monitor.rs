@@ -2735,20 +2735,158 @@ pub async fn run(state: AppState) {
     // and teach everyone the monitor is noisy.
     tokio::time::sleep(std::time::Duration::from_secs(20)).await;
     loop {
-        crate::runtime_jobs::registry::tick(crate::runtime_jobs::registry::ids::INVARIANTS);
-        let st = state.clone();
-        // A panic in one pass must not kill the monitor for the process
-        // lifetime — a dead monitor is the failure this whole module exists to
-        // make visible, so it must not be able to die quietly itself.
-        if let Err(e) = tokio::spawn(async move { tick(&st).await }).await {
-            tracing::error!(error = %e, "invariant tick panicked");
-        }
+        one_pass(&state).await;
         tokio::time::sleep(std::time::Duration::from_secs(TICK_SECS)).await;
+    }
+}
+
+/// One monitor iteration. Returns true when the pass finished and its verdicts
+/// are durable.
+///
+/// AMUX-4734. THE TICK NOW BOOKENDS THE PASS INSTEAD OF PRECEDING IT, and the
+/// order is the whole fix. `registry::tick` used to fire at the TOP of the loop,
+/// before the pass ran, which made `monitor.ticks` mean "a pass was started"
+/// while every reader takes it to mean "a pass is done". Three separate wrong
+/// answers came out of that one placement:
+///
+/// 1. A READER THAT WAITS FOR A TICK CAN SEE NO VERDICTS. That is the reported
+///    symptom: ticks=1, last_tick_age_s=13.3, and verdicts_build=null beside
+///    counts from the PREVIOUS generation, an internally inconsistent payload.
+///    The window is not a write-commit gap: `store::record` already awaits its
+///    `write_async`, so verdicts ARE durable once the pass returns. The window
+///    is the whole pass.
+///
+/// 2. A HEALTHY MONITOR REPORTED ITSELF STALLED. `last_tick_age_s` measured
+///    time since the pass STARTED, so it carried the pass duration. Measured on
+///    this box: passes land 118s apart while `duration_ms` records only ~8.5s,
+///    because `record` then waits on a contended store writer (AMUX-4744). With
+///    stall_after_s(30) = 90, the endpoint served `state: "stalled"` on a
+///    monitor whose verdicts were current and from the serving build.
+///
+/// 3. A MONITOR THAT PANICKED EVERY PASS LOOKED ALIVE FOREVER. The tick fired
+///    before the spawn and the Err arm only logged, so ticks kept climbing while
+///    zero verdicts were produced. That is precisely the failure the comment
+///    below says this module exists to make visible, and the placement let it
+///    happen quietly.
+///
+/// So the tick is now recorded ONLY when the pass returns Ok, which is after
+/// `record` has awaited its write. `tick_start`/`tick_end` rather than the
+/// one-shot `tick`, so `last_ms` also becomes the real wall time of a pass
+/// instead of the zero that `tick` records by setting start and end together.
+async fn one_pass(state: &AppState) -> bool {
+    crate::runtime_jobs::registry::tick_start(crate::runtime_jobs::registry::ids::INVARIANTS);
+    let st = state.clone();
+    // A panic in one pass must not kill the monitor for the process
+    // lifetime. A dead monitor is the failure this whole module exists to
+    // make visible, so it must not be able to die quietly itself.
+    match tokio::spawn(async move { tick(&st).await }).await {
+        Ok(_) => {
+            crate::runtime_jobs::registry::tick_end(crate::runtime_jobs::registry::ids::INVARIANTS);
+            true
+        }
+        Err(e) => {
+            // NO TICK on this path, deliberately. A pass that panicked produced
+            // no verdicts, and letting it tick is what made a dead monitor
+            // indistinguishable from a working one.
+            tracing::error!(error = %e, "invariant tick panicked");
+            false
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// AMUX-4734: the tick BOOKENDS the pass, and only a completed pass ticks.
+    ///
+    /// A property of the SOURCE, because it is an ORDERING and the thing that
+    /// goes wrong is someone moving one line. The behavioural cell above pins
+    /// that verdicts are durable when a pass returns; this pins that the tick
+    /// is taken at that moment rather than before the pass starts.
+    ///
+    /// Reading the source is the weaker instrument and it is the one that fits:
+    /// driving `one_pass` means running `evaluate_all`, 693 checks that shell
+    /// out to git and tmux, which took over 60 seconds against an empty store
+    /// when tried.
+    #[test]
+    fn the_tick_is_taken_after_the_pass_and_only_when_it_completed() {
+        let src = include_str!("monitor.rs");
+        // BOUND THE SLICE TO ONE FUNCTION, at its closing brace in column 0.
+        // A fixed character window swept past `one_pass` into this very test
+        // module, whose assertion below contains the literal "registry::tick(",
+        // so the guard matched its OWN source and failed on a correct file.
+        // Third instance of that trap in this codebase today.
+        let body_start = src.find("async fn one_pass(").expect("one_pass exists");
+        let rest = &src[body_start..];
+        let body = &rest[..rest.find("\n}\n").map(|i| i + 2).expect("one_pass is closed")];
+
+        let start_at = body.find("tick_start(").expect("the pass is bracketed with tick_start");
+        let spawn_at = body.find("tokio::spawn(").expect("the pass runs in a spawned task");
+        let end_at = body.find("tick_end(").expect("the pass records a tick_end");
+        let ok_at = body.find("Ok(_) =>").expect("the completed arm is matched explicitly");
+
+        assert!(start_at < spawn_at, "tick_start must precede the pass");
+        assert!(spawn_at < end_at,
+            "tick_end must come AFTER the pass: a tick taken first means a pass that was \
+             STARTED, while every reader takes ticks to mean a pass that is DONE");
+        assert!(ok_at < end_at,
+            "tick_end must sit in the Ok arm: a panicking pass that still ticks makes a dead \
+             monitor indistinguishable from a working one");
+
+        // The one-shot `registry::tick(` sets last_start and last_end to the
+        // same instant, so it can neither express a duration nor separate
+        // start from finish. Using it here is what the fix replaced.
+        assert!(!body.contains("registry::tick("),
+            "one_pass must not use the one-shot tick; it cannot distinguish started from done");
+    }
+
+    /// AMUX-4734: by the time a pass returns, its verdicts are ALREADY durable.
+    ///
+    /// This is the fact the card got wrong, and it decides the fix. The card
+    /// said `record` "writes through write_async, so the rows land on the
+    /// store's writer thread" and that the tick therefore beats the commit.
+    /// `record` AWAITS that write. So there is no write-commit window at all,
+    /// and the reported symptom came from somewhere else: the tick was being
+    /// taken at the TOP of the loop, before the pass had even started.
+    ///
+    /// Pinning it here matters because the whole fix rests on it. Moving the
+    /// tick to after the pass only makes `ticks` mean "durable" if `record` has
+    /// really finished writing by then. If someone later drops the `.await`,
+    /// the tick placement silently stops delivering what it promises, and this
+    /// cell is what says so.
+    ///
+    /// Deliberately NOT driven through `one_pass`: that runs `evaluate_all`, 693
+    /// checks, several of which shell out to git and tmux. A first cut of this
+    /// cell did exactly that and ran for over 60 seconds against an empty temp
+    /// store before being killed. A slow, environment-dependent cell in the
+    /// shared suite buys less than it costs.
+    #[tokio::test]
+    async fn record_returns_only_after_its_verdicts_are_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            crate::db::Store::open(&dir.path().join("inv.db")).unwrap());
+
+        let before: i64 = store.read().unwrap()
+            .query_row("SELECT COUNT(*) FROM _amux_invariant_result", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, 0, "set-up: the fixture store starts empty");
+
+        let results = vec![
+            super::super::InvariantResult::pass("amux4734.control").entity("a"),
+            super::super::InvariantResult::fail("amux4734.probe", "expected", "observed")
+                .entity("b"),
+        ];
+        super::store::record(&store, results, 7).await;
+
+        // IMMEDIATELY, with no sleep and no retry. A poll loop here would pass
+        // against the very bug this pins, which is the difference between
+        // testing durability and waiting for it.
+        let after: i64 = store.read().unwrap()
+            .query_row("SELECT COUNT(*) FROM _amux_invariant_result", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, 2,
+            "record returned but its rows are not readable yet: {after} of 2");
+    }
 
     /// AMUX-4673: an all-zero sample must read as UNKNOWN, never as a FAIL.
     ///
