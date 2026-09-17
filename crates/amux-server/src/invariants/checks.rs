@@ -1716,11 +1716,21 @@ pub struct LaneReport {
 /// `has-session` call that could drift from what the rest of the system
 /// already calls "running."
 ///
-/// Archived lanes are excluded upstream, in `all_lane_names()` itself:
-/// `CC_ARCHIVED=1` is the one sanctioned "this lane is deliberately parked,
-/// not dead" signal this codebase has (`start_session` refuses to start an
-/// archived lane with "wake it first" rather than silently starting it) —
-/// so a lane reaching this check at all already means nothing said it was
+/// TWO signals exclude a lane upstream, in `all_lane_names()` itself, and
+/// this paragraph used to name only one. `CC_ARCHIVED="1"` is the parked
+/// signal (`start_session` refuses to start an archived lane with "wake it
+/// first" rather than silently starting it). `CC_PAUSED="1"` is the second,
+/// and it is not a rounding error: measured 2026-09-17, of 140 lane env
+/// files 85 are archived and 37 are paused, so the paused set is 26% of the
+/// fleet and more than twice the 18 lanes this check actually judges.
+///
+/// Saying "the one sanctioned signal" mattered because it is a claim about
+/// the PREDICATE. A reader auditing this check would conclude paused lanes
+/// are judged and their absence from the results is a coverage bug. They are
+/// excluded on purpose, and the count reconciles exactly: 140 - 85 - 37 = 18
+/// evaluated, all passing.
+///
+/// So a lane reaching this check at all already means nothing said it was
 /// supposed to be stopped.
 pub fn registered_lanes_are_running(lanes: &[LaneRunState]) -> Vec<InvariantResult> {
     const ID: &str = "session.registered_lane_is_running";
@@ -1828,6 +1838,63 @@ pub fn no_pane_scope_oom_kills(journal_lines: &[String]) -> Vec<InvariantResult>
             }))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod amux4660_lane_population_tests {
+    /// AMUX-4660: pin WHICH lanes `session.registered_lane_is_running` judges.
+    ///
+    /// `all_lane_names()` is the single enumeration behind six call sites
+    /// (this check, board_drive twice, status_history, telegram_poll twice),
+    /// and its own comment says why that matters: "a lane visible to one loop
+    /// and invisible to the other is precisely how a fleet-wide job silently
+    /// stops covering part of the fleet." It had no test.
+    ///
+    /// WHY IT NEEDED ONE, concretely. This check's docstring claimed
+    /// `CC_ARCHIVED` was "the one sanctioned" exclusion signal. There are two,
+    /// and the second is not marginal: measured 2026-09-17 on 140 lane env
+    /// files, 85 archived and 37 paused, leaving 18 judged. A reader auditing
+    /// the check against that comment would see 37 registered, not-running
+    /// lanes absent from the results and read it as a coverage bug.
+    ///
+    /// The quoting is part of the contract and was the thing that fooled me:
+    /// the files hold `CC_ARCHIVED="1"`, so a probe grepping for
+    /// `^CC_ARCHIVED=1` matches nothing and reports a clean fleet.
+    #[test]
+    fn archived_and_paused_lanes_are_both_excluded_from_the_judged_set() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let dir = home.path().join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Written in the REAL on-disk shape, quotes included.
+        std::fs::write(dir.join("live-one.env"), "CC_DIR=\"/tmp\"\n").unwrap();
+        std::fs::write(dir.join("live-two.env"), "CC_DIR=\"/tmp\"\nCC_ARCHIVED=\"0\"\n").unwrap();
+        std::fs::write(dir.join("is-archived.env"), "CC_DIR=\"/tmp\"\nCC_ARCHIVED=\"1\"\n").unwrap();
+        std::fs::write(dir.join("is-paused.env"), "CC_DIR=\"/tmp\"\nCC_PAUSED=\"1\"\n").unwrap();
+
+        let names = crate::api::session_verbs::all_lane_names();
+
+        assert!(
+            names.contains(&"live-one".to_string()),
+            "a plain registered lane must be judged; got {names:?}"
+        );
+        assert!(
+            names.contains(&"live-two".to_string()),
+            "CC_ARCHIVED=\"0\" is not archived; got {names:?}"
+        );
+        assert!(
+            !names.contains(&"is-archived".to_string()),
+            "an archived lane must not be judged; got {names:?}"
+        );
+        // THE CLAUSE THE DOCSTRING USED TO OMIT. Without it a paused lane is
+        // reported as a dead registered lane, once per evaluation, forever.
+        assert!(
+            !names.contains(&"is-paused".to_string()),
+            "a PAUSED lane must not be judged; got {names:?}"
+        );
+        assert_eq!(names.len(), 2, "exactly the two live lanes: {names:?}");
+    }
 }
 
 #[cfg(test)]
