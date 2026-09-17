@@ -393,6 +393,7 @@ mod tests {
         let store = Store::open(&dir.path().join("ceiling.db")).unwrap();
         store.write(|conn| {
             let mk = |desc: String| bs::NewIssue {
+                next_action: None,
                 title:"Ledger".into(), desc, status:"backlog".into(),
                 session:Some("owner".into()), item_type:"chore".into(), creator:"test".into(), owner_type:"agent".into(),
                 due:None, due_time:None, reviewer:None, shepherd:None, gate:vec![],
@@ -433,6 +434,7 @@ mod tests {
         let store = Store::open(&dir.path().join("intake.db")).unwrap();
         store.write(|conn| {
             let new = bs::NewIssue {
+                next_action: None,
                 title:"Normalize invoices".into(), desc:"Original USD contract".into(), status:"backlog".into(),
                 session:Some("owner".into()), item_type:"chore".into(), creator:"test".into(), owner_type:"agent".into(),
                 due:None, due_time:None, reviewer:Some("peer".into()), shepherd:None, gate:vec!["Independent review".into()],

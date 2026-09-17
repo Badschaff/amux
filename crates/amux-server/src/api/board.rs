@@ -541,6 +541,7 @@ mod frontier_exclusion_tests {
     fn row(status: &str) -> bs::IssueRow {
         let conn = crate::db::migrate::test_memdb();
         let new = bs::NewIssue {
+            next_action: None,
             title: "t".into(),
             desc: String::new(),
             status: status.into(),
@@ -2671,6 +2672,7 @@ mod callback_dispatch_tests {
     fn request_at(state: &AppState, status: &str) -> String {
         let status = status.to_owned();
         let new = bs::NewIssue {
+            next_action: None,
             title: "Produce the launch report".into(),
             desc: "Requested by another worker.".into(),
             status: "todo".into(),
@@ -2715,6 +2717,7 @@ mod callback_dispatch_tests {
     /// `fold_target` writes the server's own fold marker into the log.
     fn capture_shell(state: &AppState, fold_target: Option<&str>) -> String {
         let new = bs::NewIssue {
+            next_action: None,
             title: "whats the status on the rollout".into(),
             desc: "**Prompt:** whats the status on the rollout".into(),
             status: "todo".into(),
@@ -4893,6 +4896,12 @@ pub async fn create_item(
         "title", "desc", "status", "session", "type", "depends_on", "tags", "creator",
         "reviewer", "shepherd", "gate", "owner_type", "due", "due_time", "callback",
         "ask_actor", "ask_type", "ask_question", "ask_unblocks", "request_to",
+        // AMUX-4748. Omitting this made create DROP the exact field the pickup
+        // gate requires: a caller sent a good continuation, it landed in
+        // `ignored_fields`, and dispatch then refused the card for not having
+        // one. Measured 2026-09-17: 14 eligible todos, every candidate refused,
+        // the lane idle. Same shape the ask_* fields were fixed for.
+        "next_action",
     ];
     let ignored: Vec<String> = map
         .keys()
@@ -4966,7 +4975,32 @@ pub async fn create_item(
         }
     }
 
+    // VALIDATED BY THE GATE'S OWN FUNCTION, not a second opinion. `enforce`
+    // refuses a claim whose next_action is missing or not a sentence, via
+    // bs::continuation_verdict. Create now runs the identical check, so a card
+    // cannot be born carrying a continuation that dispatch will reject; the two
+    // ends of the contract agree by construction rather than by coincidence.
+    let next_action = match body_str(&map, "next_action") {
+        Some(raw) if !raw.trim().is_empty() => {
+            match bs::continuation_verdict(&raw) {
+                bs::ContinuationVerdict::NotASentence => {
+                    return err(StatusCode::BAD_REQUEST, json!({
+                        "ok": false,
+                        "code": "next_action_not_a_sentence",
+                        "error": "next_action must be a sentence saying what the next actor should do",
+                        "you_sent": raw,
+                        "why": "A card is created with the continuation the pickup gate will demand. \
+                                Storing one this gate would later reject is how a card gets filed and \
+                                then refused for the field it already carries.",
+                    }));
+                }
+                _ => Some(raw.trim().to_string()),
+            }
+        }
+        _ => None,
+    };
     let new = bs::NewIssue {
+        next_action,
         title,
         desc: body_str(&map, "desc").unwrap_or_default(),
         status: status_raw,
@@ -5962,6 +5996,7 @@ async fn decompose_item(
                     .map(|n| children[*n - 1].id.clone())
                     .collect::<Vec<_>>();
                 let new = bs::NewIssue {
+                    next_action: None,
                     title: task.title.trim().to_string(),
                     desc: task.description.trim().to_string(),
                     status: if deps.is_empty() {
@@ -7050,6 +7085,7 @@ mod overlap_reconciliation_tests {
 
     fn new_card(session: &str) -> bs::NewIssue {
         bs::NewIssue {
+            next_action: None,
             title: format!("overlap card for {session}"),
             desc: "durable semantic overlap test card".into(),
             status: "doing".into(),
@@ -12570,6 +12606,7 @@ mod capture_requeue_tests {
                 let row = bs::create_issue(
                     conn,
                     &bs::NewIssue {
+                        next_action: None,
                         title: "Clear out this worker's board then grind it all out".into(),
                         desc: "**Prompt:** clear out this worker's board then grind it all out"
                             .into(),
@@ -12736,6 +12773,7 @@ mod af701_archive_guard_tests {
                 let row = bs::create_issue(
                     conn,
                     &bs::NewIssue {
+                        next_action: None,
                         title: "AF-701 fixture card".into(),
                         desc: "fixture".into(),
                         status,
@@ -13072,6 +13110,7 @@ mod af711_acceptance_criteria_tests {
                 let mut row = bs::create_issue(
                     conn,
                     &bs::NewIssue {
+                        next_action: None,
                         title: "AF-711 fixture card".into(),
                         desc: "fixture".into(),
                         status: "doing".into(),
@@ -13275,6 +13314,7 @@ mod af703_citing_cards_tests {
                 let row = bs::create_issue(
                     conn,
                     &bs::NewIssue {
+                        next_action: None,
                         title,
                         desc,
                         status: "todo".into(),
@@ -15171,6 +15211,7 @@ mod slim_tests {
 
     fn fold_card(creator: &str, status: &str, desc: &str, session: &str) -> bs::NewIssue {
         bs::NewIssue {
+            next_action: None,
             title: "t".into(),
             desc: desc.into(),
             status: status.into(),

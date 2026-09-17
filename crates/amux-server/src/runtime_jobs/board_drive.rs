@@ -406,6 +406,7 @@ async fn file_nudge_escalation(state: &AppState, lane: &str, backlog: i64, unhee
          \x20 amux board doing <ID>                         you are picking it up\n"
     );
     let new = crate::db::board_store::NewIssue {
+        next_action: None,
         title,
         desc,
         status: "todo".into(),

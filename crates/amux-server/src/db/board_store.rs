@@ -2792,6 +2792,17 @@ pub struct NewIssue {
     /// that now demands them would otherwise be demanding data it discards,
     /// which is worse than the hole it closes.
     pub ask_type: Option<String>,
+    /// The continuation, storable AT CREATION (AMUX-4748).
+    ///
+    /// EXACTLY THE HOLE THE COMMENT ABOVE DESCRIBES, one field over. The insert
+    /// omitted this column, so a create that supplied a perfectly good
+    /// `next_action` stored NULL, and the pickup gate then refused the card for
+    /// lacking the very thing the caller sent. Measured 2026-09-17: the amux
+    /// lane sat idle with 14 eligible todos, every candidate refused for
+    /// `next_action` absent. The card filed ABOUT that failure is its own
+    /// specimen: AMUX-4748 came back carrying
+    /// `ignored_fields: ["acceptance_criteria", "next_action"]`.
+    pub next_action: Option<String>,
     pub ask_question: Option<String>,
     pub ask_unblocks: Option<String>,
     pub ask_actor: Option<String>,
@@ -2898,9 +2909,10 @@ pub fn create_issue(conn: &Connection, new: &NewIssue, now: i64) -> rusqlite::Re
              due, due_time, created, updated, owner_type, pos, gate, reviewer, depends_on, \
              ask_type, ask_question, ask_unblocks, entered_state_at, source, \
              requested_by, callback_session, callback_prompt, callback_state, ask_actor, \
+             next_action, \
              notified, pinned, archived, rev, version) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, 0, 0, 0, 0, 0)",
+             ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, 0, 0, 0, 0, 0)",
         params![
             id,
             new.title,
@@ -2931,6 +2943,7 @@ pub fn create_issue(conn: &Connection, new: &NewIssue, now: i64) -> rusqlite::Re
             new.callback_prompt.as_deref().filter(|x| !x.trim().is_empty()),
             new.callback_session.as_ref().map(|_| "armed"),
             new.ask_actor.as_deref().filter(|x| !x.trim().is_empty()),
+            new.next_action.as_deref().filter(|x| !x.trim().is_empty()),
         ],
     )?;
     for tag in &new.tags {
@@ -4970,6 +4983,7 @@ mod tests {
 
     fn new_card(status: &str) -> NewIssue {
         NewIssue {
+            next_action: None,
             title: "Ask Ethan about pricing".into(),
             desc: String::new(),
             status: status.into(),

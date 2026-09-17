@@ -7161,6 +7161,7 @@ async fn file_finding(state: &AppState, f: &Finding) -> anyhow::Result<Option<St
                 });
             }
             let new = bs::NewIssue {
+                next_action: None,
                 title: title.clone(),
                 desc: desc.clone(),
                 // PARKED, NOT QUEUED (AMUX-3645). A dwell-window fault has no

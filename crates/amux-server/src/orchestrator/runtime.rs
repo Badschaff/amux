@@ -1224,6 +1224,7 @@ impl Runtime {
                         let child = crate::db::board_store::create_issue(
                             conn,
                             &crate::db::board_store::NewIssue {
+                                next_action: None,
                                 title: format!("Decompose and continue {}", parent.id),
                                 desc,
                                 status: "todo".into(),
@@ -1762,6 +1763,7 @@ impl Runtime {
                 let mut row = crate::db::board_store::create_issue(
                     conn,
                     &crate::db::board_store::NewIssue {
+                        next_action: None,
                         title,
                         desc: captured_desc,
                         // In flight, not queued: see the doc comment — a
@@ -2372,6 +2374,7 @@ mod adherence_tests {
                 let row = bs::create_issue(
                     conn,
                     &bs::NewIssue {
+                        next_action: None,
                         title: title.clone(),
                         desc: String::new(),
                         status: status.clone(),

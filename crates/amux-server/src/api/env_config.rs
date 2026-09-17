@@ -635,6 +635,7 @@ async fn apply(
                         continue;
                     }
                     let new = crate::db::board_store::NewIssue {
+                        next_action: None,
                         title: title.clone(),
                         desc: desc.clone(),
                         status: status.clone(),

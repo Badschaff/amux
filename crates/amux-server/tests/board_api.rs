@@ -136,6 +136,88 @@ fn hdr<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
 
 // ---- create -> list -> detail lifecycle ----------------------------------
 
+/// AMUX-4748: a card created WITH a continuation can actually be claimed.
+///
+/// THE CONTRACT HAD TWO ENDS THAT DISAGREED. Create did not accept
+/// `next_action`, so a caller who supplied one had it collected into
+/// `ignored_fields` and stored as NULL; the pickup gate then refused the card
+/// for lacking the very field the caller sent. Measured 2026-09-17: the amux
+/// lane sat idle holding 14 eligible todos with every candidate refused,
+/// reason `all-candidates-refused`. The card filed ABOUT that failure is its
+/// own specimen, returned with
+/// `ignored_fields: ["acceptance_criteria", "next_action"]`.
+///
+/// Driven END TO END rather than by asserting the column, because storing the
+/// value and still being refused at pickup is the failure. The cell has to
+/// reach the gate to mean anything.
+#[tokio::test]
+async fn a_card_created_with_a_next_action_is_claimable() {
+    let (app, _dir) = app();
+    let c = create(&app, json!({
+        "title": "created with a continuation",
+        "session": "alpha", "status": "todo", "type": "chore",
+        "next_action": "Run the compatibility suite against the new build",
+    })).await;
+
+    // STORED, and not reported as dropped. Both halves matter: a silent drop
+    // and a loud one strand the card identically, but only one tells the caller.
+    assert_eq!(c["next_action"], json!("Run the compatibility suite against the new build"));
+    assert!(
+        !c["ignored_fields"].as_array().map(|a| a.iter().any(|v| v == "next_action")).unwrap_or(false),
+        "next_action must not be reported as ignored: {c}");
+
+    // THE OTHER END. Claiming must not be refused for a continuation the card
+    // already carries.
+    // The type gate is acked here so the ONLY difference between this cell and
+    // its control is the continuation. A first cut omitted it and both cards
+    // were refused by "gate not acknowledged" instead, which made the control
+    // pass for a reason that had nothing to do with next_action.
+    let id = c["id"].as_str().expect("id").to_string();
+    let (st, _, v) = send(&app, "PATCH", &format!("/api/board/{id}"), Some(json!({
+        "status": "doing",
+        "gate_checked": ["Scope is clear", "Has an owner"],
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "created with a continuation, refused at pickup: {v}");
+    assert_eq!(v["status"], json!("doing"));
+}
+
+/// THE CONTROL: create does not INVENT a continuation it was not given.
+///
+/// Without this, the cell above is satisfied by a create path that fabricates a
+/// next_action for every card, which would strand nothing and mean nothing.
+///
+/// IT DELIBERATELY DOES NOT DRIVE THE PICKUP GATE. That gate is opt-in
+/// (`AMUX_CONTINUATION_REQUIRED`, default OFF, resolved worker > group >
+/// global), so a test binary with it unset admits a card with no continuation
+/// and a "must be refused" assertion passes for the wrong reason. My first cut
+/// did exactly that: BOTH cards were being stopped by the ack gate
+/// ("Scope is clear"), not by the continuation gate, so the control would have
+/// stayed green with the continuation gate deleted entirely. The gate's own
+/// behaviour is pinned where it is decidable, in
+/// db::board_store::tests::a_claim_needs_a_next_action_a_stranger_could_act_on.
+#[tokio::test]
+async fn create_does_not_invent_a_next_action_it_was_not_given() {
+    let (app, _dir) = app();
+    let c = create(&app, json!({
+        "title": "no continuation", "session": "alpha", "status": "todo", "type": "chore",
+    })).await;
+    assert_eq!(c["next_action"], json!(null),
+        "create must store NULL when no continuation was supplied: {c}");
+}
+
+/// A continuation the gate would LATER reject is refused at creation instead of
+/// stored, so a card cannot be born carrying one dispatch will bounce.
+#[tokio::test]
+async fn a_next_action_that_is_not_a_sentence_is_refused_at_creation() {
+    let (app, _dir) = app();
+    let (st, _, v) = send(&app, "POST", "/api/board", Some(json!({
+        "title": "bad continuation", "session": "alpha", "status": "todo", "type": "chore",
+        "next_action": "fix",
+    }))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["code"], json!("next_action_not_a_sentence"));
+}
+
 #[tokio::test]
 async fn create_list_detail_lifecycle() {
     let (app, _dir) = app();
@@ -5838,6 +5920,7 @@ async fn a_card_records_where_it_came_from_and_the_api_publishes_it() {
     let row = amux_server::db::board_store::create_issue(
         &conn,
         &amux_server::db::board_store::NewIssue {
+            next_action: None,
             title: "a captured human prompt".into(),
             desc: String::new(),
             status: "doing".into(),

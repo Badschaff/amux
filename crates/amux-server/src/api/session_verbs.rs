@@ -4615,6 +4615,7 @@ fn mint_capture_card(
     let mut row = crate::db::board_store::create_issue(
         conn,
         &crate::db::board_store::NewIssue {
+            next_action: None,
             title,
             desc: captured_desc,
             // Neither Doing nor triggered Backlog is redispatched (AMUX-2613).
@@ -28343,6 +28344,7 @@ mod steer_boundary_tests {
                 create_issue(
                     conn,
                     &NewIssue {
+                        next_action: None,
                         title: "manual work".into(),
                         desc: "some manual work".into(),
                         status: "doing".into(),

@@ -1096,6 +1096,7 @@ mod tests {
                 let row = crate::db::board_store::create_issue(
                     conn,
                     &crate::db::board_store::NewIssue {
+                        next_action: None,
                         title: "drift specimen".into(),
                         desc: String::new(),
                         status: "doing".into(),
