@@ -1,5 +1,6 @@
 import { test, expect } from '../fixtures';
 import { boot, auth, checkpoint } from './evidence';
+import { cleanup } from '../teardown';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -51,7 +52,14 @@ test('LC-FILES-UPLOAD: upload, preview, rename, download exact bytes, and delete
     await expect(row(renamed)).toHaveCount(0);
     await expect(readFile(path.join(dir, renamed))).rejects.toThrow(/ENOENT/);
   } finally {
-    await request.post('/api/prefs', { headers, data: { key: 'files_cwd', value: prior.value || '' } });
-    await rm(dir, { recursive: true, force: true });
+    // AMUX-4737. Both of these can throw AFTER the body has already failed, and
+    // a throwing `finally` DISCARDS the body's error. This spec is the recorded
+    // specimen: AMUX-4643 was titled "request context closed", which is what
+    // this POST raises once a 90s timeout has killed the context, while the
+    // step that actually broke was line 35. The card sat two days wearing its
+    // teardown's error.
+    await cleanup('restore files_cwd', () =>
+      request.post('/api/prefs', { headers, data: { key: 'files_cwd', value: prior.value || '' } }), info);
+    await cleanup('remove the temp dir', () => rm(dir, { recursive: true, force: true }), info);
   }
 });
