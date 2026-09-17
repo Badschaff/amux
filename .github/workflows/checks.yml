@@ -306,15 +306,13 @@ jobs:
       # owner (ethos rule 8). This is that decision, made for 28 of the 31:
       # each was run standalone, independently verified as CI-safe (no live
       # production server, no real cargo compile), and is wired here. The
-      # remaining 3 are NOT wired, each for a checked, specific reason:
+      # remaining 2 are NOT wired, each for a checked, specific reason:
       #   test-target-clause.sh    compiles Rust for real; its cheap half
       #                            (test-selector-clauses.sh) is already above.
-      #   test-lineage-render.sh   needs a LIVE server with real, aged board
-      #                            history (`/api/why/task/<id>`) to prove the
-      #                            renderer matches a real payload rather than a
-      #                            synthetic fixture — structurally absent on a
-      #                            GitHub-hosted runner, by the script's own
-      #                            documented design ("skipping is deliberate").
+      # (test-lineage-render.sh was here until AMUX-4771 retired it: the
+      #  renderer it tested, _bdLineageHtml, was deleted in 43d0ec84 and the
+      #  Lineage tab now aliases to Details, so the harness had nothing left
+      #  to drive and reported itself blind on every run.)
       #   test-unstamped-ledger.sh same shape, against a live `/api/history`.
       # Their baseline entries now carry that reason instead of "owner to
       # confirm or wire".

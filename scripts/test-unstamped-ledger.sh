@@ -203,82 +203,80 @@ fi
 #    explaining the old wording quotes "no audit" verbatim. A check that reads
 #    the prose around a line instead of the line is pinned to the wrong layer,
 #    and would have passed just as happily on a revert that kept the comment.
-BLOCK=$(sed -n '/^  _record_unstamped_send /,/^  return 0$/p' amux | grep '^ *echo ')
-if [ -z "$BLOCK" ]; then
-  bad "could not locate the fallback's closing block in ./amux — this check proves nothing"
-else
-  case "$BLOCK" in
-    *"no audit"*) bad "the fallback still says 'no audit' one line after recording the audit row (AF-454)" ;;
-    *) ok "the fallback no longer claims 'no audit' while writing the audit row" ;;
-  esac
-  case "$BLOCK" in
-    *"reconciles into the audit trail"*) ok "it tells the sender the send is recorded and will reconcile" ;;
-    *) bad "nothing tells the sender the send was recorded — they will read the warning as loss" ;;
-  esac
-  # The remedy must not depend on the server whose unreachability is the only
-  # reason this branch runs (ethos rule 3). tmux must come BEFORE the curl.
-  T_POS=$(printf '%s' "$BLOCK" | grep -n 'tmux capture-pane' | head -1 | cut -d: -f1)
-  C_POS=$(printf '%s' "$BLOCK" | grep -n 'curl -sk' | head -1 | cut -d: -f1)
-  if [ -n "$T_POS" ] && [ -n "$C_POS" ] && [ "$T_POS" -lt "$C_POS" ]; then
-    ok "the server-independent remedy (tmux) is offered before the curl"
-  elif [ -z "$T_POS" ]; then
-    bad "the only verification offered is a curl at the server that was just proved unreachable"
-  else
-    bad "the curl is printed above the tmux remedy — the reader tries the dead one first"
-  fi
-  # $tname, not $name: gtm-engine ran `tmux has-session -t gtm-ticker` against a
-  # session actually called amux-gtm-ticker, found nothing, and briefly read a
-  # DELIVERED message as lost (the 2026-07-27 shape). And the trailing colon is
-  # load-bearing: `-t "=$tname"` fails with "can't find pane".
-  CAP=$(printf '%s\n' "$BLOCK" | grep 'capture-pane' | head -1)
-  case "$CAP" in
-    *'=$tname:'*) ok "the tmux remedy uses the REAL prefixed session name, with the colon capture-pane needs" ;;
-    *'$tname'*)   bad "the tmux remedy names \$tname but drops the trailing colon — capture-pane answers \"can't find pane\"" ;;
-    *'$name'*)    bad "the tmux remedy interpolates the FLEET name; the tmux session is prefixed and it will find nothing" ;;
-    *)            bad "the tmux remedy does not name the session at all" ;;
-  esac
-  # Scrollback, not the viewport. A bare capture-pane returns the current frame,
-  # which is the trap CLAUDE.md documents for peek: a full-screen picker clears
-  # the screen and the message being looked for scrolls off.
-  case "$CAP" in
-    *'capture-pane -p -S -'*) ok "the tmux remedy reads scrollback, not just the viewport" ;;
-    *) bad "capture-pane without -S returns the viewport only — the peek/output trap, in the remedy" ;;
-  esac
-fi
-
-# 6. WHAT THE RECEIVER SEES (AF-455). Sections 1-5 are all about the SENDER:
-#    what is recorded, and what the sender is told. This one is the other side.
+# THE RAW TMUX FALLBACK IS GONE, and this section now pins its ABSENCE (AMUX-4771).
 #
-#    A send that reaches the server arrives stamped "[amux-origin: <lane> —
-#    server-verified ...]". An injection used to arrive with no prefix at all,
-#    making it shape-identical to a prompt typed by the OWNER — whose turns
-#    carry standing authority the sending peer does not have.
-KEYS=$(grep -n 'tmux send-keys .* -l "' amux | head -1)
-case "$KEYS" in
-  *'-l "$marked"'*) ok "the injected body carries a marker, not the bare text" ;;
-  *'-l "$text"'*)   bad "the injection is sent bare — the receiver cannot tell it from an owner prompt (AF-455)" ;;
-  *)                bad "could not find the fallback's send-keys body line; this check proves nothing" ;;
-esac
-# The marker must assert the ABSENCE of verification. A marker that claimed
-# identity would be the body signature AMUX-1768 forbids.
-MARKER=$(grep -n 'local marked=' amux | head -1)
-if [ -z "$MARKER" ]; then
-  bad "no marker is constructed for fallback injections"
+# What was here asserted the wording of the fallback's closing block, extracted
+# with `sed -n '/^  _record_unstamped_send /,/^  return 0$/p' amux`. That pattern
+# expects the CALL SITE, indented two spaces inside the send path. There is no
+# call site: `_record_unstamped_send` appears exactly ONCE in ./amux, its own
+# definition at column 0, and it has appeared once at HEAD~200, HEAD~80 and
+# HEAD~20 too. The block has not existed for the whole window anyone can check.
+#
+# It is not a regression, it is a deliberate removal. The terminal path now
+# writes a `send_delivery_unknown` row with `raw_fallback: False` and says so to
+# the sender: "No raw terminal paste was attempted." `_flush_unstamped_ledger`
+# stays live because the comment above it says why -- "Historical fallback
+# ledgers still flush" -- and it is still called on every acknowledged send.
+#
+# AND THE OLD CHECK COULD NOT SAY ANY OF THAT. Under `set -euo pipefail` the
+# zero-match grep aborted the whole script AT THE ASSIGNMENT, before its own
+# `if [ -z "$BLOCK" ]` could report "this check proves nothing" and before the
+# summary line printed. The last thing a reader saw was an `ok`, so a run that
+# died read as a clean pass. That is AF-561 in mirror image: no match is a
+# legitimate answer and needs `|| true`.
+BLOCK=$(sed -n '/^  _record_unstamped_send /,/^  return 0$/p' amux | grep '^ *echo ' || true)
+if [ -n "$BLOCK" ]; then
+  # The raw fallback came back. That is a real change and the old assertions
+  # about its wording become live again, so fail loudly rather than pass a
+  # branch nobody has reviewed since it was removed.
+  bad "a raw-tmux fallback block reappeared in ./amux; typing into a peer's live pane bypasses dedupe (see this file's history for the wording checks it used to make)"
 else
-  case "$MARKER" in
-    *'NOT server-verified'*) ok "the marker asserts the absence of verification, not an identity (AMUX-1768)" ;;
-    *) bad "the marker does not say it is unverified — a prefix that merely names a sender is the forgeable kind AMUX-1768 forbids" ;;
-  esac
-  case "$MARKER" in
-    *'\n'*) bad "the marker embeds a newline — send-keys -l would submit it as a prompt of its own" ;;
-    *) ok "the marker is a single line, so the separately-sent Enter still submits body and marker together" ;;
-  esac
+  ok "no raw-tmux fallback block exists to mis-word (it was removed; the terminal path records send_delivery_unknown instead)"
 fi
-# The AUDIT row keeps the original text. The marker is for the human reading the
-# pane; a trail that stored the decorated string would drift from what was sent.
-case "$(grep -n '_record_unstamped_send "' amux | tail -1)" in
-  *'_record_unstamped_send "$name" "$text"'*) ok "the audit row records the ORIGINAL body, undecorated" ;;
-  *) bad "the audit row no longer records \$text — the trail and the pane would disagree" ;;
+# The removal is only safe if the sender is TOLD. An unacknowledged send that
+# silently does nothing is the loss this whole file is about.
+case "$(grep -c 'No raw terminal paste was attempted' amux || true)" in
+  0) bad "the unacknowledged-send path no longer tells the sender that nothing was typed" ;;
+  *) ok "the sender is told explicitly that no raw terminal paste was attempted" ;;
+esac
+case "$(grep -c 'send_delivery_unknown' amux || true)" in
+  0) bad "nothing records send_delivery_unknown, so an unacknowledged send leaves no local trace" ;;
+  *) ok "an unacknowledged send still leaves a local send_delivery_unknown trace" ;;
+esac
+
+# 6. WHAT THE RECEIVER SEES (AF-455) -- now pinned as an ABSENCE (AMUX-4771).
+#
+#    This section asserted the shape of the raw INJECTION: that the body carried
+#    a marker rather than arriving bare, that the marker said "NOT
+#    server-verified" rather than claiming an identity, and that the audit row
+#    kept the undecorated text. Every one of those is a good property OF A
+#    FEATURE THAT NO LONGER EXISTS.
+#
+#    ./amux says so itself, right above the ledger: "direct terminal pasting was
+#    removed after the TubeScience stacked-draft incident (AMUX-4359)". There is
+#    no `-l "$marked"` line, no `local marked=`, and no `_record_unstamped_send`
+#    call site anywhere in the CLI.
+#
+#    So the concern this section carried is now satisfied by construction: a
+#    peer message cannot be shape-identical to an owner prompt if no peer
+#    message is ever typed into a pane. What is worth pinning is that it STAYS
+#    removed -- reintroducing it would revive AF-455 and AMUX-1818 together.
+#
+#    THE OLD VERSION COULD NOT REPORT THIS. `KEYS=$(grep ... | head -1)` matched
+#    nothing and, under `set -euo pipefail`, aborted the script at the
+#    assignment -- before its own "this check proves nothing" arm and before the
+#    summary. Same bug as section 5, the same line apart.
+INJECT=$(grep -n 'tmux send-keys .* -l "' amux | head -1 || true)
+if [ -n "$INJECT" ]; then
+  bad "a raw send-keys injection path reappeared in ./amux ($INJECT) -- direct terminal pasting was removed after AMUX-4359 and revives AF-455/AMUX-1818"
+else
+  ok "no raw send-keys injection path exists (removed after AMUX-4359), so a peer message cannot arrive shaped like an owner prompt"
+fi
+# The removal has to be explained where the next reader of the send path looks,
+# or it reads as an accident and gets 'restored'.
+case "$(grep -c 'direct terminal pasting was removed' amux || true)" in
+  0) bad "nothing in ./amux records WHY the raw paste path is absent; the next reader will treat it as a gap and re-add it" ;;
+  *) ok "./amux records why the raw paste path is absent (AMUX-4359), so it is not mistaken for a gap" ;;
 esac
 
 echo

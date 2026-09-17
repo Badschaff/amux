@@ -8,7 +8,8 @@
 # the 3 exempt harnesses runnable on a dev box, 3 of 3 were broken on main.
 #
 #   test-target-clause.sh     drifted literal, "want [7] got [9]", since c7911c2d
-#   test-lineage-render.sh    BLIND: the function it tests was deleted in 43d0ec84
+#   test-lineage-render.sh    BLIND: the function it tested was deleted in 43d0ec84;
+#                             the harness was RETIRED in turn (AMUX-4771)
 #   test-unstamped-ledger.sh  dies on a zero-match grep under `set -o pipefail`,
 #                             reports real failures when it survives, and is not
 #                             idempotent between runs
