@@ -1,6 +1,6 @@
 {
   "measured": true,
-  "n_considered": 2019,
+  "n_considered": 2028,
   "command_handlers": {
     "_applyEmbedView": {
       "kind": "command._applyEmbedView",
@@ -3340,6 +3340,12 @@
     },
     "pauseWorker": {
       "kind": "command.pauseWorker",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "peekCheckSelection": {
+      "kind": "command.peekCheckSelection",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"

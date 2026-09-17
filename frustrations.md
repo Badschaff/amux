@@ -3100,3 +3100,15 @@ CARD: AMUX-4741
 SYMPTOM: `scripts/push-consent.sh` defaults its tip to the local branch `main` (`TIP="${2:-main}"`). CLAUDE.md's Deploy section instructs every lane to run its gates on a DETACHED worktree (`git worktree add --detach`), and on one of those, local `main` is a stale ref unrelated to the commits being pushed. Run with no arguments on a worktree holding one unpushed commit, it printed `range origin/main..main` / `commits 0` / `Nothing to push.` and exited 0. The push itself was a different range entirely (`origin/main..HEAD`, 1 commit).
 COST: A false clear on the one gate whose entire job is to stop a push that should have asked someone first. Here it cost only the minute it took to notice the count contradicted a range I already knew; the real exposure is a lane whose range holds a PEER's commits, which gets the same `Nothing to push.` and pushes them unasked, against a rule CLAUDE.md marks MANDATORY. Two instructions in the same file point opposite ways: run gates detached, and read consent from `main`.
 FIX: Fixed. Tip now defaults to HEAD, which is correct in both shapes (on a checkout sitting on main, HEAD is main). The banner also prints the resolved sha and the branch or `detached HEAD`, and prints a `note` line naming local `main` whenever it is a different commit, so a reader who remembers the old default is told which range the verdict covers. The note line is computed from a rev-parse comparison, so it cannot print when it is not true.
+
+
+## Worker terminal freezes until a browser refresh restarts updates
+AREA: browser
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-17
+SESSION: Ethan via Codex
+CARD: AF-909
+SYMPTOM: The worker terminal intermittently stops updating and resumes after refresh. Four browser regressions fail against the shipped source: a body stalled after headers outlives the cleared timeout, unrelated text selection suppresses terminal requests, a cancelled touch leaves the selection latch set, and a selection begun during a response consumes an unpainted frame's ETag/raw dedupe state.
+COST: Ethan must refresh to see ongoing worker output; all four reproduced cases leave stale text visible despite later available output.
+FIX: Keep the timeout through response consumption; commit ETags only for validated accepted frames; scope selection to terminal ranges and reconcile cancelled/resumed gestures. Log refresh-failed with the transport phase and selection-recovered with the event reason through client-debug. Browser regressions cover automatic recovery and retained reader position on desktop, phone width and Safari. Originator confirmation remains pending.

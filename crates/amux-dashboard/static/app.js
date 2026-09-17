@@ -11183,7 +11183,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.972';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.973';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -13311,24 +13311,23 @@ async function refreshPeek(liveOnly, bypassTrim) {
   // Refresh the Plan strip (throttled — task files change slowly).
   if (performance.now() - _peekPlanLast > 8000) { _peekPlanLast = performance.now(); _peekLoadPlan(); }
   if (peekSelecting) return;
-  const sel = window.getSelection();
-  if (sel && sel.toString().length > 0) return;
+  if (_peekHasSelection()) return;
   const body = document.getElementById('peek-body');
   const statusEl = document.getElementById('peek-status');
+  const _peekAc = new AbortController();
+  // Headers are not a completed frame. Keep the deadline armed through body
+  // consumption; otherwise a half-open response strands the awaited poll loop.
+  const _peekTimeout = setTimeout(() => _peekAc.abort(), 15000);
+  let phase = 'headers';
   try {
     // liveOnly (open path): a few-KB live frame — the CURRENT terminal — so the
     // peek paints the latest instantly on click. The full payload (~138KB, mostly
     // transcript history) follows and fills in scrollback. Only the full response
     // carries the ETag the poll conditions on.
     const _et = liveOnly ? _peekLiveEtag : _peekEtag;
-    const _peekAc = new AbortController();
-    const _peekTimeout = setTimeout(() => _peekAc.abort(), 15000);
     const r = await fetch(API + '/api/sessions/' + encodeURIComponent(name) + '/peek?lines=300' + (liveOnly ? '&live=1' : '') + (bypassTrim ? '&notrim=1' : ''),
       { ...(_et ? { headers: { 'If-None-Match': _et } } : {}), signal: _peekAc.signal });
-    clearTimeout(_peekTimeout);
     if (!_peekIdentityCurrent(identity)) return;
-    hidePeekLoading();   // a response arrived (200 painted below, or 304 = already latest) → drop the "Loading latest…" cue
-    if (!liveOnly) _peekLastFullMs = performance.now();   // history is fresh (200 or 304)
     // AF-83: a peek on a session that NO LONGER EXISTS 404s, and this poller had
     // no r.ok check. It fell straight through to r.json(), parsed the error body
     // {"error":"session 'X' not found"}, found no .live/.output, and painted
@@ -13340,6 +13339,7 @@ async function refreshPeek(liveOnly, bypassTrim) {
     // and SAY what happened; a poller that cannot fail is how a dead tab bills
     // the server forever.
     if (r.status === 404) {
+      hidePeekLoading();
       _stopPeekPoll();
       _peekPollActive = false;
       try { _peekPollBeacon('stop-404', name); } catch (e) {}
@@ -13347,17 +13347,24 @@ async function refreshPeek(liveOnly, bypassTrim) {
       return;
     }
     if (r.status === 304) {   // unchanged — nothing transferred, skip parse + render entirely
+      hidePeekLoading();
+      if (!liveOnly) _peekLastFullMs = performance.now();
       if (performance.now() > _peekGeoHold) statusEl.textContent = 'Updated ' + new Date().toLocaleTimeString() + ' · v' + APP_VER;
       return;
     }
-    if (liveOnly) _peekLiveEtag = r.headers.get('ETag') || _peekLiveEtag;
-    else _peekEtag = r.headers.get('ETag') || _peekEtag;
+    if (!r.ok) throw new Error('Terminal request failed (HTTP ' + r.status + ')');
+    phase = 'body';
     const data = await r.json();
     if (!_peekIdentityCurrent(identity)) return;
     if (data.name !== name) {
       _peekIdentityDiscard('live-peek', identity, data.name || '');
       return;
     }
+    // Selection can begin while the body downloads. Do not acknowledge its
+    // ETag or raw frame until it can be painted/buffered: the next request must
+    // retrieve it again instead of accepting 304 for content we never showed.
+    if (peekSelecting || _peekHasSelection()) return;
+    phase = 'render';
     // Alt-screen peeks return history + live SEPARATELY so a poll can re-render just
     // the live frame. A live=1 poll carries no history (keep what we already have);
     // non-alt/legacy shapes send one `output` blob — treat that as the live part.
@@ -13380,23 +13387,32 @@ async function refreshPeek(liveOnly, bypassTrim) {
     if (typeof rawOutput !== 'string' || (histRaw !== null && typeof histRaw !== 'string')) throw new Error('Malformed terminal frame');
     const overlapBase = histRaw !== null ? histRaw : _peekHistoryRaw;
     const output = _trimPeekLiveOverlap(overlapBase, rawOutput);
+    const acceptFrame = () => {
+      if (liveOnly) _peekLiveEtag = r.headers.get('ETag');
+      else { _peekEtag = r.headers.get('ETag'); _peekLastFullMs = performance.now(); }
+      hidePeekLoading();
+    };
     // Skip re-render when nothing we'd paint changed — saves ansiToHtml work on every
     // poll tick. This also applies with an active search: the highlights are already in
     // the DOM, so re-running applyPeekSearch would needlessly scroll the view back to
     // the current match every tick (the "force-scroll back to result" bug on idle sessions).
     if (output === _lastPeekRaw && (histRaw === null || histRaw === _peekHistoryRaw) && lastPeekHTML) {
+      acceptFrame();
       if (performance.now() > _peekGeoHold) statusEl.textContent = 'Updated ' + new Date().toLocaleTimeString() + ' · v' + APP_VER;
       return;
     }
-    _lastPeekRaw = output;
-    _peekLastChangeMs = performance.now();   // real content change → drives fast adaptive polling
+    // Prepare both regions before committing the raw-frame dedupe keys. A
+    // failed conversion must remain retryable just like a failed body read.
+    const newHTML = _peekLiveHtml(output);
     let histChanged = false;
     if (histRaw !== null && histRaw !== _peekHistoryRaw) {   // full fetch → (re)render history once
-      _peekHistoryRaw = histRaw;
       const historyTail = _peekEarlier.conversation ? _peekAfterConversation(_peekEarlier.tailRaw, histRaw) : histRaw;
       _peekHistoryHTML = historyTail ? _peekHtml(historyTail) : '';
+      _peekHistoryRaw = histRaw;
       histChanged = true;
     }
+    _lastPeekRaw = output;
+    _peekLastChangeMs = performance.now();   // real content change → drives fast adaptive polling
     // A poll cannot infer renewed consent to follow from proximity. The
     // reader may have moved only a few pixels up since the previous frame.
     const atBottom = _peekFollowBottom && _isScrolledToBottom(body);
@@ -13404,8 +13420,6 @@ async function refreshPeek(liveOnly, bypassTrim) {
       _peekScrollLocked = false;
       _peekBufferedOutput = false;
     }
-    const newHTML = _peekLiveHtml(output);
-    if (peekSelecting || (window.getSelection()?.toString().length > 0)) return;
     if (newHTML.includes('class="peek-queued-msg"') && !_lastLiveHTML.includes('class="peek-queued-msg"')) {
       _peekPollBeacon('worker-input-separated', name, { verdict: 'composer_excluded_from_messages' });
     }
@@ -13458,6 +13472,7 @@ async function refreshPeek(liveOnly, bypassTrim) {
       });
     }
     if (performance.now() > _peekGeoHold) statusEl.textContent = (data.saved ? 'Saved log' : 'Updated') + ' ' + new Date().toLocaleTimeString() + ' · v' + APP_VER;
+    acceptFrame();
     // Cache peek output for offline browsing
     // Cache BOTH slices — since the live-split, `output` alone is just the tiny
     // live frame (sometimes ''), which painted an EMPTY black peek from cache
@@ -13466,6 +13481,10 @@ async function refreshPeek(liveOnly, bypassTrim) {
   } catch(e) {
     if (!_peekIdentityCurrent(identity)) return;
     console.error('peek:', e);
+    _peekPollBeacon('refresh-failed', name, { phase,
+      reason: _peekAc.signal.aborted ? 'timeout' : 'request_or_render_error',
+      verdict: 'retrying', measured: true, n_considered: 1 });
+    statusEl.textContent = 'Reconnecting… retrying terminal updates';
     hidePeekLoading();   // fetch failed — stop the "Loading latest…" cue (we fall back to cache / retry below)
     // Offline: load cached peek
     if (!lastPeekHTML || lastPeekHTML.includes('Loading...')) {
@@ -13479,7 +13498,7 @@ async function refreshPeek(liveOnly, bypassTrim) {
         statusEl.textContent = 'Reconnecting…';
       }
     }
-  }
+  } finally { clearTimeout(_peekTimeout); }
 }
 
 // Split DOM: history lives in a stable container and the live frame in its own,
@@ -23889,13 +23908,25 @@ document.addEventListener('click', e => {
 // ═══════ EVENT HANDLERS ═══════
 // Pause peek refresh while selecting text (keep paused until selection is cleared or copied)
 let peekSelectTimer = null;
-function peekCheckSelection() {
+function _peekHasSelection() {
+  const sel = window.getSelection(), body = document.getElementById('peek-body');
+  if (!body || !sel || !sel.toString()) return false;
+  for (let i = 0; i < sel.rangeCount; i++) {
+    if (sel.getRangeAt(i).intersectsNode(body)) return true;
+  }
+  return false;
+}
+function peekCheckSelection(event) {
   clearTimeout(peekSelectTimer);
-  const sel = window.getSelection();
-  if (sel && sel.toString().length > 0) {
+  if (_peekHasSelection()) {
+    _peekStopFollowing();
     peekSelecting = true;
     peekSelectTimer = setTimeout(peekCheckSelection, 500);
   } else {
+    if (peekSelecting && ['touchcancel', 'pointercancel', 'blur', 'resume'].includes(event?.type)) {
+      _peekPollBeacon('selection-recovered', peekSession, { reason: event.type,
+        verdict: 'no_terminal_selection', measured: true, n_considered: 1 });
+    }
     peekSelecting = false;
   }
 }
@@ -23958,6 +23989,13 @@ document.getElementById('peek-body').addEventListener('click', _peekOpenLink);
 document.getElementById('peek-body').addEventListener('touchend', _peekOpenLink, {passive: false});
 document.addEventListener('mouseup', () => { peekCheckSelection(); _peekShowSelPopover(); });
 document.addEventListener('touchend', () => { peekCheckSelection(); setTimeout(_peekShowSelPopover, 50); });
+// OS gestures, focus changes and cancelled touches need not emit mouseup or
+// touchend. Reconcile from the actual selection instead of retaining a latch
+// that suppresses every subsequent terminal request until the page reloads.
+document.addEventListener('touchcancel', peekCheckSelection);
+document.addEventListener('pointercancel', peekCheckSelection);
+document.addEventListener('selectionchange', peekCheckSelection);
+window.addEventListener('blur', peekCheckSelection);
 
 // ── Peek selection popover (Look up / Copy) ──
 function _peekShowSelPopover() {
@@ -34211,6 +34249,7 @@ function _resyncEverything() {
   _runDeltaSync();
 }
 function _onClientResume(reason) {
+  peekCheckSelection({ type: 'resume' });
   if (document.hidden) { _peekPollStop('hidden'); return; }
   _resumePendingUploads();
   // Resume the open-view poller if we're on a peek and it was paused while
