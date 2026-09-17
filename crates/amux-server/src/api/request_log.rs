@@ -1243,6 +1243,8 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/system-jobs/{id}/run", methods: &["POST"] },
     RouteEntry { path: "/api/health/invariants", methods: &["GET"] },
     RouteEntry { path: "/api/debug/invariants", methods: &["GET"] },
+    // AMUX-4682: deterministic stale/unverifiable dependency-citation scan.
+    RouteEntry { path: "/api/debug/dependency-audit", methods: &["GET"] },
     RouteEntry { path: "/api/gmail/callback", methods: &["GET"] },
     RouteEntry { path: "/invite/{token}", methods: &["GET", "POST"] },
     // -- core state

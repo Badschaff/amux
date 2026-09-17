@@ -15,6 +15,7 @@ pub mod board;
 pub mod board_intake;
 pub mod board_lifecycle;
 pub mod criteria;
+pub mod dependency_audit;
 pub mod browser;
 pub mod browser_import;
 pub mod calendar;
@@ -470,6 +471,7 @@ pub fn router(state: AppState) -> Router {
             axum::routing::get(crate::legacy_port::debug),
         )
         .merge(invariants_api::routes())
+        .merge(dependency_audit::routes())
         .merge(crate::runtime_jobs::board_drive::routes())
         .merge(crate::runtime_jobs::autofix::routes())
         .merge(crate::runtime_jobs::storage::routes())
