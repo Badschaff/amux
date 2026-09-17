@@ -1595,6 +1595,7 @@ impl LiveDeliverer {
                 let body: serde_json::Value = resp.json().await.unwrap_or_default();
                 let started = body.get("workers_started").and_then(|v| v.as_u64()).unwrap_or(0);
                 let epic_id = body.get("epic").and_then(|v| v.as_str()).unwrap_or("?");
+                let detail = format!("fan-out: epic {epic_id}, {started} workers ({model})");
                 tracing::info!(
                     target: "amux::scheduler",
                     schedule = %sched.id(),
@@ -1605,9 +1606,21 @@ impl LiveDeliverer {
                     measured = true,
                     "scheduler fan-out delivered"
                 );
+                let origin = schedule_message_origin(
+                    sched.str_field("title"),
+                    sched.id(),
+                    "cron-rs",
+                );
+                crate::api::session_verbs::cmd_hist_record_schedule(
+                    &self.state,
+                    &session,
+                    &format!("[fan-out] {detail}\n\n{command}"),
+                    &origin,
+                )
+                .await;
                 RunOutcome::Delivered {
                     submission: "confirmed".into(),
-                    detail: format!("fan-out: epic {epic_id}, {started} workers ({model})"),
+                    detail,
                 }
             }
             Ok(resp) => {

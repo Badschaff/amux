@@ -11226,7 +11226,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.978';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.979';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -32119,35 +32119,34 @@ async function _orchLoad() {
     const sessMap = {};
     (Array.isArray(allSess) ? allSess : []).forEach(s => { sessMap[s.name] = s; });
 
-    // Find epics that have at least one child with an ephemeral worker
-    const epicIds = new Set();
-    const childByEpic = {};
     const cards = Array.isArray(allCards) ? allCards : [];
+    const childByEpic = {};
+    const parentIds = new Set();
     cards.forEach(c => {
-      if (c.item_type === 'epic') epicIds.add(c.id);
-    });
-    cards.forEach(c => {
-      if (c.epic && epicIds.has(c.epic)) {
+      if (c.epic) {
+        parentIds.add(c.epic);
         if (!childByEpic[c.epic]) childByEpic[c.epic] = [];
         childByEpic[c.epic].push(c);
       }
     });
 
-    // Filter to epics that have at least one ephemeral worker child
-    const orchEpics = cards.filter(c => {
-      if (c.item_type !== 'epic') return false;
-      const children = childByEpic[c.id] || [];
-      return children.some(ch => {
-        const s = sessMap[ch.session];
-        return s && s.ephemeral;
-      });
-    });
+    // An orchestration epic is any card that has children with ephemeral/fan-out workers,
+    // or is typed as epic, or has source=launch, or has [EPIC] in its title with children
+    const seen = new Set();
+    const orchEpics = [];
+    const addEpic = c => { if (!seen.has(c.id)) { seen.add(c.id); orchEpics.push(c); } };
 
-    // Also include epics with source=launch (even if workers haven't started yet)
     cards.forEach(c => {
-      if (c.item_type === 'epic' && c.source === 'launch' && !orchEpics.find(e => e.id === c.id)) {
-        orchEpics.push(c);
-      }
+      if (!parentIds.has(c.id)) return;
+      const children = childByEpic[c.id] || [];
+      const hasEph = children.some(ch => {
+        const s = sessMap[ch.session || ''];
+        return (s && s.ephemeral) || (ch.session || '').includes('-eph-');
+      });
+      if (hasEph) addEpic(c);
+      if (c.item_type === 'epic') addEpic(c);
+      if (c.source === 'launch') addEpic(c);
+      if ((c.title || '').startsWith('[EPIC]')) addEpic(c);
     });
 
     if (!orchEpics.length) {
