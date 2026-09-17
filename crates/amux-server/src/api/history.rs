@@ -672,7 +672,7 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
             // NULL — the UI distinguishes "not recorded" from "direct", and
             // coalescing here would assert a delivery path nobody observed.
             "SELECT id, text, type, session, ts, origin, card_id, \
-             delivery, queued_at, delivered_at, submit_verdict, capture_pending, \
+             delivery, queued_at, delivered_at, submit_verdict, capture_pending, client_meta, \
              (SELECT title FROM issues WHERE issues.id=cmd_history.card_id) AS card_title, \
              (SELECT status FROM issues WHERE issues.id=cmd_history.card_id) AS card_status, \
              (SELECT archived FROM issues WHERE issues.id=cmd_history.card_id) AS card_archived, \
@@ -713,6 +713,29 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
             // row classifiable, the recorded value is authoritative when
             // present, and the client prefers it. Where they disagree on a NEW
             // row that is a contradiction worth seeing, not one to smooth over.
+            // `client_meta` is stored as a JSON STRING. Hand the client a parsed
+            // object, and when there is nothing to hand over REMOVE THE KEY.
+            //
+            // Absence is not a value here (AMUX-4694). 11,526 of 11,591 rows
+            // predate the capture and every client that sends none will add
+            // more, so this is the common case, not the edge. A `null` would
+            // reach the renderer as a present-but-empty field and tempt a
+            // placeholder chip; a missing key cannot. `d.get("client_meta")` is
+            // then falsy in JS for exactly one reason.
+            let parsed = d
+                .get("client_meta")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                .filter(Value::is_object);
+            match parsed {
+                Some(obj) => d["client_meta"] = obj,
+                None => {
+                    if let Some(map) = d.as_object_mut() {
+                        map.remove("client_meta");
+                    }
+                }
+            }
             if let Some(q) = d.get("queued_at").and_then(Value::as_i64) {
                 if let Some(dl) = d.get("delivered_at").and_then(Value::as_i64) {
                     if dl > q {

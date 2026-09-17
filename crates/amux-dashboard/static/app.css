@@ -6714,3 +6714,40 @@ select.input { height:var(--control-height); }
   .recorder-dir-row { flex-direction:column; align-items:stretch; }
   .recorder-dir-row .btn { min-height:44px; }
 }
+
+
+/* ── A message's context: inline chip + tap block (AMUX-4694) ──────────────
+   The chip sits beside the time on every message row. 375px is the width that
+   decides it: the meta line already carries a kind badge, a delivery chip, the
+   session, the time and MSG-N, so a chip that does not shrink pushes the row
+   to two lines and it does that on ALL 100 rows of a page at once, not one.
+   Hence the ellipsis and the max-width rather than a fixed size. */
+.msg-ctx-chip {
+  display:inline-block; font-size:0.6rem; padding:1px 6px; margin-right:6px;
+  border-radius:4px; border:1px solid var(--border); background:var(--bg);
+  color:var(--dim); cursor:pointer; flex-shrink:0; vertical-align:baseline;
+  max-width:11ch; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.msg-ctx-chip:hover, .msg-ctx-chip:focus-visible { border-color:var(--accent); color:var(--accent); }
+
+.msg-ctx-box {
+  background:var(--panel,var(--bg)); border:1px solid var(--border); border-radius:10px;
+  padding:16px; min-width:min(320px,92vw); max-width:min(440px,94vw);
+  color:var(--text); font-size:0.85rem; box-shadow:0 8px 32px rgba(0,0,0,0.35);
+}
+.msg-ctx-title { font-weight:600; margin-bottom:10px; font-size:0.9rem; }
+.msg-ctx-row { display:flex; gap:10px; padding:5px 0; border-top:1px solid var(--border); }
+.msg-ctx-row:first-of-type { border-top:none; }
+.msg-ctx-k { color:var(--dim); flex:0 0 33%; min-width:0; word-break:break-word; }
+.msg-ctx-v { flex:1; min-width:0; word-break:break-word; }
+.msg-ctx-dim { color:var(--dim); font-size:0.75rem; }
+.msg-ctx-close { margin-top:12px; width:100%; }
+
+@media (max-width: 600px) {
+  /* Touch target, per .claude/rules/css-mobile.md. The chip itself stays small
+     because the row is a list item and a 44px chip would set the row height;
+     the padding here buys the target without changing the visual size. */
+  .msg-ctx-chip { padding:6px; margin:-5px 6px -5px 0; max-width:9ch; }
+  .msg-ctx-close { min-height:44px; }
+  .msg-ctx-k { flex-basis:38%; }
+}

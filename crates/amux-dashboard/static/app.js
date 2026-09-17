@@ -11183,7 +11183,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.970';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.971';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -17578,6 +17578,11 @@ function _msgNorm(x) {
            submit_verdict: x.submit_verdict, card_id: x.card_id || '',
            card_title: x.card_title, card_status: x.card_status,
            card_archived: x.card_archived, card_deleted: x.card_deleted,
+           // Carried only when the server sent it. The server REMOVES the key
+           // for a message with no metadata rather than sending null, so
+           // `client_meta` here is either an object or absent, never an empty
+           // shell a renderer could mistake for a value (AMUX-4694).
+           ...(x.client_meta && typeof x.client_meta === 'object' ? {client_meta: x.client_meta} : {}),
            linked_cards: Array.isArray(x.linked_cards) ? x.linked_cards : [] };
 }
 // ONE row renderer for all three message surfaces. `ctx` carries only what
@@ -17606,6 +17611,114 @@ function _msgToggleCollapse(btn, key, ev) {
   btn.innerHTML = nowCollapsed ? '&#9656;' : '&#9662;';
   btn.setAttribute('aria-expanded', String(!nowCollapsed));
   btn.title = nowCollapsed ? 'Expand message' : 'Collapse message';
+}
+
+// ── A message's context: the inline chip and the full block (AMUX-4694) ──
+//
+// ABSENCE IS NOT A VALUE, and that is the load-bearing rule here rather than a
+// nicety. 11,526 of the 11,591 stored messages predate the capture, and every
+// client that sends none adds more, so "no metadata" is the DEFAULT rendering,
+// not an edge case. A placeholder chip or an "unknown" would therefore be what
+// almost every row shows. Both functions below return '' for that case and the
+// row is byte-identical to what it renders today.
+
+/// ONE short fact for the inline chip: device OR place, never both.
+///
+/// A named place wins when there is one, because "Home" is both shorter and
+/// more informative than "iPhone". COORDINATES ARE NOT A PLACE NAME and stay
+/// out of here: "40.7128, -74.0060" does not fit beside the time at 375px, and
+/// it would render the same six digits on all 100 rows of a page. They go in
+/// the tap block, which has room to label them.
+///
+/// `place` is read but never currently sent: resolving a fix to a named place
+/// needs a saved-places store and a proximity test, and neither primitive
+/// exists in this codebase today (checked: no places table, no radius logic).
+/// Reading it here means the chip needs no change on the day one lands.
+function _msgContextShort(m) {
+  if (m && typeof m.place === 'string' && m.place.trim()) return m.place.trim();
+  if (m && typeof m.device === 'string' && m.device.trim()) return m.device.trim();
+  return '';
+}
+
+/// The inline chip, beside the time. '' when the message carries no metadata.
+function _msgContextChip(e) {
+  const m = (e && typeof e === 'object') ? e.client_meta : null;
+  if (!m || typeof m !== 'object') return '';
+  const label = _msgContextShort(m);
+  if (!label) return '';
+  // The row's own click inserts into the composer, so this MUST stop
+  // propagation or tapping the chip would both open the block and overwrite
+  // whatever the user was typing.
+  const enc = encodeURIComponent(JSON.stringify({m, ts: (e.time !== undefined ? e.time : e.ts) || null}));
+  return `<span class="msg-ctx-chip" role="button" tabindex="0"`
+    + ` title="Where this was sent from. Click for the full context"`
+    + ` onclick="event.stopPropagation();_msgContextOpen('${enc}')">${esc(label)}</span>`;
+}
+
+/// One labelled row of the block, or '' when the value is missing.
+/// Never prints a label with nothing beside it.
+function _msgCtxRow(label, value) {
+  if (value === undefined || value === null || String(value).trim() === '') return '';
+  return `<div class="msg-ctx-row"><span class="msg-ctx-k">${esc(label)}</span>`
+    + `<span class="msg-ctx-v">${esc(String(value))}</span></div>`;
+}
+
+/// The full block, on tap.
+function _msgContextOpen(enc) {
+  let payload;
+  try { payload = JSON.parse(decodeURIComponent(enc)); } catch (_) { return; }
+  const m = (payload && payload.m) || {};
+  const serverTs = payload && payload.ts;
+  const server = serverTs ? new Date(serverTs).toLocaleString() : '';
+
+  // SENDER'S LOCAL TIME BESIDE THE SERVER TIME, which is the whole point of
+  // carrying a timezone: the two differ exactly when the sender was somewhere
+  // else, and that is the fact worth seeing. Shown as one row so they cannot
+  // be read apart.
+  const tzOff = (typeof m.tz_offset_min === 'number')
+    ? (m.tz_offset_min >= 0 ? `UTC+${(m.tz_offset_min/60).toFixed(2).replace(/\.00$/,'')}`
+                            : `UTC${(m.tz_offset_min/60).toFixed(2).replace(/\.00$/,'')}`)
+    : '';
+  const tz = [m.tz, tzOff].filter(Boolean).join(' · ');
+
+  // COORDINATES, NOT A PLACE, and labelled as coordinates so nobody reads
+  // them as one. A named place needs a saved-places store and a proximity
+  // test; neither exists yet, so the honest rendering is the raw fix plus its
+  // accuracy, which at least says how much to trust it.
+  let loc = '';
+  if (m.place && String(m.place).trim()) {
+    loc = _msgCtxRow('Place', m.place);
+  } else if (m.geo && typeof m.geo === 'object'
+             && typeof m.geo.lat === 'number' && typeof m.geo.lon === 'number') {
+    const acc = (typeof m.geo.accuracy_m === 'number') ? ` (±${Math.round(m.geo.accuracy_m)}m)` : '';
+    loc = _msgCtxRow('Coordinates', `${m.geo.lat.toFixed(5)}, ${m.geo.lon.toFixed(5)}${acc}`);
+  }
+
+  const body = _msgCtxRow('Device', m.device)
+    + _msgCtxRow('Platform', m.platform)
+    + _msgCtxRow('App version', m.app_ver)
+    + _msgCtxRow('Timezone', tz)
+    + (m.local_time || server
+        ? `<div class="msg-ctx-row"><span class="msg-ctx-k">Time</span><span class="msg-ctx-v">`
+          + (m.local_time ? `${esc(String(m.local_time))} <span class="msg-ctx-dim">sender</span>` : '')
+          + (m.local_time && server ? '<br>' : '')
+          + (server ? `${esc(server)} <span class="msg-ctx-dim">server</span>` : '')
+          + `</span></div>`
+        : '')
+    + loc;
+  if (!body) return;   // nothing to say, so say nothing
+
+  document.querySelectorAll('.msg-ctx-overlay').forEach(n => n.remove());
+  const o = document.createElement('div');
+  // `amux-dialog-backdrop` so this inherits the shared viewport treatment,
+  // including the safe-area top clamp, rather than growing a private copy.
+  o.className = 'amux-dialog-backdrop msg-ctx-overlay';
+  o.onclick = (ev) => { if (ev.target === o) o.remove(); };
+  o.innerHTML = `<div class="msg-ctx-box" onclick="event.stopPropagation()">`
+    + `<div class="msg-ctx-title">Message context</div>${body}`
+    + `<button class="btn msg-ctx-close" onclick="this.closest('.msg-ctx-overlay').remove()">Close</button>`
+    + `</div>`;
+  document.body.appendChild(o);
 }
 
 function _cmdHistItemHTML(e, ctx) {
@@ -17646,7 +17759,8 @@ function _cmdHistItemHTML(e, ctx) {
   const idTag = _mid
     ? `<code class="msg-id-badge" title="Message id — click to copy" onclick="event.stopPropagation();_copyMsgId('${esc(_mid)}')">MSG-${esc(_mid)}</code>`
     : '';
-  const meta = tag + _msgDeliveryChip(e) + _msgSubmitChip(e) + sessTag + tsTag + idTag
+  const meta = tag + _msgDeliveryChip(e) + _msgSubmitChip(e) + sessTag + tsTag
+    + _msgContextChip(e) + idTag
     + _msgCardChips(e);
   const locSess = (session || (typeof peekSession !== 'undefined' ? peekSession : '') || '').replace(/'/g,'');
   const _target = ctx.target(e) || locSess;
