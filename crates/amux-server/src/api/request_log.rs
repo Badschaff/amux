@@ -1246,6 +1246,8 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // AMUX-4682: deterministic stale/unverifiable dependency-citation scan.
     RouteEntry { path: "/api/debug/dependency-audit", methods: &["GET"] },
     RouteEntry { path: "/api/gmail/callback", methods: &["GET"] },
+    // AF-540 approval fate. Mounted at email.rs:71 and unlisted until AMUX-4668.
+    RouteEntry { path: "/api/email/approval/{id}", methods: &["GET"] },
     RouteEntry { path: "/invite/{token}", methods: &["GET", "POST"] },
     // -- core state
     RouteEntry { path: "/api/interactions/recent", methods: &["GET"] },
@@ -1536,6 +1538,10 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/board/changes", methods: &["GET"] },
     RouteEntry { path: "/api/board/bulk-migrate", methods: &["POST"] },
     RouteEntry { path: "/api/board/{id}/decompose", methods: &["POST"] },
+    RouteEntry { path: "/api/board/{id}/fan-out", methods: &["POST"] },
+    // b707aefd one-shot launch endpoint, caught unlisted by the completeness
+    // check in tests/route_table_completeness.rs minutes after it landed.
+    RouteEntry { path: "/api/board/launch", methods: &["POST"] },
     RouteEntry { path: "/api/board/needsyou", methods: &["GET"] },
     RouteEntry { path: "/api/schedules/{id}/skip", methods: &["POST"] },
     RouteEntry { path: "/api/search", methods: &["GET"] },
