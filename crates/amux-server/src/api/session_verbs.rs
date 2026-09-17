@@ -5737,6 +5737,22 @@ async fn steer_enqueue_precond_with_id(
                             "older pending recovery belongs to a replaced worker generation; only current recovery remains queued");
                     }
                 }
+                // A different parked card is not permission to stack another
+                // model turn before this worker receives its pending review.
+                // Enforce under the writer as well as board-drive's read gate.
+                if fixed.starts_with("board-blocker:") {
+                    use rusqlite::OptionalExtension;
+                    let pending: Option<String> = conn.query_row(
+                        "SELECT id FROM steering_queue WHERE session=?1 AND id GLOB 'board-blocker:*' AND id<>?2 LIMIT 1",
+                        rusqlite::params![session, fixed], |r|r.get(0)).optional()?;
+                    if let Some(pending) = pending {
+                        should_emit_w.store(false, std::sync::atomic::Ordering::SeqCst);
+                        if let Ok(mut value)=disposition_w.lock() { *value=StableEnqueueDisposition::AlreadyQueued; }
+                        if let Ok(mut id)=effective_id_w.lock() { *id=pending; }
+                        tracing::info!(session, verdict="blocker_recovery_pending", "another blocker review is already queued; no extra model turn");
+                        return Ok(crate::db::WriteOutcome {applied:false,events:vec![]});
+                    }
+                }
                 let delivered = conn
                     .query_row(
                         "SELECT 1 FROM steering_history WHERE id=?1 LIMIT 1",
@@ -31701,6 +31717,25 @@ mod steer_coalescing_tests {
         }).await.unwrap();
         assert!(enqueue_state_reminder(&st,"lane","New requirement","board-drive","TASK-1",3,"state-b").await.is_err(),"a void is not a delivered reminder");
         assert!(enqueue_state_reminder(&st,"lane","New requirement","board-drive","TASK-1",4,"state-b").await.unwrap(),"a stale revision can recover without a duplicate confirmed send");
+    }
+
+    #[tokio::test]
+    async fn only_one_blocker_review_waits_per_worker_even_for_different_cards() {
+        let (st,_d)=store().await;
+        assert!(enqueue_state_reminder(&st,"lane","Review A","board-drive","TASK-A",1,"board-blocker:a").await.unwrap());
+        assert!(!enqueue_state_reminder(&st,"lane","Review B","board-drive","TASK-B",1,"board-blocker:b").await.unwrap());
+        assert_eq!(pending(&st,"lane"),vec!["Review A"]);
+        st.write_async(|c| {
+            c.execute("INSERT INTO steering_history(id,session,text,queued_at,delivered_at,outcome) SELECT id,session,text,queued_at,2,'sent' FROM steering_queue",[])?;
+            c.execute("DELETE FROM steering_queue",[])?;
+            Ok(crate::db::WriteOutcome {applied:true,events:vec![]})
+        }).await.unwrap();
+        assert!(enqueue_state_reminder(&st,"lane","Review B","board-drive","TASK-B",1,"board-blocker:b").await.unwrap());
+        assert!(!enqueue_state_reminder(&st,"lane","Review B","board-drive","TASK-B",2,"board-blocker:b").await.unwrap());
+        assert_eq!(pending(&st,"lane"),vec!["Review B"]);
+        // Other state reminders still retain their independent identities.
+        assert!(enqueue_state_reminder(&st,"lane","Other C","board-drive","TASK-C",1,"state-c").await.unwrap());
+        assert_eq!(pending(&st,"lane").len(),2);
     }
 
     /// THE CELL THAT WOULD HAVE CAUGHT AMUX-3938. Two DIFFERENT board notes,

@@ -7118,10 +7118,13 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
             if fleet.auto_continue_enabled(lane) && dispatch_backlog_when_idle(lane) {
                 let recovery_lane = lane.to_string();
                 let recoveries = state.store.read_async(move |conn| {
-                    Ok(blocker_recoveries(conn, &recovery_lane)?)
+                    let pending: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM steering_queue WHERE session=?1 AND id GLOB 'board-blocker:*')", [&recovery_lane], |r|r.get(0))?;
+                    if pending { return Ok(None); }
+                    Ok(Some(blocker_recoveries(conn, &recovery_lane)?))
                 }).await;
                 let recoveries = match recoveries {
-                    Ok(rows) => rows,
+                    Ok(Some(rows)) => rows,
+                    Ok(None) => return LaneTrace::skip(lane, "blocker-recovery-pending", "one specific review is already awaiting delivery").with_counts(eligible, open),
                     Err(error) => return LaneTrace::skip(lane, "blocker-recovery-unmeasured", error.to_string()).with_counts(eligible, open),
                 };
                 let considered = recoveries.len();
@@ -9570,6 +9573,26 @@ mod tests {
         assert_eq!(drive_lane(&state, &fleet, "lane").await.outcome, "blocker-recovery");
         assert_eq!(drive_status(&store, "PARKED"), "backlog");
         assert_eq!(drive_events(&store, "task.blocker_recovery"), 2);
+    }
+
+    #[tokio::test]
+    async fn pending_blocker_review_suppresses_more_reviews_and_generic_nudges() {
+        let (_dir,state,store)=drive_state();
+        for id in ["PARKED-A","PARKED-B"] { drive_card(&store,id,"backlog","agent","code"); }
+        store.write(|conn| {
+            conn.execute("UPDATE issues SET blocked_on='peer availability' WHERE id LIKE 'PARKED-%'",[])?;
+            conn.execute("INSERT INTO steering_queue(id,session,text,queued_at,guard) VALUES ('board-blocker:first:1','lane','Review A',1,'board-drive')",[])?;
+            Ok(crate::db::WriteOutcome {applied:true,events:vec![]})
+        }).unwrap();
+        let fleet=BoundaryFleet::default();
+        for _ in 0..3 {
+            assert_eq!(drive_lane(&state,&fleet,"lane").await.reason,"blocker-recovery-pending");
+        }
+        assert!(fleet.delivered.lock().unwrap().is_empty());
+        assert_eq!(drive_events(&store,"task.blocker_recovery"),0);
+        store.write(|conn| {conn.execute("DELETE FROM steering_queue",[])?;
+            Ok(crate::db::WriteOutcome {applied:true,events:vec![]})}).unwrap();
+        assert_eq!(drive_lane(&state,&fleet,"lane").await.outcome,"blocker-recovery");
     }
 
     #[tokio::test]

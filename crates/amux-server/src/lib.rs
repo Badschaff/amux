@@ -111,11 +111,27 @@ use std::time::Instant;
 /// rule; ethos rule 4). Falls back to the compile-time version when the
 /// binary path is unreadable.
 pub fn build_hash() -> String {
-    (|| -> Option<String> {
-        let exe = std::env::current_exe().ok()?;
-        activation::file_build_hash(&exe).ok()
-    })()
-    .unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")))
+    // Identity belongs to this process image. Re-hashing the installed path
+    // per invariant row read tens of GB per pass while holding the sole writer
+    // (AF-911 / AMUX-4744). A replaced executable is a candidate until exec;
+    // activation::Candidate still hashes those on-disk candidates separately.
+    static RUNNING_BUILD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    RUNNING_BUILD.get_or_init(|| {
+        let measured = std::env::current_exe().ok()
+            .and_then(|exe| activation::file_build_hash(&exe).ok());
+        match measured {
+            Some(build) => {
+                tracing::info!(verdict="running_build_measured", %build, measured=true,
+                    "running executable identity measured once for this process");
+                build
+            }
+            None => {
+                tracing::warn!(verdict="running_build_unmeasured", measured=false,
+                    "running executable unreadable; using package version identity");
+                format!("v{}", env!("CARGO_PKG_VERSION"))
+            }
+        }
+    }).clone()
 }
 
 pub fn run() {

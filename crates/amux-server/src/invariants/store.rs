@@ -54,10 +54,9 @@ pub async fn record(store: &SharedStore, results: Vec<InvariantResult>, duration
             let ts = now();
             for r in &results {
                 conn.execute(
-                    // `build` is stamped per ROW rather than per batch: the
-                    // auto-builder can swap the binary mid-pass, and a
-                    // batch-level stamp would then claim one build for verdicts
-                    // produced by two (AMUX-4719).
+                    // Stamp the loaded process image on every row. Replacing
+                    // the file on disk does not change the code executing this
+                    // pass; build_hash caches startup identity until exec.
                     "INSERT INTO _amux_invariant_result
                        (ts, invariant_id, status, entity_key, expected, observed, evidence, duration_ms, build)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
@@ -312,6 +311,28 @@ pub fn result_log_stats(store: &SharedStore) -> anyhow::Result<(i64, f64)> {
 mod tests {
     use super::*;
     use crate::invariants::InvariantResult;
+
+    #[tokio::test]
+    async fn invariant_record_does_not_rehash_the_binary_inside_the_writer() {
+        let (s, _d) = store();
+        // Production measures identity at startup before starting jobs too.
+        let build = crate::build_hash();
+        let rows = (0..128).map(|n| {
+            let mut r=InvariantResult::pass("test.writer_latency");
+            r.entity_key=n.to_string(); r
+        }).collect();
+        let recording_store=s.clone();
+        let recording=tokio::spawn(async move {record(&recording_store,rows,0).await});
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let started=std::time::Instant::now();
+        s.write_async(|_|Ok(WriteOutcome {applied:false,events:vec![]})).await.unwrap();
+        assert!(started.elapsed()<std::time::Duration::from_secs(1),
+            "interactive write waited {:?} behind invariant recording",started.elapsed());
+        recording.await.unwrap();
+        let c=s.read().unwrap();
+        let stamped:i64=c.query_row("SELECT count(*) FROM _amux_invariant_result WHERE invariant_id='test.writer_latency' AND build=?1",[build],|r|r.get(0)).unwrap();
+        assert_eq!(stamped,128,"every result retains the executing image identity");
+    }
 
     /// AMUX-4538. A failing check's stored evidence reaches the reader through
     /// the SHIPPED writer (`record`) and reader (`latest_per_invariant`); a
