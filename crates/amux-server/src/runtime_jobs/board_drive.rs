@@ -5476,7 +5476,36 @@ pub fn select_advance_with(
             |r| r.get(0),
         )
         .unwrap_or(0);
+    // HOW MANY OF THOSE PICKUP WOULD REFUSE (AMUX-4748 follow-up).
+    //
+    // `queued` is a raw COUNT with no reachability filter, so 14 workable cards
+    // and 14 unclaimable ones produce the same number. That is the number Ethan
+    // read on 2026-09-17 while this lane sat idle: the nudge said "14 more
+    // card(s) queued" and every one of the 14 was being refused by the
+    // continuation gate for a missing `next_action`. A count that invites you
+    // to expect work, above a queue with none reachable in it.
+    //
+    // Counted over the SAME population as `queued`, so "N of M" is coherent.
+    // Zero when the gate is off for this lane, because then nothing is refused
+    // for this reason and a clause would be inventing a problem.
+    let unpickable: i64 = if bs::continuation_required(Some(session)) {
+        conn.prepare(
+            "SELECT COALESCE(next_action,'') FROM issues WHERE session=?1 AND deleted IS NULL \
+             AND COALESCE(archived,0)=0 AND status IN ('todo','backlog') AND owner_type='agent'",
+        )
+        .and_then(|mut stmt| {
+            let rows = stmt.query_map(rusqlite::params![session], |r| r.get::<_, String>(0))?;
+            Ok(rows
+                .filter_map(|na| na.ok())
+                .filter(|na| bs::continuation_verdict(na) != bs::ContinuationVerdict::Ok)
+                .count() as i64)
+        })
+        .unwrap_or(0)
+    } else {
+        0
+    };
     let text = advance_text(AdvanceMsg {
+        unpickable,
         card: &card_id,
         status: &status,
         title: &row.title,
@@ -5520,6 +5549,9 @@ struct AdvanceMsg<'a> {
     gate_txt: &'a str,
     term: &'a str,
     queued: i64,
+    /// How many of `queued` the continuation gate would refuse at pickup. Same
+    /// population as `queued`, so the two numbers are comparable.
+    unpickable: i64,
     reviewer: &'a str,
     ball_with_author: &'a str,
     item_type: &'a str,
@@ -5572,6 +5604,23 @@ fn advance_text(m: AdvanceMsg<'_>) -> String {
         )
     };
     let close_cmd = advance_cmd(m.card, m.term);
+    // A QUEUE DEPTH THAT DOES NOT SAY HOW MUCH OF IT IS REACHABLE IS WORSE THAN
+    // NO NUMBER (AMUX-4748 follow-up). "14 more queued" above 14 cards pickup
+    // refuses reads as "there is work waiting" and sends the lane looking for
+    // it. The remedy verb is spelled out literally for the same reason every
+    // other verb in this template is: `tests/nudge_commands_exist.rs` checks
+    // these against the CLI's dispatch table, and an interpolated verb is
+    // invisible to that guard.
+    let unpickable_note = if m.unpickable > 0 {
+        format!(
+            " {} of them cannot be picked up: no next_action, which the continuation \
+             gate refuses. Give one a continuation with `amux board next <ID> \"<what \
+             the next actor should do>\"` before counting on that queue.",
+            m.unpickable
+        )
+    } else {
+        String::new()
+    };
     let ball = if m.ball_with_author.is_empty() {
         String::new()
     } else {
@@ -5586,7 +5635,7 @@ fn advance_text(m: AdvanceMsg<'_>) -> String {
          4) Needs You only under scoped categories: {}. Ordinary choices are yours.\n\
          5) Cannot be done? `amux board fail {} --reason \"<why>\"` (quarantined, for the owner). \
          Mis-shaped? Discard or retype to watch.\n\n\
-         {} more queued. Update the card desc with current state before moving on.",
+         {} more queued.{} Update the card desc with current state before moving on.",
         m.card,
         m.status,
         quoted_card_text(&m.title.chars().take(110).collect::<String>(), m.card),
@@ -5600,6 +5649,7 @@ fn advance_text(m: AdvanceMsg<'_>) -> String {
         m.approval_types,
         m.card,
         m.queued,
+        unpickable_note,
     )
 }
 
@@ -13434,6 +13484,7 @@ mod tests {
             item_type: "code",
             has_evidence: true,
             approval_types: "budget, customer_outbound",
+            unpickable: 0,
         });
         for cmd in [
             "amux board review AX-1",
@@ -13459,11 +13510,72 @@ mod tests {
             item_type: "code",
             has_evidence: true,
             approval_types: "budget",
+            unpickable: 0,
         });
         assert!(waiting.contains("peer-lane"), "the reviewer must still be named:\n{waiting}");
         assert!(waiting.contains("amux board needs AX-2"), "a waiting card can still be blocked:\n{waiting}");
         assert!(waiting.contains("amux board fail AX-2"), "a waiting card can still fail:\n{waiting}");
         assert!(waiting.contains("amux board verified AX-2"), "its terminal is verified, not done:\n{waiting}");
+    }
+
+    /// AMUX-4748 follow-up: a queue depth must say how much of it is REACHABLE.
+    ///
+    /// On 2026-09-17 this lane sat idle while its nudge reported "14 more
+    /// card(s) queued". All 14 were being refused at pickup by the continuation
+    /// gate for a missing `next_action`. Nothing in the nudge said so, and a
+    /// bare count reads as "there is work waiting", which is how the idle was
+    /// read as the lane's fault rather than the queue's shape.
+    #[test]
+    fn the_queue_count_says_how_many_of_those_cards_pickup_would_refuse() {
+        let msg = |queued: i64, unpickable: i64| {
+            advance_text(AdvanceMsg {
+                card: "AX-3",
+                status: "doing",
+                title: "A card in flight",
+                gate_next: "review",
+                gate_txt: "  [ ] Implemented and merged",
+                term: "done",
+                queued,
+                unpickable,
+                reviewer: "",
+                ball_with_author: "",
+                item_type: "code",
+                has_evidence: true,
+                approval_types: "budget",
+            })
+        };
+
+        let stranded = msg(14, 14);
+        assert!(
+            stranded.contains("14 of them cannot be picked up"),
+            "the nudge must say how many are unreachable:\n{stranded}"
+        );
+        assert!(
+            stranded.contains("next_action"),
+            "it must name WHY they are refused, or the count is a dead end:\n{stranded}"
+        );
+        // The remedy has to be a verb the CLI dispatches. AMUX-2140: a nudge
+        // named `amux board claim`, the verb did not exist, the CLI printed
+        // help and exited 0, so following the instruction exactly produced a
+        // success signal and no claim.
+        assert!(
+            stranded.contains("amux board next "),
+            "it must name the verb that fixes it:\n{stranded}"
+        );
+
+        // THE CONTROL, and it is the half that can actually be got wrong: a
+        // healthy queue must not carry the clause. Without this the assertions
+        // above pass on an implementation that prints the warning always, which
+        // would tell every lane on every nudge that its queue is stranded.
+        let healthy = msg(14, 0);
+        assert!(
+            healthy.contains("14 more queued"),
+            "the plain count must survive:\n{healthy}"
+        );
+        assert!(
+            !healthy.contains("cannot be picked up"),
+            "a queue with nothing refused must not claim otherwise:\n{healthy}"
+        );
     }
 
     // --- backlog triage ---------------------------------------------------
