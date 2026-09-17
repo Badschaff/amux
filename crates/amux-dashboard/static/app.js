@@ -5603,10 +5603,12 @@ function render() {
           `<div class="card-log-hit" onclick="event.stopPropagation();openPeek('${s.name}',{query:'${sq}',hitIdx:${hi}})"><span class="log-hit-loc">${esc(s.name)}:${h.line}</span> <span class="log-hit-text">${esc(h.text.slice(0, 80))}</span></div>`
         ).join('') + (hits.length > 2 ? `<div class="card-log-hit" style="color:var(--dim);font-style:italic;" onclick="event.stopPropagation();openPeek('${s.name}',{query:'${sq}'})">+${hits.length - 2} more matches</div>` : '');
       })() : ''}
-      ${(isYolo || (provider && provider !== 'claude') || effort || s.backend === 'herdr' || model || (s.tags||[]).length) ? `<div class="badges">
+      ${(isYolo || (provider && provider !== 'claude') || effort || s.backend === 'herdr' || model || (s.tags||[]).length || s.worktree_active || s.ephemeral) ? `<div class="badges">
         ${s.backend === 'herdr' ? `<span class="badge herdr" title="Hosted on herdr">herdr</span>` : ''}
         ${provider && provider !== 'claude' ? `<span class="badge provider ${provider}" onclick="event.stopPropagation();editField('${s.name}','provider','${escJs(provider)}')" title="Change provider">${pLabel}</span>` : ''}
         ${isYolo ? '<span class="badge yolo">YOLO</span>' : ''}
+        ${s.worktree_active ? '<span class="badge worktree" title="Running in an isolated git worktree">worktree</span>' : ''}
+        ${s.ephemeral ? `<span class="badge ephemeral" title="Ephemeral fan-out worker${s.ephemeral_parent ? ' of ' + esc(s.ephemeral_parent) : ''}">eph${s.ephemeral_parent ? ' of ' + esc(s.ephemeral_parent) : ''}</span>` : ''}
         ${effort ? `<span class="badge effort" onclick="event.stopPropagation();editField('${s.name}','model','${esc(model)}','${esc(provider)}')" title="Reasoning effort — click to change">${esc(effort)}</span>` : ''}
         ${(s.tags||[]).map(g => `<span class="grp-chip" title="Filter by group ${esc(g)}" onclick="event.stopPropagation();toggleTagFilter('${escJs(g)}')">${esc(g)}</span>`).join('')}
         ${model ? `<span class="badge model card-model-inline" onclick="event.stopPropagation();editField('${s.name}','model','${esc(model)}','${esc(provider)}')" title="Change model">${esc(model)}</span>` : ''}
@@ -11217,7 +11219,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.974';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.975';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.

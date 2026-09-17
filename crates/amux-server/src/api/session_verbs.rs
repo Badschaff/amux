@@ -104,7 +104,7 @@ fn transcripts_dir() -> PathBuf {
 fn claude_home() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".claude")
 }
-fn env_path(name: &str) -> PathBuf {
+pub(crate) fn env_path(name: &str) -> PathBuf {
     sessions_dir().join(format!("{name}.env"))
 }
 fn meta_path(name: &str) -> PathBuf {
@@ -254,7 +254,7 @@ impl EnvFile {
     pub(crate) fn get(&self, key: &str) -> Option<&str> {
         self.pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
     }
-    fn get_or<'a>(&'a self, key: &str, default: &'a str) -> &'a str {
+    pub(crate) fn get_or<'a>(&'a self, key: &str, default: &'a str) -> &'a str {
         self.get(key).unwrap_or(default)
     }
     pub(crate) fn set(&mut self, key: &str, value: &str) {
@@ -9005,7 +9005,7 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
             return (false, error);
         }
     };
-    let work_dir = {
+    let mut work_dir = {
         let wd = pending_context.as_ref().map(|c| c.cwd.as_str())
             .unwrap_or_else(|| cfg.get_or("CC_DIR", "")).trim();
         let wd = if wd.is_empty() {
@@ -9018,6 +9018,33 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| expanduser(&wd).to_string_lossy().into_owned())
     };
+
+    // --- Worktree isolation (opt-in via CC_WORKTREE=1) ---
+    let worktree_enabled = cfg.get_or("CC_WORKTREE", "") == "1";
+    if worktree_enabled {
+        let wt_dir = home().join("worktrees").join(name);
+        let wt_path = wt_dir.to_string_lossy().into_owned();
+        // Clean up stale worktree from a previous run
+        if wt_dir.exists() {
+            let _ = run_cmd("git", &["-C", &work_dir, "worktree", "remove", "--force", &wt_path], OP_TIMEOUT).await;
+            if wt_dir.exists() {
+                let _ = tokio::fs::remove_dir_all(&wt_dir).await;
+            }
+        }
+        if let Some(parent) = wt_dir.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        match run_cmd("git", &["-C", &work_dir, "worktree", "add", "--detach", &wt_path, "HEAD"], OP_TIMEOUT).await {
+            Some(o) if o.status.success() => {
+                tracing::info!(session = name, worktree = %wt_path, "worktree created for isolated workspace");
+                work_dir = wt_path;
+            }
+            _ => {
+                tracing::warn!(session = name, "worktree creation failed, falling back to shared checkout");
+            }
+        }
+    }
+
     // AC-346: seed per-directory folder-trust so the claude about to launch in
     // work_dir does not stop at the first-run "trust this folder?" dialog. Runs
     // BEFORE the pane starts claude; strictly fail-open (see seed_dir_trust).
@@ -9998,7 +10025,7 @@ fn structured_resume_prompt(context: &StructuredResumeContext, reason: &str) -> 
 // for the shell, hard-kill on timeout. tmux stays alive.
 // ---------------------------------------------------------------------------
 
-async fn stop_session(state: &AppState, name: &str) -> (bool, String) {
+pub(crate) async fn stop_session(state: &AppState, name: &str) -> (bool, String) {
     if !valid_session_name(name) {
         return (false, "invalid session name".into());
     }
@@ -10013,6 +10040,7 @@ async fn stop_session(state: &AppState, name: &str) -> (bool, String) {
             return (false, format!("worker stopped but status reset failed: {error}"));
         }
     }
+    cleanup_worktree(name).await;
     result
 }
 
@@ -10129,6 +10157,37 @@ async fn stop_session_process(name: &str) -> (bool, String) {
         return (false, "could not confirm the worker process stopped".into());
     }
     (true, "stopped (hard-kill)".into())
+}
+
+/// Remove the per-worker worktree if one exists. Resolves the parent repo from
+/// the worktree's `.git` file so `git worktree remove` prunes the lock.
+async fn cleanup_worktree(name: &str) {
+    let wt_dir = home().join("worktrees").join(name);
+    if !wt_dir.exists() {
+        return;
+    }
+    let wt_path = wt_dir.to_string_lossy().into_owned();
+    // The worktree's .git is a file containing "gitdir: <repo>/.git/worktrees/<name>"
+    let repo_dir = match tokio::fs::read_to_string(wt_dir.join(".git")).await {
+        Ok(content) => {
+            content.strip_prefix("gitdir: ")
+                .and_then(|s| s.split("/.git/worktrees/").next())
+                .map(|s| s.trim().to_string())
+        }
+        Err(_) => None,
+    };
+    let removed = if let Some(ref repo) = repo_dir {
+        matches!(
+            run_cmd("git", &["-C", repo, "worktree", "remove", "--force", &wt_path], OP_TIMEOUT).await,
+            Some(o) if o.status.success()
+        )
+    } else {
+        false
+    };
+    if !removed && wt_dir.exists() {
+        let _ = tokio::fs::remove_dir_all(&wt_dir).await;
+    }
+    tracing::info!(session = name, worktree = %wt_path, "worktree cleaned up on stop");
 }
 
 async fn kill_tmux_session(name: &str) {

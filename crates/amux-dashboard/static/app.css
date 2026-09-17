@@ -493,6 +493,8 @@
     font-weight: 600; text-transform: uppercase; white-space: nowrap; flex-shrink: 0;
   }
   .badge.yolo { background: rgba(210,153,34,0.2); color: var(--yellow); }
+  .badge.worktree { background: rgba(45,212,191,0.15); color: #2dd4bf; border: 1px dashed rgba(45,212,191,0.4); }
+  .badge.ephemeral { background: rgba(251,146,60,0.15); color: #fb923c; }
   /* Mobile hit area: expanded to ~32px, NOT the 44px the css-mobile rule asks
      for, and that is a deliberate deviation rather than an oversight. 44px-tall
      pills would push the task label and preview below the fold on a 375px card,

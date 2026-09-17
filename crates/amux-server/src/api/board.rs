@@ -105,6 +105,7 @@ pub fn routes() -> Router<AppState> {
         // epic that the originating message already points at, and every child
         // is created with its owner, priority and dependency edges intact.
         .route("/{id}/decompose", post(decompose_item))
+        .route("/{id}/fan-out", post(fan_out_item))
         .route("/{id}/capsule", get(capsule))
         .route("/{id}/verifications", get(list_verifications))
         .route("/{id}/artifacts", get(list_artifacts).post(create_artifact))
@@ -6185,6 +6186,295 @@ async fn decompose_item(
                 .into_response()
         }
         None => internal("decompose produced no outcome"),
+    }
+}
+
+// ---- Ephemeral fan-out (plan task #6) -----------------------------------
+
+#[derive(Deserialize)]
+struct FanOutBody {
+    model: Option<String>,
+    provider: Option<String>,
+    flags: Option<String>,
+}
+
+/// POST /api/board/{id}/fan-out — spin up ephemeral workers for an epic's children.
+///
+/// The epic must already be decomposed (have children). For each non-terminal
+/// child card, the handler: (1) creates a session env file with CC_WORKTREE=1,
+/// CC_EPHEMERAL=1, and self-containment flags, (2) reassigns the child card's
+/// session to the ephemeral worker, (3) starts the worker. The epic card tracks
+/// overall progress; `complete_finished_epics` in board_drive auto-completes it
+/// when all children reach terminal status; the reaper tears down the ephemeral
+/// workers afterward.
+async fn fan_out_item(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<FanOutBody>,
+) -> Response {
+    use crate::api::session_verbs::{self, EnvFile, env_path, start_session};
+
+    let (_, actor) = actor_from_headers(&headers);
+    if actor == "api-anonymous" {
+        return err(
+            StatusCode::UNAUTHORIZED,
+            json!({"error": "fan-out requires X-Amux-Worker or X-Amux-Session attribution"}),
+        );
+    }
+
+    // Phase 1: DB read+write (reassign child sessions) inside write_async
+    #[derive(Debug)]
+    enum Out {
+        Missing,
+        NotEpic,
+        NoChildren,
+        WrongOwner(String),
+        Fanned {
+            epic: Box<IssueRow>,
+            children: Vec<(IssueRow, String)>,
+        },
+    }
+
+    let model = body.model.unwrap_or_else(|| "haiku".into());
+    let provider = body.provider.unwrap_or_else(|| "claude".into());
+    let extra_flags = body.flags.unwrap_or_default();
+    let id_w = id.clone();
+    let actor_w = actor.clone();
+    let model_w = model.clone();
+    let slot: Arc<Mutex<Option<Out>>> = Arc::new(Mutex::new(None));
+    let slot_w = slot.clone();
+
+    let write = state
+        .store
+        .write_async(move |conn| {
+            let Some(parent) = bs::get_issue(conn, &id_w)? else {
+                return finish(&slot_w, Out::Missing, no_write());
+            };
+            if parent.item_type != "epic" {
+                return finish(&slot_w, Out::NotEpic, no_write());
+            };
+            if parent
+                .session
+                .as_deref()
+                .is_some_and(|owner| owner != actor_w)
+            {
+                return finish(
+                    &slot_w,
+                    Out::WrongOwner(parent.session.clone().unwrap_or_default()),
+                    no_write(),
+                );
+            }
+
+            let child_ids: Vec<String> = {
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM issues WHERE epic=?1 AND deleted IS NULL ORDER BY created,id",
+                )?;
+                let ids = stmt.query_map(rusqlite::params![id_w], |r| r.get::<_, String>(0))?
+                    .flatten()
+                    .collect::<Vec<_>>();
+                ids
+            };
+            if child_ids.is_empty() {
+                return finish(&slot_w, Out::NoChildren, no_write());
+            }
+
+            let terminal: HashSet<&str> = ["done", "verified", "discarded"].iter().copied().collect();
+            let now = now_secs();
+            let stamp = chrono::Local::now().format("%H:%M").to_string();
+            let mut events = Vec::new();
+            let mut children = Vec::new();
+
+            for cid in &child_ids {
+                let Some(mut child) = bs::get_issue(conn, cid)? else {
+                    continue;
+                };
+                if terminal.contains(child.status.as_str()) {
+                    continue;
+                }
+                let suffix = if cid.len() > 8 { &cid[..8] } else { cid };
+                let eph_name = format!("{actor_w}-eph-{suffix}");
+
+                child.session = Some(eph_name.clone());
+                if child.status == "backlog" {
+                    child.status = "todo".into();
+                }
+                child.updated = now;
+                child.rev += 1;
+                child.version += 1;
+                child.log = Some(bs::append_log(
+                    child.log.as_deref(),
+                    &stamp,
+                    &format!(
+                        "fan-out: assigned to ephemeral worker {eph_name} (model={model_w}) by {actor_w}",
+                    ),
+                ));
+                bs::save_patched(conn, &mut child)?;
+                events.push(ev_snap(&child, MutationKind::Updated));
+                children.push((child, eph_name));
+            }
+
+            if children.is_empty() {
+                return finish(&slot_w, Out::NoChildren, no_write());
+            }
+
+            // Log on the epic itself
+            let mut epic = parent;
+            epic.updated = now;
+            epic.rev += 1;
+            epic.version += 1;
+            epic.log = Some(bs::append_log(
+                epic.log.as_deref(),
+                &stamp,
+                &format!(
+                    "fan-out: {} ephemeral worker(s) created by {actor_w} (model={model_w})",
+                    children.len(),
+                ),
+            ));
+            bs::save_patched(conn, &mut epic)?;
+            events.push(ev_snap(&epic, MutationKind::Updated));
+
+            finish(
+                &slot_w,
+                Out::Fanned {
+                    epic: Box::new(epic),
+                    children,
+                },
+                WriteOutcome {
+                    applied: true,
+                    events,
+                },
+            )
+        })
+        .await;
+
+    if let Err(e) = write {
+        return internal(e);
+    }
+
+    let outcome = slot.lock().expect("fan-out slot poisoned").take();
+    match outcome {
+        Some(Out::Missing) => not_found(&id),
+        Some(Out::NotEpic) => err(
+            StatusCode::CONFLICT,
+            json!({"error": "card is not an epic; decompose it first", "item": id}),
+        ),
+        Some(Out::NoChildren) => err(
+            StatusCode::CONFLICT,
+            json!({"error": "epic has no non-terminal children to fan out", "item": id}),
+        ),
+        Some(Out::WrongOwner(owner)) => err(
+            StatusCode::FORBIDDEN,
+            json!({"error": "epic belongs to another worker", "item": id, "owner": owner, "caller": actor}),
+        ),
+        Some(Out::Fanned { epic, children }) => {
+            // Phase 2: async work (env files + start sessions)
+            let parent_cfg = session_verbs::parse_env(&actor);
+            let parent_dir = parent_cfg.get_or("CC_DIR", "");
+            let mut started = Vec::new();
+            let mut failed = Vec::new();
+
+            for (child, eph_name) in &children {
+                let mut env = EnvFile::load(std::path::Path::new(""));
+                env.set("CC_DIR", parent_dir);
+                env.set("CC_WORKTREE", "1");
+                env.set("CC_EPHEMERAL", "1");
+                env.set("CC_PARENT", &actor);
+                env.set("CC_PROVIDER", &provider);
+                env.set("CC_TAGS", "ephemeral");
+                env.set("CC_CREATOR", &format!("fan-out:{actor}"));
+                env.set("AMUX_DISPATCH_BACKLOG_WHEN_IDLE", "0");
+                env.set("AMUX_BOARD_DELEGATION", "0");
+
+                let model_flag = format!("--model {} --dangerously-skip-permissions", model);
+                let flags = if extra_flags.is_empty() {
+                    model_flag
+                } else {
+                    format!("{model_flag} {extra_flags}")
+                };
+                env.set("CC_FLAGS", &flags);
+
+                if let Some(ac) = child.acceptance_criteria.as_deref() {
+                    env.set("CC_ACCEPTANCE_CRITERIA", ac);
+                }
+                env.set("CC_DESC", &format!(
+                    "Ephemeral worker for: {}",
+                    child.title.chars().take(120).collect::<String>()
+                ));
+
+                let ep = env_path(eph_name);
+                if let Err(e) = env.write(&ep) {
+                    tracing::error!(
+                        session = %eph_name,
+                        error = %e,
+                        "fan-out: failed to write env file"
+                    );
+                    failed.push(json!({
+                        "name": eph_name,
+                        "error": format!("env write: {e}"),
+                    }));
+                    continue;
+                }
+
+                let (ok, detail) = start_session(&state, eph_name, "", true).await;
+                if ok {
+                    tracing::info!(
+                        target: "amux::board",
+                        session = %eph_name,
+                        card = %child.id,
+                        model = %model,
+                        epic = %epic.id,
+                        parent = %actor,
+                        verdict = "ephemeral_started",
+                        measured = true,
+                        "fan-out: ephemeral worker started"
+                    );
+                    started.push(eph_name.clone());
+                } else {
+                    tracing::warn!(
+                        target: "amux::board",
+                        session = %eph_name,
+                        card = %child.id,
+                        error = %detail,
+                        "fan-out: failed to start ephemeral worker"
+                    );
+                    failed.push(json!({
+                        "name": eph_name,
+                        "error": detail,
+                    }));
+                }
+            }
+
+            tracing::info!(
+                target: "amux::board",
+                epic = %epic.id,
+                workers_started = started.len(),
+                workers_failed = failed.len(),
+                model = %model,
+                parent = %actor,
+                verdict = "fan_out_complete",
+                measured = true,
+                n_considered = children.len(),
+                "board epic fan-out completed"
+            );
+
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "ok": true,
+                    "epic": id,
+                    "model": model,
+                    "workers_started": started.len(),
+                    "workers_failed": failed.len(),
+                    "started": started,
+                    "failed": failed,
+                    "measured": true,
+                    "n_considered": children.len(),
+                })),
+            )
+                .into_response()
+        }
+        None => internal("fan-out produced no outcome"),
     }
 }
 

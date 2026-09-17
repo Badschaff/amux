@@ -676,6 +676,7 @@ pub struct DriveReport {
     /// only ever scanned `backlog`, so a dependency-blocked card stayed blocked
     /// after its blocker finished; this count is how that pass is watched.
     pub unblocked_blocked: usize,
+    pub reaped_ephemeral: usize,
     pub lanes: Vec<LaneTrace>,
 }
 
@@ -2679,6 +2680,104 @@ mod epic_completion_unit_tests {
         assert_eq!(got[0].0, "E-1");
         assert_eq!(got[0].1.len(), 2);
     }
+}
+
+/// Reap ephemeral workers whose cards are all terminal.
+///
+/// Scans env files for CC_EPHEMERAL=1. For each, queries the board: if every
+/// card assigned to that session is in a terminal status (done/verified/discarded),
+/// the worker is stopped, its worktree cleaned up, and its env file removed.
+/// Returns how many were reaped.
+pub(crate) async fn reap_ephemeral_workers(state: &AppState) -> usize {
+    use crate::api::session_verbs::{self, EnvFile, env_path, home};
+
+    let sessions_dir = home().join("sessions");
+    let entries = match std::fs::read_dir(&sessions_dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+
+    let mut ephemeral_names = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(fname) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !fname.ends_with(".env") || fname.starts_with('.') {
+            continue;
+        }
+        let name = fname.trim_end_matches(".env");
+        let cfg = EnvFile::load(&path);
+        if cfg.get("CC_EPHEMERAL") == Some("1") {
+            ephemeral_names.push(name.to_string());
+        }
+    }
+
+    if ephemeral_names.is_empty() {
+        return 0;
+    }
+
+    let terminal: HashSet<&str> = ["done", "verified", "discarded"].iter().copied().collect();
+    let mut reaped = 0;
+
+    for name in &ephemeral_names {
+        let all_terminal = match state.store.read() {
+            Ok(conn) => {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT status FROM issues WHERE session=?1 AND deleted IS NULL",
+                    )
+                    .unwrap_or_else(|_| panic!("reaper query"));
+                let statuses: Vec<String> = stmt
+                    .query_map(rusqlite::params![name], |r| r.get(0))
+                    .unwrap_or_else(|_| panic!("reaper query_map"))
+                    .flatten()
+                    .collect();
+                !statuses.is_empty() && statuses.iter().all(|s| terminal.contains(s.as_str()))
+            }
+            Err(_) => continue,
+        };
+
+        if !all_terminal {
+            continue;
+        }
+
+        let (stopped, detail) = session_verbs::stop_session(state, name).await;
+        if !stopped {
+            tracing::warn!(
+                target: "amux::board_drive",
+                session = %name,
+                detail = %detail,
+                verdict = "ephemeral_reap_stop_failed",
+                measured = true,
+                "reaper: could not stop ephemeral worker"
+            );
+        }
+
+        let ep = env_path(name);
+        if ep.exists() {
+            if let Err(e) = std::fs::remove_file(&ep) {
+                tracing::warn!(
+                    target: "amux::board_drive",
+                    session = %name,
+                    error = %e,
+                    "reaper: failed to remove env file"
+                );
+            }
+        }
+
+        tracing::info!(
+            target: "amux::board_drive",
+            session = %name,
+            verdict = "ephemeral_reaped",
+            measured = true,
+            n_considered = 1,
+            "reaper: ephemeral worker reaped (all cards terminal)"
+        );
+        reaped += 1;
+    }
+
+    reaped
 }
 
 /// The revisit-date arm: promote `backlog` cards whose own due date arrived,
@@ -6144,6 +6243,7 @@ pub async fn drive_tick<F: Fleet>(state: &AppState, fleet: &F) -> DriveReport {
     // Complete root epics before dispatch so the Messages chip and the board
     // agree that a command is finished as soon as all of its leaves are.
     report.completed_epics = complete_finished_epics(state).await;
+    report.reaped_ephemeral = reap_ephemeral_workers(state).await;
     // DRIVE TO VERIFIED, BEFORE DISPATCH. A card parked in `backlog` on a
     // `depends_on` dependency re-activates to `todo` the moment every dependency
     // reaches a terminal status, so a "do B after A" command completes instead

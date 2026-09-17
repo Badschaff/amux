@@ -768,6 +768,28 @@ cmd_start() {
   esac
   [[ -d "$dir" ]] || die "directory not found: $dir"
 
+  # --- Worktree isolation (opt-in via CC_WORKTREE=1) ---
+  # When enabled, each worker gets its own git worktree so it cannot read or
+  # clobber a peer's uncommitted edits. The worktree is created at start and
+  # removed at stop; it shares the .git object store (no disk duplication).
+  # Skip for dry-run: no tmux session follows, so the worktree would be orphaned.
+  local worktree_dir=""
+  if ! $dry_run && [[ "${CC_WORKTREE:-}" == "1" ]] && git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; then
+    worktree_dir="$CC_HOME/worktrees/$name"
+    if [[ -d "$worktree_dir" ]]; then
+      # Stale worktree from a previous run that wasn't cleaned up
+      git -C "$dir" worktree remove --force "$worktree_dir" 2>/dev/null || rm -rf "$worktree_dir"
+    fi
+    mkdir -p "$(dirname "$worktree_dir")"
+    if git -C "$dir" worktree add --detach "$worktree_dir" HEAD 2>/dev/null; then
+      echo "  ${DIM}worktree: $worktree_dir${RESET}"
+      dir="$worktree_dir"
+    else
+      echo "${YELLOW}warn: worktree creation failed, falling back to shared checkout${RESET}" >&2
+      worktree_dir=""
+    fi
+  fi
+
   # codex/ollama: DELEGATE the launch to the server (POST /api/sessions/<n>/start)
   # instead of building the command + tmux session here (AMUX-3164). The server's
   # start_session seeds codex dir-trust (~/.codex/config.toml, AC-356) AND forces
@@ -906,6 +928,9 @@ cmd_start() {
   fi
   if $dry_run; then
     echo "${BOLD}$name${RESET} in $dir"
+    if [[ "${CC_WORKTREE:-}" == "1" ]]; then
+      echo "  ${DIM}worktree: $CC_HOME/worktrees/$name (created on real start)${RESET}"
+    fi
     echo "  ${DIM}$cmd${RESET}"
     return
   fi
@@ -1529,6 +1554,22 @@ cmd_stop() {
   else
     echo "${DIM}$name is not running${RESET}"
   fi
+
+  # Clean up worktree if one exists for this session
+  local wt_dir="$CC_HOME/worktrees/$name"
+  if [[ -d "$wt_dir" ]]; then
+    # Resolve the repo that owns this worktree from the .git file
+    local repo_dir=""
+    if [[ -f "$wt_dir/.git" ]]; then
+      repo_dir=$(sed -n 's/^gitdir: \(.*\)\/\.git\/worktrees\/.*/\1/p' "$wt_dir/.git")
+    fi
+    if [[ -n "$repo_dir" ]] && git -C "$repo_dir" worktree remove --force "$wt_dir" 2>/dev/null; then
+      echo "  ${DIM}worktree removed: $wt_dir${RESET}"
+    else
+      rm -rf "$wt_dir"
+      echo "  ${DIM}worktree cleaned: $wt_dir${RESET}"
+    fi
+  fi
 }
 
 cmd_pause() {
@@ -1609,9 +1650,23 @@ cmd_rm() {
   local name
   name=$(resolve_session "${1:-}")
 
-  # Stop if running
+  # Stop if running (also cleans up any worktree)
   if is_running "$name" 2>/dev/null; then
     cmd_stop "$name"
+  else
+    # Not running, but a stale worktree might still exist
+    local wt_dir="$CC_HOME/worktrees/$name"
+    if [[ -d "$wt_dir" ]]; then
+      local repo_dir=""
+      if [[ -f "$wt_dir/.git" ]]; then
+        repo_dir=$(sed -n 's/^gitdir: \(.*\)\/\.git\/worktrees\/.*/\1/p' "$wt_dir/.git")
+      fi
+      if [[ -n "$repo_dir" ]]; then
+        git -C "$repo_dir" worktree remove --force "$wt_dir" 2>/dev/null || rm -rf "$wt_dir"
+      else
+        rm -rf "$wt_dir"
+      fi
+    fi
   fi
 
   rm -f "$CC_SESSIONS/$name.env"
@@ -1626,6 +1681,12 @@ cmd_info() {
   echo "${BOLD}$name${RESET}"
   echo "  dir:   ${CC_DIR:-"(not set)"}"
   echo "  flags: ${CC_FLAGS:-"(none)"}"
+  local wt_dir="$CC_HOME/worktrees/$name"
+  if [[ -d "$wt_dir" ]]; then
+    echo "  worktree: $wt_dir"
+  elif [[ "${CC_WORKTREE:-}" == "1" ]]; then
+    echo "  worktree: ${DIM}enabled (created on start)${RESET}"
+  fi
   if is_running "$name" 2>/dev/null; then
     echo "  status: ${GREEN}running${RESET}"
   else
@@ -3228,6 +3289,52 @@ Every child needs a concrete description, next_action, and 1-12 falsifiable acce
       echo "$result" | _board_outcome "$id" "" "decomposed atomically"
       return $?
       ;;
+    fan-out|fanout)
+      local id="${1:-}"
+      local help='Usage: amux board fan-out <EPIC-ID> [--model MODEL] [--provider PROVIDER] [--flags "extra flags"]'
+      if [[ "$id" == --help || "$id" == -h ]]; then
+        printf '%s\n' "$help"
+        return 0
+      fi
+      [[ -n "$id" ]] || die "$help"
+      _board_id_guard "fan-out" "$id"
+      shift
+      local model="" provider="" flags=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --model) [[ -n "${2:-}" ]] || die "amux board fan-out: --model needs a value"; model="$2"; shift 2 ;;
+          --provider) [[ -n "${2:-}" ]] || die "amux board fan-out: --provider needs a value"; provider="$2"; shift 2 ;;
+          --flags) [[ -n "${2:-}" ]] || die "amux board fan-out: --flags needs a value"; flags="$2"; shift 2 ;;
+          --*) _board_bad_flag fan-out "$1" "--model <model> --provider <provider> --flags <extra>" ;;
+          *) die "amux board fan-out: unexpected argument '$1'" ;;
+        esac
+      done
+      local body='{'
+      [[ -n "$model" ]] && body+="\"model\":\"$model\","
+      [[ -n "$provider" ]] && body+="\"provider\":\"$provider\","
+      [[ -n "$flags" ]] && body+="\"flags\":\"$flags\","
+      body="${body%,}}"
+      local result
+      result=$(_curl -sk -X POST -H 'Content-Type: application/json' \
+        -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
+        -d "$body" "$AMUX_API/api/board/$id/fan-out")
+      local started; started=$(echo "$result" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("workers_started",0))' 2>/dev/null || echo "?")
+      local failed; failed=$(echo "$result" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("workers_failed",0))' 2>/dev/null || echo "?")
+      if echo "$result" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("ok") else 1)' 2>/dev/null; then
+        echo "fan-out: $started worker(s) started, $failed failed"
+        echo "$result" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+for n in d.get("started",[]): print(f"  started: {n}")
+for f in d.get("failed",[]): print(f"  FAILED:  {f[\"name\"]}: {f[\"error\"]}")
+' 2>/dev/null
+        return 0
+      else
+        echo "fan-out failed:" >&2
+        echo "$result" >&2
+        return 1
+      fi
+      ;;
     artifact)
       # The API has had a structured artifact registry since migration 0046,
       # but workers had no attributed CLI path to write it. A registry nobody
@@ -4362,6 +4469,9 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
   amux board decompose <ID> --stdin Atomically turn a captured prompt into an epic
                                    plus ordered child tasks with dependencies,
                                    p0-p3 priorities and concrete next actions.
+  amux board fan-out <EPIC-ID>     Spin up ephemeral workers for each child card
+    [--model M] [--provider P]     of an already-decomposed epic. Each worker gets
+    [--flags "extra"]              its own worktree and board card.
   amux board artifact <ID> <ref>   Register a file, URL, commit, PR, screenshot or
                                    verification asset on the task.
   amux board reviewer <ID> <W>     Name the peer a card in review is handed to
