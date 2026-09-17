@@ -2030,6 +2030,45 @@ mod tests {
         send_with(app, method, path, body, &[]).await
     }
 
+    /// Like `read_fixture_sessions`, but bounded by a DEADLINE instead of an
+    /// attempt count, for the two tests that read the REAL handler.
+    ///
+    /// AMUX-4647. `SESSIONS_EPOCH` is process-wide, 12 call sites bump it, and
+    /// cargo runs this binary's tests in parallel, so a sibling create or delete
+    /// invalidates this build. Measured on this host: 7 of 10 module runs failed,
+    /// every one of them `legacy_sessions_stores_do_not_share_cached_rows` at the
+    /// assert after its retry loop.
+    ///
+    /// SEPARATE FROM `read_fixture_sessions` ON PURPOSE. That helper's attempt
+    /// count is a pinned contract:
+    /// `fixture_session_reader_preserves_errors_and_bounds_epoch_churn` stands up
+    /// a stub router and asserts EXACTLY 5 reads for the race body and 1 for any
+    /// other error. Widening it in place made that test spin 722 times against a
+    /// stub that returns the same refusal by construction, which is how I learned
+    /// the count is load-bearing rather than incidental.
+    ///
+    /// Still fails closed: only the one explicit race body is retried, every
+    /// other status and body returns immediately, and an exhausted deadline
+    /// returns the last refusal for the caller to assert on.
+    async fn read_real_sessions_settled(app: &axum::Router, stage: &str) -> (StatusCode, HeaderMap, Value) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut attempts = 0u32;
+        loop {
+            let result = send(app, "GET", "/api/sessions", None).await;
+            attempts += 1;
+            let racing = result.0 == StatusCode::SERVICE_UNAVAILABLE
+                && result.2["error"].as_str() == Some("sessions list changed during discovery; retry");
+            if !racing || std::time::Instant::now() >= deadline {
+                if racing {
+                    eprintln!("{}", json!({"verdict":"discovery_deadline_exhausted", "stage":stage,
+                        "attempts":attempts, "measured":true, "n_considered":1}));
+                }
+                return result;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
     // AF-766: both phases of the sticky truth fixture share this bounded
     // response policy. Other tests may invalidate the process-wide epoch.
     async fn read_fixture_sessions(app: &axum::Router, stage: &str) -> (StatusCode, HeaderMap, Value) {
@@ -2685,19 +2724,7 @@ mod tests {
         // Bare /api/sessions now serves the PYTHON SHAPE (bare array from
         // the dedicated handler, no Deprecated header) — the SPA's
         // fetchSessions throws on anything else (browser-golden finding #3).
-        let (mut st, mut headers, mut legacy) = send(&app, "GET", "/api/sessions", None).await;
-        // Parallel worker tests can invalidate the global discovery revision.
-        // Retry only its explicit fail-closed response; other failures retain
-        // their body below and must not be hidden by a general retry.
-        for attempt in 1..5 {
-            if st != StatusCode::SERVICE_UNAVAILABLE
-                || legacy["error"].as_str() != Some("sessions list changed during discovery; retry")
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50 * attempt)).await;
-            (st, headers, legacy) = send(&app, "GET", "/api/sessions", None).await;
-        }
+        let (st, headers, legacy) = read_real_sessions_settled(&app, "deprecated-header").await;
         assert_eq!(st, StatusCode::OK, "legacy discovery response: {legacy}");
         assert!(headers.get("deprecated").is_none());
         let arr = legacy.as_array().expect("bare array");
@@ -2733,17 +2760,7 @@ mod tests {
             (&second, "second-store-worker"),
             (&first, "first-store-worker"),
         ] {
-            let (mut status, _, mut rows) = send(app, "GET", "/api/sessions", None).await;
-            for attempt in 1..5 {
-                if status != StatusCode::SERVICE_UNAVAILABLE
-                    || rows["error"].as_str()
-                        != Some("sessions list changed during discovery; retry")
-                {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50 * attempt)).await;
-                (status, _, rows) = send(app, "GET", "/api/sessions", None).await;
-            }
+            let (status, _, rows) = read_real_sessions_settled(app, "stores-do-not-share").await;
             assert_eq!(status, StatusCode::OK, "{rows}");
             let rows = rows.as_array().expect("legacy rows");
             assert_eq!(rows.len(), 1, "{rows:?}");
