@@ -178,11 +178,16 @@ async fn needsyou_queue(
     // One `today` for the whole pass: computing it per row could straddle
     // midnight mid-sort and make two cards disagree about what "due today" is.
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    // ONE pass for every row's blast radius, not one query per row. This was an
+    // N+1 over an unindexable `LIKE '%id%'` (the planner answers SCAN issues),
+    // measured at 52.7ms x 257 rows = 13.6s against 12.2-14.3s observed on a
+    // 26KB response (AMUX-4618).
+    let radii = bs::blast_radius_many(&conn, &rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>());
     let mut scored: Vec<(bool, f64, Value)> = rows
         .iter()
         .map(|r| {
             let age_days = ((now - r.created as f64) / 86_400.0).max(0.0);
-            let radius = bs::blast_radius(&conn, &r.id);
+            let radius = radii.get(&r.id).copied().unwrap_or(0);
             // radius + 1, so a card nobody depends on still ranks by age
             // instead of scoring zero and sinking below every card forever.
             let score = age_days * (radius + 1) as f64;

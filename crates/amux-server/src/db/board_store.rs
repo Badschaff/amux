@@ -577,6 +577,55 @@ pub fn continuation_applies(status: TaskStatus) -> bool {
 /// lanes are blocked behind costs three lanes a day. The owner's scarce
 /// resource is attention, so the ranking has to be by what clearing it
 /// RELEASES, which is the one thing the board actually knows.
+/// Blast radius for MANY ids in ONE pass.
+///
+/// AMUX-4618. `needsyou_queue` scored every row with `blast_radius`, which is an
+/// N+1 over a query that cannot use an index: `depends_on LIKE '%id%'` has a
+/// LEADING wildcard, so the planner answers `SCAN issues` across all 21,592
+/// rows. Measured 2026-09-16 on the live board: 52.7ms per call, 257 needsyou
+/// rows, 13.6s projected against 12.2-14.3s actually observed on the endpoint.
+/// The payload is 26KB, so none of that was serialisation.
+///
+/// This scans once. Only 223 rows in that population carry a non-empty
+/// `depends_on` at all, so the work after the scan is counting a few hundred
+/// short JSON arrays.
+///
+/// AND IT FIXES AN OVER-COUNT. `LIKE '%id%'` is a SUBSTRING match, so
+/// `blast_radius("BR-1")` counts a card that depends on BR-18, BR-115, BR-13 or
+/// BR-12. Measured on the live board: 26 such collisions among ids that are
+/// actually depended on. The score ranks the owner's queue and that queue is
+/// capped, so an inflated card can displace a real one. Parsing the JSON and
+/// comparing ids exactly removes the whole class.
+pub fn blast_radius_many(
+    conn: &Connection,
+    ids: &[String],
+) -> std::collections::HashMap<String, i64> {
+    let mut out: std::collections::HashMap<String, i64> =
+        ids.iter().map(|i| (i.clone(), 0)).collect();
+    if ids.is_empty() {
+        return out;
+    }
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT depends_on FROM issues WHERE deleted IS NULL AND archived = 0 \
+         AND status NOT IN ('done','verified','discarded') \
+         AND depends_on IS NOT NULL AND depends_on NOT IN ('','[]')",
+    ) else {
+        return out;
+    };
+    let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) else {
+        return out;
+    };
+    for dep_json in rows.flatten() {
+        let deps: Vec<String> = serde_json::from_str(&dep_json).unwrap_or_default();
+        for d in deps {
+            if let Some(n) = out.get_mut(&d) {
+                *n += 1;
+            }
+        }
+    }
+    out
+}
+
 pub fn blast_radius(conn: &Connection, id: &str) -> i64 {
     let like = format!("%{id}%");
     conn.query_row(
@@ -4331,6 +4380,54 @@ mod tests {
 
     fn create_db() -> Connection {
         crate::db::migrate::test_memdb()
+    }
+
+    /// AMUX-4618. `blast_radius` was called once per needsyou row over a query
+    /// the planner answers with `SCAN issues`, and its `LIKE '%id%'` is a
+    /// SUBSTRING match, so it was both slow and wrong.
+    #[test]
+    fn blast_radius_counts_exact_dependents_in_one_pass() {
+        let conn = create_db();
+        let mk = |id: &str, deps: &str, status: &str| {
+            conn.execute(
+                "INSERT INTO issues (id, title, status, archived, depends_on, created, updated) \
+                 VALUES (?1, 't', ?2, 0, ?3, 1, 1)",
+                rusqlite::params![id, status, deps],
+            )
+            .unwrap();
+        };
+        // Two live cards depend on BR-1, one on BR-18.
+        mk("BR-1", "[]", "needsyou");
+        mk("BR-18", "[]", "needsyou");
+        mk("a", r#"["BR-1"]"#, "todo");
+        mk("b", r#"["BR-1"]"#, "todo");
+        mk("c", r#"["BR-18"]"#, "todo");
+        // Terminal and archived dependents must not count, which is the filter
+        // the original query already had and this must keep.
+        mk("d", r#"["BR-1"]"#, "done");
+
+        let ids = vec!["BR-1".to_string(), "BR-18".to_string()];
+        let r = blast_radius_many(&conn, &ids);
+
+        // THE OVER-COUNT, which is the point of the exact match. `LIKE '%BR-1%'`
+        // matches the row depending on BR-18, so the old path answered 3 here.
+        // Measured on the live board: 26 such prefix collisions among ids that
+        // are actually depended on.
+        assert_eq!(r.get("BR-1"), Some(&2), "BR-18's dependent must not count toward BR-1: {r:?}");
+        assert_eq!(r.get("BR-18"), Some(&1));
+
+        // POSITIVE CONTROL: the old substring query really does answer 3, so the
+        // cell above is about a behaviour that changed rather than one that was
+        // always right.
+        assert_eq!(blast_radius(&conn, "BR-1"), 3, "the substring query over-counts, which is why this exists");
+
+        // An id nobody depends on is 0 and PRESENT, not missing: the caller
+        // scores every row and a missing key would silently become a default.
+        let none = blast_radius_many(&conn, &["BR-999".to_string()]);
+        assert_eq!(none.get("BR-999"), Some(&0));
+
+        // No ids asked for, no work done.
+        assert!(blast_radius_many(&conn, &[]).is_empty());
     }
 
     /// AMUX-3949. THE CARD'S CHECK: a card blocked in `review` and one blocked
