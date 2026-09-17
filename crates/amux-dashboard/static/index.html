@@ -2882,6 +2882,10 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       </select>
     </div>
     <div id="cmd-history-filter" style="display:flex;gap:6px;flex-wrap:nowrap;overflow-x:auto;padding-bottom:10px;align-items:center;scrollbar-width:none;"></div>
+    <!-- AMUX-4695. EMPTY AND ZERO-HEIGHT until the server reports a facet, so a
+         fleet where no message carries context sees no control at all rather
+         than a row of buttons that select nothing. -->
+    <div id="cmd-history-ctx-filter" style="display:flex;gap:6px;flex-wrap:nowrap;overflow-x:auto;align-items:center;scrollbar-width:none;"></div>
     <div id="cmd-history-list" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:6px;"></div>
   </div>
 </div>

@@ -11183,7 +11183,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.971';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.972';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -17149,6 +17149,10 @@ function closeCmdHistoryModal() {
 // session messages). Kind chips are rendered from the same _MSG_KIND_ORDER the
 // peek tab uses, so the two surfaces cannot drift apart.
 let _cmdHistKind = 'human';   // all | human | session | schedule
+// AMUX-4695. `{field, value}` or null. SERVER-SIDE, like the kind filter
+// beside it: a client-side filter runs over one page and then reports
+// "1 message" when the population is 207 (AMUX-4666).
+let _cmdHistCtx = null;
 let _cmdHistRows = null;      // server window for the CURRENT kind+session, or null
 // Ask the server for the slice we are showing. Filtering the shared 500-row
 // global cache client-side meant "Human across every session" showed 48 rows
@@ -17180,6 +17184,7 @@ async function _cmdHistFetch(more) {
   const qsess = sess ? '&session=' + encodeURIComponent(sess) : '';
   let u = API + '/api/history?limit=' + _CMDHIST_PAGE + '&offset=' + _cmdHistOffset + qsess;
   if (_cmdHistKind !== 'all') u += '&kind=' + encodeURIComponent(_cmdHistKind);
+  if (_cmdHistCtx) u += '&' + _cmdHistCtx.field + '=' + encodeURIComponent(_cmdHistCtx.value);
   try {
     const [r, rc] = await Promise.all([
       fetch(u, { headers: _authHeaders() }),
@@ -17203,6 +17208,44 @@ async function _cmdHistFetch(more) {
 }
 function _cmdHistMore() { _cmdHistFetch(true); }
 function _cmdHistSetKind(k) { _cmdHistKind = k; _renderCmdHistoryList(); _cmdHistFetch(); }
+function _cmdHistSetCtx(field, value) {
+  // Tapping the active chip clears it, so the filter has an exit that does not
+  // need a separate "clear" control competing for width at 375px.
+  const same = _cmdHistCtx && _cmdHistCtx.field === field && _cmdHistCtx.value === value;
+  _cmdHistCtx = same ? null : { field, value };
+  _cmdHistOffset = 0;   // a new predicate is a new population; page 3 of it may not exist
+  _renderCmdHistoryList();
+  _cmdHistFetch();
+}
+
+/// Context filter chips, BUILT FROM THE SERVER'S FACETS.
+///
+/// Never from a fixed list: the bar can only ever offer a value that selects at
+/// least one message, so there is no dead control and nothing goes stale when a
+/// new device appears. When the server omits a facet entirely (nothing carries
+/// it) this renders '' and the bar collapses to nothing, which is the correct
+/// rendering for a fleet where no message has ever carried a place.
+function _cmdHistRenderCtxChips() {
+  const bar = document.getElementById('cmd-history-ctx-filter');
+  if (!bar) return;
+  const facets = _cmdHistCounts || {};
+  const groups = [['device', facets.devices], ['place', facets.places]];
+  const chips = [];
+  for (const [field, vals] of groups) {
+    if (!vals || typeof vals !== 'object') continue;
+    for (const [value, n] of Object.entries(vals)) {
+      const on = !!(_cmdHistCtx && _cmdHistCtx.field === field && _cmdHistCtx.value === value);
+      chips.push('<button class="msg-kind-chip" title="Only messages sent from ' + esc(value) + '"'
+        + ' onclick="_cmdHistSetCtx(\u0027' + escJs(field) + '\u0027,\u0027' + escJs(value) + '\u0027)" style="'
+        + 'border:1px solid ' + (on ? 'var(--accent)' : 'var(--border)') + ';'
+        + 'background:' + (on ? 'rgba(88,166,255,0.14)' : 'transparent') + ';'
+        + 'color:' + (on ? 'var(--accent)' : 'var(--dim)') + ';">' + esc(value) + ' ' + n + '</button>');
+    }
+  }
+  bar.innerHTML = chips.join('');
+  bar.style.paddingBottom = chips.length ? '10px' : '0';
+}
+
 function _cmdHistRenderChips(items) {
   const bar = document.getElementById('cmd-history-filter');
   if (!bar) return;
@@ -17243,6 +17286,7 @@ function _renderCmdHistoryList() {
   let filtered = items;
   if (sessFilter) filtered = filtered.filter(e => (typeof e === 'string' ? '' : (e.session || '')) === sessFilter);
   _cmdHistRenderChips(filtered);
+  _cmdHistRenderCtxChips();
   if (_cmdHistKind !== 'all') filtered = filtered.filter(e => _msgKind(e) === _cmdHistKind);
   if (q) filtered = filtered.filter(e => { const t = typeof e === 'string' ? e : e.text; return t.toLowerCase().includes(q); });
   if (!filtered.length) {

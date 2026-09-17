@@ -111,6 +111,14 @@ pub(crate) struct Row {
     pub session: String,
     pub kind: String,
     pub text: String,
+    /// One rendered context clause, or empty when the message carried none.
+    ///
+    /// EMPTY IS THE COMMON CASE, so it costs the corpus nothing: 11,526 of the
+    /// 11,591 stored messages have no metadata, and a placeholder on each line
+    /// would spend the prompt budget restating an absence. `render_corpus`
+    /// drops the oldest lines first when it overflows, so every wasted
+    /// character is a message the model never sees (AMUX-4695).
+    pub context: String,
 }
 
 /// Render the corpus newest-last, dropping the OLDEST first when it does not
@@ -122,7 +130,10 @@ pub(crate) fn render_corpus(rows: &[Row], budget: usize) -> (String, usize) {
     for row in rows.iter().rev() {
         let text: String = row.text.chars().take(MAX_TEXT_CHARS).collect();
         let stamp = chrono_stamp(row.ts);
-        let line = format!("[MSG-{}] {} · {} · {}: {}", row.id, stamp, row.session, row.kind, text.trim());
+        let line = format!(
+            "[MSG-{}] {} · {} · {}{}: {}",
+            row.id, stamp, row.session, row.kind, row.context, text.trim()
+        );
         let cost = line.chars().count() + 1;
         if used + cost > budget {
             break;
@@ -399,7 +410,8 @@ fn load_rows(
     }
     let count_sql = format!("SELECT COUNT(*) FROM cmd_history WHERE {where_sql}");
     let rows_sql = format!(
-        "SELECT id, ts, COALESCE(session,''), COALESCE(type,''), COALESCE(text,'') \
+        "SELECT id, ts, COALESCE(session,''), COALESCE(type,''), COALESCE(text,''), \
+         client_meta \
          FROM cmd_history WHERE {where_sql} ORDER BY ts DESC LIMIT {limit}"
     );
     let (available, rows) = match session {
@@ -437,7 +449,46 @@ fn map_row(r: &rusqlite::Row) -> rusqlite::Result<Row> {
         session: r.get(2)?,
         kind: super::history::msg_kind(&kind_raw).to_string(),
         text: r.get(4)?,
+        context: context_clause(r.get::<_, Option<String>>(5)?.as_deref()),
     })
+}
+
+/// Render a message's context for the model, or "" when it has none.
+///
+/// WHY THIS IS PROSE AND NOT A FIELD DUMP: the corpus is read by a model
+/// answering questions like "what did I send from the office last week", so the
+/// words have to carry the relation. "sent from iPhone" is answerable;
+/// "device=iPhone" invites the model to quote a field back.
+///
+/// Place beats device when both exist, matching the inline chip (AMUX-4694), so
+/// the two surfaces cannot disagree about which single fact represents a
+/// message. The sender's timezone rides along because "when" questions are the
+/// other half of this card: the corpus stamp is SERVER time, and the two differ
+/// exactly when the sender was somewhere else, which is the case worth
+/// answering correctly.
+pub(crate) fn context_clause(raw: Option<&str>) -> String {
+    let Some(meta) = raw
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+    else {
+        return String::new();
+    };
+    let get = |k: &str| {
+        meta.get(k)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let where_from = get("place").or_else(|| get("device"));
+    let tz = get("tz");
+    match (where_from, tz) {
+        (Some(w), Some(t)) => format!(" · sent from {w} ({t})"),
+        (Some(w), None) => format!(" · sent from {w}"),
+        (None, Some(t)) => format!(" · sender timezone {t}"),
+        (None, None) => String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -640,10 +691,59 @@ mod tests {
 
     /// A corpus too big for the prompt drops the OLDEST and says how many it
     /// kept, so "nothing about X" can never quietly mean "X was off the end".
+    /// AMUX-4695: the corpus carries where a message was sent from, so
+    /// "what did I send from the office last week" has something to answer
+    /// with. Absence costs the prompt nothing.
+    #[test]
+    fn the_corpus_carries_context_only_when_the_message_had_some() {
+        assert_eq!(
+            context_clause(Some(r#"{"device":"iPhone","tz":"America/New_York"}"#)),
+            " · sent from iPhone (America/New_York)"
+        );
+        // PLACE BEATS DEVICE, matching the inline chip (AMUX-4694), so the two
+        // surfaces cannot disagree about which single fact stands for a
+        // message.
+        assert_eq!(
+            context_clause(Some(r#"{"place":"Office","device":"iPhone","tz":"UTC"}"#)),
+            " · sent from Office (UTC)"
+        );
+        assert_eq!(context_clause(Some(r#"{"device":"Mac"}"#)), " · sent from Mac");
+        // Timezone alone is still worth carrying: the corpus stamp is SERVER
+        // time, so a "when" question needs the sender's offset to be answered
+        // about the sender's day rather than the server's.
+        assert_eq!(context_clause(Some(r#"{"tz":"Asia/Tokyo"}"#)), " · sender timezone Asia/Tokyo");
+
+        // EVERY SHAPE OF ABSENCE IS EMPTY, and this is the common case: 11,526
+        // of 11,591 stored messages have no metadata at all. A placeholder on
+        // each line would spend budget restating an absence, and render_corpus
+        // drops the OLDEST lines when it overflows, so wasted characters cost
+        // whole messages.
+        for raw in [None, Some(""), Some("   "), Some("not json"), Some("{}"), Some(r#"{"device":""}"#)] {
+            assert_eq!(context_clause(raw), "", "expected no clause for {raw:?}");
+        }
+    }
+
+    /// The clause must reach the rendered line, not merely exist on the struct.
+    #[test]
+    fn a_rendered_corpus_line_shows_the_context_and_an_empty_one_reads_as_before() {
+        let with = Row { id: 7, ts: 1_700_000_000_000, session: "amux".into(),
+                         kind: "human".into(), context: " · sent from Mac".into(),
+                         text: "hello".into() };
+        let without = Row { id: 8, ts: 1_700_000_000_000, session: "amux".into(),
+                            kind: "human".into(), context: String::new(),
+                            text: "hello".into() };
+        let (a, _) = render_corpus(&[with], 10_000);
+        assert!(a.contains("· sent from Mac"), "{a}");
+        assert!(a.contains("[MSG-7]"), "{a}");
+        let (b, _) = render_corpus(&[without], 10_000);
+        assert_eq!(b, "[MSG-8] 2023-11-14 22:13 · amux · human: hello",
+                   "a message with no context must render exactly as it did before this feature");
+    }
+
     #[test]
     fn a_corpus_over_budget_drops_the_oldest_and_reports_what_it_kept() {
         let rows: Vec<Row> = (1..=50)
-            .map(|i| Row { id: i, ts: 1_700_000_000_000 + i * 1000, session: "amux".into(), kind: "human".into(), text: format!("message number {i}") })
+            .map(|i| Row { id: i, ts: 1_700_000_000_000 + i * 1000, session: "amux".into(), kind: "human".into(), context: String::new(), text: format!("message number {i}") })
             .collect();
         let (corpus, included) = render_corpus(&rows, 400);
         assert!(included < rows.len(), "the budget must bite: {included}");

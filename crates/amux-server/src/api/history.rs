@@ -477,6 +477,18 @@ pub struct ListParams {
     group: Option<String>,
     #[serde(default)]
     q: Option<String>,
+    /// Context filters (AMUX-4695), read out of `client_meta`.
+    ///
+    /// SERVER-SIDE, beside `kind`, for the reason AMUX-4666 already paid for: a
+    /// client-side filter runs over ONE PAGE and then reports "1 message" when
+    /// the real population is 207. Every predicate here lands in SQL before the
+    /// LIMIT, and the `x-amux-total` count is built from the SAME WHERE and the
+    /// SAME params, so the number beside the list is a count of the filtered
+    /// population rather than of the page.
+    #[serde(default)]
+    device: Option<String>,
+    #[serde(default)]
+    place: Option<String>,
 }
 
 /// Python-truthy query flag: present with any non-empty value.
@@ -576,6 +588,44 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
             }
             let all: i64 = MSG_KINDS.iter().map(|k| out[*k].as_i64().unwrap_or(0)).sum();
             out.insert("all".into(), json!(all));
+
+            // CONTEXT FACETS (AMUX-4695): which devices and places actually
+            // occur, with their counts, scoped by the same session filter.
+            //
+            // DERIVED FROM THE DATA, NEVER A FIXED LIST. The UI builds its
+            // filter options from this, so it can only ever offer a value that
+            // selects at least one message. A hardcoded menu would offer
+            // "Place" on a fleet where no message has ever carried one, which
+            // is a control that looks broken to whoever clicks it, and it would
+            // go stale the day a new device appears.
+            //
+            // The key is OMITTED when nothing has that field, rather than sent
+            // as an empty object, so the client's "is there anything to filter
+            // by" test is the presence of the key. Same rule as the row
+            // renderer: an absence is not a value.
+            for field in ["device", "place"] {
+                let mut sql = format!(
+                    "SELECT json_extract(client_meta,'$.{field}') v, COUNT(*) c FROM cmd_history \
+                     WHERE json_extract(client_meta,'$.{field}') IS NOT NULL"
+                );
+                if !session.is_empty() {
+                    sql.push_str(" AND session=?1");
+                }
+                sql.push_str(" GROUP BY v ORDER BY c DESC, v ASC");
+                let mut stmt = conn.prepare(&sql)?;
+                let map_row =
+                    |r: &rusqlite::Row| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?));
+                let rows: Vec<(String, i64)> = if session.is_empty() {
+                    stmt.query_map([], map_row)?.flatten().collect()
+                } else {
+                    stmt.query_map([&session], map_row)?.flatten().collect()
+                };
+                if !rows.is_empty() {
+                    let facet: Map<String, Value> =
+                        rows.into_iter().map(|(v, c)| (v, json!(c))).collect();
+                    out.insert(format!("{field}s"), Value::Object(facet));
+                }
+            }
             return Ok((Value::Object(out), None));
         }
 
@@ -611,6 +661,28 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
                 let escaped = q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
                 params.push(rusqlite::types::Value::Text(format!("%{escaped}%")));
             }
+        }
+        // CONTEXT FILTERS (AMUX-4695). `client_meta` is JSON text, so the
+        // predicate is a json_extract, which this database already relies on in
+        // 24 other places.
+        //
+        // AN EXACT MATCH, not a LIKE. "Mac" must not also select a device
+        // called "Mac mini", because the filter's whole job is to answer "which
+        // of these" and a substring match silently merges two answers into one.
+        //
+        // A filter for a value nothing has returns NOTHING, deliberately. No
+        // row currently carries `$.place` (measured: 0 of 11,591), so
+        // `?place=Office` is an empty list today rather than an error or a
+        // silent no-op. An empty list is the truthful answer to "messages sent
+        // from the office" when the place was never recorded; ignoring the
+        // parameter would answer a different question than the one asked.
+        for (field, raw) in [("device", p.device.as_deref()), ("place", p.place.as_deref())] {
+            let v = raw.unwrap_or("").trim();
+            if v.is_empty() {
+                continue;
+            }
+            where_cl.push(format!("json_extract(client_meta,'$.{field}')=?"));
+            params.push(rusqlite::types::Value::Text(v.to_string()));
         }
         let want: Vec<String> = p
             .kind
@@ -1323,6 +1395,36 @@ mod tests {
         assert!(log.lines().any(|line| line.contains("interaction_outcome") && line.contains("link-refused") && line.contains("refused")), "positive control: the real refusal must reach the same collector: {log}");
     }
 
+    /// Rows carrying `client_meta`, written through the store because
+    /// `POST /api/history` has no field for it: the capture path that sets it
+    /// is the session send, not the history append. Seeding through the real
+    /// column is the point, since the filter reads it with json_extract.
+    async fn seed_context(state: &AppState) {
+        for (text, session, ts, meta) in [
+            ("from the mac", "ctx", 6000i64,
+             r#"{"device":"Mac","platform":"MacIntel","app_ver":"0.9.971","tz":"America/New_York"}"#),
+            ("from the mac again", "ctx", 7000,
+             r#"{"device":"Mac","platform":"MacIntel","app_ver":"0.9.971","tz":"America/New_York"}"#),
+            ("from the phone", "other", 8000,
+             r#"{"device":"iPhone","platform":"iPhone","app_ver":"0.9.971","tz":"America/New_York"}"#),
+            ("from the mac mini", "other", 9000, r#"{"device":"Mac mini"}"#),
+        ] {
+            let (t, se, m) = (text.to_string(), session.to_string(), meta.to_string());
+            state
+                .store
+                .write_async(move |conn| {
+                    conn.execute(
+                        "INSERT INTO cmd_history (text, type, session, ts, origin, client_meta) \
+                         VALUES (?1, 'direct', ?2, ?3, '', ?4)",
+                        rusqlite::params![t, se, ts, m],
+                    )?;
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                })
+                .await
+                .unwrap();
+        }
+    }
+
     async fn seed(app: &axum::Router) {
         for (text, htype, session, ts) in [
             ("hello from me", "direct", "alpha", 1000),
@@ -1651,6 +1753,89 @@ mod tests {
         assert_eq!(one["card_status"], json!("done"));
         assert_eq!(one["card_archived"], json!(0));
         assert_eq!(one["linked_cards"], row["linked_cards"]);
+    }
+
+    /// AMUX-4695: filter the Messages list by the context a message was sent
+    /// from, SERVER-SIDE.
+    ///
+    /// The card names the reason: a client-side filter runs over one page and
+    /// then reports "1 message" when the population is 207. So the total is
+    /// asserted here beside the rows, because a correct list with a wrong count
+    /// is the exact failure AMUX-4666 already paid for once.
+    #[tokio::test]
+    async fn the_context_filter_selects_server_side_and_the_total_follows_it() {
+        let (app, state, _dir) = app_with_state();
+        seed(&app).await;
+        seed_context(&state).await;
+
+        let texts = |v: &Value| -> Vec<String> {
+            v.as_array().unwrap().iter()
+                .map(|r| r["text"].as_str().unwrap_or("").to_string()).collect()
+        };
+        let total_for = |app: axum::Router, uri: String| async move {
+            let req = axum::http::Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            res.headers().get("x-amux-total").and_then(|v| v.to_str().ok()).map(str::to_string)
+        };
+
+        let (_, mac) = send(&app, "GET", "/api/history?device=Mac", None).await;
+        assert_eq!(texts(&mac), vec!["from the mac again", "from the mac"]);
+        let (_, iph) = send(&app, "GET", "/api/history?device=iPhone", None).await;
+        assert_eq!(texts(&iph), vec!["from the phone"]);
+
+        // THE COUNT IS OF THE FILTERED POPULATION, not of the page. With
+        // limit=1 the page holds one row and the total must still say two.
+        assert_eq!(total_for(app.clone(), "/api/history?device=Mac&limit=1".into()).await, Some("2".into()));
+        let (_, one) = send(&app, "GET", "/api/history?device=Mac&limit=1", None).await;
+        assert_eq!(one.as_array().unwrap().len(), 1, "the page really is short");
+
+        // A message with NO metadata is under no device, which is the whole
+        // point: 11,526 of 11,591 real rows are in this state, so a filter that
+        // swept them into some default bucket would be wrong about almost
+        // everything.
+        for uri in ["/api/history?device=Mac", "/api/history?device=iPhone"] {
+            let (_, v) = send(&app, "GET", uri, None).await;
+            assert!(!texts(&v).iter().any(|t| t == "hello from me"),
+                "{uri} must not return a message that carries no metadata");
+        }
+
+        // A VALUE NOTHING HAS RETURNS NOTHING. No row carries `$.place`, so
+        // this is an empty list rather than an ignored parameter. Ignoring it
+        // would answer a different question than the one asked.
+        let (st, none) = send(&app, "GET", "/api/history?place=Office", None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(none.as_array().unwrap().len(), 0);
+        assert_eq!(total_for(app.clone(), "/api/history?place=Office".into()).await, Some("0".into()));
+
+        // EXACT MATCH, not a prefix: "Mac" must not also select "Mac mini", or
+        // the filter silently merges two answers into one.
+        let (_, mini) = send(&app, "GET", "/api/history?device=Mac%20mini", None).await;
+        assert_eq!(texts(&mini), vec!["from the mac mini"]);
+    }
+
+    /// The filter's options come from the DATA, so the UI can only offer a
+    /// value that selects something.
+    #[tokio::test]
+    async fn context_facets_report_what_exists_and_omit_what_does_not() {
+        let (app, state, _dir) = app_with_state();
+        seed(&app).await;
+        seed_context(&state).await;
+
+        let (_, counts) = send(&app, "GET", "/api/history?counts=1", None).await;
+        assert_eq!(counts["devices"]["Mac"], json!(2));
+        assert_eq!(counts["devices"]["iPhone"], json!(1));
+        assert_eq!(counts["devices"]["Mac mini"], json!(1));
+
+        // THE KEY IS ABSENT, not an empty object. Nothing carries a place, and
+        // a `places: {}` would render as a filter control with no options.
+        assert!(counts.get("places").is_none(),
+            "a facet nothing has must be omitted, not sent empty: {counts}");
+
+        // Scoped by session, like the kind counts beside it.
+        let (_, scoped) = send(&app, "GET", "/api/history?counts=1&session=ctx", None).await;
+        assert_eq!(scoped["devices"]["Mac"], json!(2));
+        assert!(scoped["devices"].get("iPhone").is_none(),
+            "the iPhone row belongs to another session: {scoped}");
     }
 
     /// AMUX-4666: paging by PAGE NUMBER needs a page count, and a page count is
