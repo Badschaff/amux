@@ -5920,6 +5920,7 @@ async fn a_card_records_where_it_came_from_and_the_api_publishes_it() {
     let row = amux_server::db::board_store::create_issue(
         &conn,
         &amux_server::db::board_store::NewIssue {
+            acceptance_criteria: None,
             next_action: None,
             title: "a captured human prompt".into(),
             desc: String::new(),
@@ -6542,4 +6543,27 @@ async fn review_and_done_are_refused_with_every_unmet_check_listed_together() {
     assert_eq!(st, StatusCode::OK);
     let v = move_as(&app, &epic_id, "review", "lane-p").await;
     assert_eq!(v["status"], json!("review"), "{v}");
+}
+
+
+#[tokio::test]
+async fn create_preserves_acceptance_contract_and_rejects_malformed_criteria_atomically() {
+    let (app, store, _dir) = app_with_store();
+    for criteria in [json!(["The exact artifact passes its test"]), json!("The output matches the requested result"), Value::Null] {
+        let card = create(&app, json!({"title":"Acceptance contract", "status":"backlog", "session":"lane-a",
+            "next_action":"Implement and test the scoped artifact", "acceptance_criteria":criteria})).await;
+        assert!(card["ignored_fields"].as_array().is_none_or(|v|v.is_empty()), "{card}");
+        let id = card["id"].as_str().unwrap();
+        let (_,_,read) = send(&app,"GET",&format!("/api/board/{id}"),None).await;
+        assert_eq!(read["acceptance_criteria"], criteria);
+        assert_eq!(read["next_action"], "Implement and test the scoped artifact");
+    }
+    let count = || store.read().unwrap().query_row("SELECT count(*) FROM issues", [], |r|r.get::<_,i64>(0)).unwrap();
+    let before = count();
+    for criteria in [json!({"fake":true}), json!(["valid", 7]), json!(false), json!(42)] {
+        let (status,_,body) = send(&app,"POST","/api/board",Some(json!({"title":"Malformed criteria", "acceptance_criteria":criteria}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], "invalid_acceptance_criteria");
+    }
+    assert_eq!(count(), before);
 }

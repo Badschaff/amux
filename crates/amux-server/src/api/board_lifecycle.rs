@@ -318,6 +318,7 @@ fn event(row: &bs::IssueRow, created: bool) -> PendingEvent {
 }
 fn new_issue(session: &str, title: &str, desc: &str, kind: &str) -> bs::NewIssue {
     bs::NewIssue {
+        acceptance_criteria: None,
         next_action: None,
         title: title.into(),
         desc: desc.into(),

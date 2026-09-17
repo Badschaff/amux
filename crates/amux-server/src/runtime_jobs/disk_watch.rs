@@ -574,6 +574,7 @@ async fn tick(state: AppState) {
                 return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
             }
             let new = bs::NewIssue {
+                acceptance_criteria: None,
                 next_action: None,
                 title: title.clone(),
                 desc: desc.clone(),

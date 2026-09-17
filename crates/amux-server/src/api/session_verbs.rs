@@ -4615,6 +4615,7 @@ fn mint_capture_card(
     let mut row = crate::db::board_store::create_issue(
         conn,
         &crate::db::board_store::NewIssue {
+            acceptance_criteria: None,
             next_action: None,
             title,
             desc: captured_desc,
@@ -5579,19 +5580,20 @@ pub(crate) async fn steer_enqueue_idempotent_report(
 /// attempts are observable refusals, never mislabeled as successful delivery.
 pub(crate) async fn enqueue_state_reminder(store:&crate::db::SharedStore,name:&str,text:&str,guard:&str,card:&str,rev:i64,identity:&str)->Result<bool,String> {
     use rusqlite::OptionalExtension;
+    let prefix=format!("{identity}:*");
+    let session=name.to_string();
+    let (already_sent,queued_id)=store.read_async(move |c| {
+        let mut stmt=c.prepare("SELECT outcome FROM steering_history WHERE id GLOB ?1 AND session=?2")?;
+        let outcomes=stmt.query_map([&prefix, &session],|r|r.get::<_,Option<String>>(0))?
+            .collect::<Result<Vec<_>,_>>()?;
+        let queued_id=c.query_row("SELECT id,precond_rev FROM steering_queue WHERE id GLOB ?1 AND session=?2 ORDER BY queued_at LIMIT 1",[&prefix, &session],|r|Ok((r.get::<_,String>(0)?, r.get::<_,Option<i64>>(1)?))).optional()?;
+        Ok((outcomes.iter().flatten().any(|v|matches!(submit_verdict_of(v),Some("confirmed"|"retried"))),queued_id))
+    }).await.map_err(|e|e.to_string())?;
+    if already_sent || queued_id.as_ref().is_some_and(|(_,queued_rev)| *queued_rev == Some(rev)) { return Ok(false); }
     store.write_async(|c|{ensure_fleet_tables(c)?;Ok(crate::db::WriteOutcome{applied:false,events:vec![]})}).await.map_err(|e|e.to_string())?;
-    let (already_sent,queued_id)={
-        let c=store.read().map_err(|e|e.to_string())?;
-        let mut stmt=c.prepare("SELECT outcome FROM steering_history WHERE id LIKE ?1").map_err(|e|e.to_string())?;
-        let outcomes=stmt.query_map([format!("{identity}:%")],|r|r.get::<_,Option<String>>(0)).map_err(|e|e.to_string())?
-            .collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
-        let queued_id=c.query_row("SELECT id FROM steering_queue WHERE id LIKE ?1 ORDER BY queued_at LIMIT 1",[format!("{identity}:%")],|r|r.get::<_,String>(0)).optional().map_err(|e|e.to_string())?;
-        (outcomes.iter().flatten().any(|v|matches!(submit_verdict_of(v),Some("confirmed"|"retried"))),queued_id)
-    };
-    if already_sent { return Ok(false); }
     // A revision only distinguishes previously voided attempts. Confirmed
     // history above is shared across revisions of the same meaningful state.
-    let id=queued_id.unwrap_or_else(||format!("{identity}:{rev}"));
+    let id=queued_id.map(|(id,_)|id).unwrap_or_else(||format!("{identity}:{rev}"));
     let result=steer_enqueue_precond_with_id(store,name,text,guard,"",Some((card,rev)),Some(&id)).await.map_err(str::to_string)?;
     match result.disposition {
         StableEnqueueDisposition::New=>Ok(true),
@@ -10220,8 +10222,8 @@ pub(crate) async fn stop_for_pause(state: &AppState, name: &str) -> anyhow::Resu
         let (ok, detail) = stop_session_process(name).await;
         anyhow::ensure!(ok, "{detail}");
     } else {
-        let st = st(name);
-        let pane = tmux(&["list-panes", "-t", &st, "-F", "#{pane_pid}"]).await;
+        let pane_target = pt(name);
+        let pane = tmux(&["list-panes", "-t", &pane_target, "-F", "#{pane_pid}"]).await;
         if let Some(out) = pane.filter(|o| o.status.success()) {
             for line in String::from_utf8_lossy(&out.stdout).lines() {
                 let root: i32 = line.trim().parse()?;
@@ -14997,12 +14999,17 @@ async fn dispatch(
     // the defect; the doc records the same ordering.
     const NATIVE_ONLY_HERE: [&str; 3] = ["peek", "send", "duplicate"];
     if !NATIVE_ONLY_HERE.contains(&action.as_str()) {
-        let is_rust_worker = state
-            .store
-            .read()
-            .ok()
-            .and_then(|conn| crate::db::queries::get_worker(&conn, &name).ok().flatten())
-            .is_some();
+        let worker_name = name.clone();
+        let is_rust_worker = match state.store.read_async(move |conn| {
+            Ok(crate::db::queries::get_worker(conn, &worker_name)?.is_some())
+        }).await {
+            Ok(found) => found,
+            Err(error) => {
+                tracing::warn!(session = %name, %action, %error, verdict = "session_route_unmeasured");
+                return jresp(StatusCode::SERVICE_UNAVAILABLE,
+                    json!({"error":"worker routing lookup unavailable; command not executed"}));
+            }
+        };
         if is_rust_worker {
             return jresp(
                 StatusCode::NOT_IMPLEMENTED,
@@ -16591,13 +16598,20 @@ async fn post_dispatch(
             let st2 = state.clone();
             let n = name.to_string();
             crate::db::interactions::spawn(async move {
-                let (ok, msg) = stop_session(&st2, &n).await;
-                if ok {
+                let result = stop_for_pause(&st2, &n).await;
+                match result {
+                  Ok(()) => {
+                    tracing::info!(session = %n, verdict = "stop_process_tree_confirmed");
                     emit_event(&st2, &n, "session.stopped", None, None, "api-stop").await;
+                    let _ = crate::db::interactions::progress(&st2.store, "applied").await;
                     // Stopping a process never completes its board work.
-                } else {
+                  }
+                  Err(error) => {
+                    let msg = error.to_string();
                     tracing::warn!(session = %n, reason = %msg, "session_stop_failed");
                     emit_event(&st2, &n, "session.stop_failed", Some(json!({"message": msg})), None, "api-stop").await;
+                    let _ = crate::db::interactions::progress(&st2.store, "failed").await;
+                  }
                 }
             });
             jresp(StatusCode::ACCEPTED, json!({"ok": true, "message": "stopping"}))
@@ -27227,6 +27241,43 @@ CLAUDE-POSTFIX-COMPLETE
     }
 
     #[tokio::test]
+    async fn stop_route_interrupts_busy_tools_without_waiting_for_composer_commands() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let name = format!("stop-route-{}-{}", std::process::id(), ulid::Ulid::new());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        std::fs::write(home.path().join(format!("sessions/{name}.env")), "CC_PROVIDER=claude\n").unwrap();
+        struct Pane(String);
+        impl Drop for Pane {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("tmux").args(["kill-session", "-t", &session_target(&self.0)]).output();
+            }
+        }
+        let pane = Pane(tmux_name(&name));
+        let created = tmux(&["new-session", "-d", "-s", &pane.0, "/bin/sh"]).await.expect("tmux required for stop-route proof");
+        assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
+        let typed = tmux(&["send-keys", "-t", &pt(&name), "/bin/sh -c 'sleep 120 & wait'", "Enter"]).await.unwrap();
+        assert!(typed.status.success(), "{}", String::from_utf8_lossy(&typed.stderr));
+        sleep_ms(150).await;
+        assert_eq!(pane_has_live_child(&name).await, Some(true), "busy-tool fixture must be running");
+        let state = AppState {store:Arc::new(crate::db::Store::open(&home.path().join("stop.db")).unwrap()),
+            started:std::time::Instant::now(),build_hash:"test".into(),auth_token:None,
+            reconciled:Arc::new(std::sync::atomic::AtomicBool::new(true))};
+        let response = post_dispatch(&state, &name, "stop", &HeaderMap::new(), &json!({})).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let stopped = state.store.read().unwrap().query_row(
+                "SELECT count(*) FROM session_events WHERE session=?1 AND type='session.stopped'", [&name], |r|r.get::<_,i64>(0)).unwrap_or(0);
+            if stopped > 0 { break; }
+            assert!(std::time::Instant::now() < deadline, "Stop waited for a busy composer instead of terminating its process tree");
+            sleep_ms(50).await;
+        }
+        assert_eq!(pane_has_live_child(&name).await, Some(false));
+        assert!(!is_running(&name).await);
+    }
+
+    #[tokio::test]
     async fn pause_normal_screen_keeps_the_claude_history_contract() {
         let home = tempfile::tempdir().unwrap();
         let _home = crate::api::settings::test_env::set_home(home.path());
@@ -28344,6 +28395,7 @@ mod steer_boundary_tests {
                 create_issue(
                     conn,
                     &NewIssue {
+                        acceptance_criteria: None,
                         next_action: None,
                         title: "manual work".into(),
                         desc: "some manual work".into(),

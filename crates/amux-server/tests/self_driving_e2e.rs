@@ -115,6 +115,7 @@ async fn approve_exact(
 
 fn issue(title: &str, owner: Option<&str>) -> NewIssue {
     NewIssue {
+        acceptance_criteria: None,
         next_action: None,
         title: title.into(),
         desc: "self-driving E2E fixture".into(),

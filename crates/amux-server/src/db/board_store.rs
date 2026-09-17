@@ -2803,6 +2803,8 @@ pub struct NewIssue {
     /// specimen: AMUX-4748 came back carrying
     /// `ignored_fields: ["acceptance_criteria", "next_action"]`.
     pub next_action: Option<String>,
+    /// JSON encoded string or string array, using the same representation as PATCH.
+    pub acceptance_criteria: Option<String>,
     pub ask_question: Option<String>,
     pub ask_unblocks: Option<String>,
     pub ask_actor: Option<String>,
@@ -2909,10 +2911,10 @@ pub fn create_issue(conn: &Connection, new: &NewIssue, now: i64) -> rusqlite::Re
              due, due_time, created, updated, owner_type, pos, gate, reviewer, depends_on, \
              ask_type, ask_question, ask_unblocks, entered_state_at, source, \
              requested_by, callback_session, callback_prompt, callback_state, ask_actor, \
-             next_action, \
+             next_action, acceptance_criteria, \
              notified, pinned, archived, rev, version) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, 0, 0, 0, 0, 0)",
+             ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, 0, 0, 0, 0, 0)",
         params![
             id,
             new.title,
@@ -2944,6 +2946,7 @@ pub fn create_issue(conn: &Connection, new: &NewIssue, now: i64) -> rusqlite::Re
             new.callback_session.as_ref().map(|_| "armed"),
             new.ask_actor.as_deref().filter(|x| !x.trim().is_empty()),
             new.next_action.as_deref().filter(|x| !x.trim().is_empty()),
+            new.acceptance_criteria,
         ],
     )?;
     for tag in &new.tags {
@@ -4983,6 +4986,7 @@ mod tests {
 
     fn new_card(status: &str) -> NewIssue {
         NewIssue {
+            acceptance_criteria: None,
             next_action: None,
             title: "Ask Ethan about pricing".into(),
             desc: String::new(),

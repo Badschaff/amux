@@ -3112,3 +3112,26 @@ CARD: AF-909
 SYMPTOM: The worker terminal intermittently stops updating and resumes after refresh. Four browser regressions fail against the shipped source: a body stalled after headers outlives the cleared timeout, unrelated text selection suppresses terminal requests, a cancelled touch leaves the selection latch set, and a selection begun during a response consumes an unpainted frame's ETag/raw dedupe state.
 COST: Ethan must refresh to see ongoing worker output; all four reproduced cases leave stale text visible despite later available output.
 FIX: Keep the timeout through response consumption; commit ETags only for validated accepted frames; scope selection to terminal ranges and reconcile cancelled/resumed gestures. Log refresh-failed with the transport phase and selection-recovered with the event reason through client-debug. Browser regressions cover automatic recovery and retained reader position on desktop, phone width and Safari. Originator confirmation remains pending.
+
+
+## Stop requests time out and multiply while the worker keeps running
+AREA: browser
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-17
+SESSION: Ethan via Codex
+CARD: AF-911
+SYMPTOM: Two Stop tubescience rows appeared with a 15-second timeout. The two interaction IDs were attempted five and two times; both eventually reached the asynchronous handler and emitted stopped at 13:08:46 UTC. A separate start followed. The same interval had a 65-second health probe. Policy role lookup and legacy worker routing still acquired database readers synchronously on HTTP runtime threads; Stop also typed slash commands into a busy composer and waited for its shell.
+COST: Ethan could not tell whether Stop was accepted or effective, repeated the action, and waited through duplicate requests while tools continued running.
+FIX: Yield during policy-role/routing reads, persist and coalesce pending Stop intent across tabs, preserve Stop/Start ordering, and route Stop through the existing process-tree termination used by Pause. Record confirmed stop/failure and final interaction progress. Fault-injection tests exercise exhausted readers, browser outage/replay on desktop and mobile, and descendant termination. Originator confirmation remains pending.
+
+## Task intake loses acceptance criteria and parked backlog has no bounded recovery
+AREA: board
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-17
+SESSION: Ethan via Codex
+CARD: AF-912
+SYMPTOM: Implementation tracked by AMUX-4748. Creation preserved next_action after 553c17b1 but still discarded supplied acceptance_criteria. Idle workers excluded source_ref/blocked_on backlog and missing-continuation Todo, while the continue prompt only counted blocked status. Pickup guidance explicitly encouraged handing component work to another worker and parking ordinary decisions.
+COST: The active-fleet audit found 342 Backlog/Todo tasks across 15 workers, including nine idle workers; 16 cross-owner dependency edges pointed to inactive workers. Repeating a broad audit consumed turns without supplying a runnable next step.
+FIX: Round-trip acceptance criteria through creation, prevent semantic intake from dropping explicit execution fields, align backlog selection with the continuation gate, and send one specific recovery per substantive blocker state through the existing durable revision-guarded queue. Preserve actual holds and terminal gates. Prefer end-to-end ownership and independently executable prerequisites. Originator confirmation remains pending.

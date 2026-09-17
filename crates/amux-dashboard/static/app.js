@@ -3388,6 +3388,14 @@ async function apiCall(url, options) {
     return null;
   }
 }
+// Collapse repeated Stop intent only until another command to this worker.
+// Stop → Start → Stop must remain ordered, including across browser tabs.
+function _pendingStop(queue, url, options) {
+  if ((options?.method || '').toUpperCase() !== 'POST' || !/\/api\/sessions\/[^/?]+\/stop$/.test(url)) return null;
+  const worker = url.slice(0, -4);
+  const previous = [...queue].reverse().find(q => q.url.startsWith(worker));
+  return previous?.url === url && previous.options?.method?.toUpperCase() === 'POST' ? previous : null;
+}
 async function _queueOp(url, options) {
   // THE SINGLE ENFORCEMENT POINT for what may enter the outbox.
   //
@@ -3433,6 +3441,11 @@ async function _queueOp(url, options) {
   try {
     await _mutateQueue(current => {
       if (current.some(q => q.id === entry.id)) return;
+      const pendingStop = _pendingStop(current, url, options);
+      if (pendingStop) {
+        _outboxDiagnostic('stop_intent_coalesced', {target:url.split('/').at(-2), queue_count:current.length});
+        return;
+      }
       if (current.length >= 200) throw new Error('Queue full — this change was not queued; keep the draft');
       current.push(entry);
     });
@@ -3697,7 +3710,7 @@ async function _waitForMessageReceipt(input, init, signal) {
 }
 async function _boundedMutationFetch(input, init) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort('Send timed out (15s)'), 15000);
+  const timer = setTimeout(() => controller.abort('Request timed out (15s)'), 15000);
   const signal = init && init.signal
     ? AbortSignal.any([init.signal, controller.signal]) : controller.signal;
   const original = (async () => {
@@ -3720,10 +3733,20 @@ async function _boundedMutationFetch(input, init) {
 async function _outboxFetch(input, init) {
   const url = typeof input === 'string' ? input : (input && input.url) || '';
   if (!_outboxQueueable(url, init)) return _origFetch(input, init);
+  if (/\/api\/sessions\/[^/?]+\/stop$/.test(url) && !init?._stopLocked) {
+    return _outboxLock('amux-stop-intent:' + url, async () => {
+      if (_pendingStop(_readQueue(), url, init)) {
+        _outboxDiagnostic('stop_intent_coalesced', {target:url.split('/').at(-2)});
+        if (online) setTimeout(() => runSyncBanner(true), 0);
+        return _outboxAccepted();
+      }
+      return _outboxFetch(input, {...init, _stopLocked:true});
+    });
+  }
   init = _outboxRequestOptions(url, init || {});
   const receipt = _interactionAccept(url, init);
   init = _interactionRequestOptions(receipt, init);
-  if (_localMessageRequest(url, init)) {
+  if (_localMessageRequest(url, init) || /\/api\/sessions\/[^/?]+\/stop$/.test(url)) {
     if (!await _queueOp(url, init)) {
       _interactionFail(receipt.id, 'Queue unavailable', false);
       return new Response('Queue unavailable', {status:507});
@@ -8230,10 +8253,21 @@ async function doStart(name) {
   }
 }
 
+const _stoppingSessions = new Set();
 async function doStop(name) {
-  await apiCall(API + '/api/sessions/' + name + '/stop', { method: 'POST' });
-  await new Promise(r => setTimeout(r, 500));
-  await fetchSessions();
+  if (_stoppingSessions.has(name)) return;
+  _stoppingSessions.add(name);
+  try {
+    await apiCall(API + '/api/sessions/' + encodeURIComponent(name) + '/stop', { method: 'POST' });
+    // A 202 acknowledges intent, not a stopped process. Keep refreshing until
+    // the server observes termination; retries remain in the durable outbox.
+    for (let i = 0; i < 30; i++) {
+      await new Promise(r => setTimeout(r, 1000));
+      await fetchSessions();
+      if (sessions.find(s => s.name === name)?.running === false) return;
+    }
+    showToast('Stop has not been confirmed yet — check the worker or pending requests');
+  } finally { _stoppingSessions.delete(name); }
 }
 
 async function copyMoshCmd(name) {
@@ -11183,7 +11217,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.973';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.974';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.

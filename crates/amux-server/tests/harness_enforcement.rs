@@ -19,6 +19,7 @@ use tower::ServiceExt;
 
 fn new_issue(title: &str, status: &str) -> NewIssue {
     NewIssue {
+        acceptance_criteria: None,
         next_action: None,
         title: title.into(),
         desc: "A harness integration fixture".into(),

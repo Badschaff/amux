@@ -221,6 +221,7 @@ pub async fn tick(state: AppState) -> (usize, usize, usize) {
             }
             None => {
                 let new = bs::NewIssue {
+                    acceptance_criteria: None,
                     next_action: None,
                     title,
                     desc,

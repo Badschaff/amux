@@ -13,6 +13,11 @@ function code(name) {
   assert.ok(node, 'shipped function exists: ' + name);
   return source.slice(...node.range);
 }
+function declaration(name) {
+  const node = ast.body.find(n => n.type === 'VariableDeclaration' && n.declarations.some(d => d.id.name === name));
+  assert.ok(node, 'shipped declaration exists: ' + name);
+  return source.slice(...node.range);
+}
 function fixture(names = [], shared = {}) {
   const stored = shared.stored || new Map();
   const timers = new Map(); const timerDelays = new Map(); let tid = 0;
@@ -31,7 +36,7 @@ function fixture(names = [], shared = {}) {
     API: '', offlineQueue: [], drafts: [], online: true, _syncFlight: null, _syncRetryTimer: null, _syncBackoffMs: 0, _SYNC_MIN_MS: 2000, _SYNC_MAX_MS: 60000, _OUTBOX_STALLED_MS:600000,
     _interactionReplay:q => ({id:q.id}), _interactionAcknowledge:async () => {}, _interactionSet() {}, _upqList:async () => [], _uploadSyncPending:false, _syncChecklist:[], _localWriteError: '', window:{isSecureContext:true}, APP_VER:'test', _writeError: '', _outboxActive: new Set(), _bdSaveRequests: new Set(), consecutiveFailures: 0,
     _OUTBOX_SKIP: /\/api\/client-debug/, _OUTBOX_METHODS: {POST:1,PATCH:1,PUT:1,DELETE:1},
-    _authHeaders: h => h, esc: s => s, escJs: s => s, describeOp: q => q.url,
+    _getDeviceName: () => 'test device', _authHeaders: h => h, esc: s => s, escJs: s => s, describeOp: q => q.url,
     showToast() {}, amuxTrack() {}, updateConnectionStatus() {}, fetchSessions() {}, fetchBoard() {},
     _loadCmdHistoryFromServer: () => Promise.resolve(), _peekMessagesBadge() {}, _outboxBoardAcknowledged() {},
     _waitForMessageReceipt: () => new Promise(() => {}),
@@ -39,7 +44,9 @@ function fixture(names = [], shared = {}) {
     _apiErrText: async r => `${r.status}: ${await r.text()}`,
   };
   const ctx = vm.createContext(sandbox);
-  for (const name of ['_localStorageBytes', '_writeUserStorage', '_outboxDiagnostic', '_outboxAgeMs', '_outboxIsStalled', '_outboxAgeLabel', '_outboxNeedsAttention', '_localWriteNotice', '_localMessageRequest', '_validateMessageAcknowledgement', '_validateBoardAcknowledgement', '_readQueue', '_outboxLock', '_mutateQueue', '_outboxQueueable', '_outboxMessageId', '_outboxUncertainMessage', '_outboxConfirmMessage', '_queueOp', '_boundedMutationFetch', '_syncOneDraft', '_syncBackoffReset', '_scheduleSyncRetry', '_clearSyncTransientToast', '_runSyncBanner', 'runSyncBanner', ...names]) vm.runInContext(code(name), ctx);
+  // Load production dependencies too: replay must execute, not fail on a stale fixture.
+  for (const name of ['_syncBannerShownAt', '_RECEIPT_TIMEOUT_MSG', '_geoFix', '_GEO_FIX_MAX_AGE_MS']) vm.runInContext(declaration(name), ctx);
+  for (const name of ['_syncBannerBeacon', '_sendContext', '_pendingStop', '_localStorageBytes', '_writeUserStorage', '_outboxDiagnostic', '_outboxAgeMs', '_outboxIsStalled', '_outboxAgeLabel', '_outboxNeedsAttention', '_localWriteNotice', '_localMessageRequest', '_validateMessageAcknowledgement', '_validateBoardAcknowledgement', '_readQueue', '_outboxLock', '_mutateQueue', '_outboxQueueable', '_outboxMessageId', '_outboxUncertainMessage', '_outboxConfirmMessage', '_queueOp', '_boundedMutationFetch', '_syncOneDraft', '_syncBackoffReset', '_scheduleSyncRetry', '_clearSyncTransientToast', '_runSyncBanner', 'runSyncBanner', ...names]) vm.runInContext(code(name), ctx);
   return {ctx, stored, timers, timerDelays, element};
 }
 const patch = {method:'PATCH', body:'{"title":"saved","expect_rev":1}'};
@@ -750,4 +757,25 @@ test('successful sync clears stale offline feedback without hiding unrelated fai
   assert.equal(visible,false); assert.equal(cancelled,true);
   visible=true; toast.textContent='Upload failed: storage unavailable';
   ctx._clearSyncTransientToast(); assert.equal(visible,true);
+});
+
+
+test('repeated Stop clicks across tabs retain one durable intent and one replay', async () => {
+  const shared = sharedStorage();
+  const a = fixture([], shared), b = fixture([], shared);
+  const url = '/api/sessions/tubescience/stop';
+  await Promise.all([a.ctx._queueOp(url, {method:'POST'}), b.ctx._queueOp(url, {method:'POST'})]);
+  assert.equal(JSON.parse(a.stored.get('amux_offline_queue')).length, 1);
+  let calls = 0;
+  a.ctx._origFetch = async () => {calls++; return new Response('{"ok":true,"message":"stopping"}', {status:202});};
+  await a.ctx.runSyncBanner();
+  assert.equal(calls, 1);
+  assert.equal(a.ctx.offlineQueue.length, 0);
+});
+
+test('Stop deduplication preserves a later Stop after Start and separate worker intent', async () => {
+  const {ctx} = fixture();
+  for (const url of ['/api/sessions/a/stop', '/api/sessions/b/stop', '/api/sessions/a/stop', '/api/sessions/a/start', '/api/sessions/a/stop'])
+    await ctx._queueOp(url, {method:'POST'});
+  assert.deepEqual(Array.from(ctx.offlineQueue, q => q.url), ['/api/sessions/a/stop', '/api/sessions/b/stop', '/api/sessions/a/start', '/api/sessions/a/stop']);
 });

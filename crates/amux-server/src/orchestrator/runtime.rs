@@ -1224,6 +1224,7 @@ impl Runtime {
                         let child = crate::db::board_store::create_issue(
                             conn,
                             &crate::db::board_store::NewIssue {
+                                acceptance_criteria: None,
                                 next_action: None,
                                 title: format!("Decompose and continue {}", parent.id),
                                 desc,
@@ -1763,6 +1764,7 @@ impl Runtime {
                 let mut row = crate::db::board_store::create_issue(
                     conn,
                     &crate::db::board_store::NewIssue {
+                        acceptance_criteria: None,
                         next_action: None,
                         title,
                         desc: captured_desc,
@@ -2374,6 +2376,7 @@ mod adherence_tests {
                 let row = bs::create_issue(
                     conn,
                     &bs::NewIssue {
+                        acceptance_criteria: None,
                         next_action: None,
                         title: title.clone(),
                         desc: String::new(),

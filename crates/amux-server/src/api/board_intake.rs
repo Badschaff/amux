@@ -98,7 +98,7 @@ where
     // folded into an unrelated finding carded in the same minute, and the trail
     // from the report to its fix ran through a card about something else.
     let structured = ["depends_on", "gate", "callback", "due", "due_time", "reviewer", "shepherd",
-        "ask_actor", "ask_type", "ask_question", "ask_unblocks", "tags", "request_to"].iter()
+        "ask_actor", "ask_type", "ask_question", "ask_unblocks", "tags", "request_to", "next_action", "acceptance_criteria"].iter()
         .any(|key| map.get(*key).is_some_and(|v| !v.is_null() && v != "" && v != &serde_json::json!([])))
         || matches!(item_type, "epic" | "watch" | "tripwire");
     if structured {
@@ -341,7 +341,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let calls = AtomicUsize::new(0);
         for key in ["depends_on", "gate", "callback", "due", "due_time", "reviewer", "shepherd",
-            "ask_actor", "ask_type", "ask_question", "ask_unblocks", "tags"] {
+            "ask_actor", "ask_type", "ask_question", "ask_unblocks", "tags", "next_action", "acceptance_criteria"] {
             let body = serde_json::json!({key: "explicit value"});
             let result = plan_create(body.as_object().unwrap(), "code", || async {
                 calls.fetch_add(1, Ordering::SeqCst);
@@ -393,6 +393,7 @@ mod tests {
         let store = Store::open(&dir.path().join("ceiling.db")).unwrap();
         store.write(|conn| {
             let mk = |desc: String| bs::NewIssue {
+                acceptance_criteria: None,
                 next_action: None,
                 title:"Ledger".into(), desc, status:"backlog".into(),
                 session:Some("owner".into()), item_type:"chore".into(), creator:"test".into(), owner_type:"agent".into(),
@@ -434,6 +435,7 @@ mod tests {
         let store = Store::open(&dir.path().join("intake.db")).unwrap();
         store.write(|conn| {
             let new = bs::NewIssue {
+                acceptance_criteria: None,
                 next_action: None,
                 title:"Normalize invoices".into(), desc:"Original USD contract".into(), status:"backlog".into(),
                 session:Some("owner".into()), item_type:"chore".into(), creator:"test".into(), owner_type:"agent".into(),

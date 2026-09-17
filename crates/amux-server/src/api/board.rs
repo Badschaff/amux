@@ -541,6 +541,7 @@ mod frontier_exclusion_tests {
     fn row(status: &str) -> bs::IssueRow {
         let conn = crate::db::migrate::test_memdb();
         let new = bs::NewIssue {
+            acceptance_criteria: None,
             next_action: None,
             title: "t".into(),
             desc: String::new(),
@@ -2672,6 +2673,7 @@ mod callback_dispatch_tests {
     fn request_at(state: &AppState, status: &str) -> String {
         let status = status.to_owned();
         let new = bs::NewIssue {
+            acceptance_criteria: None,
             next_action: None,
             title: "Produce the launch report".into(),
             desc: "Requested by another worker.".into(),
@@ -2717,6 +2719,7 @@ mod callback_dispatch_tests {
     /// `fold_target` writes the server's own fold marker into the log.
     fn capture_shell(state: &AppState, fold_target: Option<&str>) -> String {
         let new = bs::NewIssue {
+            acceptance_criteria: None,
             next_action: None,
             title: "whats the status on the rollout".into(),
             desc: "**Prompt:** whats the status on the rollout".into(),
@@ -4024,7 +4027,7 @@ fn body_opt_str(map: &Map<String, Value>, key: &str) -> Option<Option<String>> {
     }
 }
 
-/// Validates and JSON-encodes a PATCH value for `acceptance_criteria`
+/// Validates and JSON-encodes a create or PATCH value for `acceptance_criteria`
 /// (AF-711). `None` = clear; `Some(s)` = the string to store, already
 /// JSON-encoded so the read side's `parse_json_or_raw_string` round-trips it
 /// exactly — a plain string stores as a JSON string (`"..."`, reads back as
@@ -4901,7 +4904,7 @@ pub async fn create_item(
         // `ignored_fields`, and dispatch then refused the card for not having
         // one. Measured 2026-09-17: 14 eligible todos, every candidate refused,
         // the lane idle. Same shape the ask_* fields were fixed for.
-        "next_action",
+        "next_action", "acceptance_criteria",
     ];
     let ignored: Vec<String> = map
         .keys()
@@ -4909,6 +4912,17 @@ pub async fn create_item(
         .cloned()
         .collect();
 
+    // Validate before semantic reconciliation or any write; malformed criteria
+    // must not be silently discarded by either create or merge.
+    let acceptance_criteria = match encode_acceptance_criteria(
+        map.get("acceptance_criteria").unwrap_or(&Value::Null),
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(verdict = "create_acceptance_criteria_refused", %session, %error);
+            return err(StatusCode::BAD_REQUEST, json!({"error": error, "code": "invalid_acceptance_criteria"}));
+        }
+    };
     let _intake_guard = super::board_intake::lock(&session, &owner_type).await;
     let intake = super::board_intake::plan_create(&map, &item_type, || async {
         super::board_intake::plan(&state.store, &session, &owner_type, &title,
@@ -5000,6 +5014,7 @@ pub async fn create_item(
         _ => None,
     };
     let new = bs::NewIssue {
+        acceptance_criteria,
         next_action,
         title,
         desc: body_str(&map, "desc").unwrap_or_default(),
@@ -5996,6 +6011,7 @@ async fn decompose_item(
                     .map(|n| children[*n - 1].id.clone())
                     .collect::<Vec<_>>();
                 let new = bs::NewIssue {
+                    acceptance_criteria: None,
                     next_action: None,
                     title: task.title.trim().to_string(),
                     desc: task.description.trim().to_string(),
@@ -7085,6 +7101,7 @@ mod overlap_reconciliation_tests {
 
     fn new_card(session: &str) -> bs::NewIssue {
         bs::NewIssue {
+            acceptance_criteria: None,
             next_action: None,
             title: format!("overlap card for {session}"),
             desc: "durable semantic overlap test card".into(),
@@ -12606,6 +12623,7 @@ mod capture_requeue_tests {
                 let row = bs::create_issue(
                     conn,
                     &bs::NewIssue {
+                        acceptance_criteria: None,
                         next_action: None,
                         title: "Clear out this worker's board then grind it all out".into(),
                         desc: "**Prompt:** clear out this worker's board then grind it all out"
@@ -12773,6 +12791,7 @@ mod af701_archive_guard_tests {
                 let row = bs::create_issue(
                     conn,
                     &bs::NewIssue {
+                        acceptance_criteria: None,
                         next_action: None,
                         title: "AF-701 fixture card".into(),
                         desc: "fixture".into(),
@@ -13110,6 +13129,7 @@ mod af711_acceptance_criteria_tests {
                 let mut row = bs::create_issue(
                     conn,
                     &bs::NewIssue {
+                        acceptance_criteria: None,
                         next_action: None,
                         title: "AF-711 fixture card".into(),
                         desc: "fixture".into(),
@@ -13314,6 +13334,7 @@ mod af703_citing_cards_tests {
                 let row = bs::create_issue(
                     conn,
                     &bs::NewIssue {
+                        acceptance_criteria: None,
                         next_action: None,
                         title,
                         desc,
@@ -15211,6 +15232,7 @@ mod slim_tests {
 
     fn fold_card(creator: &str, status: &str, desc: &str, session: &str) -> bs::NewIssue {
         bs::NewIssue {
+            acceptance_criteria: None,
             next_action: None,
             title: "t".into(),
             desc: desc.into(),

@@ -406,6 +406,7 @@ async fn file_nudge_escalation(state: &AppState, lane: &str, backlog: i64, unhee
          \x20 amux board doing <ID>                         you are picking it up\n"
     );
     let new = crate::db::board_store::NewIssue {
+        acceptance_criteria: None,
         next_action: None,
         title,
         desc,
@@ -785,6 +786,11 @@ pub trait Fleet: Send + Sync {
         Ok(ResumeDelivery::Queued)
     }
 
+    /// One bounded blocker review per substantive card/dependency state.
+    async fn deliver_blocker_recovery(&self, lane: &str, text: &str, card: &str, rev: i64, _identity: &str) -> Result<bool, String> {
+        self.deliver_about(lane, text, card, rev).await
+    }
+
     /// Deliver a message whose text ASSERTS SOMETHING ABOUT A CARD (AMUX-3659).
     ///
     /// Same delivery, plus the card and the `issues.rev` the text was computed
@@ -919,6 +925,12 @@ impl Fleet for LiveFleet {
             }
         };
         Ok(disposition)
+    }
+    async fn deliver_blocker_recovery(&self, lane: &str, text: &str, card: &str, rev: i64, identity: &str) -> Result<bool, String> {
+        let queued = crate::api::session_verbs::enqueue_state_reminder(
+            &self.state.store, lane, text, GUARD, card, rev, identity).await?;
+        if queued { self.record_prompt(lane, text).await; }
+        Ok(queued)
     }
     async fn deliver_about(&self, lane: &str, text: &str, card: &str, rev: i64) -> Result<bool, String> {
         let identity={
@@ -1999,8 +2011,11 @@ fn drainable_backlog_count(conn: &Connection, session: &str, now: f64) -> usize 
 /// CANNOT serve this purpose — `source_ref` is on 93% of backlog cards and a
 /// future `due` on 65%, because both are auto-populated, so excluding on either
 /// would silence ~65% of the drain (AF-514).
-fn oldest_drainable_backlog(conn: &Connection, session: &str, now: f64) -> Option<String> {
-    drainable_backlog_ids(conn, session, now).into_iter().next()
+fn oldest_drainable_backlog(conn: &Connection, session: &str, now: f64, continuation_gate: bool) -> Option<String> {
+    drainable_backlog_ids(conn, session, now).into_iter().find(|id| {
+        !continuation_gate || bs::get_issue(conn, id).ok().flatten().is_some_and(|row|
+            bs::continuation_verdict(row.next_action.as_deref().unwrap_or("")) == bs::ContinuationVerdict::Ok)
+    })
 }
 
 /// Promote the next genuinely runnable backlog card when this lane opted into
@@ -2012,11 +2027,12 @@ fn backlog_drain_pickup(
     session: &str,
     now: f64,
     todo_refusals: usize,
+    continuation_gate: bool,
 ) -> Option<Pickup> {
     if !dispatch_backlog_when_idle(session) {
         return None;
     }
-    let card = oldest_drainable_backlog(conn, session, now)?;
+    let card = oldest_drainable_backlog(conn, session, now, continuation_gate)?;
     // Build the worker prompt from the selected row now, but re-check the
     // status under the claim transaction before anything is dispatched.
     let row = bs::get_issue(conn, &card).ok().flatten()?;
@@ -3556,7 +3572,7 @@ pub fn select_pickup_with(
         // acting on it. The nudge is advisory by design; this is the arm for an
         // owner who would rather it just happen.
         let drain_on = dispatch_backlog_when_idle(session);
-        if let Some(pickup) = backlog_drain_pickup(conn, session, now, 0) {
+        if let Some(pickup) = backlog_drain_pickup(conn, session, now, 0, continuation_gate) {
             return pickup;
         }
         // SAY WHY THE DRAIN DID NOT FIRE, in the line someone already reads.
@@ -3717,7 +3733,7 @@ pub fn select_pickup_with(
     // human-owned dependency). Once every todo candidate has been honestly
     // refused, continue the opted-in lane with independent backlog rather than
     // letting the blocked row shadow that work forever.
-    if let Some(pickup) = backlog_drain_pickup(conn, session, now, skipped.len()) {
+    if let Some(pickup) = backlog_drain_pickup(conn, session, now, skipped.len(), continuation_gate) {
         return pickup;
     }
     Pickup::None {
@@ -4574,67 +4590,25 @@ fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String
             // The sentence now shares the predicate of the mechanism it
             // describes (ethos rule 1) rather than giving one lane's exit to a
             // lane it does not work on.
-            qnote.push_str(if dispatch_backlog_when_idle(session) {
-                " Triage first: park not-ready cards with the condition that would make \
-                 them ready, `amux board backlog <ID> --trigger \"<condition>\"`, and send \
-                 owner-blocked ones to review. A BARE `backlog` is not an exit on this \
-                 lane: it drains untriggered backlog cards, so the card comes straight \
-                 back. Do not bounce ready cards to todo (brief re-claim cooldown). Work \
-                 this card or move it where it honestly belongs."
-            } else {
-                " Triage first: move not-ready cards to `backlog`, owner-blocked to review. \
-                 Do not bounce ready cards to todo (brief re-claim cooldown). Work this \
-                 card or move it where it honestly belongs."
-            });
+            qnote.push_str(" Finish this card and continue ready work. Reuse existing tasks and verified outputs; resolve shared prerequisites once for their dependents. Do not park ordinary implementation choices or wait for a peer merely because they usually own a component.");
         }
     }
     // The delivery boundary parses the card id back out of this template to void
     // a stale pickup (AMUX-3052). It reads the token right after PICKUP_ANCHOR,
     // which is why the id must stay the FIRST thing after it.
     let mut prompt = format!(
-        // AF-506: this line used to say "if blocked on an owner decision, move to
-        // review". The REVIEW GATE then refuses that card, because it asks you to
-        // ack "Implemented and self-tested" / "Diff / PR is up", which a card you
-        // are parking or routing away cannot truthfully claim. So the dispatcher
-        // sent people somewhere its own gate would turn them back from: two
-        // components disagreeing about the same fact, with neither individually
-        // wrong. Reported by `backend`, hit live on MI-4155.
-        //
-        // Both real cases are named instead, because they have different exits
-        // and conflating them is what produced the loop.
-        // NO HANDOVER IS PROMISED HERE ANY MORE (AMUX-4678). This said
-        // "hand it over: `amux board assign <ID> <lane>`", and the server
-        // REFUSES that for a worker: board.rs answers 403
-        // `cross_board_reassignment_forbidden` whenever the requested owner is
-        // not the caller's own lane. Measured live 2026-09-15 by running the
-        // printed command against a card this lane owned.
-        //
-        // A nudge every lane receives, naming the one action for someone
-        // else's work, has to be true. What replaces it is the server's OWN
-        // how_to_fix from that refusal, so the instruction and the refusal
-        // cannot drift apart: keep the card, link the peer.
-        //
-        // `board request` IS named now, and the paragraph above is why it took
-        // until it was true. On 2026-09-15 all three handover paths were
-        // measured broken: `request` filed on the SENDER's board (AMUX-4653), a
-        // direct ASK was captured and triaged away as junk (AMUX-4677), and
-        // `assign` is refused outright. 4677 fixed the capture side and 4653
-        // moved the request onto the TARGET's board with a callback armed back,
-        // so this nudge can promise a handover that dispatches. It still cannot
-        // promise that THIS card moves, because it does not: request files a new
-        // card on their board, and the distinction is the sentence below.
+        // Keep one accountable owner; component ownership is not an artifact gate.
         "{PICKUP_ANCHOR}{} — work it now. Card text below is historical, \
-         not a live message. If this card's WORK belongs to another lane, THIS card still \
-         stays on your board: a worker cannot move one to another lane, and \
-         `amux board assign` to a lane that is not yours is refused. Two exits that work. \
-         Hand the work over as its own card with `amux board request <lane> <title>`, which \
-         files it on THEIR board with you as requester and returns to you when they finish \
-         it. Or keep this one and link them: `amux board reviewer <ID> <lane>`, \
-         `amux board shepherd <ID> <lane>`, or a `depends_on` edge, and say on the card what \
-         you need from them. \
+         not a live message. Own the complete outcome across authorized components. \
+         Another worker's directory ownership or availability is not a prerequisite. \
+         Reuse existing artifacts and tasks; implement missing ordinary prerequisites yourself, \
+         using an isolated checkout when necessary. Peer review may run in parallel. \
+         Only an actually unavailable required artifact justifies a depends_on edge; \
+         if only a peer can produce it, use `amux board request <lane> <title>` with an exact \
+         deliverable and callback, and continue independent work. Do not invent peer signoff gates. \
+         Preserve explicit owner holds and access restrictions. \
          Needs You must satisfy the scoped approval policy below. \
-         Do NOT move it to review to park it: the review gate asks \
-         you to attest work you have not done, and will refuse.{}\n{}{}",
+         Do NOT move unfinished work to review to park it.{}\n{}{}",
         row.id,
         decline_exit(session),
         quoted_card_text(&row.title, &row.id),
@@ -6397,6 +6371,57 @@ fn nudge_delivery_failed(lane: &str, target: &str, card: &str, error: &str) -> L
         .with_card(card)
 }
 
+struct BlockerRecovery {
+    card: String,
+    rev: i64,
+    identity: String,
+    text: String,
+}
+
+/// Pickup excludes parked work. Recovery inspects that exclusion instead of
+/// treating it as an empty queue. It never clears a hold, claims held work, or
+/// routes work to a different worker. The recipient owns the safe next action.
+fn blocker_recoveries(conn: &Connection, lane: &str) -> rusqlite::Result<Vec<BlockerRecovery>> {
+    use sha2::{Digest, Sha256};
+    let mut stmt = conn.prepare(&format!(
+        "SELECT i.id FROM issues i WHERE i.session=?1 AND i.owner_type='agent' \
+         AND i.status IN ('todo','backlog','blocked','doing') AND i.deleted IS NULL \
+         AND COALESCE(i.archived,0)=0 AND COALESCE(i.type,'') NOT IN ('epic','watch','tripwire') \
+         AND NOT {capture} AND COALESCE(i.source,'')<>'capture' \
+         AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=i.id AND lower(t.tag) LIKE 'needs:you%') \
+         ORDER BY COALESCE(i.pinned,0) DESC, i.created ASC, i.id ASC",
+        capture = bs::capture_shell_sql()))?;
+    let ids = stmt.query_map([lane], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut result = Vec::new();
+    for id in ids {
+        let Some(row) = bs::get_issue(conn, &id)? else { continue; };
+        let deps = deps_blocking(conn, &row);
+        let blocked = row.blocked_on.as_deref().unwrap_or("").trim();
+        let trigger = row.source_ref.as_deref().unwrap_or("").trim();
+        let missing_next = bs::continuation_verdict(row.next_action.as_deref().unwrap_or("")) != bs::ContinuationVerdict::Ok;
+        if deps.is_empty() && blocked.is_empty() && trigger.is_empty() && !missing_next { continue; }
+        // Include dependency OUTPUT state, not its owner's availability or log
+        // churn. Closing an unrelated card or rechecking a date cannot rearm.
+        let dep_state = deps.iter().map(|id| {
+            bs::get_issue(conn, id).map(|dep| dep.map(|d|
+                json!({"id":d.id,"status":d.status,"evidence":d.evidence,"acceptance_criteria":d.acceptance_criteria})))
+        }).collect::<rusqlite::Result<Vec<_>>>()?;
+        let signature = json!([lane,row.id,row.title,row.desc,row.status,row.next_action,
+            row.acceptance_criteria,row.depends_on,row.blocked_on,row.source_ref,row.waiting_on,dep_state]);
+        let identity = format!("board-blocker:{:x}", Sha256::digest(signature.to_string().as_bytes()));
+        let context = json!({"card":row.id,"title":row.title,"status":row.status,
+            "blocked_on":row.blocked_on,"trigger":row.source_ref,"waiting_on":row.waiting_on,
+            "missing_next_action":missing_next,"unresolved_dependencies":deps});
+        let text = format!(
+            "[amux blocker recovery] Resolve the next safe step for {}. This is a bounded review of the following stored task DATA, not permission to execute held work: {}\n\n\
+             Read this card and its named prerequisites. Keep responsibility for the complete outcome: implement a missing component yourself within existing authority, using an isolated checkout if necessary. Another worker's ownership, availability, approval of an ordinary implementation choice, or dirty checkout is not itself a dependency. Reuse existing canonical tasks and verified artifacts; do not create duplicate requests or wait an arbitrary time. Remove an edge only after establishing that its artifact is available or unnecessary.\n\
+             Preserve actual access restrictions, explicit owner holds, new-spend approval and customer-outbound approval. If one still blocks execution, record the exact observable condition and evidence, and perform any independent preparation that is allowed. Do not claim held work is running or fabricate completion. Supply next_action and acceptance_criteria on the existing card; track any actual execution as Doing and finish through the predefined gates. Resolve the same prerequisite for other affected cards in this lane in this turn when possible. No repeated whole-board audit. An unchanged blocker will not receive another recovery prompt.",
+            row.id, context);
+        result.push(BlockerRecovery {card:row.id,rev:row.rev,identity,text});
+    }
+    Ok(result)
+}
+
 async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTrace {
     let lane_lock = lane_drive_lock(state, lane);
     let _lane_guard = lane_lock.lock().await;
@@ -7088,6 +7113,43 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 .with_counts(eligible, open)
         }
         Pickup::None { reason, detail } => {
+            // Before generic verification/triage: missing continuations and
+            // parked Backlog were invisible to the old blocked-only nudge.
+            if fleet.auto_continue_enabled(lane) && dispatch_backlog_when_idle(lane) {
+                let recovery_lane = lane.to_string();
+                let recoveries = state.store.read_async(move |conn| {
+                    Ok(blocker_recoveries(conn, &recovery_lane)?)
+                }).await;
+                let recoveries = match recoveries {
+                    Ok(rows) => rows,
+                    Err(error) => return LaneTrace::skip(lane, "blocker-recovery-unmeasured", error.to_string()).with_counts(eligible, open),
+                };
+                let considered = recoveries.len();
+                for recovery in recoveries {
+                    match fleet.deliver_blocker_recovery(lane, &recovery.text, &recovery.card, recovery.rev, &recovery.identity).await {
+                        Ok(false) => continue,
+                        Err(error) => return nudge_delivery_failed(lane, lane, &recovery.card, &error).with_counts(eligible, open),
+                        Ok(true) => {
+                            crate::api::session_verbs::emit_event(state, lane, "task.blocker_recovery",
+                                Some(json!({"issue":recovery.card,"identity":recovery.identity,
+                                    "measured":true,"n_considered":considered,"verdict":"specific_blocker_review_queued"})),
+                                None, "board-drive").await;
+                            tracing::info!(session=lane, card=%recovery.card, measured=true, n_considered=considered,
+                                verdict="specific_blocker_review_queued", "board_drive: one bounded blocker review queued; holds preserved");
+                            return LaneTrace::acted(lane, "blocker-recovery", &recovery.card,
+                                format!("one specific blocker review queued from {considered} parked/incomplete cards; unchanged state will not repeat"))
+                                .with_counts(eligible, open);
+                        }
+                    }
+                }
+                if considered > 0 {
+                    // Do not spend a generic triage/continue turn on the same
+                    // work that already has a durable specific recovery.
+                    return LaneTrace::skip(lane, "blocker-recovery-unchanged",
+                        format!("{considered} parked/incomplete cards already reviewed or queued; waiting for a substantive change"))
+                        .with_counts(eligible, open);
+                }
+            }
             // VERIFY NUDGE — options A+B. When a session has no todo/doing/
             // review work but holds `done` cards, nudge it to verify them.
             // This is NOT the removed `done` advance tier (lines 1042-1076):
@@ -9411,6 +9473,9 @@ mod tests {
             self.deliver(lane, text).await;
             Ok(())
         }
+        async fn deliver_blocker_recovery(&self, lane: &str, text: &str, _card: &str, _rev: i64, identity: &str) -> Result<bool, String> {
+            self.deliver_resume(lane, text, identity).await.map(|d| d == ResumeDelivery::Queued)
+        }
         async fn deliver_resume(
             &self,
             lane: &str,
@@ -9467,6 +9532,100 @@ mod tests {
         let got: Vec<String> = blocked_dep_unblocks(&conn).into_iter().map(|(id, _)| id).collect();
         assert_eq!(got, vec!["FREE".to_string()],
             "only a card whose dependencies were the whole block is released");
+    }
+
+    #[tokio::test]
+    async fn idle_parked_backlog_gets_one_specific_recovery_without_clearing_holds() {
+        let (_dir, state, store) = drive_state();
+        drive_card(&store, "PARKED", "backlog", "agent", "code");
+        drive_card(&store, "EXTERNAL", "todo", "agent", "code");
+        store.write(|conn| {
+            conn.execute("UPDATE issues SET session='paused-peer' WHERE id='EXTERNAL'", [])?;
+            conn.execute("UPDATE issues SET source_ref='owner deployment hold', blocked_on='missing library output', \
+                last_verified_at=?1, depends_on='[\"EXTERNAL\"]' WHERE id='PARKED'", [now_f64() as i64])?;
+            Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
+        }).unwrap();
+        let fleet = BoundaryFleet::default();
+        let first = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(first.outcome, "blocker-recovery", "{first:?}");
+        assert_eq!(first.card.as_deref(), Some("PARKED"));
+        assert_eq!(drive_status(&store, "PARKED"), "backlog");
+        assert_eq!(drive_status(&store, "EXTERNAL"), "todo");
+        assert_eq!(fleet.starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let text = fleet.delivered.lock().unwrap()[0].1.clone();
+        assert!(text.contains("owner deployment hold") && text.contains("EXTERNAL"));
+        assert!(text.contains("implement a missing component yourself"));
+        // Incidental edits and advancing an unrelated task do not buy another turn.
+        store.write(|conn| {
+            conn.execute("UPDATE issues SET rev=rev+1, log='checked again', last_verified_at=?1 WHERE id='PARKED'", [now_f64() as i64])?;
+            Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
+        }).unwrap();
+        assert_eq!(drive_lane(&state, &fleet, "lane").await.reason, "blocker-recovery-unchanged");
+        assert_eq!(fleet.delivered.lock().unwrap().len(), 1);
+        // Actual output becoming available re-arms recovery; the explicit hold stays.
+        store.write(|conn| {
+            conn.execute("UPDATE issues SET status='verified', evidence='library test passed' WHERE id='EXTERNAL'", [])?;
+            Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
+        }).unwrap();
+        assert_eq!(drive_lane(&state, &fleet, "lane").await.outcome, "blocker-recovery");
+        assert_eq!(drive_status(&store, "PARKED"), "backlog");
+        assert_eq!(drive_events(&store, "task.blocker_recovery"), 2);
+    }
+
+    #[tokio::test]
+    async fn blocker_recovery_does_not_run_into_busy_isolated_or_stopped_workers() {
+        let (_dir, state, store) = drive_state();
+        drive_card(&store, "PARKED", "backlog", "agent", "code");
+        store.write(|conn| {
+            conn.execute("UPDATE issues SET blocked_on='peer availability' WHERE id='PARKED'", [])?;
+            Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
+        }).unwrap();
+        let fleet = BoundaryFleet::default();
+        fleet.boundary.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(drive_lane(&state, &fleet, "lane").await.reason, "mid-turn");
+        fleet.boundary.store(true, std::sync::atomic::Ordering::SeqCst);
+        fleet.isolated.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(drive_lane(&state, &fleet, "lane").await.reason, "isolated");
+        fleet.isolated.store(false, std::sync::atomic::Ordering::SeqCst);
+        fleet.running.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(drive_lane(&state, &fleet, "lane").await.reason, "not-running-no-dispatchable-work");
+        assert!(fleet.delivered.lock().unwrap().is_empty());
+        assert_eq!(drive_status(&store, "PARKED"), "backlog");
+    }
+
+    #[test]
+    fn missing_continuation_backlog_is_prepared_instead_of_repeatedly_failing_claim() {
+        let (_dir, _state, store) = drive_state();
+        drive_card(&store, "INCOMPLETE", "backlog", "agent", "code");
+        store.write(|conn| {
+            conn.execute("UPDATE issues SET next_action=NULL WHERE id='INCOMPLETE'", [])?;
+            Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
+        }).unwrap();
+        let conn = store.read().unwrap();
+        assert!(matches!(select_pickup_with(&conn, "lane", now_f64(), true), Pickup::None{..}));
+        let recovery = blocker_recoveries(&conn, "lane").unwrap();
+        assert_eq!(recovery.len(), 1);
+        assert_eq!(recovery[0].card, "INCOMPLETE");
+        assert!(matches!(select_pickup_with(&conn, "lane", now_f64(), false), Pickup::DrainBacklog{..}),
+            "the explicit continuation opt-out still works");
+    }
+
+    #[tokio::test]
+    async fn incomplete_intake_is_recoverable_and_delivery_failure_consumes_no_attempt() {
+        let (_dir, state, store) = drive_state();
+        drive_card(&store, "INCOMPLETE", "backlog", "agent", "code");
+        store.write(|conn| {
+            conn.execute("UPDATE issues SET next_action=NULL, blocked_on='needs an implementation decision' WHERE id='INCOMPLETE'", [])?;
+            Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
+        }).unwrap();
+        let fleet = BoundaryFleet::default();
+        *fleet.delivery_error.lock().unwrap() = Some("queue unavailable".into());
+        let failed = drive_lane(&state, &fleet, "lane").await;
+        assert!(failed.reason.contains("delivery"), "{failed:?}");
+        assert_eq!(drive_events(&store, "task.blocker_recovery"), 0);
+        *fleet.delivery_error.lock().unwrap() = None;
+        assert_eq!(drive_lane(&state, &fleet, "lane").await.outcome, "blocker-recovery");
+        assert!(fleet.delivered.lock().unwrap()[0].1.contains("missing_next_action\":true"));
     }
 
     #[tokio::test]

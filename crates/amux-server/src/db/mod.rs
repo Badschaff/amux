@@ -91,6 +91,8 @@ type WriteFn = Box<dyn FnOnce(&Connection) -> rusqlite::Result<WriteOutcome> + S
 
 struct WriteRequest {
     work: WriteFn,
+    origin: &'static str,
+    queued_at: std::time::Instant,
     interaction_id: Option<String>,
     reply: mpsc::Sender<rusqlite::Result<WriteReply>>,
 }
@@ -206,6 +208,8 @@ impl Store {
         self.write_tx
             .send(WriteRequest {
                 work: Box::new(f),
+                origin: std::any::type_name::<F>(),
+                queued_at: std::time::Instant::now(),
                 interaction_id,
                 reply: reply_tx,
             })
@@ -436,6 +440,8 @@ fn writer_loop(
     events_tx: tokio::sync::broadcast::Sender<StateEvent>,
 ) {
     while let Ok(req) = rx.recv() {
+        let queued_ms = req.queued_at.elapsed().as_millis() as u64;
+        let started = std::time::Instant::now();
         // A panicking caller must not kill the sole writer and strand every
         // later mutation. The transaction guard rolls back during unwinding.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -446,6 +452,14 @@ fn writer_loop(
             Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
                 std::io::Error::other("writer mutation panicked; transaction rolled back"))))
         });
+        let work_ms = started.elapsed().as_millis() as u64;
+        if work_ms >= 250 || queued_ms >= 1000 {
+            // Function identity only; never record the request body or SQL
+            // values. Separate the slow writer from callers waiting behind it.
+            tracing::warn!(target: "store", verdict = "writer_slow", origin = req.origin,
+                queued_ms, work_ms, ok = result.is_ok(), measured = true, n_considered = 1,
+                "serialized write delayed; origin identifies the blocking mutation");
+        }
         if let Err(error) = &result {
             tracing::warn!(target: "store", verdict = "writer_mutation_failed", %error,
                 autocommit = conn.is_autocommit(), "mutation failed; no acknowledgement was issued");
