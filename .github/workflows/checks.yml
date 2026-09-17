@@ -210,6 +210,22 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-claude-scratch-report.sh
+      # AMUX-4661. The mac tripwire called `sysctl` bare; it lives in /usr/sbin,
+      # which is NOT on the PATH the amux server runs under (measured on the box:
+      # no /usr/sbin in the running process env), so two of its three thresholds
+      # could never trip. A memory fire alarm that could not read memory.
+      #
+      # THIS RUNNER IS LINUX AND THE SCRIPT READS DARWIN SYSCTLS, so the cell
+      # that reproduces the bug SKIPS here and prints that it skipped. What runs
+      # on this runner is the source-level cell: the PATH export exists and sits
+      # ABOVE the first probe. Verified by mutation that this is not decorative;
+      # removing the export reddens this step on Linux (2 of 5 cells, exit 1),
+      # and on a Mac it reddens 5 of 8. Wiring a Darwin-only assertion into a
+      # Linux runner is what turned a green step red in ea07267a the same day.
+      - name: the mac tripwire can still reach sysctl (AMUX-4661)
+        run: |
+          set -uo pipefail
+          ./scripts/test-mac-pressure-tripwire.sh
       # AF-561, THE RATCHET. A scripts/test-*.sh that prints a verdict without
       # `set -e` will report PASS after calling a helper that does not exist —
       # bash writes "command not found" to stderr and the suite carries on, and

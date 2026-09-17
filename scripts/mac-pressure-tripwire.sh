@@ -36,6 +36,21 @@
 #   scripts/mac-pressure-tripwire.sh --dry-run # never page, just print
 set -uo pipefail
 
+# `sysctl` lives in /usr/sbin, which is NOT on the PATH this runs under, so both
+# the pressure level and the swap reading came back empty and two of the three
+# thresholds could never trip (AMUX-4661). Measured on this box: the running
+# amux-server-rs process, which is what executes SCHED-458, carries
+#   PATH=/Users/ethan/.cargo/bin:/Users/ethan/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin
+# with no /usr/sbin, and the script printed `measured=false level=-1
+# swap_free=-1MB swap_used=MB` under it. Its sibling mac-cleanup-tick.sh already
+# exports this for the same reason; host-analysis.sh does too.
+#
+# The script was HONEST about the gap rather than silent (measured=false is in
+# every line it prints), which is the only reason this was findable at all. That
+# is the property to keep if these probes ever change.
+PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+export PATH
+
 PRESSURE_ALERT=${AMUX_TRIPWIRE_PRESSURE:-3}       # >= this pages. 2 self-clears, so not 2.
 FSEVENTSD_GB=${AMUX_TRIPWIRE_FSEVENTSD_GB:-20}    # 12.8 GB seen 09-14; 20 is a real escalation
 SWAP_FREE_MB=${AMUX_TRIPWIRE_SWAP_FREE_MB:-512}   # last cushion
