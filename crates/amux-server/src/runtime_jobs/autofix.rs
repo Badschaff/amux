@@ -7539,83 +7539,6 @@ async fn note_quiet_signatures(
 }
 
 // ---------------------------------------------------------------------------
-// Auto-expire stale autofix cards (transient operational alerts).
-// ---------------------------------------------------------------------------
-
-fn autofix_expire_hours() -> i64 {
-    std::env::var("AMUX_AUTOFIX_EXPIRE_HOURS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(72)
-}
-
-/// Discard autofix-created cards in todo/backlog that are older than the TTL.
-/// These are transient operational alerts; if the condition persists, the next
-/// autofix tick will re-file. Returns the number of cards expired.
-async fn expire_stale_autofix_cards(state: &AppState) -> anyhow::Result<usize> {
-    let ttl_h = autofix_expire_hours();
-    if ttl_h <= 0 {
-        return Ok(0);
-    }
-    let cutoff = crate::api::reclaim::now_secs() - (ttl_h * 3600);
-    let expired: Vec<(String, String)> = {
-        let conn = state.store.read()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, title FROM issues \
-             WHERE creator = 'autofix' \
-               AND status IN ('todo', 'backlog') \
-               AND COALESCE(archived, 0) = 0 \
-               AND deleted IS NULL \
-               AND COALESCE(updated_at, created_at) < ?1",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![cutoff], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?;
-        rows.flatten().collect()
-    };
-    if expired.is_empty() {
-        return Ok(0);
-    }
-    let now = crate::api::reclaim::now_secs();
-    let count = expired.len();
-    let ids = expired.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
-    state
-        .store
-        .write_async(move |conn| {
-            for id in &ids {
-                conn.execute(
-                    "UPDATE issues SET status = 'discarded', \
-                        updated_at = ?2, \
-                        log = COALESCE(log, '') || ?3 \
-                     WHERE id = ?1",
-                    rusqlite::params![
-                        id,
-                        now,
-                        format!(
-                            "\n[autofix-expire] discarded after {}h with no action",
-                            ttl_h
-                        )
-                    ],
-                )?;
-            }
-            Ok(crate::db::WriteOutcome {
-                applied: true,
-                events: vec![],
-            })
-        })
-        .await?;
-    for (id, title) in &expired {
-        tracing::info!(
-            card = %id,
-            title = %title,
-            ttl_hours = ttl_h,
-            "autofix_expire: discarded stale autofix card (no action within TTL)"
-        );
-    }
-    Ok(count)
-}
-
-// ---------------------------------------------------------------------------
 // Spawn + debug surface.
 // ---------------------------------------------------------------------------
 
@@ -7659,11 +7582,15 @@ pub fn spawn(state: AppState) -> Option<super::PeriodicTask> {
                     "autofix tick"
                 );
             }
-            match expire_stale_autofix_cards(&state).await {
-                Ok(n) if n > 0 => tracing::info!(expired = n, "autofix tick: expired stale cards"),
-                Err(e) => tracing::warn!(err = %e, "autofix tick: expire sweep failed"),
-                _ => {}
-            }
+            // Expiring stale autofix cards belongs to `board_hygiene::stale_sweep`,
+            // NOT here. This tick used to call a second copy of that sweep whose
+            // SELECT read `issues.updated_at`, a column `issues` has never had
+            // (it is `updated`, since 0001_baseline.sql; `updated_at` is correct
+            // on a dozen other tables, which is why the wrong name reads as
+            // right). So it failed on every tick from 7e3ca68f until it was
+            // removed, 680 errors, while board_hygiene quietly did the job with
+            // the correct column and a test. Do not re-add a sweep here: a
+            // duplicate is what let the broken one look alive for a week.
         }
     }))
 }

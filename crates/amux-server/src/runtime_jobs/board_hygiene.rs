@@ -59,10 +59,45 @@ struct StatusCount {
     count: i64,
 }
 
+/// Prepare a sweep query, and SAY SO when it fails.
+///
+/// Every sweep below returns a `Vec`, and the `let Ok(..) else { return out }`
+/// form turns a broken query into an EMPTY one with no log line at all. Empty
+/// is a legitimate answer here ("nothing is stale"), so the failure is
+/// indistinguishable from the healthy case at every call site and in every
+/// downstream count.
+///
+/// That is not hypothetical. A second, duplicate copy of the autofix sweep in
+/// `runtime_jobs::autofix` selected `issues.updated_at`, a column `issues` has
+/// never had, and failed on every tick for a week (AMUX-4740). It was only ever
+/// found because it used `?` and logged 680 errors. These four sites would have
+/// made the same defect completely silent.
+fn prepare_or_warn<'c>(
+    conn: &'c rusqlite::Connection,
+    probe: &'static str,
+    sql: &str,
+) -> Option<rusqlite::Statement<'c>> {
+    match conn.prepare(sql) {
+        Ok(st) => Some(st),
+        Err(e) => {
+            tracing::warn!(
+                probe = probe,
+                err = %e,
+                measured = false,
+                verdict = "board_hygiene_query_unprepared",
+                "board-hygiene sweep query did not prepare, so this sweep reports EMPTY. Read that as unmeasured, not as nothing being stale"
+            );
+            None
+        }
+    }
+}
+
 fn find_needsyou_cards(conn: &rusqlite::Connection, now_secs: i64) -> Vec<NeedsyouCard> {
     let cutoff = now_secs - (NEEDSYOU_WARN_DAYS * 86_400);
     let mut out = Vec::new();
-    let Ok(mut st) = conn.prepare(
+    let Some(mut st) = prepare_or_warn(
+        conn,
+        "needsyou_aging",
         "SELECT id, title, created, COALESCE(ask_actor, '') FROM issues \
          WHERE status = 'needsyou' AND deleted IS NULL \
          AND COALESCE(archived, 0) = 0 AND created < ?1 \
@@ -87,7 +122,9 @@ fn find_needsyou_cards(conn: &rusqlite::Connection, now_secs: i64) -> Vec<Needsy
 fn find_stale_autofix_cards(conn: &rusqlite::Connection, now_secs: i64) -> Vec<StaleAutofixCard> {
     let cutoff = now_secs - (AUTOFIX_STALE_HOURS * 3600);
     let mut out = Vec::new();
-    let Ok(mut st) = conn.prepare(
+    let Some(mut st) = prepare_or_warn(
+        conn,
+        "stale_autofix",
         "SELECT id, title, created FROM issues \
          WHERE status = 'todo' AND creator = 'autofix' AND deleted IS NULL \
          AND COALESCE(archived, 0) = 0 AND created < ?1 \
@@ -114,7 +151,9 @@ fn find_stale_backlog_cards(conn: &rusqlite::Connection, now_secs: i64) -> Vec<S
     // Cards that have been in backlog for 30+ days and were never moved to
     // doing or done. We check the log column for evidence of a status transition;
     // if the log is empty or NULL, the card was never worked.
-    let Ok(mut st) = conn.prepare(
+    let Some(mut st) = prepare_or_warn(
+        conn,
+        "stale_backlog",
         "SELECT id, title, created FROM issues \
          WHERE status = 'backlog' AND deleted IS NULL \
          AND COALESCE(archived, 0) = 0 AND created < ?1 \
@@ -138,7 +177,9 @@ fn find_stale_backlog_cards(conn: &rusqlite::Connection, now_secs: i64) -> Vec<S
 
 fn count_by_session_status(conn: &rusqlite::Connection) -> Vec<StatusCount> {
     let mut out = Vec::new();
-    let Ok(mut st) = conn.prepare(
+    let Some(mut st) = prepare_or_warn(
+        conn,
+        "count_by_session_status",
         "SELECT COALESCE(session, '(unowned)'), status, COUNT(*) FROM issues \
          WHERE deleted IS NULL AND COALESCE(archived, 0) = 0 \
          GROUP BY session, status ORDER BY session, status",
@@ -634,6 +675,72 @@ mod tests {
         assert_eq!(cards.len(), 1, "expected 1 card, got {}", cards.len());
         assert_eq!(cards[0].id, "AF-1");
         assert_eq!(cards[0].age_hours, 80);
+    }
+
+    /// The guard has to be able to FAIL, or it is decoration (ethos rule 7).
+    ///
+    /// This is the exact SELECT that ran in `runtime_jobs::autofix` and failed
+    /// on every tick for a week: `issues` has `updated`/`created`, never
+    /// `updated_at` (AMUX-4740). Pin it against the REAL migrated schema, so
+    /// this asserts something about the shipped table rather than about a
+    /// fixture built to agree with the query.
+    #[test]
+    fn prepare_or_warn_reports_a_column_that_does_not_exist() {
+        let conn = crate::db::migrate::test_memdb();
+
+        let bad = prepare_or_warn(
+            &conn,
+            "amux_4740_specimen",
+            "SELECT id, title FROM issues WHERE COALESCE(updated_at, created_at) < ?1",
+        );
+        assert!(
+            bad.is_none(),
+            "a SELECT on issues.updated_at must not prepare: the column does not exist"
+        );
+
+        // The positive control. Without it this test passes just as happily
+        // against a connection with no `issues` table at all, which would make
+        // it a test of the fixture rather than of the column name.
+        let good = prepare_or_warn(
+            &conn,
+            "amux_4740_control",
+            "SELECT id, title FROM issues WHERE COALESCE(updated, created) < ?1",
+        );
+        assert!(
+            good.is_some(),
+            "the corrected column names must prepare, or this test is measuring a missing table"
+        );
+    }
+
+    /// `count_by_session_status` was the one sweep query with no test, so a
+    /// rename under it would have produced an empty rollup that reads exactly
+    /// like a quiet board.
+    #[test]
+    fn count_by_session_status_prepares_and_counts() {
+        let conn = crate::db::migrate::test_memdb();
+        for (id, session, status) in [
+            ("CB-1", "amux", "todo"),
+            ("CB-2", "amux", "todo"),
+            ("CB-3", "amux", "doing"),
+        ] {
+            conn.execute(
+                "INSERT INTO issues (id, title, status, session, creator, created, updated, owner_type) \
+                 VALUES (?1, ?2, ?3, ?4, 'human', 1, 1, 'agent')",
+                rusqlite::params![id, "t", status, session],
+            )
+            .unwrap();
+        }
+
+        let counts = count_by_session_status(&conn);
+        assert!(
+            !counts.is_empty(),
+            "empty here would be indistinguishable from a query that failed to prepare"
+        );
+        let todo = counts
+            .iter()
+            .find(|c| c.session == "amux" && c.status == "todo")
+            .expect("amux/todo row");
+        assert_eq!(todo.count, 2);
     }
 
     #[test]
