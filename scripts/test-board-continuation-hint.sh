@@ -9,6 +9,16 @@
 # Reading only the tail, the obvious move was --override-doing, which cannot
 # clear this gate.
 #
+# AMUX-4731, THE SECOND REPAIR OF THE SAME ARM. AMUX-4570 special-cased two
+# error codes by name and left the predicate underneath unchanged: it still
+# matched on the PRESENCE of `holding`. Two different refusals send that key and
+# mean different things, a doing-WIP refusal sends a LIST of held cards and
+# todo_wip_limit_reached sends an INTEGER queue depth, so `amux board todo`
+# printed the doing remedy and exited 4, naming --override-doing, which cannot
+# clear a todo limit. The server had sent four correct remedies in how_to_fix in
+# the same body. The cells below pin the branch on `code` and the printing of
+# the server remedy, in both directions.
+#
 # WHAT IS PINNED, in both directions. A continuation refusal must print the
 # server remedy and exit 1, and must never print the override hint. The real WIP
 # refusal (a holding list, error "already holding doing") must still print the
@@ -54,12 +64,13 @@ for _ in $(seq 1 50); do [ -s "$PORTF" ] && break; sleep 0.1; done
 PORT=$(cat "$PORTF")
 [ -n "${PORT:-}" ] || { echo "listener never bound"; exit 1; }
 
-run_doing() {  # run_doing <http status> <json body>  -> sets RC and ERR
-  printf '%s\n%s' "$1" "$2" > "$REPLY"
+run_board() {  # run_board <status> <http status> <json body>  -> sets RC and ERR
+  printf '%s\n%s' "$2" "$3" > "$REPLY"
   if timeout 20 env AMUX_API="http://127.0.0.1:$PORT" AMUX_SESSION=continuation-hint-test CC_HOME="$(dirname "$ERRF")" \
-      bash "$AMUX_BIN" board doing TEST-1 >/dev/null 2>"$ERRF"; then RC=0; else RC=$?; fi
+      bash "$AMUX_BIN" board "$1" TEST-1 >/dev/null 2>"$ERRF"; then RC=0; else RC=$?; fi
   ERR=$(cat "$ERRF")
 }
+run_doing() { run_board doing "$1" "$2"; }
 
 echo "amux board doing refusal remedies (AMUX-4570)"
 
@@ -95,6 +106,32 @@ run_doing 409 "$GATE"
 [ "$RC" -eq 3 ] && ok "ack gate still exits 3" || bad "ack gate still exits 3" "exit $RC"
 case "$ERR" in *"--checked"*) ok "ack gate still names --checked" ;;
   *) bad "ack gate still names --checked" "stderr: $ERR" ;; esac
+
+# ---- AMUX-4731: todo_wip_limit_reached must not get the doing remedy ----
+# The live body, keys as api/board.rs 10816 sends them. `holding` is an INTEGER
+# here, which is the whole trap: the old predicate accepted it as a held-card
+# list.
+TODO_WIP='{"error":"todo queue is at its limit for this lane","code":"todo_wip_limit_reached","ok":false,"blocked":true,"item":"TEST-1","attempted_status":"todo","session":"continuation-hint-test","holding":20,"limit":20,"why":"continuation-hint-test already holds 20 todo card(s) and the limit is 20.","close_these_first":[{"id":"AMUX-11","title":"an old one","days_since_touched":9,"already_undispatchable":true}],"how_to_fix":{"finish_one":"amux board done <ID> --evidence-stdin","not_next":"amux board backlog <ID> --trigger \"<what re-arms it>\"","not_a_unit_of_work":"amux board discard <ID>","raise_it":"set AMUX_TODO_WIP_LIMIT=<n>","force":"true (explicit bypass; logged)"}}'
+run_board todo 409 "$TODO_WIP"
+case "$ERR" in *"--override-doing"*) bad "todo WIP never suggests --override-doing" "stderr: $ERR" ;;
+  *) ok "todo WIP never suggests --override-doing" ;; esac
+case "$ERR" in *"What clears it:"*"amux board backlog"*) ok "todo WIP prints the server remedy naming backlog" ;;
+  *) bad "todo WIP prints the server remedy naming backlog" "stderr: $ERR" ;; esac
+case "$ERR" in *"amux board done TEST-1 --evidence-stdin"*) ok "todo WIP substitutes the real id into the remedy" ;;
+  *) bad "todo WIP substitutes the real id into the remedy" "stderr: $ERR" ;; esac
+case "$ERR" in *"AMUX-11"*"already undispatchable"*) ok "todo WIP names the stalest cards the server computed" ;;
+  *) bad "todo WIP names the stalest cards the server computed" "stderr: $ERR" ;; esac
+# ITS OWN EXIT CODE: 4 is the doing-WIP code and the two need opposite remedies,
+# so a script cannot be left unable to tell them apart.
+[ "$RC" -eq 7 ] && ok "todo WIP exits 7, not the doing-WIP 4" || bad "todo WIP exits 7, not the doing-WIP 4" "exit $RC"
+
+# how_to_fix is a bare STRING at api/board.rs 5100. A reader that assumes a dict
+# prints nothing for it, which is the same silent-drop this card is about.
+TODO_WIP_STR='{"ok":false,"code":"todo_wip_limit_reached","error":"todo queue is at its limit for this lane","session":"continuation-hint-test","holding":20,"limit":20,"how_to_fix":"create in backlog or finish existing todo work"}'
+run_board todo 409 "$TODO_WIP_STR"
+case "$ERR" in *"What clears it:"*"create in backlog"*) ok "a string how_to_fix is printed too" ;;
+  *) bad "a string how_to_fix is printed too" "stderr: $ERR" ;; esac
+[ "$RC" -eq 7 ] && ok "string-form todo WIP also exits 7" || bad "string-form todo WIP also exits 7" "exit $RC"
 
 run_doing 200 '{"ok":true,"id":"TEST-1","status":"doing"}'
 [ "$RC" -eq 0 ] && ok "a successful move exits 0" || bad "a successful move exits 0" "exit $RC; stderr: $ERR"

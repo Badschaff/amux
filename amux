@@ -2740,9 +2740,67 @@ if err in ("doing_requires_next_action", "doing_next_action_not_a_sentence"):
         sys.stderr.write("  or, only when the next action is genuinely unknowable:\n  "
                          + str(esc).replace("<ID>", iid) + "\n")
     sys.exit(1)
+# AMUX-4731. BRANCH ON THE CODE, NOT ON THE PRESENCE OF `holding`.
+#
+# Two different refusals send `holding` and they mean different things: the
+# doing-WIP refusal sends a LIST of held cards, todo_wip_limit_reached sends an
+# INTEGER queue depth. The test below used to accept either, so a todo-WIP
+# refusal printed the doing remedy and exited 4, naming --override-doing, which
+# cannot clear a todo limit. The server had already sent four correct remedies
+# in how_to_fix in the same body, and they were discarded for a hardcoded line.
+#
+# This is the SECOND repair of this arm. AMUX-4570 (the comment above) fixed the
+# identical class by special-casing two error codes by name and left the
+# predicate underneath unchanged, so the next refusal carrying `holding` walked
+# straight back in. Its own instruction, print the server remedy, is what this
+# does: a hardcoded remedy cannot disagree with the run, which is why the defect
+# survived a round of fixing (ethos rule 4).
+#
+# NO APOSTROPHE IN THIS BLOCK. The whole function is a python3 -c argument
+# delimited by single quotes, so one apostrophe breaks the CLI for every session.
+def _remedies(v):
+    # how_to_fix is a DICT at two server sites and a bare STRING at a third, so
+    # a reader that assumes either shape prints nothing for the other. Both are
+    # real today (api/board.rs 4957, 10839, and 5100).
+    if isinstance(v, dict):
+        return [str(x) for x in v.values() if x]
+    if isinstance(v, str) and v.strip():
+        return [v.strip()]
+    return []
+
+code = (d.get("code") or "") if isinstance(d, dict) else ""
+if code == "todo_wip_limit_reached":
+    why = d.get("why") or ""
+    if why:
+        sys.stderr.write("\n" + str(why) + "\n")
+    # The specific cards the dispatcher has already stopped dealing. Far more
+    # use than a generic close something, and the server computed them.
+    stale = [c for c in (d.get("close_these_first") or []) if isinstance(c, dict)]
+    if stale:
+        sys.stderr.write("\nOldest untouched todo cards on this lane:\n")
+        for c in stale[:5]:
+            sys.stderr.write("  %s  %s%s\n" % (
+                c.get("id") or "?",
+                str(c.get("title") or "")[:58],
+                "  (already undispatchable)" if c.get("already_undispatchable") else ""))
+    rem = _remedies(d.get("how_to_fix"))
+    if rem:
+        sys.stderr.write("\nWhat clears it:\n")
+        for r in rem:
+            sys.stderr.write("  " + r.replace("<ID>", iid) + "\n")
+    # ITS OWN EXIT CODE. Reusing the doing-WIP exit 4 makes the two
+    # indistinguishable to any script, and they need opposite remedies.
+    sys.exit(7)
 # A real WIP refusal carries a holding list and the error already holding doing.
 if d.get("holding") or "holding" in e or "wip" in e:
-    if tgt:
+    # PREFER THE COMMAND THE SERVER SENT. It emits `cli` for this refusal, so
+    # the hardcoded form below is a second copy that can drift from it, which is
+    # the defect this whole block is about. Fall back only when it is absent.
+    cli = d.get("cli")
+    if cli:
+        sys.stderr.write("\nFinish or demote the held card, or hold both deliberately:\n"
+                         "  " + str(cli).replace("<ID>", iid) + "\n")
+    elif tgt:
         sys.stderr.write("\nFinish or demote the held card, or hold both deliberately:\n"
                          "  amux board " + tgt + " " + iid + " --override-doing\n")
     sys.exit(4)
