@@ -200,6 +200,55 @@ fn ok(v: Value, disposition: &str) -> Response {
     r
 }
 
+/// True for the one failure `legacy_sessions_values` documents as retryable.
+///
+/// Decided on the TYPE, never on the message, matching `discovery_failure`
+/// beside it: rewording the Display text must not silently turn a retryable
+/// race into a permanent failure.
+fn is_discovery_race(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<super::sessions_legacy::DiscoveryRaced>().is_some()
+}
+
+/// The session list, retrying ONCE when discovery raced a structural change.
+///
+/// `DiscoveryRaced` is the one error in this path that its own doc comment
+/// calls retryable: "the request was fine and the answer exists a moment
+/// later", which is why every HTTP reader of the projection answers 503 with
+/// `Retry-After: 1` rather than 500. This caller had no retry, so a race that
+/// every other reader recovers from left the git map stale until the next tick,
+/// and in a test binary it panicked (AMUX-4700).
+///
+/// THE RACE IS NOT A TEST ARTEFACT, which is why the fix belongs here and not in
+/// a test. `SESSIONS_EPOCH` is a process-global `AtomicU64`, so ANY session
+/// mutation anywhere in the process invalidates a build in flight, no matter
+/// whose home directory it reads. In production that is a real worker starting
+/// or stopping while this refresh runs.
+///
+/// ONCE, not a loop. A second failure means the fleet is changing faster than a
+/// build takes, and the honest answer then is the error: the caller serves the
+/// previous value, which is what the cache is for. A loop here would turn a
+/// churning fleet into an unbounded refresh.
+async fn sessions_values_retrying_the_race(state: &AppState) -> anyhow::Result<Vec<Value>> {
+    match super::sessions_legacy::legacy_sessions_values(state.store.clone()).await {
+        Ok(v) => Ok(v),
+        Err(first) if is_discovery_race(&first) => {
+            // The signal, per the repo's two-fix rule: a retry that starts
+            // happening on every refresh is a fleet-churn problem, and without
+            // this line it would be invisible because the retry succeeds.
+            tracing::warn!(
+                verdict = "sessions_git_discovery_raced",
+                measured = true,
+                n_considered = 1,
+                "session list raced a structural change during the git refresh; retrying once"
+            );
+            super::sessions_legacy::legacy_sessions_values(state.store.clone())
+                .await
+                .map_err(|e| e.context("session list unavailable"))
+        }
+        Err(other) => Err(other.context("session list unavailable")),
+    }
+}
+
 /// Rebuild the map and store it. Callable from the request path AND from a
 /// background task, which is the whole point: the two must not drift, so there
 /// is one function rather than a handler and a copy of it.
@@ -208,9 +257,7 @@ fn ok(v: Value, disposition: &str) -> Response {
 /// reader cannot accidentally make the background path re-enter it.
 async fn recompute(state: &AppState) -> anyhow::Result<Value> {
     // (name, dir, branch) from the SAME source the session list renders.
-    let arr = super::sessions_legacy::legacy_sessions_values(state.store.clone())
-        .await
-        .map_err(|e| e.context("session list unavailable"))?;
+    let arr = sessions_values_retrying_the_race(state).await?;
     let rows: Vec<(String, String, String)> = arr
         .iter()
         .filter_map(|v| {
@@ -262,6 +309,35 @@ async fn recompute(state: &AppState) -> anyhow::Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AMUX-4700: the retry predicate decides on the TYPE, never the message.
+    ///
+    /// `SESSIONS_EPOCH` is a process-global AtomicU64, so any session mutation
+    /// anywhere in the process can invalidate a build in flight. This path had
+    /// no retry, so a race every HTTP reader recovers from (503 + Retry-After)
+    /// left the git map stale, and in a test binary it panicked. The two-test
+    /// reproducer on the card failed 3 of 3 with the retry disabled and passes
+    /// 6 of 6 with it.
+    #[test]
+    fn the_retry_is_decided_on_the_type_and_not_on_the_wording() {
+        let raced: anyhow::Error = super::super::sessions_legacy::DiscoveryRaced.into();
+        assert!(is_discovery_race(&raced), "the documented retryable race must be retried");
+        // ...and it survives being wrapped, which is how it actually arrives:
+        // `recompute` adds context before any caller sees it.
+        assert!(is_discovery_race(&raced.context("session list unavailable")));
+
+        // THE CONTROL, and the reason this cell exists rather than a string
+        // compare. An error carrying the IDENTICAL words but not the type is a
+        // different failure, and retrying it would repeat whatever real fault
+        // produced it. sessions_legacy pins the same distinction for the HTTP
+        // status; this pins it for the retry.
+        let look_alike = anyhow::anyhow!("sessions list changed during discovery; retry");
+        assert!(
+            !is_discovery_race(&look_alike),
+            "same words, different type: rewording Display must not be able to create a retry"
+        );
+        assert!(!is_discovery_race(&anyhow::anyhow!("tmux not found")));
+    }
 
     /// SERIALISE THE CELLS THAT DRIVE THE GLOBAL STATICS (AMUX-3684 follow-up).
     ///
