@@ -220,6 +220,44 @@ impl Store {
         tokio::task::spawn_blocking(move || this.write_correlated(f, interaction_id)).await?
     }
 
+    /// Run a read WITHOUT pinning a runtime worker (AF-640 / AMUX-4744).
+    ///
+    /// THE MISSING HALF THAT AF-640 NAMES. The comment on the read pool's
+    /// `connection_timeout` says it plainly: "`read()` is synchronous and there
+    /// is no `read_async` to match `write_async`, whose own doc says it exists
+    /// so a handler can await a write without pinning a runtime worker. So
+    /// every one of the ~440 `read()` call sites blocks its thread for the
+    /// whole acquire."
+    ///
+    /// That is self-sustaining, and the same comment says why: the pool's
+    /// `max_size` is `available_parallelism`, which is ALSO tokio's default
+    /// worker count, so a saturated pool can pin every worker at once. The
+    /// 2026-09-08 outage ran 22 minutes and recurred five times that day. The
+    /// timeout was cut from 30s to 5s, which bounds the pin; it does not remove
+    /// it. This removes it, for callers that can await.
+    ///
+    /// The acquire happens on the BLOCKING pool, where blocking is what the
+    /// threads are for, so a saturated read pool costs latency instead of
+    /// costing the runtime its ability to poll anything else.
+    ///
+    /// ADDITIVE ON PURPOSE. `read()` keeps working and keeps its slow-acquire
+    /// warning; converting ~440 call sites in one change is not a reviewable
+    /// diff and most of them are on background jobs that already run on the
+    /// maintenance runtime (AMUX-4225) where a pinned thread costs far less.
+    /// The callers worth moving are the ones on the request path.
+    pub async fn read_async<F, T>(&self, f: F) -> anyhow::Result<T>
+    where
+        F: FnOnce(&Connection) -> anyhow::Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = this.read()?;
+            f(&conn)
+        })
+        .await?
+    }
+
     /// A read acquire this slow means the pool is already saturated. Well under
     /// `connection_timeout` so the warning arrives BEFORE the failures do, which
     /// is the difference between a signal and a post-mortem.
@@ -507,6 +545,57 @@ pub type SharedStore = Arc<Store>;
 #[cfg(test)]
 mod af640_read_pool_tests {
     use super::*;
+
+    /// AF-640 / AMUX-4744: a read must not pin the runtime worker that awaits it.
+    ///
+    /// The pool's `max_size` is `available_parallelism`, which is ALSO tokio's
+    /// default worker count, so a saturated pool could pin every worker at once.
+    /// That is what made the 2026-09-08 exhaustion self-sustaining for 22
+    /// minutes and recur five times the same day. Cutting the timeout 30s -> 5s
+    /// bounded the pin; `read_async` removes it for callers that can await.
+    ///
+    /// SINGLE-WORKER RUNTIME ON PURPOSE. With one worker thread a blocking
+    /// acquire makes everything else on that runtime unrunnable, so this cell
+    /// cannot pass by falling back on a spare worker.
+    #[test]
+    fn a_read_async_leaves_the_runtime_worker_free_to_poll() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("ra.db")).unwrap();
+
+        rt.block_on(async move {
+            // Hold EVERY read connection, so any further acquire must wait.
+            let held: Vec<_> = (0..store.read_pool.max_size())
+                .map(|_| store.read_pool.get().expect("prefill"))
+                .collect();
+
+            let s2 = store.clone();
+            let reader = tokio::spawn(async move {
+                s2.read_async(|c| Ok(c.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))?)).await
+            });
+
+            // THE POINT: while that read waits for a connection, the single
+            // runtime worker must still poll something else. Before read_async
+            // this task could not be polled at all, because the blocked acquire
+            // owned the worker.
+            let ticked = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                tokio::spawn(async { 42u8 }),
+            )
+            .await
+            .expect("the runtime worker was pinned by a blocked read acquire")
+            .expect("join");
+            assert_eq!(ticked, 42);
+
+            drop(held);
+            let got = reader.await.expect("join");
+            assert_eq!(got.unwrap(), 1, "the read still returns once a connection frees");
+        });
+    }
 
     /// The DIAGNOSTIC half, which the timeout test does not cover: mutating the
     /// warn away leaves that cell green, because a pool can fail fast and say

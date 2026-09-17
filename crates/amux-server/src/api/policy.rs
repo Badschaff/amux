@@ -314,7 +314,19 @@ fn exact_resource(uri: &axum::http::Uri, body: &[u8]) -> String {
     format!("{route}#sha256={}", hex::encode(hash.finalize()))
 }
 
-fn request_trust(state: &AppState, headers: &HeaderMap) -> Result<TrustLevel, String> {
+/// AF-640 / AMUX-4744: this runs on the HTTP runtime for EVERY write.
+///
+/// `enforce` short-circuits reads before it (`ActionClass::Read` returns
+/// early), so this synchronous `store.read()` was a per-WRITE blocking acquire
+/// on an HTTP worker while GETs never reached it. That is the exact asymmetry
+/// the request log shows: reads 0.013% over 10s, writes 5.6%, on the same
+/// server in the same window. A saturated read pool then pins HTTP workers, and
+/// the pool's max_size is `available_parallelism`, which is also tokio's
+/// default worker count, so it can pin every one of them.
+///
+/// Now awaits on the blocking pool instead. Same queries, same order, same
+/// verdicts; only the thread it waits on changes.
+async fn request_trust(state: &AppState, headers: &HeaderMap) -> Result<TrustLevel, String> {
     if headers
         .get("x-amux-input-trust")
         .and_then(|v| v.to_str().ok())
@@ -326,16 +338,24 @@ fn request_trust(state: &AppState, headers: &HeaderMap) -> Result<TrustLevel, St
     if actor_name == "api-anonymous" {
         return Ok(TrustLevel::Trusted);
     }
-    let conn = state.store.read().map_err(|e| e.to_string())?;
-    let Some(worker) =
-        crate::db::queries::get_worker(&conn, &actor_name).map_err(|e| e.to_string())?
-    else {
+    state
+        .store
+        .read_async(move |conn| trust_from_conn(conn, &actor_name))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The verdict itself, unchanged, split out so it runs on the blocking pool.
+fn trust_from_conn(
+    conn: &rusqlite::Connection,
+    actor_name: &str,
+) -> anyhow::Result<TrustLevel> {
+    let Some(worker) = crate::db::queries::get_worker(conn, actor_name)? else {
         return Ok(TrustLevel::Trusted);
     };
-    let worker_id = amux_core::ids::WorkerId::parse(&worker.id).map_err(|e| e.to_string())?;
-    let Some(command) =
-        crate::db::commands::in_flight(&conn, &worker_id).map_err(|e| e.to_string())?
-    else {
+    let worker_id = amux_core::ids::WorkerId::parse(&worker.id)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let Some(command) = crate::db::commands::in_flight(conn, &worker_id)? else {
         return Ok(TrustLevel::Trusted);
     };
     if !matches!(
@@ -344,8 +364,7 @@ fn request_trust(state: &AppState, headers: &HeaderMap) -> Result<TrustLevel, St
     ) {
         return Ok(TrustLevel::Trusted);
     }
-    let snapshot = crate::orchestrator::context::load_snapshot(&conn, &command.idempotency_key)
-        .map_err(|e| e.to_string())?;
+    let snapshot = crate::orchestrator::context::load_snapshot(conn, &command.idempotency_key)?;
     Ok(match snapshot {
         Some(snapshot)
             if snapshot
@@ -404,7 +423,7 @@ pub async fn enforce(State(state): State<AppState>, mut req: Request, next: Next
     if action == ActionClass::Read {
         return next.run(req).await;
     }
-    let trust = match request_trust(&state, req.headers()) {
+    let trust = match request_trust(&state, req.headers()).await {
         Ok(trust) => trust,
         Err(error) => {
             return (
