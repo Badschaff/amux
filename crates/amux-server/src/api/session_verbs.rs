@@ -8987,23 +8987,104 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
     if worktree_enabled {
         let wt_dir = home().join("worktrees").join(name);
         let wt_path = wt_dir.to_string_lossy().into_owned();
-        // Clean up stale worktree from a previous run
+        // Clean up stale worktree from a previous run.
+        //
+        // UNLOCK FIRST. `worktree remove --force` REFUSES a locked worktree, and
+        // the ephemeral path leaves them locked (AMUX-4767: 3 of 3 read
+        // `locked` = "initializing", including the two that materialized fine).
+        // Without this the leftover registration survives every cleanup, and
+        // since the creation below is now fatal rather than silently falling
+        // back, one leaked lock would wedge every later start for that name.
+        let _ = run_cmd("git", &["-C", &work_dir, "worktree", "unlock", &wt_path], OP_TIMEOUT).await;
+        let _ = run_cmd("git", &["-C", &work_dir, "worktree", "remove", "--force", &wt_path], OP_TIMEOUT).await;
         if wt_dir.exists() {
-            let _ = run_cmd("git", &["-C", &work_dir, "worktree", "remove", "--force", &wt_path], OP_TIMEOUT).await;
-            if wt_dir.exists() {
-                let _ = tokio::fs::remove_dir_all(&wt_dir).await;
-            }
+            let _ = tokio::fs::remove_dir_all(&wt_dir).await;
         }
+        // A registration whose directory is already gone is not removed by the
+        // two commands above; prune is what clears it, and it is a no-op when
+        // there is nothing stale.
+        let _ = run_cmd("git", &["-C", &work_dir, "worktree", "prune"], OP_TIMEOUT).await;
         if let Some(parent) = wt_dir.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
-        match run_cmd("git", &["-C", &work_dir, "worktree", "add", "--detach", &wt_path, "HEAD"], OP_TIMEOUT).await {
-            Some(o) if o.status.success() => {
-                tracing::info!(session = name, worktree = %wt_path, "worktree created for isolated workspace");
+        // PIN AT origin/main, NOT THE MAIN CHECKOUT'S HEAD (AMUX-4770).
+        //
+        // graft-push never advances local HEAD on this fleet, so HEAD is stale
+        // by construction — CLAUDE.md says so outright, and the worktree that
+        // triggered this card was cut from a sha 5,213 commits behind
+        // origin/main. A worker isolated onto a tree that old cannot see files
+        // that exist upstream, which is how it passed a guard locally by never
+        // generating the case for a file it could not see, then failed in the
+        // pushed tree.
+        //
+        // The fallback is DECLARED rather than silent: a repo with no
+        // origin/main (a fresh local repo, a fork mid-setup) still starts, and
+        // the log says which ref it used and why.
+        let pinned_at = match run_cmd(
+            "git",
+            &["-C", &work_dir, "rev-parse", "--verify", "--quiet", "origin/main"],
+            OP_TIMEOUT,
+        )
+        .await
+        {
+            Some(o) if o.status.success() => "origin/main",
+            _ => {
+                tracing::warn!(session = name, verdict = "worktree_pin_fallback",
+                    "origin/main does not resolve in this repo; pinning the worktree at HEAD, \
+                     which on a graft-push fleet is stale by construction");
+                "HEAD"
+            }
+        };
+        let added = run_cmd(
+            "git",
+            &["-C", &work_dir, "worktree", "add", "--detach", &wt_path, pinned_at],
+            OP_TIMEOUT,
+        )
+        .await;
+        // A `git worktree add` that exits 0 is not proof the directory is
+        // there. The incident behind this card had the worktree REGISTERED and
+        // the directory MISSING, so the exit status alone would have passed it.
+        let materialized = wt_dir.join(".git").exists();
+        match added {
+            Some(o) if o.status.success() && materialized => {
+                tracing::info!(session = name, worktree = %wt_path, pinned_at,
+                    "worktree created for isolated workspace");
                 work_dir = wt_path;
             }
-            _ => {
-                tracing::warn!(session = name, "worktree creation failed, falling back to shared checkout");
+            other => {
+                // REFUSE, DO NOT FALL BACK (AMUX-4770).
+                //
+                // This used to warn and leave work_dir as the shared checkout,
+                // which starts the session in a tree ~18 other lanes are
+                // writing to. A worker that asked to be isolated and silently
+                // is not gets the whole shared-checkout hazard class: a peer's
+                // uncommitted edits in its build, index.lock collisions,
+                // hooks reporting a peer's work as its own. Measured on the
+                // lane that reported this, it cost a wrong conclusion sent to
+                // a peer. Setup failing loudly is cheaper than that every time.
+                let detail = other
+                    .as_ref()
+                    .map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| {
+                        if materialized {
+                            "git worktree add produced no output".to_string()
+                        } else {
+                            "git reported success but the worktree directory is absent".to_string()
+                        }
+                    });
+                tracing::error!(session = name, worktree = %wt_path, verdict = "worktree_required",
+                    materialized, "refusing to start: isolation was requested and could not be provided");
+                return (
+                    false,
+                    format!(
+                        "refusing to start {name}: CC_WORKTREE=1 asked for an isolated worktree at \
+                         {wt_path} and it could not be created ({detail}). Starting in the shared \
+                         checkout instead would put this session in a tree other lanes are writing \
+                         to, which is the hazard the isolation exists to avoid. Fix the worktree \
+                         (git -C {work_dir} worktree prune) or unset CC_WORKTREE."
+                    ),
+                );
             }
         }
     }
@@ -33087,5 +33168,167 @@ mod lifecycle_token_tests {
         c.execute("UPDATE issues SET status='done' WHERE id='SEED-1'",[]).unwrap();
         c.execute("INSERT INTO cmd_history(session,text,type,ts,capture_pending) VALUES('new-worker','Please answer this question','user',1,0)",[]).unwrap();
         assert!(!empty_resume_queue(&c,"new-worker").unwrap());
+    }
+}
+
+#[cfg(test)]
+mod amux4770_worktree_isolation_tests {
+    use std::process::Command;
+
+    fn git(repo: &std::path::Path, args: &[&str]) -> std::process::Output {
+        Command::new("git").arg("-C").arg(repo).args(args).output().expect("git runs")
+    }
+
+    /// AMUX-4770: the exact leak that wedges a start, and the cleanup that clears it.
+    ///
+    /// The incident had a worktree REGISTERED, LOCKED with reason
+    /// "initializing", and its directory MISSING. That combination survives the
+    /// obvious cleanup: `worktree remove --force` REFUSES a locked worktree,
+    /// and `prune` SKIPS a locked one too, so the registration outlives every
+    /// attempt and the path can never be re-added.
+    ///
+    /// That only became load-bearing when the fallback was removed. While a
+    /// failed create silently used the shared checkout, a permanently stuck
+    /// registration was invisible; now it would refuse the start, so the
+    /// cleanup has to actually work. This drives real git, not a mock.
+    #[test]
+    fn a_locked_registration_with_no_directory_is_cleared_before_re_adding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.email", "t@t"]);
+        git(&repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("f.txt"), "x").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "seed"]);
+
+        let wt = tmp.path().join("wt");
+        let wt_s = wt.to_string_lossy().to_string();
+        assert!(git(&repo, &["worktree", "add", "--detach", &wt_s, "HEAD"]).status.success());
+
+        // Reproduce the incident exactly: lock it, then lose the directory.
+        assert!(git(&repo, &["worktree", "lock", "--reason", "initializing", &wt_s]).status.success());
+        std::fs::remove_dir_all(&wt).unwrap();
+
+        // THE CONTROL that makes the rest mean something: without unlocking,
+        // the registration really is stuck. If this ever stops holding, the
+        // cleanup below is not being tested against a real obstruction.
+        let _ = git(&repo, &["worktree", "remove", "--force", &wt_s]);
+        let _ = git(&repo, &["worktree", "prune"]);
+        let listed = String::from_utf8_lossy(&git(&repo, &["worktree", "list"]).stdout).to_string();
+        assert!(
+            listed.contains(&wt_s),
+            "a LOCKED registration must survive remove+prune, or this cell proves nothing:\n{listed}"
+        );
+        assert!(
+            !git(&repo, &["worktree", "add", "--detach", &wt_s, "HEAD"]).status.success(),
+            "and the path must be un-addable while it is stuck"
+        );
+
+        // The shipped order: unlock, then remove, then prune.
+        let _ = git(&repo, &["worktree", "unlock", &wt_s]);
+        let _ = git(&repo, &["worktree", "remove", "--force", &wt_s]);
+        let _ = git(&repo, &["worktree", "prune"]);
+        let after = String::from_utf8_lossy(&git(&repo, &["worktree", "list"]).stdout).to_string();
+        assert!(
+            !after.contains(&wt_s),
+            "unlock+remove+prune must clear the stuck registration:\n{after}"
+        );
+        assert!(
+            git(&repo, &["worktree", "add", "--detach", &wt_s, "HEAD"]).status.success(),
+            "and the path must be usable again afterwards"
+        );
+    }
+
+    /// A `worktree add` that exits 0 is not proof the directory is there, which
+    /// is why the start path checks for `.git` rather than trusting the status.
+    /// The incident had exit-success and an absent directory.
+    #[test]
+    fn a_registered_worktree_whose_directory_is_gone_fails_the_materialized_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.email", "t@t"]);
+        git(&repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("f.txt"), "x").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "seed"]);
+
+        let wt = tmp.path().join("wt");
+        let wt_s = wt.to_string_lossy().to_string();
+        assert!(git(&repo, &["worktree", "add", "--detach", &wt_s, "HEAD"]).status.success());
+        assert!(wt.join(".git").exists(), "a real worktree carries a .git entry");
+
+        std::fs::remove_dir_all(&wt).unwrap();
+        assert!(
+            !wt.join(".git").exists(),
+            "with the directory gone the check must fail, even though git still lists the worktree"
+        );
+        let listed = String::from_utf8_lossy(&git(&repo, &["worktree", "list"]).stdout).to_string();
+        assert!(
+            listed.contains(&wt_s),
+            "git still reports it as registered, which is exactly why exit status is not enough"
+        );
+    }
+
+    /// The start path must REFUSE, not fall back. Pinned at source because the
+    /// behaviour lives inside `start_session`, which spawns tmux and cannot run
+    /// in a unit test.
+    #[test]
+    fn the_start_path_refuses_instead_of_using_the_shared_checkout() {
+        let src = include_str!("session_verbs.rs");
+        let body = src
+            .split_once("    // --- Worktree isolation (opt-in via CC_WORKTREE=1) ---")
+            .expect("the isolation block exists")
+            .1;
+        let body = body.split_once("\n    // AC-346:").expect("its end marker").0;
+        // Strip comments: a scan that reads the prose describing the code
+        // passes on the description instead of the code, which cost a green
+        // mutation earlier today on a different file.
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            code.contains("worktree") && code.contains("OP_TIMEOUT"),
+            "the scan is not reading the isolation block; {} chars of something else",
+            code.len()
+        );
+        assert!(
+            !code.contains("falling back to shared checkout"),
+            "the silent fallback is back: a session that asked for isolation would run in the \
+             shared checkout"
+        );
+        assert!(
+            code.contains("return (") && code.contains("refusing to start"),
+            "failing to create the worktree must REFUSE the start, not continue"
+        );
+        // NOT just `contains("origin/main")`: that string is also in the
+        // rev-parse probe, so the loose form stayed green under a mutation that
+        // changed the resolved pin back to HEAD. Assert the RESOLUTION.
+        assert!(
+            code.contains("=> \"origin/main\""),
+            "the worktree must RESOLVE to origin/main; HEAD is stale by construction on a \
+             graft-push fleet, and merely mentioning origin/main is not pinning to it"
+        );
+        assert!(
+            code.contains("&wt_path, pinned_at"),
+            "the add must use the resolved pin, not a literal ref"
+        );
+        assert!(
+            code.contains("worktree\", \"unlock\"") || code.contains("\"unlock\""),
+            "the pre-create cleanup must unlock, or one leaked lock wedges every later start"
+        );
+        // THE CHECK THAT CATCHES THE REPORTED INCIDENT: registered, exit 0,
+        // directory absent. Exit status alone would have accepted it.
+        assert!(
+            code.contains("o.status.success() && materialized"),
+            "success must require the directory to exist, not just a zero exit; the incident \
+             behind this card had git reporting success with no directory"
+        );
     }
 }
