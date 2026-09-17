@@ -2663,6 +2663,21 @@
   /* Kanban view of session issues: let the inner .board-columns scroll horizontally */
   .peek-tasks-list.peek-issues-kanban { overflow-y: auto; }
   .peek-tasks-list.peek-issues-kanban .board-columns { flex: 1; min-height: 0; }
+  /* THE ACTIVITY BANNER MUST SCROLL WITH THE BOARD (Ethan, 2026-09-16:
+     "I should be able to scroll this down. It should not be fixed.").
+     `_renderBoardActivity` inserts the strip as a SIBLING BEFORE its host, and
+     on this panel the host is `#peek-issues-list`, which is the element that
+     carries `overflow-y: auto`. So the banner landed in the non-scrolling flex
+     parent and stayed pinned while the cards scrolled underneath it, costing
+     fixed vertical space on a phone. Moving the strip inside the list instead
+     is not available: `renderPeekIssues` rewrites `list.innerHTML` at four
+     points across two functions with early returns between them, so a child
+     would be wiped on the next render.
+     Scoped to this panel by id. Other `.peek-tasks-panel` tabs set their own
+     inline `overflow-y: auto` and must keep scrolling themselves. */
+  #peek-issues-panel { overflow-y: auto; -webkit-overflow-scrolling: touch; }
+  #peek-issues-panel > .peek-tasks-list,
+  #peek-issues-panel > .peek-tasks-list.peek-issues-kanban { overflow-y: visible; flex: 0 0 auto; }
   .peek-issue-item { display: flex; flex-shrink: 0; align-items: flex-start; gap: 8px; padding: 8px 10px;
     border-radius: 8px; border: 1px solid var(--border); cursor: pointer; transition: background 0.15s; }
   .peek-issue-item:hover { background: var(--hover); border-color: var(--accent); }
@@ -6511,7 +6526,20 @@ input.mdai-edge-path-input:focus { border-color: var(--accent); box-shadow: 0 0 
 
 /* AF-749: modal space is the visible viewport, including the software keyboard. */
 .amux-dialog-viewport {
-  top: var(--dialog-viewport-top, 0px) !important;
+  /* AMUX-4642. THE CHROME TAB OFFSET HAS TO SURVIVE THIS RULE. AF-749 pins every
+     dialog to the visual viewport, and `--dialog-viewport-top` is SET to
+     `visualViewport.offsetTop` (app.js), which is 0 on a desktop with no
+     keyboard. With `!important` that beat `.file-overlay`'s
+     `top: max(var(--chrome-tab-h), ...)`, so the overlay started at y=0 and slid
+     UNDER the 38px chrome tab bar, which is fixed at top:0 with z-index 1000.
+     Measured in the browser at the failing click: --chrome-tab-h "38px", bar box
+     0..38, overlay computed top "0px", the overlay's close button at y 12..52 and
+     the bar's "Hide tabs" control at y 18..38, overlapping in both axes. The
+     close button was unclickable, which is what reddened LC-LINKED-RECORD.
+     max() keeps AF-749's behaviour when the keyboard shifts the viewport, and it
+     costs nothing on phones, where the strip is display:none and the JS already
+     forces --chrome-tab-h to 0. Same idiom as the .overlay rule below. */
+  top: max(var(--dialog-viewport-top, 0px), var(--chrome-tab-h, 0px), env(safe-area-inset-top, 0px)) !important;
   height: var(--dialog-viewport-height, 100dvh) !important;
   bottom: auto !important;
 }
@@ -6557,7 +6585,7 @@ input.mdai-edge-path-input:focus { border-color: var(--accent); box-shadow: 0 0 
   max-height:calc(var(--dialog-viewport-height, 100dvh) - 40px) !important;
 }
 .amux-dialog-viewport.overlay {
-  top:max(var(--dialog-viewport-top, 0px),env(safe-area-inset-top, 0px)) !important;
+  top:max(var(--dialog-viewport-top, 0px),var(--chrome-tab-h, 0px),env(safe-area-inset-top, 0px)) !important;
   height:calc(var(--dialog-viewport-height, 100dvh) - env(safe-area-inset-top, 0px)) !important;
 }
 

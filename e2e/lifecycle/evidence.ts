@@ -56,6 +56,15 @@ export async function deleteOwnedWorkers(page: Page, request: APIRequestContext,
     const response = await getSessionsResilient(request, headers);
     expect(response.ok(), 'sessions listing must recover from a transient race').toBeTruthy();
     if (!(await response.json()).some((row: any) => row.name === name)) continue;
+    // A THROW HERE REPLACES THE TEST'S OWN ERROR. This helper runs in the
+    // spec's `finally`, and in JS a finally that throws discards the try
+    // block's exception, so a teardown that cannot click reports itself as the
+    // failure and hides what actually broke. That is what made AMUX-4642 read
+    // as "Back click times out" for two days: the real failure was earlier, and
+    // this click was only blocked by the overlay that earlier failure left open.
+    // Close the topmost layer by calling its handler, which cannot be
+    // intercepted, so teardown stops competing with the bug it is hiding.
+    await page.evaluate(() => (window as any).closeFilePreview?.());
     const closeDetail = page.locator('#board-detail-overlay.active > .overlay-header').getByRole('button', { name: 'Back', exact: false });
     if (await closeDetail.isVisible()) await closeDetail.click();
     const closePeek = page.locator('#peek-overlay.active').getByRole('button', { name: 'Close worker', exact: true });
