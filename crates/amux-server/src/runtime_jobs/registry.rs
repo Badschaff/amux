@@ -110,14 +110,12 @@ pub mod ids {
     pub const AUTOFIX: &str = "autofix";
     pub const BOARD_DRIVE: &str = "board-drive";
     pub const CDC_POLLER: &str = "cdc-poller";
-    pub const GHOST_RESCUE: &str = "ghost-rescue";
     pub const PANE_SIZE: &str = "pane_size";
     pub const STORAGE: &str = "storage";
     pub const HEARTBEAT: &str = "heartbeat";
     pub const TAILNET_WATCH: &str = "tailnet-watch";
     pub const TELEGRAM_POLL: &str = "telegram-poll";
     pub const TELEGRAM_RELAY: &str = "telegram-relay";
-    pub const QUEUE_DISPOSITION: &str = "queue-disposition";
     pub const MESSAGE_CAPTURE: &str = "message-capture";
     pub const MAC_HEALTH: &str = "mac-health";
     pub const ACCOUNTABILITY_NUDGE: &str = "accountability-nudge";
@@ -154,14 +152,12 @@ pub const ALL_IDS: &[&str] = &[
     ids::AUTOFIX,
     ids::BOARD_DRIVE,
     ids::CDC_POLLER,
-    ids::GHOST_RESCUE,
     ids::PANE_SIZE,
     ids::STORAGE,
     ids::HEARTBEAT,
     ids::TAILNET_WATCH,
     ids::TELEGRAM_POLL,
     ids::TELEGRAM_RELAY,
-    ids::QUEUE_DISPOSITION,
     ids::MESSAGE_CAPTURE,
     ids::MAC_HEALTH,
     ids::ACCOUNTABILITY_NUDGE,
@@ -334,18 +330,6 @@ pub const CATALOG: &[Doc] = &[
         detail: Some("/api/history"),
     },
     Doc {
-        id: ids::QUEUE_DISPOSITION,
-        name: "Queue disposition",
-        purpose: "Tells a lane which of its todo cards auto-pickup has already stopped offering, and asks for one of three dispositions. Files ONE card per lane and updates it; it never retires or retypes a card itself.",
-        env: &[EnvControl {
-            var: "AMUX_QUEUE_DISPOSITION_SECS",
-            effect: "sweep seconds; 0 stops the sweep",
-            off: Some("0"),
-        }],
-        pref: None,
-        detail: None,
-    },
-    Doc {
         id: ids::STORAGE,
         name: "Storage retention",
         purpose: "Bounds append-only history, caches, diagnostic run logs and build artifacts; preserves referenced uploads and expires transcript cache entries.",
@@ -364,14 +348,6 @@ pub const CATALOG: &[Doc] = &[
         env: NO_ENV,
         pref: None,
         detail: Some("/api/debug/invariants"),
-    },
-    Doc {
-        id: ids::GHOST_RESCUE,
-        name: "Ghost rescue",
-        purpose: "Presses Enter for a message that was typed into a lane's input box and never submitted — the fallback for keystroke delivery.",
-        env: NO_ENV,
-        pref: None,
-        detail: None,
     },
     Doc {
         id: ids::PIPE_RECONCILE,
@@ -1190,18 +1166,6 @@ pub fn outcome_for(id: &str) -> Option<String> {
         }),
         ids::BOARD_DRIVE => super::board_drive::last_report().map(|r| {
             format!("{} assigned, {} nudged across {} lane(s)", r.assigned, r.nudged, r.lanes.len())
-        }),
-        // Was `None`, so the one job whose entire purpose is finding
-        // unsubmitted messages reported nothing about whether it had found any.
-        ids::GHOST_RESCUE => super::ghost_rescue::last_report().map(|r| {
-            format!(
-                "{} lane(s) examined, {} rescued, {} left alone ({} holding a collapsed paste the sweep cannot claim), {} empty composer(s)",
-                r.examined,
-                r.rescued.len(),
-                r.left_alone.len(),
-                r.chips.len(),
-                r.placeholders
-            )
         }),
         ids::STORAGE => super::storage::last_report().map(|r| {
             format!(

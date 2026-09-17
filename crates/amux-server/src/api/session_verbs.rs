@@ -632,16 +632,6 @@ fn load_meta(name: &str) -> Map<String, Value> {
         .unwrap_or_default()
 }
 
-/// Epoch seconds since this lane's composer has held unsubmitted text, or 0.
-///
-/// Stamped by `rate_limit_sweep`, and read here by `autofix`'s stuck-composer
-/// detector, which needs the AGE: `ghost_rescue` can say a lane holds a
-/// collapsed paste right now but not for how long, and "held for six days" is
-/// the whole difference between noise and a card (AMUX-3885).
-pub(crate) fn composer_stuck_since(name: &str) -> i64 {
-    meta_i64(&load_meta(name), "composer_stuck_since")
-}
-
 fn save_meta(name: &str, meta: &Map<String, Value>) {
     let _ = std::fs::create_dir_all(sessions_dir());
     let _ = std::fs::write(meta_path(name), Value::Object(meta.clone()).to_string());
@@ -6568,6 +6558,16 @@ fn gemini_composer_state(raw_lines: &[&str], stripped: &[String]) -> Option<Comp
     Some(ComposerState::Typed(plain))
 }
 
+/// Claude Code renders a large paste as `[Pasted text #N +M lines]`.
+pub fn is_collapsed_paste(pending: &str) -> bool {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)pasted\s*text.*?\+\s*\d+\s*lines?").expect("paste chip regex")
+    });
+    re.is_match(pending)
+}
+
 /// Codex's model/path line is footer chrome, not a continuation of the input.
 ///
 /// The current TUI draws no box rule between its composer and this footer, so
@@ -7034,7 +7034,7 @@ pub(crate) fn read_frame(raw: &str, tail_sq: &str) -> FrameRead {
     // same conclusion from the other side and refuses to submit on a guess —
     // this is the same refusal, one layer earlier, where it can still be
     // reported to the sender rather than only logged.
-    if state.typed().is_some_and(crate::runtime_jobs::ghost_rescue::is_collapsed_paste) {
+    if state.typed().is_some_and(is_collapsed_paste) {
         return FrameRead::CollapsedPaste;
     }
     // Only REAL input counts as "still there". A dim suggestion that happens to
@@ -7381,28 +7381,6 @@ pub(crate) fn session_send_lock(name: &str) -> std::sync::Arc<tokio::sync::Mutex
 /// machine at the time of writing `_amux_sessions` held 0 live rows.
 ///
 /// It is a function, not a constant, so the day an interactive lane IS
-/// protocol-hosted, the send path and the ghost-rescue sweep both switch on
-/// one edit here rather than needing to be found.
-pub(crate) fn lane_has_protocol_path(state: &AppState, name: &str) -> bool {
-    // A lane is protocol-driven when a live `_amux_sessions` row names its
-    // backend ref. `amux-<name>` is the L2 ref shape for tmux-hosted lanes.
-    let want = tmux_name(name);
-    state
-        .store
-        .read()
-        .ok()
-        .and_then(|conn| {
-            conn.query_row(
-                "SELECT COUNT(*) FROM _amux_sessions WHERE backend_ref = ?1 AND ended_at IS NULL",
-                rusqlite::params![want],
-                |r| r.get::<_, i64>(0),
-            )
-            .ok()
-        })
-        .map(|n| n > 0)
-        .unwrap_or(false)
-}
-
 /// Every registered, non-archived lane, whatever backend hosts it.
 ///
 /// ONE enumeration for the whole process: `keystroke_lanes` below is a FILTERED
@@ -7420,21 +7398,6 @@ pub(crate) fn all_lane_names() -> Vec<String> {
         .collect();
     names.sort();
     names.retain(|n| { let cfg = parse_env(n); cfg.get("CC_ARCHIVED") != Some("1") && cfg.get("CC_PAUSED") != Some("1") });
-    names
-}
-
-/// Lanes whose ONLY delivery channel is keystrokes: registered, not archived,
-/// tmux-hosted, and with no structured-protocol session. This is the set the
-/// ghost-rescue sweep may act on — and the set that shrinks to nothing when
-/// interactive lanes become protocol-driven, which is that job's exit.
-pub(crate) fn keystroke_lanes(state: &AppState) -> Vec<String> {
-    let mut names = all_lane_names();
-    names.retain(|n| {
-        let cfg = parse_env(n);
-        iterm2_id(&cfg).is_empty()
-            && backend_of_cfg(&cfg) == "tmux"
-            && !lane_has_protocol_path(state, n)
-    });
     names
 }
 
@@ -16853,7 +16816,6 @@ pub(crate) fn env_flag_on(v: Option<&str>) -> bool {
 /// sessions — so a lane marked "raw agent, no amux harness" was still receiving
 /// commit nudges and board auto-pickup claims. Now:
 ///
-/// - `commit_nudge` skips isolated lanes.
 /// - `board_drive` filters them out of `lanes()` — at the SELECTION, not the
 ///   send. Gating delivery would let auto-pickup CLAIM a card for a lane it then
 ///   cannot reach, stranding it in `doing`, which is worse than the bug.

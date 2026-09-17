@@ -339,12 +339,10 @@ async fn needsyou_queue(
     .into_response()
 }
 
-/// The creator name the queue-disposition job files under (AF-317).
-///
-/// Exempt from the todo WIP limit BY NAME. Its card is the one that has to
-/// arrive precisely when a lane's queue is too long, so refusing it for queue
-/// depth would make the mechanism suppress its own alarm.
-pub const QUEUE_DISPOSITION_CREATOR: &str = "queue-disposition";
+/// Creator name exempt from the todo WIP limit (AF-317). Cards filed under
+/// this creator exist to report queue problems, so refusing them for queue
+/// depth would suppress their own alarm.
+pub const WIP_EXEMPT_CREATOR: &str = "queue-disposition";
 
 /// How many needsyou cards the owner view shows before hiding the rest.
 const NEEDSYOU_VIEW_CAP: usize = 10;
@@ -4961,7 +4959,7 @@ pub async fn create_item(
     // queue-disposition job is exempt BY NAME: it is the one card whose whole
     // purpose is to arrive when the queue is too long, so refusing it for queue
     // depth would be the mechanism suppressing its own alarm.
-    if !intake_matches && status_raw == "todo" && owner_type == "agent" && !session.is_empty() && creator != QUEUE_DISPOSITION_CREATOR {
+    if !intake_matches && status_raw == "todo" && owner_type == "agent" && !session.is_empty() && creator != WIP_EXEMPT_CREATOR {
         let limit = bs::todo_wip_limit(Some(&session));
         if limit > 0 {
             let held_and_stalest = state.store.read().ok().map(|c| {
@@ -5091,7 +5089,7 @@ pub async fn create_item(
             }
             // Recheck in the writer, including a semantic target that changed
             // while the model ran. A failed merge must not bypass the WIP gate.
-            if new.status == "todo" && new.owner_type == "agent" && new.creator != QUEUE_DISPOSITION_CREATOR {
+            if new.status == "todo" && new.owner_type == "agent" && new.creator != WIP_EXEMPT_CREATOR {
                 if let Some(session) = new.session.as_deref() {
                     let limit = bs::todo_wip_limit(Some(session));
                     let held = bs::todo_wip_count(conn, session, "");

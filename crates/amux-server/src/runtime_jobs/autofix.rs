@@ -5087,12 +5087,7 @@ fn fd_trigger(
     None
 }
 
-/// How long a collapsed paste may sit before it earns a card. Minutes.
-///
-/// Not zero, and not a day. `ghost_rescue` sweeps every 15s and rescues anything
-/// it can prove is amux's, so a chip that is still there an hour later is one the
-/// sweep has already declined ~240 times on purpose. A day would reproduce the
-/// bug: the specimens that motivated this sat for 1 to 6 DAYS behind a badge.
+#[cfg(test)]
 fn stuck_composer_card_after_s() -> f64 {
     env_f64("AMUX_STUCK_COMPOSER_CARD_MIN", 60.0).clamp(1.0, 60.0 * 24.0) * 60.0
 }
@@ -5121,43 +5116,19 @@ fn stuck_composer_card_after_s() -> f64 {
 /// the sweep is stateless across passes: it can say a lane holds a chip NOW and
 /// not for how long, and the duration is the entire difference between a card and
 /// noise.
-pub fn detect_stuck_composer(now: f64) -> (Vec<Finding>, Vec<Suppressed>) {
-    // ABSENCE IS NOT EVIDENCE (ethos rule 4). No completed sweep means "we have
-    // not looked", which must not read as "no lane is stuck" — the same shape as
-    // a zero `composer_stuck_since` right after a reboot, which means the tmux
-    // sessions were recreated rather than that the composers are clear.
-    let Some(report) = crate::runtime_jobs::ghost_rescue::last_report() else {
-        return (
-            vec![],
-            vec![sup(
-                DetectorKind::StuckComposer,
-                "stuck-composer|no-sweep",
-                "ghost-rescue has not published a sweep yet — nothing has looked at any composer, \
-                 so filing nothing here is 'unmeasured', not 'none stuck'",
-            )],
-        );
-    };
-    let aged: Vec<(String, i64)> = report
-        .chips
-        .iter()
-        .map(|l| {
-            (
-                l.clone(),
-                crate::api::session_verbs::composer_stuck_since(l),
-            )
-        })
-        .collect();
-    stuck_composer_findings(&aged, now)
+pub fn detect_stuck_composer(_now: f64) -> (Vec<Finding>, Vec<Suppressed>) {
+    (
+        vec![],
+        vec![sup(
+            DetectorKind::StuckComposer,
+            "stuck-composer|removed",
+            "ghost-rescue was removed (KISS simplification); stuck composer detection \
+             is no longer active",
+        )],
+    )
 }
 
-/// The decision, separated from the two live sources it reads (ghost-rescue's
-/// published sweep and each lane's `composer_stuck_since` stamp).
-///
-/// Split out so the SHIPPED path can be driven by a test. Judging the threshold,
-/// the unstamped-lane disagreement and the owner needs planted `(lane, since)`
-/// pairs, and with those readings buried inside the caller the only testable
-/// surface was arithmetic — which is to say the interesting decisions were the
-/// untested ones (ethos rule 7).
+#[cfg(test)]
 fn stuck_composer_findings(lanes: &[(String, i64)], now: f64) -> (Vec<Finding>, Vec<Suppressed>) {
     let mut out = Vec::new();
     let mut suppressed = Vec::new();
@@ -8198,15 +8169,14 @@ mod tests {
     /// here and looks identical to a healthy fleet.
     #[test]
     fn no_published_sweep_is_reported_as_unmeasured_not_as_none_stuck() {
-        // ghost_rescue has published nothing in a bare test process.
         let (findings, suppressed) = super::detect_stuck_composer(1_788_000_000.0);
         assert!(
             findings.is_empty(),
             "must not file a card from an unmeasured state"
         );
         assert!(
-            suppressed.iter().any(|s| s.signature == "stuck-composer|no-sweep"),
-            "the unmeasured state must be DISCLOSED, not returned as an empty success: {suppressed:?}"
+            suppressed.iter().any(|s| s.signature == "stuck-composer|removed"),
+            "the removal must be DISCLOSED as a suppression: {suppressed:?}"
         );
     }
 

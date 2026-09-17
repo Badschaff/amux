@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# test-ephemeral-fan-out.sh — validate the fan-out endpoint and reaper lifecycle.
+# test-ephemeral-fan-out.sh — validate the fan-out endpoint and callback lifecycle.
 #
-# This test exercises the API surface (decompose -> fan-out -> reaper) without
-# spinning up real Claude sessions. Real Haiku E2E is a manual test; this script
-# proves the plumbing: env files are created with the right keys, cards are
-# reassigned, the reaper cleans up terminal sessions.
+# This test exercises the API surface (decompose -> fan-out -> callback cleanup)
+# without spinning up real Claude sessions. Real Haiku E2E is a manual test;
+# this script proves the plumbing: env files are created with the right keys,
+# cards are reassigned, and callbacks are armed for cleanup on terminal status.
 #
 # Usage: ./scripts/test-ephemeral-fan-out.sh [--live]
 #   --live: actually start Haiku workers (requires API key, costs money)
@@ -176,38 +176,28 @@ if [[ "$FANOUT_OK" == "true" ]]; then
     "$AMUX_API/api/board/$EPIC_ID/fan-out")
   echo "  Second fan-out: $FANOUT2"
 
-  # 9. Simulate terminal state and test reaper
-  echo "--- simulate terminal + test reaper ---"
+  # 9. Verify callbacks are armed on child cards
+  echo "--- verify callbacks armed ---"
+  for cid in "${CHILD_IDS[@]}"; do
+    CARD=$(_curl "$AMUX_API/api/board/$cid")
+    CB_SESSION=$(echo "$CARD" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("callback_session",""))' 2>/dev/null)
+    CB_STATE=$(echo "$CARD" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("callback_state",""))' 2>/dev/null)
+    check "card $cid callback_session=test-fanout-parent" "$([ "$CB_SESSION" = "test-fanout-parent" ] && echo true || echo false)"
+    check "card $cid callback_state=armed" "$([ "$CB_STATE" = "armed" ] && echo true || echo false)"
+  done
+
+  # 10. Simulate terminal state and verify callback fires
+  echo "--- simulate terminal + test callback ---"
   for cid in "${CHILD_IDS[@]}"; do
     _curl -X PATCH -H 'Content-Type: application/json' \
       -H "X-Amux-Session: test-fanout-parent" \
       -d '{"status":"done","evidence":"test evidence","force":true}' \
       "$AMUX_API/api/board/$cid" >/dev/null 2>&1
   done
-
-  # Trigger a board drive tick by waiting a bit or calling the debug endpoint
-  echo "  Waiting for reaper to run (board-drive tick)..."
-  sleep 5
-
-  # Check if env files were cleaned up by the reaper
-  echo "--- verify reaper ---"
-  REAPER_CLEANED=0
-  for eph in "${EPH_NAMES[@]:-}"; do
-    [[ -z "$eph" ]] && continue
-    EP="$HOME/.amux/sessions/${eph}.env"
-    if [ ! -f "$EP" ]; then
-      echo "  Reaped: $eph (env file removed)"
-      ((REAPER_CLEANED++))
-    else
-      echo "  Still alive: $eph (reaper may not have ticked yet)"
-    fi
-  done
-  if [[ $REAPER_CLEANED -gt 0 ]]; then
-    check "reaper cleaned at least one worker" "true"
-  else
-    echo "  (Reaper may need more time or a manual board-drive tick)"
-    check "reaper ran (may need manual tick)" "false"
-  fi
+  # Callback is triggered by save_patched on terminal status, then
+  # dispatch_pending_callbacks delivers it. The callback prompt tells
+  # the parent to stop and clean up the ephemeral worker.
+  echo "  Callbacks triggered on terminal status (cleanup is model-driven)"
 fi
 
 echo ""

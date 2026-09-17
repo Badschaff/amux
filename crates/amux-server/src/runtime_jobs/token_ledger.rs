@@ -117,6 +117,109 @@ pub(crate) fn turn_cost_usd(table: &[(String, [f64; 4])], model: &str, t: [i64; 
         / 1_000_000.0
 }
 
+/// A single row destined for the `token_ledger` table. Shared by all three
+/// provider parsers so the INSERT SQL lives in one place.
+pub(crate) struct LedgerRow {
+    pub ts: i64,
+    pub session: String,
+    pub conversation: String,
+    pub model: String,
+    pub tokens: [i64; 4],
+    pub cost: f64,
+    pub message_id: Option<String>,
+}
+
+/// One conversation's parsed turns plus the cursor state to commit.
+pub(crate) struct LedgerFileBatch {
+    pub conversation: String,
+    pub offset: u64,
+    pub mtime: i64,
+    pub rows: Vec<LedgerRow>,
+}
+
+/// Read all ledger cursors. Both codex and gemini duplicated this query.
+pub(crate) fn read_cursors(store: &SharedStore) -> anyhow::Result<HashMap<String, u64>> {
+    let conn = store.read()?;
+    let mut stmt = conn.prepare("SELECT conversation, offset FROM ledger_cursor")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))?;
+    Ok(rows.flatten().collect())
+}
+
+/// Warn about rows that took the default price because no table entry names
+/// their model. Duplicated in codex and gemini before this was extracted.
+pub(crate) fn warn_unpriced(provider: &str, table: &[(String, [f64; 4])], batches: &[LedgerFileBatch]) {
+    let models: std::collections::BTreeSet<String> = batches
+        .iter()
+        .flat_map(|b| b.rows.iter())
+        .filter(|r| !model_is_priced(table, &r.model))
+        .map(|r| r.model.clone())
+        .collect();
+    let guessed: usize = batches
+        .iter()
+        .flat_map(|b| b.rows.iter())
+        .filter(|r| !model_is_priced(table, &r.model))
+        .count();
+    let expected: usize = batches.iter().map(|b| b.rows.len()).sum();
+    if guessed > 0 {
+        tracing::warn!(
+            verdict = %format!("{provider}_rows_priced_by_default"),
+            rows = guessed,
+            models = %models.into_iter().collect::<Vec<_>>().join(","),
+            measured = true,
+            n_considered = expected,
+            "{provider} turns carry the DEFAULT price: their token counts are measured, their cost is not. \
+             Set real rates for these models in ~/.amux/prices.json (config, no redeploy)."
+        );
+    }
+}
+
+/// Commit parsed turns to the ledger and update cursors. Returns rows inserted.
+///
+/// This is the shared write path for codex and gemini. Claude's own
+/// `index_once_at` keeps its richer variant (request_id column, per-pass cap,
+/// task attribution) rather than forcing those into a generic interface.
+pub(crate) async fn commit_ledger_batch(
+    store: &SharedStore,
+    batches: Vec<LedgerFileBatch>,
+) -> anyhow::Result<usize> {
+    if batches.is_empty() {
+        return Ok(0);
+    }
+    let expected: usize = batches.iter().map(|b| b.rows.len()).sum();
+    store
+        .write_async(move |conn| {
+            let mut n = 0usize;
+            {
+                let mut ins = conn.prepare(
+                    "INSERT INTO token_ledger
+                       (ts, session, conversation, model, input, cache_read, cache_write, output, cost_usd, message_id)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+                     ON CONFLICT(conversation, message_id) WHERE message_id IS NOT NULL
+                     DO UPDATE SET output = MAX(output, excluded.output),
+                                   cost_usd = MAX(cost_usd, excluded.cost_usd)",
+                )?;
+                let mut cur = conn.prepare(
+                    "INSERT INTO ledger_cursor (conversation, offset, mtime) VALUES (?1,?2,?3)
+                     ON CONFLICT(conversation) DO UPDATE SET offset=?2, mtime=?3",
+                )?;
+                for b in &batches {
+                    for r in &b.rows {
+                        ins.execute(rusqlite::params![
+                            r.ts, r.session, r.conversation, r.model,
+                            r.tokens[0], r.tokens[1], r.tokens[2], r.tokens[3],
+                            r.cost, r.message_id
+                        ])?;
+                        n += 1;
+                    }
+                    cur.execute(rusqlite::params![b.conversation, b.offset as i64, b.mtime])?;
+                }
+            }
+            Ok(WriteOutcome { applied: n > 0, events: vec![] })
+        })
+        .await
+        .map(|_| expected)
+}
+
 /// py:17969 — the owning amux session. "" means an ad-hoc conversation amux
 /// does not own; those still count toward fleet totals under an empty session.
 ///

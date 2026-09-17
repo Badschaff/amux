@@ -20,7 +20,7 @@
 //! nobody". Charging a guess to a named lane is worse than charging nobody:
 //! the ledger is what the cost view bills, and AMUX-2612 already records what
 //! a wrong owner costs to unpick.
-use crate::db::{SharedStore, WriteOutcome};
+use crate::db::SharedStore;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -189,27 +189,22 @@ pub async fn index_once_at(
     sessions: &Path,
     workdirs: &BTreeMap<String, String>,
 ) -> anyhow::Result<usize> {
+    use super::token_ledger::{self, LedgerFileBatch, LedgerRow};
     if !sessions.is_dir() {
         return Ok(0);
     }
-    let table = super::token_ledger::prices(home);
+    let table = token_ledger::prices(home);
     let owners = unambiguous_owners(workdirs);
-    let cursors: HashMap<String, u64> = {
-        let conn = store.read()?;
-        let mut stmt = conn.prepare("SELECT conversation, offset FROM ledger_cursor")?;
-        let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))?;
-        rows.flatten().collect()
-    };
+    let cursors = token_ledger::read_cursors(store)?;
 
-    let mut pending: Vec<(String, String, u64, i64, Vec<CodexTurn>)> = Vec::new();
+    let mut batches: Vec<LedgerFileBatch> = Vec::new();
     for path in rollout_files(sessions) {
         let conversation = conversation_key(&path);
         let Ok(meta) = path.metadata() else { continue };
         let size = meta.len();
         let offset = cursors.get(&conversation).copied().unwrap_or(0);
         if offset >= size {
-            continue; // nothing new; a truncated file re-reads from its start
+            continue;
         }
         let offset = if offset > size { 0 } else { offset };
         let lane = rollout_cwd(&path)
@@ -225,82 +220,28 @@ pub async fn index_once_at(
         if turns.is_empty() && new_off == offset {
             continue;
         }
-        pending.push((conversation, lane, new_off, mtime, turns));
-    }
-    if pending.is_empty() {
-        return Ok(0);
-    }
-    let expected: usize = pending.iter().map(|(_, _, _, _, turns)| turns.len()).sum();
-
-    // How many of these rows take the default price because no table entry
-    // names their model. Reported beside the row count: a defaulted dollar
-    // figure that looks measured is worse than no figure at all.
-    let guessed: usize = pending
-        .iter()
-        .flat_map(|(_, _, _, _, turns)| turns.iter())
-        .filter(|t| !super::token_ledger::model_is_priced(&table, &t.model))
-        .count();
-    let models: std::collections::BTreeSet<String> = pending
-        .iter()
-        .flat_map(|(_, _, _, _, turns)| turns.iter())
-        .filter(|t| !super::token_ledger::model_is_priced(&table, &t.model))
-        .map(|t| t.model.clone())
-        .collect();
-    if guessed > 0 {
-        tracing::warn!(
-            verdict = "codex_rows_priced_by_default",
-            rows = guessed,
-            models = %models.into_iter().collect::<Vec<_>>().join(","),
-            measured = true,
-            n_considered = expected,
-            "codex turns carry the DEFAULT price: their token counts are measured, their cost is not. \
-             Set real rates for these models in ~/.amux/prices.json (config, no redeploy)."
-        );
-    }
-    let inserted = store
-        .write_async(move |conn| {
-            let mut n = 0usize;
-            {
-                let mut ins = conn.prepare(
-                    "INSERT INTO token_ledger
-                       (ts, session, conversation, model, input, cache_read, cache_write, output, cost_usd, message_id)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
-                     ON CONFLICT(conversation, message_id) WHERE message_id IS NOT NULL
-                     DO UPDATE SET output = MAX(output, excluded.output),
-                                   cost_usd = MAX(cost_usd, excluded.cost_usd)",
-                )?;
-                let mut cur = conn.prepare(
-                    "INSERT INTO ledger_cursor (conversation, offset, mtime) VALUES (?1,?2,?3)
-                     ON CONFLICT(conversation) DO UPDATE SET offset=?2, mtime=?3",
-                )?;
-                for (conversation, lane, off, mtime, turns) in &pending {
-                    for t in turns {
-                        let cost = super::token_ledger::turn_cost_usd(&table, &t.model, t.tokens);
-                        ins.execute(rusqlite::params![
-                            t.ts,
-                            lane,
-                            conversation,
-                            t.model,
-                            t.tokens[0],
-                            t.tokens[1],
-                            t.tokens[2],
-                            t.tokens[3],
-                            cost,
-                            format!("ord:{}", t.ordinal),
-                        ])?;
-                        n += 1;
-                    }
-                    cur.execute(rusqlite::params![conversation, *off as i64, mtime])?;
+        let rows = turns
+            .into_iter()
+            .map(|t| {
+                let cost = token_ledger::turn_cost_usd(&table, &t.model, t.tokens);
+                LedgerRow {
+                    ts: t.ts,
+                    session: lane.clone(),
+                    conversation: conversation.clone(),
+                    model: t.model,
+                    tokens: t.tokens,
+                    cost,
+                    message_id: Some(format!("ord:{}", t.ordinal)),
                 }
-            }
-            Ok(WriteOutcome { applied: n > 0, events: vec![] })
-        })
-        .await
-        .map(|_| expected)?;
-    // Codex rows join the same task attribution pass Claude rows get, so a
-    // card's cost view does not silently mean "Claude only".
+            })
+            .collect();
+        batches.push(LedgerFileBatch { conversation, offset: new_off, mtime, rows });
+    }
+
+    token_ledger::warn_unpriced("codex", &table, &batches);
+    let inserted = token_ledger::commit_ledger_batch(store, batches).await?;
     if inserted > 0 {
-        super::token_ledger::attribute_tasks(store).await?;
+        token_ledger::attribute_tasks(store).await?;
     }
     Ok(inserted)
 }

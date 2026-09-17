@@ -418,7 +418,7 @@ async fn file_nudge_escalation(state: &AppState, lane: &str, backlog: i64, unhee
         // Exempt from the AF-317 todo WIP limit by name, for the same reason the
         // queue-disposition card is: this card exists BECAUSE the queue is too
         // long, so refusing it for queue depth would suppress its own alarm.
-        creator: crate::api::board::QUEUE_DISPOSITION_CREATOR.into(),
+        creator: crate::api::board::WIP_EXEMPT_CREATOR.into(),
         owner_type: "agent".into(),
         due: None,
         due_time: None,
@@ -554,10 +554,6 @@ use crate::config::env_i64;
 /// gate then refuses, which is the view/mechanism split ethos rule 1 names.
 pub(crate) fn wip_cap() -> i64 {
     env_i64("AMUX_MAX_DOING_PER_SESSION", 1).max(1)
-}
-/// py:13387 `AMUX_ADVANCE_CARD_BUDGET`.
-fn advance_card_budget() -> i64 {
-    env_i64("AMUX_ADVANCE_CARD_BUDGET", 3).max(1)
 }
 /// py:6885 `AMUX_NEEDSYOU_RENAG_DAYS`.
 fn needsyou_renag_days() -> f64 {
@@ -1020,136 +1016,6 @@ impl LiveFleet {
 // Predicates, ported. Every one of these was a logged incident.
 // ---------------------------------------------------------------------------
 
-/// py:12889 `_pickup_junk_reason` — why auto-pickup must refuse this card, or
-/// "" if it is a real task.
-///
-/// ORDER IS LOAD-BEARING (py's "MG ground truth, second revision"): marker ->
-/// artifact/dormant -> STRUCTURE VETO -> journal -> shell. Structure beats the
-/// fold count because a real investigation card can carry fold RESIDUE from the
-/// folding era; a true journal has folds and no structure.
-pub fn pickup_junk_reason(title: &str, desc: &str, log: &str) -> String {
-    pickup_junk_reason_scoped(title, desc, log, "", "")
-}
-
-/// `pickup_junk_reason` plus the review-state veto (AF-721), which needs the
-/// card's `status`/`reviewer` that the title/desc/log-only signature does not
-/// carry. Kept as a separate function rather than widening every caller's
-/// signature at once: two call sites (the decompose-candidate scan and the
-/// bare title/desc/log doctest-style unit tests) genuinely have no reviewer
-/// to pass and default it to "" — no reviewer, no status — same as before
-/// this fix for those.
-pub fn pickup_junk_reason_scoped(
-    title: &str,
-    desc: &str,
-    log: &str,
-    status: &str,
-    reviewer: &str,
-) -> String {
-    use std::sync::OnceLock;
-    static ARTIFACT: OnceLock<regex::Regex> = OnceLock::new();
-    static CAPS_HEAD: OnceLock<regex::Regex> = OnceLock::new();
-    static STRUCTURE: OnceLock<regex::Regex> = OnceLock::new();
-    static PROMPT: OnceLock<regex::Regex> = OnceLock::new();
-
-    // The card's HISTORY (`log`) is legitimate signal for the STRUCTURE veto and
-    // the FOLD count (content that can live in either field), so those read the
-    // combined blob. The CAPTURE brand does NOT: it must read the card's CURRENT
-    // DEFINITION (`desc`) only. `capture: session prompt` is a DURABLE LOG marker
-    // minted once at capture (session_verbs.rs) that NEVER clears, so a card
-    // auto-captured and then RESHAPED into a real task (desc rewritten, retyped)
-    // carries it in the log forever. Reading it from the blob re-branded a
-    // reshaped card "a captured chat prompt" on every 6h decompose tick and
-    // nagged a card the session had already fixed (AMUX-3187). A fresh capture's
-    // desc ALWAYS begins "**Prompt:** " (session_verbs.rs:2574), so the anchored
-    // PROMPT check below still catches every real capture on its CURRENT desc,
-    // and reshaping the desc — the sanctioned exit — now actually works.
-    let blob = if log.trim().is_empty() {
-        desc.to_string()
-    } else {
-        format!("{desc}\n{log}")
-    };
-    let folds = blob.matches("New task:").count();
-    // The marker on the CURRENT desc still brands (a card literally defined as the
-    // capture marker is a shell); but read `desc`, NOT the blob, so the durable
-    // LOG copy of a reshaped card does not (AMUX-3187, see above).
-    // ANCHORED (AF-569). This used to be `desc.contains(...)`, which brands a card
-    // that merely MENTIONS the marker. Specimen: AF-568, the card about duplicate
-    // capture cards, quoted the string inside backticks while explaining the bug
-    // and was nudged "captured chat prompt, not a unit of work" while it sat in
-    // `doing` with a shipped fix. A card cannot describe the capture mechanism
-    // without being classified as its output.
-    //
-    // The intent stated two paragraphs up is "a card literally defined as the
-    // capture marker", and starts_with is that intent. Every REAL capture is still
-    // caught by the anchored PROMPT check below, on `**Prompt:** `, which is the
-    // prefix session_verbs.rs actually mints.
-    //
-    // It also fired BEFORE the STRUCTURE VETO below, so a substring match
-    // short-circuited the 2+ ALLCAPS-heads evidence that exists to stop this. AF-568
-    // had three such heads.
-    if desc.trim_start().starts_with("capture: session prompt") && folds < 2 {
-        return "captured chat prompt, not a unit of work".into();
-    }
-    // ANCHORED, and the word must END as a subject too (GCA-85 + creative-dna's
-    // residual): `\b` matches at a hyphen, and the fleet's own title convention
-    // is `[area] subject`, so `[test-hygiene]` fired on `test`. The comma in the
-    // lookahead is load-bearing — "[TRIPWIRE, fires on recurrence]" is a genuine
-    // armed tripwire.
-    let artifact = ARTIFACT.get_or_init(|| {
-        regex::Regex::new(
-            r"(?i)^\s*\[?(probe-stale|probe|temp|test|canary|tripwire|armed watch)([\s:,\]]|$)",
-        )
-        .expect("artifact regex")
-    });
-    // REVIEW-STATE VETO (AF-721). This branch used to return immediately on a
-    // title-prefix match with no downstream check at all — unlike the capture
-    // brand above it, which carries its own STRUCTURE VETO. A legitimate area
-    // tag from this fleet's own "[area] subject" title convention ("[canary]
-    // monitoring...", "[test-hygiene] ...") collides with the same word list,
-    // and the false-positive destructive verdict reached TG-3603, a card in
-    // active multi-lane review (status=review, reviewer=backend, 15,837-char
-    // desc, 1,737-char evidence, 5,897-entry log) — none of which this branch
-    // ever looked at before offering discard first. Any one of these signals
-    // means a human or peer already treats the card as real work:
-    let has_review_signal = desc.trim().chars().count() > 200
-        || log.trim().chars().count() > 200
-        || !reviewer.trim().is_empty()
-        || !matches!(status, "backlog" | "todo" | "");
-    if artifact.is_match(title) && !has_review_signal {
-        return "looks like a test artifact or armed tripwire".into();
-    }
-    // STRUCTURE VETO. 2+ ALLCAPS section heads, or an explicit structure marker.
-    let caps = CAPS_HEAD.get_or_init(|| {
-        regex::Regex::new(r"(?m)^[A-Z][A-Z0-9 /'\-]{3,40}:").expect("caps head regex")
-    });
-    let structure = STRUCTURE.get_or_init(|| {
-        regex::Regex::new(
-            r"(?im)^#{1,3}\s|success criteri|acceptance criteri|^SCOPE:|^- \[[ x]\]|gate(?:_checked| policy| criteria)\b|ROOT CAUSE|unhappy path",
-        )
-        .expect("structure regex")
-    });
-    if caps.find_iter(&blob).count() >= 2 || structure.is_match(&blob) {
-        return String::new();
-    }
-    if folds >= 2 {
-        return format!("journal card ({folds} folded tasks)");
-    }
-    // Anchored on the CURRENT `desc`, not the blob: a fresh capture's desc begins
-    // "**Prompt:** " and a reshaped card's does not, which is what lets the
-    // reshape clear the brand (AMUX-3187).
-    let prompt = PROMPT
-        .get_or_init(|| regex::Regex::new(r"(?s)^\s*\*\*Prompt:\*\*\s*(?:\[[^\]]*\]\s*)?(.*)$").expect("prompt regex"));
-    if let Some(c) = prompt.captures(desc.trim()) {
-        let body = c.get(1).map(|m| m.as_str().trim()).unwrap_or("");
-        return if body.starts_with('/') {
-            "harness slash command, not a task".into()
-        } else {
-            "captured chat prompt, not a unit of work".into()
-        };
-    }
-    String::new()
-}
-
 /// py:14597 — an irreversible operation named in a card is never auto-executed.
 pub fn irreversible_op(blob: &str) -> Option<String> {
     use std::sync::OnceLock;
@@ -1161,56 +1027,6 @@ pub fn irreversible_op(blob: &str) -> Option<String> {
         .expect("danger regex")
     });
     re.find(blob).map(|m| m.as_str().trim().to_string())
-}
-
-/// Find a possible dependency mention for a worker-facing recheck hint only.
-/// Never use prose to veto pickup: historical logs, self-references and citations
-/// cannot establish the current dependency graph. `depends_on` is authoritative.
-pub fn prose_dependency(blob: &str) -> Option<String> {
-    use std::sync::OnceLock;
-    static RE: OnceLock<regex::Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| {
-        regex::Regex::new(
-            // Case-insensitive on the PHRASE ONLY — `(?i:...)` scoped, never
-            // global, because a global flag would also lowercase the id class
-            // and start matching "amux-2948" citations. And `wait(?:s|ing)?`
-            // rather than `waits?`: "waiting on X" is how people actually
-            // write it (AMUX-2950; measured before widening: 19 of 829 open
-            // cards newly block, incl. TG-3195 whose title says "WAITS ON
-            // TG-3193 DEPLOY" in caps and was dispatching anyway).
-            r"(?:(?i:blocked\s+(?:by|on)|cannot\s+start\s+until|depends\s+on|wait(?:s|ing)?\s+(?:for|on)))\s+[\s\S]{0,40}?\b([A-Z][A-Z]+-\d+)(?:[^0-9]|$)",
-        )
-        .expect("prose dep regex")
-    });
-    // DIRECTION, not just presence (AMUX-2948). The phrase alone does not say
-    // WHICH card is blocked, and the reverse construction is ordinary English
-    // on a well-written card:
-    //
-    //     "Evidence record: BACKE-3272. Fix that depends on this: BACKE-3276."
-    //
-    // That declares BACKE-3276 a DEPENDENT of this card. The matcher read it as
-    // "this is blocked by BACKE-3276" and refused to dispatch — and because the
-    // refusal guard runs per card, every todo carrying a downstream-work note
-    // was held. Measured on backend 2026-08-11: 17 eligible todos, ALL refused,
-    // lane idle with auto-pickup enabled and the drive loop running. The
-    // skip detail even told the operator to "POPULATE depends_on", which is
-    // sound advice that nobody had followed on any of the 17.
-    //
-    // `this`/`these`/`the above` between the phrase and the id is the tell: the
-    // subject of the dependency is THIS card, so the id named is the dependent,
-    // not the blocker. This narrows the hint without making a dispatch
-    // decision: ambiguous prose remains context for the worker to reconcile.
-    let c = re.captures(blob)?;
-    let whole = c.get(0)?.as_str();
-    let id = c.get(1)?.as_str();
-    let between = &whole[..whole.len() - id.len().min(whole.len())];
-    let reversed = ["this", "these", "the above", "us"]
-        .iter()
-        .any(|w| between.to_ascii_lowercase().contains(w));
-    if reversed {
-        return None;
-    }
-    Some(id.to_string())
 }
 
 #[cfg(test)]
@@ -1257,59 +1073,6 @@ mod drain_trigger_tests {
         assert!(!should_drain_nudge(0, 0, 0, 0), "no drainable backlog");
         assert!(!should_drain_nudge(1, 0, 10, 0), "already has a card in doing");
         assert!(!should_drain_nudge(0, 1, 10, 0), "has a dispatchable todo");
-    }
-}
-
-#[cfg(test)]
-mod prose_direction_tests {
-    use super::prose_dependency;
-
-    /// THE SPECIMEN, verbatim from BACKE-3278 (AMUX-2948). This sentence
-    /// declares a DEPENDENT, and reading it as a blocker held backend's entire
-    /// queue: 17 eligible todos, all refused, lane idle with auto-pickup on.
-    #[test]
-    fn a_downstream_dependent_does_not_block_this_card() {
-        let blob = "Evidence record: BACKE-3272. Fix that depends on this: BACKE-3276.                     Migration (owner-gated): BACKE-3277.";
-        assert_eq!(
-            prose_dependency(blob),
-            None,
-            "\"depends on this: X\" names X as the DEPENDENT — this card is not blocked by it"
-        );
-    }
-
-    /// Forward dependency language remains useful context for a recheck hint.
-    /// The selector tests below cover the structured execution gate separately.
-    #[test]
-    fn forward_dependency_language_is_reported_as_a_hint() {
-        // AMUX-2950 closed both gaps these fixtures originally mis-asserted:
-        // the phrase match is now case-insensitive (scoped, so the ID class is
-        // not) and takes "waiting" as well as "wait/waits". Widened only after
-        // measuring: 19 of 829 open cards newly block, and the sample includes
-        // a real missed blocker (TG-3195, "WAITS ON TG-3193 DEPLOY", caps).
-        for blob in [
-            "This is blocked by BACKE-3276 until the cache lands.",
-            "Cannot start until BACKE-3276 ships.",
-            "depends on BACKE-3276",
-            "waiting on BACKE-3276 to land",
-            "Waits on BACKE-3276.",
-            "blocked on BACKE-3276",
-        ] {
-            assert_eq!(
-                prose_dependency(blob),
-                Some("BACKE-3276".to_string()),
-                "must still surface the hint: {blob:?}"
-            );
-        }
-    }
-
-    /// A bare citation was never matched and must stay unmatched — the guard
-    /// keys on dependency LANGUAGE, which is what makes it usable at all on a
-    /// fleet whose cards cite each other constantly (backend's 17 todos carry
-    /// up to 9 citations each).
-    #[test]
-    fn a_bare_citation_is_not_a_dependency() {
-        assert_eq!(prose_dependency("See BACKE-3276 for the measurement."), None);
-        assert_eq!(prose_dependency("Split from BACKE-3276; supersedes AC-12."), None);
     }
 }
 
@@ -1467,59 +1230,6 @@ fn reviewer_left_review(log: &str, reviewer: &str) -> bool {
         .any(|l| l.contains(&needle) && l.contains("review ->"))
 }
 
-fn card_event_count(conn: &Connection, etype: &str, card: &str, since: f64) -> i64 {
-    conn.query_row(
-        "SELECT COUNT(*) FROM session_events WHERE type=?1 AND ts > ?2 AND data LIKE ?3",
-        rusqlite::params![etype, since, format!("%\"{card}\"%")],
-        |r| r.get(0),
-    )
-    .unwrap_or(0)
-}
-
-/// How many times this exact card has been advance-nudged while sitting in
-/// this exact status, and when the most recent one was (AMUX-3563).
-///
-/// The status is part of the key on purpose: a card that MOVED has responded to
-/// the nudge, and the streak should start over rather than punish the card for
-/// its history. `advance.nudged` already records the status at nudge time
-/// (module header, line 67), so this needs no new write.
-fn advance_streak(conn: &Connection, card: &str, status: &str, since: f64) -> (i64, f64) {
-    conn.query_row(
-        "SELECT COUNT(*), COALESCE(MAX(ts), 0) FROM session_events \
-         WHERE type='advance.nudged' AND ts > ?1 AND data LIKE ?2 \
-         AND json_extract(data, '$.status') = ?3",
-        rusqlite::params![since, format!("%\"{card}\"%"), status],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )
-    .unwrap_or((0, 0.0))
-}
-
-/// py `AMUX_ADVANCE_BACKOFF_MAX_S` — the ceiling on the doubling below.
-fn advance_backoff_max_s() -> f64 {
-    env_i64("AMUX_ADVANCE_BACKOFF_MAX_S", 6 * 3600) as f64
-}
-
-/// The gap this card must have had since its last nudge, given how many times
-/// it has already been nudged in this status.
-///
-/// AMUX-3563. The per-card budget (3 per 24h) is a COUNT WITH NO SPACING, and
-/// measured over 7 days that is the whole defect: TUBES-2063 spent its entire
-/// 24h budget in 40 MINUTES and then went silent for 23 hours, which is the
-/// worst of both — a burst that reads as nagging, then a gap long enough that
-/// the card is effectively forgotten. 28 (lane, card) pairs were nudged 3+
-/// times and account for 30% of all idle-holding injections, while 147 of 212
-/// pairs were nudged exactly once and are the nudge WORKING.
-///
-/// So this must not touch the first nudge. It only stretches the gap before
-/// each REPEAT: 15m, 30m, 1h, 2h, 4h, then the cap. A lane that answers the
-/// first prompt never encounters it.
-fn advance_required_gap_s(streak: i64) -> f64 {
-    if streak <= 0 {
-        return ADVANCE_COOLDOWN_S;
-    }
-    let doubled = ADVANCE_COOLDOWN_S * 2f64.powi(streak.min(8) as i32);
-    doubled.min(advance_backoff_max_s())
-}
 
 /// The lane's most recent nudge of ANY shape. Python kept this in memory
 /// (`_advance_last`) on a process that re-execs many times a day; deriving it
@@ -3665,10 +3375,9 @@ pub fn select_pickup_with(
             skipped.push(format!("{id} has no next_action (continuation gate)"));
             continue;
         }
-        let junk = pickup_junk_reason_scoped(&row.title, &row.desc, row.log.as_deref().unwrap_or(""), &row.status, row.reviewer.as_deref().unwrap_or(""));
-        if !junk.is_empty() {
+        if bs::is_capture_shell(&row) {
             shells.push((id.clone(), row.title.chars().take(70).collect()));
-            skipped.push(format!("{id} — {junk}"));
+            skipped.push(format!("{id} — capture shell"));
             continue;
         }
         let lower = format!("{}\n{}", row.title, blob_desc).to_lowercase();
@@ -3676,30 +3385,7 @@ pub fn select_pickup_with(
             skipped.push(format!("{id} declined — names an irreversible operation ('{op}')"));
             continue;
         }
-        let mut prompt = pickup_prompt(conn, session, &row);
-        // Prose is evidence for the worker to assess, not a dependency graph.
-        // The old veto stranded six live lanes, including MS-1253 "blocked"
-        // by itself and MR-21 held by a superseded note (AMUX-4168). Structured
-        // dependencies above still gate execution. Give ambiguous cards a turn
-        // to reconcile their current blocker instead of withholding them forever.
-        if row.depends_on.is_empty() {
-            let hay = format!("{}\n{}", row.title, blob_desc);
-            if let Some(dep) = prose_dependency(&hay) {
-                tracing::warn!(
-                    session, card = %id, mentioned = %dep,
-                    verdict = "prose_dependency_requires_recheck",
-                    "board_drive: historical dependency text requires worker judgment; dispatching reconciliation instead of silently vetoing the card"
-                );
-                prompt.push_str(&format!(
-                    "\n\n[dependency recheck] Historical text mentions {dep}, but this card has no \
-                     structured depends_on. Read the full card and its latest updates before acting. \
-                     Establish the CURRENT blocker; do not execute work whose prerequisite is unmet. \
-                     Record actual board dependencies in depends_on. For an external wait, use \
-                     `amux board backlog {id} --trigger \"<current condition>\"`, then continue \
-                     independent ready work. A citation, self-reference or superseded note is not a blocker."
-                ));
-            }
-        }
+        let prompt = pickup_prompt(conn, session, &row);
         return Pickup::Claim { card: id.clone(), prompt };
     }
 
@@ -4740,8 +4426,7 @@ fn capture_cleanup_reason(row: &bs::IssueRow) -> String {
     if bs::is_capture_shell(row) {
         return "captured command is not a unit of work until reshaped or linked as an epic".into();
     }
-    pickup_junk_reason_scoped(&row.title, &row.desc, row.log.as_deref().unwrap_or(""),
-        &row.status, row.reviewer.as_deref().unwrap_or(""))
+    String::new()
 }
 
 /// Select the owning model's once-per-card disposition request. Neither a
@@ -4790,7 +4475,6 @@ pub fn select_advance_with(
     now: f64,
     reviewer_unreachable: &dyn Fn(&str, &str) -> Option<String>,
 ) -> Advance {
-    let budget = advance_card_budget();
     let capture_cleanup = unnudged_capture_cleanup(conn, session);
 
     // PER-SESSION COOLDOWN, with PROGRESS YIELDING IT (py:13346, AMUX-2500).
@@ -4957,70 +4641,17 @@ pub fn select_advance_with(
             detail: "no agent-owned doing/review card to drive".into(),
         };
     }
-    let day_ago = now - 86400.0;
-    let mut chosen: Option<(String, String)> = None;
-    // AMUX-3563: why the skip reasons below are worded per-candidate rather than
-    // as one count. A lane skipped for "budget-spent" and a lane skipped for
-    // "still inside the backoff gap" are different states with different
-    // remedies, and the only place either is visible is this string.
-    let mut backoff_skips: Vec<String> = Vec::new();
-    // The streak is measured since the card last MOVED, so a 24h lookback would
-    // reset it nightly and let a genuinely stuck card be re-nudged forever at
-    // the base interval. Bounded at 14d so a long-dead event log cannot make the
-    // gap grow without limit.
-    let streak_since = now - 14.0 * 86400.0;
-    for (id, status) in &cands {
-        // Disposition is a separate once-ever action, not another "continue"
-        // turn. MF-1231 spent three generic nudges on its untouched envelope;
-        // that budget must not suppress the first corrective judgment.
-        if capture_cleanup.as_deref() == Some(id.as_str()) {
-            tracing::info!(target: "amux::board_drive", session, card = %id,
-                measured = true, n_considered = 1, verdict = "capture_disposition_selected",
-                "board-drive: unresolved captured command needs its one explicit disposition");
-            chosen = Some((id.clone(), status.clone()));
-            break;
+    // Capture cleanup gets priority over regular cards.
+    if let Some(capture_id) = capture_cleanup.as_deref() {
+        if let Some(pos) = cands.iter().position(|(id, _)| id == capture_id) {
+            let c = cands.remove(pos);
+            cands.insert(0, c);
         }
-        if card_event_count(conn, "advance.nudged", id, day_ago) >= budget {
-            continue;
-        }
-        let (streak, last_ts) = advance_streak(conn, id, status, streak_since);
-        let need = advance_required_gap_s(streak);
-        let since_last = now - last_ts;
-        if streak > 0 && last_ts > 0.0 && since_last < need {
-            backoff_skips.push(format!(
-                "{id} in '{status}': nudged {streak}x already, last {:.0}m ago, next not before \
-                 {:.0}m",
-                since_last / 60.0,
-                need / 60.0
-            ));
-            continue;
-        }
-        chosen = Some((id.clone(), status.clone()));
-        break;
     }
-    let Some((card_id, status)) = chosen else {
-        // Two distinct exhaustion states, named separately. Folding them into
-        // one "budget-spent" would say the prompt was repeated to death when in
-        // fact it is deliberately waiting, and the operator's next move differs:
-        // budget-spent means the card needs a human or a retype, backoff means
-        // it will come round on its own.
-        if !backoff_skips.is_empty() {
-            return Advance::None {
-                reason: "backoff",
-                detail: format!(
-                    "all {} candidate(s) held by repeat-backoff — {}",
-                    cands.len(),
-                    backoff_skips.join("; ")
-                ),
-            };
-        }
+    let Some((card_id, status)) = cands.into_iter().next() else {
         return Advance::None {
-            reason: "budget-spent",
-            detail: format!(
-                "all {} candidate(s) have spent their {budget}-nudge 24h budget — repeating the \
-                 prompt is not the fix",
-                cands.len()
-            ),
+            reason: "no-open-card",
+            detail: "no agent-owned doing/review card to drive".into(),
         };
     };
     let Ok(Some(row)) = bs::get_issue(conn, &card_id) else {
@@ -5278,13 +4909,6 @@ pub fn select_advance_with(
                 detail: format!("{card_id} names reviewer `{rev}`: {why}"),
             };
         }
-        let spent = card_event_count(conn, "advance.nudged", &card_id, day_ago);
-        if spent >= budget {
-            return Advance::None {
-                reason: "budget-spent",
-                detail: format!("reviewer {rev} nudged {spent}x in 24h on {card_id}"),
-            };
-        }
         return Advance::Nudge {
             text: format!(
                 "You reviewed `{card_id}` ({}) and moved it out of `review` yourself, which \
@@ -5365,13 +4989,6 @@ pub fn select_advance_with(
             // to needsyou if a human owes the review"), which is why this needs
             // no new vocabulary and covers the typo and renamed-lane cases too
             // — those were parking just as silently.
-            let spent = card_event_count(conn, "advance.nudged", &card_id, day_ago);
-            if spent >= budget {
-                return Advance::None {
-                    reason: "budget-spent",
-                    detail: format!("{card_id} unreachable-reviewer nudged {spent}x in 24h"),
-                };
-            }
             return Advance::Nudge {
                 text: format!(
                     "`{card_id}` ({}) is in `{status}` naming reviewer `{rev}`, and that review \
@@ -5399,17 +5016,6 @@ pub fn select_advance_with(
                 );
             }
             None => {
-                // Charge the SAME per-card budget the holder edge uses (py:13782,
-                // AC-220): this edge returned before ever reaching the cap, so the
-                // budget was enforced on one of two symmetric paths and a reviewer
-                // was nudged three times for one card.
-                let spent = card_event_count(conn, "advance.nudged", &card_id, day_ago);
-                if spent >= budget {
-                    return Advance::None {
-                        reason: "budget-spent",
-                        detail: format!("reviewer {rev} nudged {spent}x in 24h on {card_id}"),
-                    };
-                }
                 // AF-214: they have already reviewed it. Asking again is asking
                 // them to review their own rejection, and the instruction this
                 // nudge gives ("say what fails on the card") is what put the card
@@ -8148,7 +7754,6 @@ pub async fn debug_board_drive(
         "tick_secs": std::env::var(super::per_job_disable_var(JOB)).ok()
             .and_then(|v| v.parse::<u64>().ok()).unwrap_or(BOARD_DRIVE_TICK_SECS),
         "wip_cap": wip_cap(),
-        "advance_card_budget": advance_card_budget(),
         "advance_cooldown_s": ADVANCE_COOLDOWN_S,
         "last_tick_age_s": report.as_ref().map(|r| now - r.finished_at),
         "last": report,
@@ -9229,91 +8834,6 @@ mod tests {
 
     /// AMUX-3563, built from the 7-day specimen rather than a convenient one.
     ///
-    /// The measured defect: the per-card budget is 3 per 24h with NO SPACING,
-    /// so TUBES-2063 spent all three in 42 MINUTES and then went silent for 23
-    /// hours. Meanwhile 147 of 212 (lane, card) pairs were nudged exactly once,
-    /// which is the nudge working and must not change.
-    ///
-    /// The controls are the point. A backoff that also delays the FIRST nudge
-    /// would look like a bigger win in the aggregate and would be a regression:
-    /// it is the repeats that are waste, and the first prompt is the product.
-    #[test]
-    fn repeat_nudges_back_off_without_delaying_the_first() {
-        // The first nudge is never held, at any streak-0 state.
-        assert_eq!(
-            advance_required_gap_s(0),
-            ADVANCE_COOLDOWN_S,
-            "the first nudge about a card must not be delayed — 147 of 212 pairs \
-             in the specimen were nudged exactly once and that IS the feature"
-        );
-
-        // Repeats stretch: 15m, 30m, 1h, 2h...
-        assert_eq!(advance_required_gap_s(1), 30.0 * 60.0);
-        assert_eq!(advance_required_gap_s(2), 60.0 * 60.0);
-        assert!(
-            advance_required_gap_s(3) > advance_required_gap_s(2),
-            "each repeat must cost more than the last, or this is a flat cooldown \
-             wearing a backoff's name"
-        );
-
-        // TUBES-2063's actual burst: 3 nudges inside 42 minutes. The second one
-        // arrived 21 minutes in, which clears the flat 15m cooldown and is
-        // exactly why the flat cooldown did not stop it.
-        // The precondition is deliberately a compile-time assert: if the base
-        // cooldown is ever raised past the recorded burst spacing, this specimen
-        // stops demonstrating anything and the build should say so rather than
-        // the test quietly continuing to pass for the wrong reason. `const`
-        // form because clippy correctly rejects a runtime assert on constants.
-        const BURST_GAP_S: f64 = 21.0 * 60.0; // TUBES-2063's actual 2nd nudge
-        const _: () = assert!(BURST_GAP_S > ADVANCE_COOLDOWN_S);
-        assert!(
-            BURST_GAP_S < advance_required_gap_s(1),
-            "the 2nd nudge of the recorded burst must now be held; the burst \
-             cleared the old flat cooldown, which is why it happened at all"
-        );
-
-        // And it is bounded: a card nudged forever cannot push the gap to
-        // infinity and effectively mute itself.
-        let capped = advance_required_gap_s(40);
-        assert_eq!(capped, advance_backoff_max_s(), "the doubling must hit its cap");
-    }
-
-    /// The streak is keyed on STATUS, so a card that MOVED starts over. Without
-    /// this the backoff punishes a card for history it has already answered, and
-    /// a lane that acts on the nudge gets a longer wait as its reward.
-    #[test]
-    fn moving_the_card_resets_the_backoff_streak() {
-        let conn = Connection::open_in_memory().expect("memdb");
-        conn.execute_batch(
-            "CREATE TABLE session_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
-                session TEXT NOT NULL DEFAULT '', type TEXT NOT NULL, data TEXT,
-                idem TEXT, source TEXT NOT NULL DEFAULT '');",
-        )
-        .expect("schema");
-        for ts in [100.0, 200.0, 300.0] {
-            conn.execute(
-                "INSERT INTO session_events (ts, session, type, data) \
-                 VALUES (?1,'me','advance.nudged',?2)",
-                rusqlite::params![ts, r#"{"issue":"TUBES-2063","status":"doing"}"#],
-            )
-            .expect("insert");
-        }
-
-        let (streak, last) = advance_streak(&conn, "TUBES-2063", "doing", 0.0);
-        assert_eq!(streak, 3, "three nudges in 'doing' is a streak of three");
-        assert_eq!(last, 300.0, "and the most recent one is what the gap measures from");
-
-        // CONTROL: the same card in a different status has no history. This is
-        // what proves the status filter EXCLUDES rather than matching every row
-        // — an unbounded match and a correct one are identical from a count.
-        let (moved, _) = advance_streak(&conn, "TUBES-2063", "review", 0.0);
-        assert_eq!(moved, 0, "moving the card must reset the streak to zero");
-
-        // CONTROL: a different card is unaffected.
-        let (other, _) = advance_streak(&conn, "TUBES-9999", "doing", 0.0);
-        assert_eq!(other, 0, "the streak must be per-card, not per-status-globally");
-    }
-
     /// AMUX-2825's non-negotiable constraint, which fe44d61 did not implement:
     /// the sweep MUST exclude types where `verified` is meaningless. 299 of
     /// 1162 live agent-owned done cards (25%, 36 lanes) are such types.
@@ -9916,11 +9436,6 @@ mod tests {
         drive_claim(&store, "ABANDONED");
         store.write(|conn| {
             conn.execute("UPDATE issues SET updated=?1 WHERE id='ABANDONED'", [now_f64() as i64 - 48 * 3600])?;
-            // Exhaust the normal reminder path just as in the live incident.
-            for _ in 0..advance_card_budget() {
-                conn.execute("INSERT INTO session_events(ts,session,type,data) VALUES(?1,'lane','advance.nudged',?2)",
-                    rusqlite::params![now_f64() - 3600.0, json!({"issue":"ABANDONED","status":"doing"}).to_string()])?;
-            }
             Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
         }).unwrap();
         let fleet = BoundaryFleet::default();
@@ -10728,46 +10243,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn historical_prose_reaches_each_stranded_worker_for_dependency_recheck() {
-        // Real refusal identities from the 48h audit. Keep the text small and
-        // exercise selection, not the regex in isolation: its match is a hint.
-        for (lane, card, dep) in [
-            ("amux-frustrations", "AF-298", "AF-398"),
-            ("amux-gtm", "AG-39", "AG-41"),
-            ("general-canvas-apps", "GCA-157", "CO-237"),
-            ("mixpeek-frustrations", "MF-841", "BACKE-3872"),
-            ("mixpeek-security", "MS-1253", "MS-1253"),
-            ("mixpeek-security", "MS-1273", "MG-1578"),
-            ("mvs-research", "MR-21", "MR-17"),
-            ("mvs-research", "MR-112", "MI-5201"),
-            ("mvs-research", "MR-148", "BACKE-3836"),
-        ] {
-            let conn = board_db();
-            if dep != card {
-                add_card(&conn, dep, "peer", "needsyou", "Owner decision", "SCOPE: decide");
-            }
-            add_card(&conn, card, lane, "todo", "Recheck remaining work",
-                &format!("SCOPE: reconcile current prerequisites. Historically blocked by {dep}."));
-            match select_pickup_with(&conn, lane, now_f64(), false) {
-                Pickup::Claim { card: picked, prompt } => {
-                    assert_eq!(picked, card, "{lane}");
-                    assert!(prompt.contains("[dependency recheck]"), "{lane}: {prompt}");
-                    assert!(prompt.contains("do not execute work whose prerequisite is unmet"), "{lane}");
-                    assert!(prompt.contains("independent ready work"), "{lane}");
-                }
-                other => panic!("{lane}/{card} must receive a reconciliation turn: {other:?}"),
-            }
-            if dep != card {
-                // The SAME board with an explicit dependency still refuses it.
-                conn.execute("UPDATE issues SET depends_on=?1 WHERE id=?2",
-                    rusqlite::params![json!([dep]).to_string(), card]).unwrap();
-                assert!(matches!(select_pickup_with(&conn, lane, now_f64(), false),
-                    Pickup::None { reason: "all-candidates-refused", .. }),
-                    "{lane}: an unresolved structured dependency must still block");
-            }
-        }
-    }
+    // prose_dependency was removed (KISS simplification): cards with prose
+    // references to other cards are now picked up normally. Structured
+    // depends_on is the only dependency mechanism.
 
     #[test]
     fn stale_reclaim_cools_the_reclaimed_card_so_the_next_card_runs() {
@@ -12585,7 +12063,7 @@ mod tests {
         let conn = board_db();
         // pos orders the queue, so the shell is first.
         add_card(&conn, "S-1", "lane", "todo", "shell", "**Prompt:** do a thing for me");
-        conn.execute("UPDATE issues SET pos=1 WHERE id='S-1'", []).expect("pos");
+        conn.execute("UPDATE issues SET pos=1, creator='amux' WHERE id='S-1'", []).expect("pos");
         add_card(&conn, "T-1", "lane", "todo", "real", "SCOPE: x\n- [ ] y");
         conn.execute("UPDATE issues SET pos=2 WHERE id='T-1'", []).expect("pos");
         assert_eq!(claimed(&select_pickup_with(&conn, "lane", now_f64(), false)), Some("T-1"));
@@ -12706,7 +12184,9 @@ mod tests {
     fn every_shell_in_the_queue_produces_a_decompose_ask_not_silence() {
         let conn = board_db();
         add_card(&conn, "S-1", "lane", "todo", "shell one", "**Prompt:** please do a thing");
-        add_card(&conn, "S-2", "lane", "todo", "shell two", "capture: session prompt");
+        conn.execute("UPDATE issues SET creator='amux' WHERE id='S-1'", []).expect("creator");
+        add_card(&conn, "S-2", "lane", "todo", "shell two", "**Prompt:** capture session prompt");
+        conn.execute("UPDATE issues SET creator='amux' WHERE id='S-2'", []).expect("creator");
         match select_pickup_with(&conn, "lane", now_f64(), false) {
             Pickup::Decompose { ids, text } => {
                 assert_eq!(ids.len(), 2);
@@ -13144,7 +12624,7 @@ mod tests {
             "Post-fix status verification only",
             "**Prompt:** Post-fix status verification only; do not create or retain a board task.",
         );
-        conn.execute("UPDATE issues SET source='capture' WHERE id='PRIMI-204'", [])
+        conn.execute("UPDATE issues SET source='capture', creator='amux' WHERE id='PRIMI-204'", [])
             .expect("capture source");
 
         match select_advance(&conn, "primis", &[], now) {
@@ -13357,6 +12837,7 @@ mod tests {
     fn a_shell_card_in_doing_gets_a_split_ask_not_an_advance_nudge() {
         let conn = board_db();
         add_card(&conn, "S-1", "lane", "doing", "shell", "**Prompt:** please do a thing");
+        conn.execute("UPDATE issues SET creator='amux', source='capture' WHERE id='S-1'", []).expect("capture shell");
         match select_advance(&conn, "lane", &[], now_f64()) {
             Advance::Nudge { kind, text, .. } => {
                 assert_eq!(kind, "decompose-asked");
@@ -13394,145 +12875,6 @@ mod tests {
     }
 
     // --- predicates ------------------------------------------------------
-
-    #[test]
-    fn the_junk_predicate_matches_pythons_specimens() {
-        // Structure beats the fold count: a real card with fold RESIDUE.
-        let structured = "ROOT CAUSE: the thing\nNew task: a\nNew task: b\nNew task: c";
-        assert_eq!(pickup_junk_reason("MG-1328 real investigation", structured, ""), "");
-        // A true journal: folds, no structure.
-        assert!(pickup_junk_reason("journal", "New task: a\nNew task: b", "").contains("journal card"));
-        // GCA-85 + creative-dna: the artifact word must be the SUBJECT.
-        assert!(
-            pickup_junk_reason("Investigate the canary alerting path", "", "").is_empty(),
-            "a card ABOUT a canary is not a canary (GCA-85: three investigation cards fired \
-             on a mid-title mention)"
-        );
-        assert!(pickup_junk_reason("[test-hygiene] flaky suite", "", "").is_empty(), "area prefix is vocabulary");
-        assert!(!pickup_junk_reason("[TRIPWIRE, fires on recurrence]", "", "").is_empty());
-        assert!(!pickup_junk_reason("probe: is the server up", "", "").is_empty());
-        // Shells.
-        assert!(pickup_junk_reason("x", "**Prompt:** /compact", "").contains("slash command"));
-        assert!(pickup_junk_reason("x", "**Prompt:** go fix the thing", "").contains("captured chat prompt"));
-    }
-
-    /// AF-721: TG-3603 was a real card in active multi-lane review whose title
-    /// happened to start with the legitimate area tag "[canary]" — the artifact
-    /// regex branded it a test artifact with no check of the card's actual
-    /// state, unlike the capture-marker branch just above it (which carries its
-    /// own STRUCTURE VETO). Any one of desc length, log activity, a named
-    /// reviewer, or a non-backlog/todo status must veto the verdict.
-    #[test]
-    fn a_review_state_signal_vetoes_the_artifact_verdict() {
-        // CONTROL: with none of the four signals, the title still brands —
-        // otherwise this test would not be testing the veto at all.
-        assert!(
-            !pickup_junk_reason_scoped("[canary] monitoring stub", "", "", "backlog", "").is_empty(),
-            "a genuinely bare canary-prefixed title with no review signal must still brand"
-        );
-        let long_desc = "x".repeat(201);
-        assert!(
-            pickup_junk_reason_scoped("[canary] monitoring rollout", &long_desc, "", "backlog", "").is_empty(),
-            "a substantive desc must veto the artifact verdict"
-        );
-        let long_log = "y".repeat(201);
-        assert!(
-            pickup_junk_reason_scoped("[canary] monitoring rollout", "", &long_log, "backlog", "").is_empty(),
-            "real log activity must veto the artifact verdict"
-        );
-        assert!(
-            pickup_junk_reason_scoped("[canary] monitoring rollout", "", "", "backlog", "backend").is_empty(),
-            "a named reviewer must veto the artifact verdict"
-        );
-        assert!(
-            pickup_junk_reason_scoped("[canary] monitoring rollout", "", "", "review", "").is_empty(),
-            "a non-backlog/todo status must veto the artifact verdict"
-        );
-        // `pickup_junk_reason` (the 3-arg form every OTHER call site still
-        // uses) has no status/reviewer to pass and must keep its old, stricter
-        // behavior — this is what the two-fix-rule wrapper split preserves.
-        assert!(
-            !pickup_junk_reason("[canary] monitoring rollout", "", "").is_empty(),
-            "the unscoped wrapper has no review signal available and must still brand"
-        );
-    }
-
-    /// AMUX-3187: `capture: session prompt` is a durable LOG marker, so a card
-    /// that was auto-captured and then RESHAPED into a real task keeps it forever.
-    /// The brand must read the current DESC, not the log, or the decompose nudge
-    /// re-nags a card the session already fixed.
-    #[test]
-    fn a_reshaped_capture_is_no_longer_branded_a_capture() {
-        // POSITIVE CONTROL: a still-raw capture (desc begins "**Prompt:** ", log
-        // carries the marker) IS junk. If this ever passed clean the test below
-        // would be vacuous.
-        let raw_log = "12:00 capture: session prompt";
-        assert!(
-            pickup_junk_reason("Look up the top VLLM", "**Prompt:** [05:32 PM] look up the top VLLM", raw_log)
-                .contains("captured chat prompt"),
-            "a still-raw capture must be branded"
-        );
-        // THE FIX: same log marker, but the desc has been rewritten into a real
-        // ops task (AMUX-3185's actual reshaped desc shape). Not junk.
-        let reshaped = "Ethan (2026-08-15): find the current top open-weights LLM and pull it into \
-                        ollama so it appears in the model picker. Chosen qwen3-coder:30b. \
-                        Done when the model shows in GET /api/ollama/models.";
-        assert_eq!(
-            pickup_junk_reason("Pull qwen3-coder:30b into ollama", reshaped, raw_log),
-            "",
-            "a card reshaped out of its capture form must NOT be re-branded by the durable log marker"
-        );
-        // And the marker sitting ONLY in the log never brands on its own.
-        assert_eq!(
-            pickup_junk_reason("A perfectly normal task", "Do the normal thing.", raw_log),
-            "",
-            "the capture-origin log marker alone must not brand a card"
-        );
-    }
-
-    /// AF-569. The brand must fire on a card DEFINED as the capture marker, and not
-    /// on one that merely QUOTES it. AF-568 was the specimen: the card about
-    /// duplicate capture cards explained the bug with the marker in backticks, and
-    /// the unanchored `desc.contains` nudged it "not a unit of work" while it sat in
-    /// `doing` with a shipped fix. A card could not describe the capture mechanism
-    /// without being classified as its output.
-    ///
-    /// Both cells are required. `starts_with` alone would also be satisfied by a
-    /// check that never fires, so the first assertion is the one that keeps the
-    /// second honest.
-    #[test]
-    fn the_capture_brand_fires_on_the_marker_as_definition_not_as_a_quotation() {
-        // STILL BRANDS: the desc IS the marker. This is the intent the code states.
-        assert!(
-            pickup_junk_reason("shell", "capture: session prompt", "")
-                .contains("captured chat prompt"),
-            "a card whose desc IS the capture marker must still be branded"
-        );
-
-        // THE BUG: the marker QUOTED inside a real write-up. AF-568's actual shape,
-        // trimmed. Three ALLCAPS heads, so the structure veto below would clear it
-        // too, which the substring check short-circuited by returning first.
-        let real_work = "MEASURED, 2026-09-07 (population: every card from that broadcast).\n\
-                         There are two capture paths and both write the same durable \
-                         `capture: session prompt` log marker, so nothing downstream can \
-                         tell them apart.\n\
-                         WHAT I CLAIMED: a second mint path.\n\
-                         WHY IT IS WRONG: the orchestrator stamps source='orchestrator'.\n\
-                         WHAT I DID NOT ESTABLISH: what re-delivered the prompt.";
-        assert_eq!(
-            pickup_junk_reason("One broadcast minted 105 capture cards", real_work, ""),
-            "",
-            "a card that QUOTES the capture marker while doing real work must not be branded"
-        );
-    }
-
-    #[test]
-    fn the_prose_dependency_fallback_finds_a_blocker_and_ignores_a_citation() {
-        assert_eq!(prose_dependency("blocked by AC-138 until it lands"), Some("AC-138".into()));
-        assert_eq!(prose_dependency("depends on MG-1363"), Some("MG-1363".into()));
-        // A bare citation is not a dependency.
-        assert_eq!(prose_dependency("see AC-138 for context"), None);
-    }
 
     #[test]
     fn norm_actor_flattens_the_real_origin_spellings() {

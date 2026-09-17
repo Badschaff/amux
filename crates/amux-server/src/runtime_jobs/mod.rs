@@ -57,12 +57,10 @@ pub mod cdc_poller;
 pub mod codex_ledger;
 pub mod gemini_ledger;
 pub mod commit_mention_notes;
-pub mod commit_nudge;
 pub mod context_health;
 pub mod status_history;
 pub mod disk_watch;
 pub(crate) mod executor;
-pub mod ghost_rescue;
 pub mod heartbeat;
 pub mod host_metrics;
 pub mod mac_health;
@@ -70,7 +68,6 @@ mod memory_consumers;
 pub mod pane_size;
 /// The live registry of the jobs below — see [`registry`] for why it is
 /// derived from the spawn sites rather than declared alongside them.
-pub mod queue_disposition;
 pub mod recordings_transcribe;
 pub mod registry;
 mod poll_watch;
@@ -165,7 +162,7 @@ pub(crate) fn per_job_disable_var(name: &str) -> String {
 /// control without touching process-global env, which cargo's parallel tests
 /// share.
 ///
-/// The hazard: some periodic jobs (`pane_size`, `ghost_rescue`) enumerate the
+/// The hazard: some periodic jobs (`pane_size`) enumerate the
 /// tmux fleet directly and take no `AppState`, so `AMUX_HOME` does not scope
 /// them. A SECOND or TEST amux-server pointed at the production tmux socket would
 /// therefore press Enter and resize panes in the real lanes. Two switches turn a
@@ -373,13 +370,11 @@ mod tests {
         let files: &[(&str, &str)] = &[
             ("board_drive.rs", include_str!("board_drive.rs")),
             ("autofix.rs", include_str!("autofix.rs")),
-            ("ghost_rescue.rs", include_str!("ghost_rescue.rs")),
             ("pane_size.rs", include_str!("pane_size.rs")),
             ("storage.rs", include_str!("storage.rs")),
             ("token_ledger.rs", include_str!("token_ledger.rs")),
             ("heartbeat.rs", include_str!("heartbeat.rs")),
             ("status_history.rs", include_str!("status_history.rs")),
-            ("commit_nudge.rs", include_str!("commit_nudge.rs")),
             ("board_hygiene.rs", include_str!("board_hygiene.rs")),
         ];
         // The control first: this cell is worthless unless the literal it looks
@@ -390,11 +385,6 @@ mod tests {
 
         let mut offenders: Vec<String> = Vec::new();
         for (name, src) in files {
-            // ONLY modules that actually go through the deriver. `commit_nudge`
-            // reads AMUX_COMMIT_NUDGE_SECS and spawns with a bare
-            // `tokio::spawn`, so nothing derives that name and its one spelling
-            // is the only one — flagging it would be telling a module to stop
-            // duplicating something it does not duplicate.
             if !src.contains("spawn_periodic") {
                 continue;
             }

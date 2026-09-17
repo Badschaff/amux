@@ -472,15 +472,6 @@ async fn async_main() {
     );
 
     // Ghost-rescue (AMUX-2629): the FALLBACK sweep for the keystroke delivery
-    // path — it presses Enter for an amux message that was typed into a lane's
-    // input box and never submitted. Every rescue logs at WARN because a
-    // rescue means the send path failed. It retires when interactive lanes are
-    // protocol-driven; see runtime_jobs::ghost_rescue for the exit condition.
-    // The handle is dropped on purpose — a PeriodicTask is NOT aborted on drop
-    // (runtime_jobs' contract: an internal maintenance loop outlives the handle
-    // that spawned it, and is stopped only by an explicit `abort`).
-    drop(runtime_jobs::ghost_rescue::spawn(state.clone()));
-
     // Board -> worker drive loop (AMUX-2637): auto-pickup + the advance nudge.
     // Python owned this entire loop and the cutover left it behind, so no card
     // was assigned and no nudge was sent to any of the fleet's python-owned
@@ -504,12 +495,6 @@ async fn async_main() {
     // repair at boot, then holds the line on a 20s sweep against an
     // expiring viewer lease.
     drop(runtime_jobs::pane_size::spawn());
-    // The idle uncommitted-work nudge (AMUX-2638). Ownership comes from the
-    // staged-guard, never from the dirty tree — see the module docs for the
-    // three sweeps that rule exists to prevent. Its spawn owns the registry
-    // entry and selects the maintenance runtime like every other loop.
-    drop(runtime_jobs::commit_nudge::spawn(state.clone()));
-
     // AUTOFIX (AMUX-2681) — notice, file, hand off. Runs in the SERVER, on
     // purpose: the thing that watches for breakage must not share fate with
     // the thing that breaks, so nothing in it touches a pane, a send or a turn
@@ -531,7 +516,6 @@ async fn async_main() {
     drop(runtime_jobs::storage::spawn(state.clone()));
     drop(runtime_jobs::disk_watch::spawn(state.clone()));
     drop(runtime_jobs::host_metrics::spawn(state.clone()));
-    drop(runtime_jobs::queue_disposition::spawn(state.clone()));
     // Record tab transcripts (AMUX-4624): the folder is the work list, so a
     // restart or a late model install resolves on the next tick.
     drop(runtime_jobs::recordings_transcribe::spawn(state.clone()));
