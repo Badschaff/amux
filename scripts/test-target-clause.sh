@@ -13,6 +13,24 @@
 # was derived from BASH_SOURCE, and because the runner snapshots itself to a
 # temp file and re-execs (AF-368), it resolved to nothing and the clause never
 # printed. A missing warning is indistinguishable from nothing to warn about.
+# ASSERT ON A MARKER, NEVER ON THE LENGTH OF THE PROSE (AMUX-4735).
+#
+# Three cells used to pin `grep -c '^targets:'` against a literal 7 or 4. That
+# counts LINES OF THE RUNNER'S EXPLANATION, so c7911c2d broke two of them by
+# adding sentences to the message: want [7] got [9], on a runner that was
+# working perfectly. The labels already said what the cells meant, "the clause
+# fires" and "announces the skipped lib", and a paragraph length is not that.
+#
+# The irony was one line down. The very next assertion in cell 1 is labelled
+# "the count matches the tree, not a constant" and passes, because it compares
+# against `find`. A drifted literal sat directly above a computed one.
+#
+# This file is deliberately NOT wired into `checks` (see
+# scripts/fixtures/harness-wired-baseline.txt: every cell compiles for real, so
+# wiring it adds minutes to every lane's push). That is defensible and it is
+# also why the drift went unseen for as long as it did: nothing runs a
+# recorded-unwired harness, so nothing notices when one stops being true.
+# Tracked separately as AMUX-4747.
 set -u
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNNER="$SRC/scripts/test-contended.sh"
@@ -22,7 +40,7 @@ ok() { if [ "$2" = "$3" ]; then pass=$((pass+1)); echo "  ok   $1"; else
 
 echo "cell 1: --lib says how many integration targets it skipped"
 o=$("$RUNNER" -p amux-server --lib invariants::checks::negative_controls 2>&1)
-ok "the clause fires" "$(printf '%s' "$o" | grep -c '^targets:')" "7"
+ok "the clause fires" "$(printf '%s' "$o" | grep -c 'were NOT built or run')" "1"
 n=$(printf '%s' "$o" | grep -oE 'subset — [0-9]+ integration' | grep -oE '[0-9]+')
 real=$(find "$SRC/crates/amux-server/tests" -maxdepth 1 -name '*.rs' | wc -l | tr -d ' ')
 ok "the count matches the tree, not a constant" "$n" "$real"
@@ -42,7 +60,10 @@ ok "the count matches the tree, not a constant" "$n" "$real"
 # never had one.
 echo "cell 2: --test skips the LIB, and now says so"
 o2=$("$RUNNER" -p amux-server --test browser_errors_carry_cause 2>&1)
-ok "announces the skipped lib" "$(printf '%s' "$o2" | grep -c '^targets:')" "4"
+# TWO DISTINCT PROPERTIES, not one property twice: that a clause was printed at
+# all, and that it was specifically about the lib. Expressed as booleans, since
+# "did it print" has no number in it.
+ok "a clause is printed" "$(printf '%s' "$o2" | grep -qE '^targets:' && echo yes || echo no)" "yes"
 ok "and names which half"      "$(printf '%s' "$o2" | grep -c 'THE LIB WAS NOT RUN')" "1"
 
 echo "cell 3: the count is derived from the repo, not from the running script"
@@ -50,7 +71,7 @@ echo "cell 3: the count is derived from the repo, not from the running script"
 # resolves to /var/folders/... and silently yields nothing. Assert the clause
 # survives being invoked from an unrelated cwd.
 o3=$(cd /tmp && "$RUNNER" -p amux-server --lib invariants::checks::negative_controls 2>&1)
-ok "still fires from another cwd" "$(printf '%s' "$o3" | grep -c '^targets:')" "7"
+ok "still fires from another cwd" "$(printf '%s' "$o3" | grep -c 'were NOT built or run')" "1"
 
 echo ""
 echo "test-target-clause: $pass passed, $fail failed"
