@@ -11226,7 +11226,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.977';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.978';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -30746,6 +30746,10 @@ function updateSchedKindUI() {
   document.getElementById('sched-command').placeholder = shell
     ? 'e.g. /bin/bash /path/to/script.sh' : 'e.g. /status or npm run build';
 }
+function updateSchedFanOutUI() {
+  const on = document.getElementById('sched-fan-out').checked;
+  document.getElementById('sched-fan-out-model-group').style.display = on ? '' : 'none';
+}
 // Determine which mode an existing schedule maps to
 function schedModeOf(s) {
   if (s.sched_type === 'once' && !s.schedule_expr) return 'once';
@@ -30770,6 +30774,10 @@ function openSchedModal(editId) {
   setVal('sched-loop-every', '30m');
   setVal('sched-expr', '');
   setVal('sched-run-at', new Date(Date.now() + 3600000).toISOString().slice(0,16));
+  setChk('sched-fan-out', false);
+  setVal('sched-fan-out-model', 'haiku');
+  setChk('sched-worktree', false);
+  updateSchedFanOutUI();
 
   let mode = 'loop';
   if (editId) {
@@ -30780,6 +30788,10 @@ function openSchedModal(editId) {
       sel.value = s.session;
       setVal('sched-command', s.command);
       setVal('sched-run-at', s.run_at && s.run_at.includes('T') ? s.run_at : '');
+      setChk('sched-fan-out', !!s.fan_out);
+      setVal('sched-fan-out-model', s.fan_out_model || 'haiku');
+      setChk('sched-worktree', !!s.worktree);
+      updateSchedFanOutUI();
       mode = schedModeOf(s);
       const expr = s.schedule_expr || '';
       if (mode === 'loop') {
@@ -30853,8 +30865,12 @@ async function saveSchedModal() {
   // REFUSES to arm them (400, AMUX-2680), so sending them would turn every
   // save into an error; they are gone from the payload for the same reason
   // they are gone from the form.
+  const fanOut = document.getElementById('sched-fan-out').checked ? 1 : 0;
+  const fanOutModel = fanOut ? (document.getElementById('sched-fan-out-model').value || 'haiku') : null;
+  const worktree = document.getElementById('sched-worktree').checked ? 1 : 0;
   const payload = { title, worker, kind, command, sched_type: stype, recurrence: null, run_at,
                     schedule_expr: schedExpr || null,
+                    fan_out: fanOut, fan_out_model: fanOutModel, worktree,
                     by: 'dashboard' };
   const url = _schedEditId ? API + '/api/schedules/' + _schedEditId : API + '/api/schedules';
   const method = _schedEditId ? 'PATCH' : 'POST';

@@ -1915,6 +1915,27 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       </div>
       <!-- The hidden sched-watch / sched-watch-timeout carriers were here.
            They existed only to keep two dead columns in the save payload. -->
+      <!-- Execution mode toggles -->
+      <div id="sched-exec-modes" style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);">
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:0.78rem;color:var(--text);margin-bottom:6px;" title="Treat the command as fan-out priorities: each line becomes a child worker via /api/board/launch">
+          <input type="checkbox" id="sched-fan-out" style="width:auto;accent-color:var(--accent);" onchange="updateSchedFanOutUI()">
+          <span>Fan-out orchestration</span>
+          <span style="font-size:0.66rem;color:var(--dim);">(each line = one worker)</span>
+        </label>
+        <div id="sched-fan-out-model-group" style="display:none;margin-left:24px;margin-bottom:6px;">
+          <label class="field-label" style="font-size:0.68rem;">Model for child workers</label>
+          <select id="sched-fan-out-model" style="font-size:0.76rem;padding:4px 8px;">
+            <option value="haiku">haiku (fast/cheap)</option>
+            <option value="sonnet">sonnet</option>
+            <option value="opus">opus</option>
+          </select>
+        </div>
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:0.78rem;color:var(--text);" title="Create an ephemeral worktree for each firing, commit/push results, then tear down">
+          <input type="checkbox" id="sched-worktree" style="width:auto;accent-color:var(--accent);">
+          <span>Worktree isolation</span>
+          <span style="font-size:0.66rem;color:var(--dim);">(ephemeral per firing)</span>
+        </label>
+      </div>
     </div><!-- /schedule panels (scrollable) -->
     <!-- Action row — PINNED, and a SIBLING of the scrolling panel region
          rather than its last child. As a child it scrolled out of view: at

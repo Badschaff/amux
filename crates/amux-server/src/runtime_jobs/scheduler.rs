@@ -933,11 +933,11 @@ fn due_schedules(conn: &Connection, now_str: &str) -> rusqlite::Result<Vec<Durab
 
 /// INSERT with Python's exact column list (create parity).
 pub fn insert_schedule(conn: &Connection, s: &DurableSchedule) -> rusqlite::Result<()> {
-    const COLS: [&str; 24] = [
+    const COLS: [&str; 27] = [
         "id", "title", "session", "command", "kind", "sched_type", "recurrence", "run_at",
         "next_run", "last_run", "enabled", "run_count", "schedule_expr", "watch", "watch_timeout",
         "done_pattern", "done_action", "trigger_on", "trigger_cooldown", "trigger_sessions",
-        "exit_actions", "created", "updated", "deleted",
+        "exit_actions", "created", "updated", "deleted", "worktree", "fan_out", "fan_out_model",
     ];
     let placeholders: Vec<String> = (1..=COLS.len()).map(|i| format!("?{i}")).collect();
     let sql = format!(
@@ -952,10 +952,11 @@ pub fn insert_schedule(conn: &Connection, s: &DurableSchedule) -> rusqlite::Resu
 
 /// Full-row UPDATE with Python's PATCH column list.
 pub fn update_schedule(conn: &Connection, s: &DurableSchedule) -> rusqlite::Result<usize> {
-    const COLS: [&str; 19] = [
+    const COLS: [&str; 22] = [
         "title", "session", "command", "kind", "sched_type", "recurrence", "run_at", "next_run",
         "enabled", "schedule_expr", "watch", "watch_timeout", "done_pattern", "done_action",
         "trigger_on", "trigger_cooldown", "trigger_sessions", "exit_actions", "updated",
+        "worktree", "fan_out", "fan_out_model",
     ];
     let sets: Vec<String> = COLS.iter().enumerate().map(|(i, c)| format!("{c}=?{}", i + 1)).collect();
     let sql = format!("UPDATE schedules SET {} WHERE id=?{}", sets.join(","), COLS.len() + 1);
@@ -1539,6 +1540,88 @@ impl LiveDeliverer {
         )
         .await;
     }
+
+    async fn deliver_fan_out(&self, sched: &DurableSchedule, command: &str) -> RunOutcome {
+        use crate::api::session_verbs::env_path;
+
+        let session = sched.str_field("session").to_string();
+        let model = {
+            let m = sched.str_field("fan_out_model");
+            if m.is_empty() { "haiku" } else { m }
+        };
+
+        let priorities: Vec<String> = command
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        if priorities.is_empty() {
+            return RunOutcome::Refused {
+                reason: "fan-out schedule has no parseable priorities in command".into(),
+            };
+        }
+
+        let ep = env_path(&session);
+        if !ep.exists() {
+            return RunOutcome::Failed {
+                reason: format!("fan-out parent session {session} has no env file"),
+            };
+        }
+
+        let launch_body = serde_json::json!({
+            "title": sched.str_field("title"),
+            "priorities": priorities,
+            "parent_session": session,
+            "model": model,
+            "provider": "claude",
+        });
+
+        let port = crate::config::canonical_port();
+        let base = format!("https://127.0.0.1:{port}");
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap_or_default();
+        let r = client
+            .post(format!("{base}/api/board/launch"))
+            .header("Content-Type", "application/json")
+            .header("X-Amux-Session", format!("sched:{}", sched.id()))
+            .json(&launch_body)
+            .send()
+            .await;
+
+        match r {
+            Ok(resp) if resp.status().is_success() => {
+                let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                let started = body.get("workers_started").and_then(|v| v.as_u64()).unwrap_or(0);
+                let epic_id = body.get("epic").and_then(|v| v.as_str()).unwrap_or("?");
+                tracing::info!(
+                    target: "amux::scheduler",
+                    schedule = %sched.id(),
+                    epic = %epic_id,
+                    workers = started,
+                    model = %model,
+                    verdict = "fan_out_delivered",
+                    measured = true,
+                    "scheduler fan-out delivered"
+                );
+                RunOutcome::Delivered {
+                    submission: "confirmed".into(),
+                    detail: format!("fan-out: epic {epic_id}, {started} workers ({model})"),
+                }
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                RunOutcome::Failed {
+                    reason: format!("fan-out launch returned {status}: {text}"),
+                }
+            }
+            Err(e) => RunOutcome::Failed {
+                reason: format!("fan-out launch request failed: {e}"),
+            },
+        }
+    }
 }
 
 /// The text a session actually receives.
@@ -1647,11 +1730,14 @@ impl Deliverer for LiveDeliverer {
         }
         let command = sched.str_field("command").trim().to_string();
         if command.is_empty() {
-            // Not an error and not a success: there is nothing to deliver, and
-            // a row claiming otherwise is the whole defect (rule 3 — the honest
-            // exit has to exist).
             return RunOutcome::Refused { reason: "schedule has no command to deliver".into() };
         }
+
+        // Fan-out path: treat the command as priorities and call the launch endpoint
+        if sched.i64_field("fan_out", 0) != 0 {
+            return self.deliver_fan_out(sched, &command).await;
+        }
+
         let session = sched.str_field("session").to_string();
         let text = delivered_text(&command, source);
         let d = crate::api::session_verbs::deliver_automated(

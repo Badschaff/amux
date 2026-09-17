@@ -448,6 +448,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0078_invariant_result_build",
         sql: include_str!("../../migrations/0078_invariant_result_build.sql"),
     },
+    Migration {
+        version: 79,
+        name: "0079_schedules_worktree",
+        sql: include_str!("../../migrations/0079_schedules_worktree.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.

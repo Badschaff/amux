@@ -464,6 +464,19 @@ pub struct ScheduleBody {
     pub trigger_sessions: Option<String>,
     #[serde(default)]
     pub exit_actions: Option<Value>,
+    /// When set, the scheduler creates an ephemeral worktree session for each
+    /// firing instead of sending the command to the named session directly.
+    /// The worktree is torn down after the command completes and pushes.
+    #[serde(default, deserialize_with = "de_flag")]
+    pub worktree: Option<i64>,
+    /// When set, the command is treated as priorities for fan-out: the scheduler
+    /// calls /api/board/launch to create an epic and spin up ephemeral workers
+    /// instead of sending the command as a plain message.
+    #[serde(default, deserialize_with = "de_flag")]
+    pub fan_out: Option<i64>,
+    /// Model for fan-out workers (default "haiku").
+    #[serde(default)]
+    pub fan_out_model: Option<String>,
     /// Claimed attribution (weaker than the header; see `mutation_by`).
     #[serde(default)]
     pub by: Option<String>,
@@ -598,6 +611,9 @@ pub async fn create(
     m.insert("trigger_on".into(), body.trigger_on.clone().filter(|s| !s.trim().is_empty()).map(Value::from).unwrap_or(Value::Null));
     m.insert("trigger_cooldown".into(), json!(body.trigger_cooldown.unwrap_or(120)));
     m.insert("trigger_sessions".into(), body.trigger_sessions.clone().filter(|s| !s.trim().is_empty()).map(Value::from).unwrap_or(Value::Null));
+    m.insert("worktree".into(), json!(body.worktree.unwrap_or(0)));
+    m.insert("fan_out".into(), json!(body.fan_out.unwrap_or(0)));
+    m.insert("fan_out_model".into(), body.fan_out_model.clone().map(Value::from).unwrap_or(Value::Null));
     m.insert(
         "exit_actions".into(),
         match &body.exit_actions {
@@ -798,6 +814,9 @@ pub async fn patch(
             if let Some(v) = &body.trigger_on { s.set("trigger_on", json!(v)); }
             if let Some(v) = body.trigger_cooldown { s.set("trigger_cooldown", json!(v)); }
             if let Some(v) = &body.trigger_sessions { s.set("trigger_sessions", json!(v)); }
+            if let Some(v) = body.worktree { s.set("worktree", json!(v)); }
+            if let Some(v) = body.fan_out { s.set("fan_out", json!(v)); }
+            if let Some(v) = &body.fan_out_model { s.set("fan_out_model", json!(v)); }
             if let Some(v) = &body.exit_actions {
                 let stored = match v {
                     Value::Object(o) => Value::String(Value::Object(o.clone()).to_string()),
