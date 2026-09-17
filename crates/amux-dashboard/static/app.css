@@ -6412,6 +6412,63 @@ input.mdai-edge-path-input:focus { border-color: var(--accent); box-shadow: 0 0 
 .board-page-heading > button { width:48px; height:48px; font-size:1.6rem; border-radius:14px; }
 .board-quick-filters { display:flex; gap:8px; overflow-x:auto; padding:4px 0 16px; scrollbar-width:none; }
 .board-quick-filters button { min-height:44px; flex-shrink:0; padding:8px 18px; border:1px solid var(--border); border-radius:14px; background:var(--surface); color:var(--text); font:inherit; font-size:.85rem; cursor:pointer; }
+/* Launch bar: type priorities, auto fan-out */
+.board-launch-bar { margin:0 0 12px; border:1px solid var(--border); border-radius:14px; background:var(--surface); overflow:hidden; }
+.launch-header { display:flex; align-items:center; gap:10px; padding:10px 14px; cursor:pointer; user-select:none; }
+.launch-header:hover { background:var(--surface2); }
+.launch-ico { font-size:1.1rem; }
+.launch-title { font-weight:600; font-size:.88rem; flex:1; }
+.launch-caret { font-size:.7rem; color:var(--dim); transition:transform .15s; }
+.launch-caret.open { transform:rotate(90deg); }
+.launch-body { padding:0 14px 14px; display:flex; flex-direction:column; gap:10px; }
+.launch-textarea { font:inherit; font-size:.85rem; resize:vertical; min-height:80px; border-radius:10px; padding:10px 12px; }
+.launch-controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+.launch-controls select { border-radius:10px; font-size:.82rem; }
+.launch-status { font-size:.8rem; padding:6px 0; color:var(--dim); }
+.launch-status.error { color:var(--danger); }
+/* Fanout children in board detail */
+.bd-fanout-child { display:flex; align-items:center; gap:8px; padding:6px 0; border-bottom:1px solid var(--border); }
+.bd-fanout-child:last-child { border-bottom:none; }
+.bd-fanout-worker { font-size:.82rem; font-weight:500; cursor:pointer; text-decoration:underline; text-decoration-color:var(--dim); text-underline-offset:2px; }
+.bd-fanout-status { font-size:.72rem; padding:2px 8px; border-radius:8px; }
+.bd-fanout-status.running { background:rgba(34,197,94,0.15); color:#22c55e; }
+.bd-fanout-status.idle { background:rgba(100,116,139,0.15); color:var(--dim); }
+.bd-fanout-status.done { background:rgba(59,130,246,0.15); color:#3b82f6; }
+/* Fanout peek panel items */
+.fanout-worker-row { display:flex; align-items:center; gap:10px; padding:8px 0; border-bottom:1px solid var(--border); }
+.fanout-worker-row:last-child { border-bottom:none; }
+.fanout-worker-name { font-size:.84rem; font-weight:500; flex:1; cursor:pointer; }
+.fanout-worker-name:hover { text-decoration:underline; }
+.fanout-worker-card { font-size:.72rem; color:var(--dim); }
+@media (max-width:600px) {
+  .launch-controls { flex-direction:column; align-items:stretch; }
+  .launch-controls select, .launch-controls button { width:100%; min-height:44px; }
+}
+/* Orchestrations tab */
+.orch-epic { border:1px solid var(--border); border-radius:14px; background:var(--surface); margin-bottom:10px; overflow:hidden; }
+.orch-epic.active { border-color:var(--accent); }
+.orch-epic-header { display:flex; align-items:center; gap:10px; padding:12px 14px; cursor:pointer; user-select:none; min-height:44px; }
+.orch-epic-header:hover { background:var(--surface2); }
+.orch-caret { font-size:.7rem; color:var(--dim); transition:transform .15s; flex-shrink:0; }
+.orch-caret.open { transform:rotate(90deg); }
+.orch-title { font-weight:600; font-size:.88rem; flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.orch-progress { font-size:.75rem; color:var(--dim); white-space:nowrap; }
+.orch-progress-bar { height:3px; background:var(--border); margin:0 14px 2px; border-radius:2px; }
+.orch-progress-fill { height:100%; background:var(--accent); border-radius:2px; transition:width .3s; }
+.orch-children { padding:4px 14px 10px; }
+.orch-child { display:flex; align-items:center; gap:8px; padding:8px 0; border-bottom:1px solid var(--border); flex-wrap:wrap; min-height:44px; }
+.orch-child:last-child { border-bottom:none; }
+.orch-child-title { font-size:.84rem; font-weight:500; flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; cursor:pointer; }
+.orch-child-title:hover { text-decoration:underline; }
+.orch-worker { font-size:.72rem; color:var(--accent); cursor:pointer; }
+.orch-worker:hover { text-decoration:underline; }
+.orch-worker-plain { font-size:.72rem; color:var(--dim); }
+@media (max-width:600px) {
+  .orch-epic-header { padding:10px 12px; gap:8px; }
+  .orch-child { gap:6px; }
+  .orch-title { font-size:.82rem; }
+  .orch-child-title { font-size:.8rem; }
+}
 #board-view .board-toolbar { padding:10px 0 14px; }
 #board-view .board-columns { gap:16px; align-items:flex-start; }
 #board-view .board-col:not(.col-collapsed) { flex:0 0 310px; min-width:310px; max-width:360px; padding:10px; background:var(--surface2); border:1px solid var(--border); border-radius:16px; }

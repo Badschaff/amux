@@ -550,6 +550,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <button id="tab-torrents" onclick="switchView('torrents')"><span class="tab-ico">↓</span><span class="tab-lbl">Torrents</span></button>
   <button id="tab-terminal" onclick="switchView('terminal')"><span class="tab-ico">⮞</span><span class="tab-lbl">Terminal</span></button>
   <button id="tab-browser" onclick="switchView('browser')"><span class="tab-ico">◳</span><span class="tab-lbl">Browser</span></button>
+  <button id="tab-orchestrations" onclick="switchView('orchestrations')"><span class="tab-ico">&#x2B53;</span><span class="tab-lbl">Orchestrations</span></button>
 </div>
 <div class="tab-customize-wrap">
   <button class="tab-customize-btn" onclick="event.stopPropagation();toggleTabCustomizer()" title="Show/hide tabs">&#x229E;</button>
@@ -598,6 +599,32 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 <div id="board-view" style="display:none;">
   <div class="board-page-heading"><div><h1>Board</h1><p>Turn work into outcomes</p></div><button class="btn primary" onclick="openBoardAdd('todo')" aria-label="Create board task">+</button></div>
   <div class="board-quick-filters" aria-label="Quick board filters"><button onclick="_boardQuick('')">All</button><button onclick="_boardQuick('owner:human is:open')">My tasks</button><button onclick="_boardQuick('status:doing')">In progress</button><button onclick="_boardQuick('is:needsyou')">Needs you</button><button onclick="_boardQuick('status:review')">Review</button></div>
+  <!-- Launch bar: type priorities, auto-fan-out to ephemeral workers -->
+  <div class="board-launch-bar" id="board-launch-bar">
+    <div class="launch-header" onclick="_toggleLaunchBar()">
+      <span class="launch-ico">&#x1F680;</span>
+      <span class="launch-title">Launch priorities</span>
+      <span class="launch-caret" id="launch-caret">&#x25B6;</span>
+    </div>
+    <div class="launch-body" id="launch-body" style="display:none;">
+      <textarea id="launch-input" class="input launch-textarea" placeholder="Type priorities, one per line:&#10;1. Consolidate GKE clusters to zero budget&#10;2. Search parity with browser validation&#10;3. Single Docker image of full platform" rows="4" spellcheck="false"></textarea>
+      <div class="launch-controls">
+        <select id="launch-model" class="input" style="width:auto;min-height:36px;">
+          <option value="opus">Opus</option>
+          <option value="sonnet">Sonnet</option>
+          <option value="haiku">Haiku</option>
+        </select>
+        <select id="launch-provider" class="input" style="width:auto;min-height:36px;">
+          <option value="claude">Claude</option>
+        </select>
+        <select id="launch-session" class="input" style="width:auto;min-height:36px;">
+          <option value="">Orchestrator (self)</option>
+        </select>
+        <button class="btn primary" id="launch-btn" onclick="_launchFanOut()">Launch</button>
+      </div>
+      <div class="launch-status" id="launch-status" style="display:none;"></div>
+    </div>
+  </div>
   <div class="board-toolbar">
     <div id="bf-chips" style="display:none;flex-basis:100%;order:3;flex-wrap:wrap;gap:6px;padding-top:6px;"></div>
     <!-- #bf-add is the FIRST flex child of the wrap (AMUX-2569): as a later
@@ -1609,6 +1636,13 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   </div>
 </div>
 
+<div id="orchestrations-view" style="display:none;flex-direction:column;flex:1;min-height:0;overflow-y:auto;">
+  <div style="padding:12px 14px 8px;display:flex;align-items:center;gap:8px;">
+    <h2 style="font-size:1rem;font-weight:600;margin:0;flex:1;">Orchestrations</h2>
+    <button class="btn primary" onclick="switchView('board');_toggleLaunchBar()" style="font-size:.8rem;">+ Launch</button>
+  </div>
+  <div id="orch-list" style="padding:0 14px 14px;"></div>
+</div>
 <div id="graph-view" style="display:none;flex-direction:row;overflow:hidden;">
   <!-- Graph sidebar -->
   <div class="graph-sidebar" id="graph-sidebar">
@@ -2297,6 +2331,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="peek-tab" id="peek-tab-memory" onclick="setPeekTab('memory')"><span class="tab-ico">&#x1F4DD;</span><span class="tab-lbl">Memory</span></button>
     <button class="peek-tab" id="peek-tab-git" onclick="setPeekTab('git')"><span class="tab-ico">⎇</span><span class="tab-lbl">Worktree</span></button>
     <button class="peek-tab" id="peek-tab-logs" onclick="setPeekTab('logs')" title="HTTP request log for this worker"><span class="tab-ico">≡</span><span class="tab-lbl">Logs</span><span class="peek-tab-count" id="peek-tab-logs-count"></span></button>
+    <button class="peek-tab" id="peek-tab-fanout" onclick="setPeekTab('fanout')" title="Ephemeral fan-out workers spawned by this session" style="display:none;"><span class="tab-ico">&#x1F680;</span><span class="tab-lbl">Fan-out</span><span class="peek-tab-count" id="peek-tab-fanout-count"></span></button>
     <button class="tab-customize-btn" id="peek-tab-customize" onclick="event.stopPropagation();togglePeekTabCustomizer()" title="Show, hide or reorder worker tabs" aria-label="Customize worker tabs" aria-expanded="false" style="flex:0 0 auto;">&#x229E;</button>
     <!-- The menu itself is NOT here on purpose — it is a direct child of the
          document body, at the end of this file. `.peek-tabs` is a ~44px
@@ -2703,6 +2738,15 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <input id="peek-logs-search" class="search-input" type="text" placeholder="Filter..." style="flex:1;font-size:0.72rem;padding:4px 8px;min-width:60px;" oninput="_peekLogsSearchQ=this.value;_peekLogsRender()">
     </div>
     <div class="peek-tasks-list" id="peek-logs-list" style="padding:0;"></div>
+  </div>
+  <!-- Fan-out panel: shows ephemeral children of the peeked session -->
+  <div id="peek-fanout-panel" class="peek-tasks-panel" style="padding:0;gap:0;">
+    <div style="padding:8px 12px 6px;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--border);flex-shrink:0;">
+      <span style="font-weight:600;font-size:0.85rem;">Fan-out Workers</span>
+      <span id="peek-fanout-stats" style="font-size:0.68rem;color:var(--dim);flex:1;"></span>
+      <button class="btn" title="Refresh" onclick="_peekFanoutLoad()" style="font-size:0.7rem;padding:2px 6px;">&#x21BB;</button>
+    </div>
+    <div class="peek-tasks-list" id="peek-fanout-list" style="padding:8px 12px;"></div>
   </div>
   <!-- Notes panel -->
 </div>

@@ -4569,6 +4569,7 @@ async function _fetchSessionsOnce() {
       render();
       _refreshOpenPeekOnSessions();   // list AND details update from the one event
       _refreshBoardActivityOnSessions();
+      _updateFanoutTabVisibility();
       if (!window._peekEmbed) _fetchGitBranches(sessions);
     }
   } catch(e) {
@@ -9707,6 +9708,12 @@ function setPeekTab(tab) {
   const logsP = document.getElementById('peek-logs-panel');
   if (tab === 'logs') { logsP.classList.add('active'); _peekLogsLoad(); }
   else { logsP.classList.remove('active'); }
+  document.getElementById('peek-tab-fanout')?.classList.toggle('active', tab === 'fanout');
+  const fanoutP = document.getElementById('peek-fanout-panel');
+  if (fanoutP) {
+    if (tab === 'fanout') { fanoutP.classList.add('active'); _peekFanoutLoad(); if (!_fanoutRefreshTimer) _fanoutRefreshTimer = setInterval(_peekFanoutLoad, 4000); }
+    else { fanoutP.classList.remove('active'); if (_fanoutRefreshTimer) { clearInterval(_fanoutRefreshTimer); _fanoutRefreshTimer = null; } }
+  }
   requestAnimationFrame(() => {
     const selected=document.getElementById('peek-tab-'+tab);
     if (!selected || _peekTab!==tab || !selected.getClientRects().length) return;
@@ -11219,7 +11226,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.975';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.977';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -25573,6 +25580,7 @@ function switchView(view) {
     ['cost', 'cost', 'flex'], ['disk', 'disk', 'flex'], ['torrents', 'torrents', 'flex'], ['terminal', 'terminal', ''],
     ['browser', 'browser', 'flex'], ['graph', 'graph', 'flex'],
     ['email', 'email', 'flex'], ['connectors', 'connectors', 'flex'],
+    ['orchestrations', 'orchestrations', 'flex'],
   ];
   for (const [domId, name, display] of _svViews) {
     const ve = document.getElementById(domId + '-view');
@@ -25607,6 +25615,7 @@ function switchView(view) {
   if (view === 'mdai') _mdaiTabLoad();
   if (view === 'email') _emailLoad();
   if (view === 'connectors') _connectorsTabLoad();
+  if (view === 'orchestrations') _orchLoad();
   if (view === 'proxies') { loadProxies(); _startProxiesTimer(); } else { _stopProxiesTimer(); }
   if (view !== 'files') {
     try { if (location.hash.startsWith('#path=')) history.replaceState({}, '', location.pathname); } catch(e) {}
@@ -31264,9 +31273,7 @@ function _bdRenderMeta(item) {
     '<span class="task-id-chip" onclick="_openIssue(\'' + escJs(d) + '\')">' + esc(d) + '</span>').join(' ') + '</div>';
 
   const children = Array.isArray(item.children) ? item.children : [];
-  if (children.length) html += '<section class="bd-card-section"><h4>Subtasks (' + children.length + ')</h4>'
-    + children.map(c => '<div class="board-detail-meta-row">' + _bdTaskLink(c.id, c.title)
-      + '<span class="status-badge">' + esc(c.status || 'todo') + '</span></div>').join('') + '</section>';
+  if (children.length) html += _bdRenderFanoutChildren(item);
   if (relationHtml) html += '<section class="bd-card-section"><h4>Task relationships</h4>' + relationHtml + '</section>';
 
   const gates = (Array.isArray(item.gate_requirements) ? item.gate_requirements : [])
@@ -31910,6 +31917,298 @@ async function deleteBoardItem(id) {
     saveBoardCache();
     renderBoard();
   }
+}
+
+// ── Launch bar: auto fan-out from typed priorities ──
+function _toggleLaunchBar() {
+  const body = document.getElementById('launch-body');
+  const caret = document.getElementById('launch-caret');
+  if (!body) return;
+  const open = body.style.display !== 'none';
+  body.style.display = open ? 'none' : '';
+  if (caret) caret.classList.toggle('open', !open);
+  if (!open) _populateLaunchSessions();
+}
+
+function _populateLaunchSessions() {
+  const sel = document.getElementById('launch-session');
+  if (!sel) return;
+  const sess = typeof sessions !== 'undefined' ? sessions : [];
+  const opts = ['<option value="">Orchestrator (self)</option>'];
+  sess.filter(s => s.running && !s.ephemeral && !s.archived).forEach(s => {
+    opts.push('<option value="' + esc(s.name) + '">' + esc(s.name) + '</option>');
+  });
+  sel.innerHTML = opts.join('');
+}
+
+function _parsePriorities(text) {
+  return text.split('\n')
+    .map(line => line.replace(/^\s*[\d]+[.):\-]\s*/, '').replace(/^\s*[-*+]\s*/, '').trim())
+    .filter(line => line.length > 0);
+}
+
+async function _launchFanOut() {
+  const input = document.getElementById('launch-input');
+  const model = document.getElementById('launch-model');
+  const provider = document.getElementById('launch-provider');
+  const session = document.getElementById('launch-session');
+  const statusEl = document.getElementById('launch-status');
+  const btn = document.getElementById('launch-btn');
+  if (!input || !input.value.trim()) { showToast('Type at least one priority'); return; }
+
+  const lines = _parsePriorities(input.value);
+  if (lines.length < 1) { showToast('Could not parse any priorities from input'); return; }
+
+  const orchSession = session && session.value ? session.value : (typeof peekSession !== 'undefined' ? peekSession : '');
+  const modelVal = model ? model.value : 'opus';
+  const providerVal = provider ? provider.value : 'claude';
+
+  btn.disabled = true;
+  statusEl.style.display = '';
+  statusEl.className = 'launch-status';
+  statusEl.textContent = 'Launching ' + lines.length + ' worker' + (lines.length !== 1 ? 's' : '') + '...';
+
+  try {
+    const epicTitle = lines.length === 1 ? lines[0] : 'Fan-out: ' + lines[0] + (lines.length > 1 ? ' (+' + (lines.length - 1) + ' more)' : '');
+
+    const r = await fetch(API + '/api/board/launch', {
+      method: 'POST',
+      headers: _authHeaders({ 'Content-Type': 'application/json', 'X-Amux-Session': orchSession || 'dashboard' }),
+      body: JSON.stringify({
+        title: epicTitle,
+        priorities: lines,
+        parent_session: orchSession || 'dashboard',
+        model: modelVal,
+        provider: providerVal,
+      })
+    });
+    if (!r.ok) {
+      const errBody = await r.text();
+      throw new Error(errBody);
+    }
+    const result = await r.json();
+
+    const started = result.workers_started || 0;
+    const failed = result.workers_failed || 0;
+    statusEl.textContent = 'Launched ' + started + ' worker' + (started !== 1 ? 's' : '') + (failed ? ' (' + failed + ' failed)' : '') + '. Epic: ' + result.epic;
+    showToast('Launched: ' + result.epic + ' (' + started + ' workers)');
+    input.value = '';
+    fetchBoard();
+    fetchSessions();
+
+    setTimeout(() => { if (result.epic) openBoardDetail(result.epic); }, 500);
+  } catch (e) {
+    statusEl.className = 'launch-status error';
+    statusEl.textContent = 'Error: ' + e.message;
+    showToast('Launch failed: ' + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ── Peek fan-out tab: show ephemeral children of peeked session ──
+let _fanoutRefreshTimer = null;
+
+function _peekFanoutLoad() {
+  const list = document.getElementById('peek-fanout-list');
+  const stats = document.getElementById('peek-fanout-stats');
+  if (!list || !peekSession) return;
+
+  const allSess = typeof sessions !== 'undefined' ? sessions : [];
+  const children = allSess.filter(s => s.ephemeral && s.ephemeral_parent === peekSession);
+
+  if (stats) stats.textContent = children.length + ' worker' + (children.length !== 1 ? 's' : '');
+
+  if (!children.length) {
+    list.innerHTML = '<div style="color:var(--dim);font-size:.82rem;padding:8px 0;">No active fan-out workers for this session.</div>';
+    return;
+  }
+
+  let html = '';
+  children.forEach(child => {
+    const statusCls = child.status === 'busy' ? 'running' : (child.status === 'idle' ? 'idle' : 'done');
+    const statusLabel = child.status || 'unknown';
+    const cardId = child.runtime_board && child.runtime_board.card_id ? child.runtime_board.card_id : '';
+    const cardStatus = child.runtime_board && child.runtime_board.runtime_status ? child.runtime_board.runtime_status : '';
+    html += '<div class="fanout-worker-row">'
+      + '<span class="fanout-worker-name" onclick="showSession(\'' + escJs(child.name) + '\')">' + esc(child.name) + '</span>'
+      + '<span class="bd-fanout-status ' + statusCls + '">' + esc(statusLabel) + '</span>'
+      + (cardId ? '<span class="fanout-worker-card" onclick="_openIssue(\'' + escJs(cardId) + '\')" style="cursor:pointer;text-decoration:underline;">' + esc(cardId) + (cardStatus ? ' (' + esc(cardStatus) + ')' : '') + '</span>' : '')
+      + '</div>';
+  });
+  list.innerHTML = html;
+}
+
+function _updateFanoutTabVisibility() {
+  const tab = document.getElementById('peek-tab-fanout');
+  const countBadge = document.getElementById('peek-tab-fanout-count');
+  if (!tab) return;
+
+  const allSess2 = typeof sessions !== 'undefined' ? sessions : [];
+  const children = allSess2.filter(s => s.ephemeral && s.ephemeral_parent === peekSession);
+  const hasChildren = children.length > 0;
+
+  tab.style.display = hasChildren ? '' : 'none';
+  if (countBadge) countBadge.textContent = hasChildren ? String(children.length) : '';
+}
+
+// ── Enhanced subtasks in board detail with fan-out worker status ──
+function _bdRenderFanoutChildren(item) {
+  const children = Array.isArray(item.children) ? item.children : [];
+  if (!children.length) return '';
+
+  const allSess3 = typeof sessions !== 'undefined' ? sessions : [];
+  const sessionMap = {};
+  allSess3.forEach(s => { sessionMap[s.name] = s; });
+
+  let html = '<section class="bd-card-section"><h4>Subtasks (' + children.length + ')</h4>';
+  children.forEach(c => {
+    const childSession = c.session || '';
+    const sess = sessionMap[childSession];
+    const isEphemeral = sess && sess.ephemeral;
+    const workerStatus = sess ? (sess.status || 'unknown') : '';
+    const statusCls = workerStatus === 'busy' ? 'running' : (workerStatus === 'idle' ? 'idle' : 'done');
+
+    html += '<div class="bd-fanout-child">';
+    html += _bdTaskLink(c.id, c.title);
+    html += '<span class="status-badge">' + esc(c.status || 'todo') + '</span>';
+    if (isEphemeral && workerStatus) {
+      html += '<span class="bd-fanout-status ' + statusCls + '" title="Worker: ' + esc(childSession) + '">' + esc(workerStatus) + '</span>';
+      html += '<span class="bd-fanout-worker" onclick="showSession(\'' + escJs(childSession) + '\')">' + esc(childSession) + '</span>';
+    } else if (childSession) {
+      html += '<span style="font-size:.72rem;color:var(--dim);">' + esc(childSession) + '</span>';
+    }
+    html += '</div>';
+  });
+  html += '</section>';
+  return html;
+}
+
+// ── Global Orchestrations tab ──
+let _orchTimer = null;
+async function _orchLoad() {
+  const el = document.getElementById('orch-list');
+  if (!el) return;
+
+  // Fetch board items that are epics with source=launch or source=decomposition
+  // and have children with ephemeral workers
+  try {
+    const [boardR, sessR] = await Promise.all([
+      fetch(API + '/api/board?all=1&slim=0'),
+      fetch(API + '/api/sessions')
+    ]);
+    if (!boardR.ok || !sessR.ok) { el.innerHTML = '<div style="color:var(--dim);padding:8px;">Failed to load.</div>'; return; }
+    const allCards = await boardR.json();
+    const allSess = await sessR.json();
+    const sessMap = {};
+    (Array.isArray(allSess) ? allSess : []).forEach(s => { sessMap[s.name] = s; });
+
+    // Find epics that have at least one child with an ephemeral worker
+    const epicIds = new Set();
+    const childByEpic = {};
+    const cards = Array.isArray(allCards) ? allCards : [];
+    cards.forEach(c => {
+      if (c.item_type === 'epic') epicIds.add(c.id);
+    });
+    cards.forEach(c => {
+      if (c.epic && epicIds.has(c.epic)) {
+        if (!childByEpic[c.epic]) childByEpic[c.epic] = [];
+        childByEpic[c.epic].push(c);
+      }
+    });
+
+    // Filter to epics that have at least one ephemeral worker child
+    const orchEpics = cards.filter(c => {
+      if (c.item_type !== 'epic') return false;
+      const children = childByEpic[c.id] || [];
+      return children.some(ch => {
+        const s = sessMap[ch.session];
+        return s && s.ephemeral;
+      });
+    });
+
+    // Also include epics with source=launch (even if workers haven't started yet)
+    cards.forEach(c => {
+      if (c.item_type === 'epic' && c.source === 'launch' && !orchEpics.find(e => e.id === c.id)) {
+        orchEpics.push(c);
+      }
+    });
+
+    if (!orchEpics.length) {
+      el.innerHTML = '<div style="color:var(--dim);padding:12px 0;font-size:.85rem;">No active orchestrations. Use the Launch bar on the Board tab to fan out priorities.</div>';
+      return;
+    }
+
+    // Sort: active (doing) first, then by updated desc
+    orchEpics.sort((a, b) => {
+      if (a.status === 'doing' && b.status !== 'doing') return -1;
+      if (b.status === 'doing' && a.status !== 'doing') return 1;
+      return (b.updated || 0) - (a.updated || 0);
+    });
+
+    let html = '';
+    orchEpics.forEach(epic => {
+      const children = childByEpic[epic.id] || [];
+      const done = children.filter(c => c.status === 'done' || c.status === 'verified' || c.status === 'discarded').length;
+      const total = children.length;
+      const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+      const epicStatus = epic.status || 'todo';
+      const isActive = epicStatus === 'doing';
+
+      html += '<div class="orch-epic' + (isActive ? ' active' : '') + '">';
+      html += '<div class="orch-epic-header" onclick="_orchToggle(this)">';
+      html += '<span class="orch-caret">&#x25B6;</span>';
+      html += '<span class="orch-title">' + esc(epic.title) + '</span>';
+      html += '<span class="orch-progress">' + done + '/' + total + ' (' + pct + '%)</span>';
+      html += '<span class="status-badge ' + epicStatus + '">' + esc(epicStatus) + '</span>';
+      html += '</div>';
+
+      // Progress bar
+      html += '<div class="orch-progress-bar"><div class="orch-progress-fill" style="width:' + pct + '%;"></div></div>';
+
+      // Children (collapsed by default)
+      html += '<div class="orch-children" style="display:none;">';
+      children.forEach(child => {
+        const sess = sessMap[child.session];
+        const isEph = sess && sess.ephemeral;
+        const workerStatus = sess ? (sess.status || 'stopped') : 'stopped';
+        const childStatus = child.status || 'todo';
+        const statusCls = childStatus === 'done' || childStatus === 'verified' ? 'done'
+          : childStatus === 'doing' ? 'running' : 'pending';
+
+        html += '<div class="orch-child ' + statusCls + '">';
+        html += '<span class="orch-child-title" onclick="switchView(\'board\');setTimeout(function(){openBoardDetail(\'' + escJs(child.id) + '\')},300)">' + esc(child.title) + '</span>';
+        html += '<span class="status-badge ' + childStatus + '">' + esc(childStatus) + '</span>';
+        if (isEph) {
+          const wsCls = workerStatus === 'busy' ? 'running' : (workerStatus === 'idle' ? 'idle' : 'stopped');
+          html += '<span class="bd-fanout-status ' + wsCls + '">' + esc(workerStatus) + '</span>';
+          html += '<span class="orch-worker" onclick="event.stopPropagation();showSession(\'' + escJs(child.session) + '\')">' + esc(child.session) + '</span>';
+        } else if (child.session) {
+          html += '<span class="orch-worker-plain">' + esc(child.session) + '</span>';
+        }
+        html += '</div>';
+      });
+      html += '</div></div>';
+    });
+    el.innerHTML = html;
+  } catch (e) {
+    el.innerHTML = '<div style="color:var(--error);padding:8px;">Error: ' + esc(e.message) + '</div>';
+  }
+
+  // Auto-refresh while on tab
+  clearTimeout(_orchTimer);
+  if (activeView === 'orchestrations') {
+    _orchTimer = setTimeout(_orchLoad, 10000);
+  }
+}
+
+function _orchToggle(hdr) {
+  const children = hdr.parentElement.querySelector('.orch-children');
+  const caret = hdr.querySelector('.orch-caret');
+  if (!children) return;
+  const open = children.style.display !== 'none';
+  children.style.display = open ? 'none' : '';
+  if (caret) caret.classList.toggle('open', !open);
 }
 
 // ── Board status GATES (confirm-on-move checklists) ──
@@ -34081,6 +34380,7 @@ function connectSSE() {
           // continuous mid-turn stream that SSE-on-change alone would miss.
           _refreshOpenPeekOnSessions();
           _refreshBoardActivityOnSessions();
+          _updateFanoutTabVisibility();
           // If workspace is open but no panes were restored yet (e.g. sessions
           // cache was empty on startup), retry restoration now that we have data.
           if (firstLoad && _grid && Object.keys(_gridPanes).length === 0) {

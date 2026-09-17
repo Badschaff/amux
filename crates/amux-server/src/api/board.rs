@@ -86,6 +86,8 @@ pub fn routes() -> Router<AppState> {
         // items are not moving" (AMUX board sweep, 2026-08-09).
         // Before the /{id} wildcard, or "clear-done" is swallowed as an id.
         .route("/clear-done", post(clear_done))
+        // One-shot launcher: plain-text priorities -> epic + children + fan-out.
+        .route("/launch", post(launch_priorities))
         // RR-0052 Invariant 3: the pull half of dispatch. Static, so it sits
         // before the /{id} wildcard like clear-done.
         .route("/lease-next", post(lease_next_item))
@@ -6283,6 +6285,7 @@ async fn fan_out_item(
             let mut events = Vec::new();
             let mut children = Vec::new();
 
+            let mut used_names: HashSet<String> = HashSet::new();
             for cid in &child_ids {
                 let Some(mut child) = bs::get_issue(conn, cid)? else {
                     continue;
@@ -6290,8 +6293,18 @@ async fn fan_out_item(
                 if terminal.contains(child.status.as_str()) {
                     continue;
                 }
-                let suffix = if cid.len() > 8 { &cid[..8] } else { cid };
-                let eph_name = format!("{actor_w}-eph-{suffix}");
+                let base = slugify_name(&child.title, 30);
+                let mut eph_name = if base.is_empty() {
+                    let suffix = if cid.len() > 8 { &cid[..8] } else { cid };
+                    format!("{actor_w}-eph-{suffix}")
+                } else {
+                    base
+                };
+                if used_names.contains(&eph_name) {
+                    let suffix = if cid.len() > 4 { &cid[..4] } else { cid };
+                    eph_name = format!("{eph_name}-{suffix}");
+                }
+                used_names.insert(eph_name.clone());
 
                 child.session = Some(eph_name.clone());
                 child.callback_session = Some(actor_w.clone());
@@ -6480,6 +6493,392 @@ async fn fan_out_item(
         }
         None => internal("fan-out produced no outcome"),
     }
+}
+
+// ---- One-shot launch: priorities -> epic -> children -> fan-out -----------
+
+#[derive(Deserialize)]
+struct LaunchPriority {
+    text: Option<String>,
+    /// Worker name override. If omitted, derived from text.
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PriorityEntry {
+    Plain(String),
+    Structured(LaunchPriority),
+}
+
+impl PriorityEntry {
+    fn text(&self) -> &str {
+        match self {
+            PriorityEntry::Plain(s) => s.as_str(),
+            PriorityEntry::Structured(p) => p.text.as_deref().unwrap_or(""),
+        }
+    }
+    fn name_override(&self) -> Option<&str> {
+        match self {
+            PriorityEntry::Plain(_) => None,
+            PriorityEntry::Structured(p) => p.name.as_deref(),
+        }
+    }
+}
+
+fn slugify_name(text: &str, max_len: usize) -> String {
+    let slug: String = text
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let trimmed: String = slug
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .take(4)
+        .collect::<Vec<_>>()
+        .join("-");
+    if trimmed.len() > max_len {
+        trimmed[..max_len].trim_end_matches('-').to_string()
+    } else {
+        trimmed
+    }
+}
+
+#[derive(Deserialize)]
+struct LaunchBody {
+    /// Human-readable title for the epic (defaults to "Priorities")
+    title: Option<String>,
+    /// Each entry becomes one child card with its own ephemeral worker.
+    /// Accepts plain strings or {text, name} objects.
+    priorities: Vec<PriorityEntry>,
+    /// Parent session whose CC_DIR, CC_PROVIDER etc. are inherited by children.
+    parent_session: String,
+    /// Model for ephemeral workers (default "haiku").
+    model: Option<String>,
+    /// Provider for ephemeral workers (default "claude").
+    provider: Option<String>,
+    /// Extra CC_FLAGS passed to each worker.
+    flags: Option<String>,
+}
+
+/// POST /api/board/launch
+///
+/// Takes plain-text priorities and does the full create-epic, create-children,
+/// fan-out pipeline in one call. Each priority becomes a child card assigned to
+/// its own ephemeral worker with CC_WORKTREE=1, CC_EPHEMERAL=1 and
+/// self-containment flags.
+async fn launch_priorities(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<LaunchBody>,
+) -> Response {
+    use crate::api::session_verbs::{self, EnvFile, env_path, start_session};
+
+    let (_, actor) = actor_from_headers(&headers);
+    if actor == "api-anonymous" {
+        return err(
+            StatusCode::UNAUTHORIZED,
+            json!({"error": "launch requires X-Amux-Session attribution"}),
+        );
+    }
+
+    if body.priorities.is_empty() || body.priorities.len() > 20 {
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "provide 1 to 20 priorities"}),
+        );
+    }
+    for (i, p) in body.priorities.iter().enumerate() {
+        if p.text().trim().is_empty() {
+            return err(
+                StatusCode::BAD_REQUEST,
+                json!({"error": format!("priority {} is empty", i + 1)}),
+            );
+        }
+    }
+
+    let parent_session = body.parent_session.clone();
+    let parent_env_path = env_path(&parent_session);
+    if !parent_env_path.exists() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "parent_session has no env file", "session": parent_session}),
+        );
+    }
+
+    let model = body.model.unwrap_or_else(|| "haiku".into());
+    let provider = body.provider.unwrap_or_else(|| "claude".into());
+    let extra_flags = body.flags.unwrap_or_default();
+    let epic_title = body
+        .title
+        .unwrap_or_else(|| "Priorities".into());
+
+    // Phase 1: create epic + children in one transaction
+    #[derive(Debug)]
+    struct Created {
+        epic: IssueRow,
+        children: Vec<(IssueRow, String)>, // (card, ephemeral_name)
+    }
+
+    let priorities = body.priorities;
+    let parent_session_w = parent_session.clone();
+    let actor_w = actor.clone();
+    let model_w = model.clone();
+    let slot: Arc<Mutex<Option<Created>>> = Arc::new(Mutex::new(None));
+    let slot_w = slot.clone();
+
+    let write = state
+        .store
+        .write_async(move |conn| {
+            let now = now_secs();
+            let stamp = chrono::Local::now().format("%H:%M").to_string();
+
+            // Create the epic
+            let epic_desc = priorities
+                .iter()
+                .enumerate()
+                .map(|(i, p)| format!("{}. {}", i + 1, p.text().trim()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let epic_new = bs::NewIssue {
+                title: epic_title,
+                desc: format!("**Prompt:** {epic_desc}"),
+                status: "doing".into(),
+                session: Some(parent_session_w.clone()),
+                item_type: "epic".into(),
+                creator: actor_w.clone(),
+                owner_type: "agent".into(),
+                due: None,
+                due_time: None,
+                reviewer: None,
+                shepherd: None,
+                gate: Vec::new(),
+                depends_on: Vec::new(),
+                tags: vec!["launch".into()],
+                ask_type: None,
+                next_action: None,
+                acceptance_criteria: None,
+                ask_question: None,
+                ask_unblocks: None,
+                ask_actor: None,
+                source: Some("launch".into()),
+                requested_by: Some(actor_w.clone()),
+                callback_session: None,
+                callback_prompt: None,
+            };
+            let mut epic = bs::create_issue(conn, &epic_new, now)?;
+            epic.log = Some(bs::append_log(
+                epic.log.as_deref(),
+                &stamp,
+                &format!(
+                    "launched by {actor_w}: {} priorities, fan-out model={model_w}",
+                    priorities.len(),
+                ),
+            ));
+            bs::save_patched(conn, &mut epic)?;
+            let mut events = vec![ev_snap(&epic, MutationKind::Created)];
+
+            // Create child cards
+            let mut children = Vec::with_capacity(priorities.len());
+            let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for (idx, priority) in priorities.iter().enumerate() {
+                let trimmed = priority.text().trim();
+                let base_name = if let Some(name) = priority.name_override() {
+                    name.to_string()
+                } else {
+                    slugify_name(trimmed, 30)
+                };
+                let mut eph_name = base_name.clone();
+                if used_names.contains(&eph_name) || eph_name.is_empty() {
+                    eph_name = format!("{eph_name}-{}", idx + 1);
+                }
+                used_names.insert(eph_name.clone());
+
+                let child_new = bs::NewIssue {
+                    title: trimmed.to_string(),
+                    desc: trimmed.to_string(),
+                    status: "todo".into(),
+                    session: Some(eph_name.clone()),
+                    item_type: "code".into(),
+                    creator: actor_w.clone(),
+                    owner_type: "agent".into(),
+                    due: None,
+                    due_time: None,
+                    reviewer: None,
+                    shepherd: None,
+                    gate: Vec::new(),
+                    depends_on: Vec::new(),
+                    tags: vec![format!("p{}", idx)],
+                    ask_type: None,
+                    next_action: Some(format!("Investigate and implement: {trimmed}")),
+                    acceptance_criteria: Some(
+                        serde_json::to_string(&[format!("{trimmed}: implemented and verified")])
+                            .expect("single-element array always serializes"),
+                    ),
+                    ask_question: None,
+                    ask_unblocks: None,
+                    ask_actor: None,
+                    source: Some("launch".into()),
+                    requested_by: Some(actor_w.clone()),
+                    callback_session: Some(parent_session_w.clone()),
+                    callback_prompt: Some(format!(
+                        "ephemeral worker {eph_name} finished card. stop and clean up: amux stop {eph_name} && rm -f ~/.amux/sessions/{eph_name}.env",
+                    )),
+                };
+                let mut child = bs::create_issue(conn, &child_new, now)?;
+                child.epic = Some(epic.id.clone());
+                child.callback_state = Some("armed".into());
+                child.log = Some(bs::append_log(
+                    child.log.as_deref(),
+                    &stamp,
+                    &format!(
+                        "launched: assigned to ephemeral worker {eph_name} (model={model_w}) by {actor_w}",
+                    ),
+                ));
+                child.updated = now;
+                child.rev += 1;
+                child.version += 1;
+                bs::save_patched(conn, &mut child)?;
+                events.push(ev_snap(&child, MutationKind::Created));
+                children.push((child, eph_name));
+            }
+
+            *slot_w.lock().expect("launch slot poisoned") = Some(Created {
+                epic,
+                children,
+            });
+            Ok(WriteOutcome {
+                applied: true,
+                events,
+            })
+        })
+        .await;
+
+    if let Err(e) = write {
+        return internal(e);
+    }
+
+    let created = match slot.lock().expect("launch slot poisoned").take() {
+        Some(c) => c,
+        None => return internal("launch produced no outcome"),
+    };
+
+    // Phase 2: write env files and start sessions (outside the DB transaction)
+    let parent_cfg = session_verbs::parse_env(&parent_session);
+    let parent_dir = parent_cfg.get_or("CC_DIR", "");
+    let mut started = Vec::new();
+    let mut failed = Vec::new();
+
+    for (child, eph_name) in &created.children {
+        let mut env = EnvFile::load(std::path::Path::new(""));
+        env.set("CC_DIR", parent_dir);
+        env.set("CC_WORKTREE", "1");
+        env.set("CC_EPHEMERAL", "1");
+        env.set("CC_PARENT", &parent_session);
+        env.set("CC_PROVIDER", &provider);
+        env.set("CC_TAGS", "ephemeral");
+        env.set("CC_CREATOR", &format!("launch:{actor}"));
+        env.set("AMUX_DISPATCH_BACKLOG_WHEN_IDLE", "0");
+        env.set("AMUX_BOARD_DELEGATION", "0");
+
+        let model_flag = format!("--model {} --dangerously-skip-permissions", model);
+        let flags = if extra_flags.is_empty() {
+            model_flag
+        } else {
+            format!("{model_flag} {extra_flags}")
+        };
+        env.set("CC_FLAGS", &flags);
+
+        if let Some(ac) = child.acceptance_criteria.as_deref() {
+            env.set("CC_ACCEPTANCE_CRITERIA", ac);
+        }
+        env.set(
+            "CC_DESC",
+            &format!(
+                "Ephemeral worker for: {}",
+                child.title.chars().take(120).collect::<String>()
+            ),
+        );
+
+        let ep = env_path(eph_name);
+        if let Err(e) = env.write(&ep) {
+            tracing::error!(
+                session = %eph_name,
+                error = %e,
+                "launch: failed to write env file"
+            );
+            failed.push(json!({
+                "name": eph_name,
+                "error": format!("env write: {e}"),
+            }));
+            continue;
+        }
+
+        let (ok, detail) = start_session(&state, eph_name, "", true).await;
+        if ok {
+            tracing::info!(
+                target: "amux::board",
+                session = %eph_name,
+                card = %child.id,
+                model = %model,
+                epic = %created.epic.id,
+                parent = %parent_session,
+                verdict = "launch_ephemeral_started",
+                measured = true,
+                "launch: ephemeral worker started"
+            );
+            started.push(eph_name.clone());
+        } else {
+            tracing::warn!(
+                target: "amux::board",
+                session = %eph_name,
+                card = %child.id,
+                error = %detail,
+                "launch: failed to start ephemeral worker"
+            );
+            failed.push(json!({
+                "name": eph_name,
+                "error": detail,
+            }));
+        }
+    }
+
+    tracing::info!(
+        target: "amux::board",
+        epic = %created.epic.id,
+        workers_started = started.len(),
+        workers_failed = failed.len(),
+        model = %model,
+        parent = %parent_session,
+        caller = %actor,
+        verdict = "launch_complete",
+        measured = true,
+        n_considered = created.children.len(),
+        "board launch completed"
+    );
+
+    (
+        StatusCode::CREATED,
+        Json(json!({
+            "ok": true,
+            "epic": created.epic.id,
+            "model": model,
+            "priorities": created.children.len(),
+            "workers_started": started.len(),
+            "workers_failed": failed.len(),
+            "started": started,
+            "failed": failed,
+            "children": created.children.iter().map(|(c, eph)| json!({
+                "id": c.id,
+                "title": c.title,
+                "worker": eph,
+            })).collect::<Vec<_>>(),
+            "measured": true,
+            "n_considered": created.children.len(),
+        })),
+    )
+        .into_response()
 }
 
 // Claim endpoint context continues below the self-contained overlap subsystem.
