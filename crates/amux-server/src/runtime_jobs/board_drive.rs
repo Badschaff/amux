@@ -60,7 +60,6 @@
 //! |---------------------------|----------------------------------------|
 //! | re-claim (24h, per card)  | `task.claimed`                         |
 //! | advance (15m, per lane)   | `advance.nudged` / `needsyou.renag` / `capture.decompose_ask` |
-//! | advance budget (3/24h)    | `advance.nudged` per card id           |
 //! | decompose (6h, per lane)  | `pickup.decompose_nudge`               |
 //! | claim reconcile (5m→1h)   | `task.claim_reconcile_requested` per exact card set |
 //! | needs:you re-nag (3d)     | `needsyou.renag` per card id           |
@@ -12211,33 +12210,6 @@ mod tests {
                 assert!(text.contains("review"), "must name the next status: {text}");
             }
             Advance::None { reason, detail } => panic!("expected a nudge, got {reason}: {detail}"),
-        }
-    }
-
-    /// py:13375: 182 advance wakes in 24h, one card nudged nine times and then
-    /// discarded. After the budget the loop goes quiet FOR THAT CARD.
-    #[test]
-    fn the_per_card_budget_silences_that_card_but_not_the_lane() {
-        let conn = board_db();
-        add_card(&conn, "D-1", "lane", "doing", "stuck", "SCOPE: x");
-        add_card(&conn, "D-2", "lane", "review", "other", "SCOPE: x");
-        for _ in 0..3 {
-            conn.execute(
-                "INSERT INTO session_events (ts,session,type,data,source) \
-                 VALUES (?1,'lane','advance.nudged','{\"issue\": \"D-1\"}','board-drive')",
-                rusqlite::params![now_f64() - 60.0],
-            )
-            .expect("event");
-        }
-        // The lane's cooldown would normally suppress this; age the events past it.
-        conn.execute(
-            "UPDATE session_events SET ts=?1",
-            rusqlite::params![now_f64() - ADVANCE_COOLDOWN_S - 60.0],
-        )
-        .expect("age");
-        match select_advance(&conn, "lane", &[], now_f64()) {
-            Advance::Nudge { card, .. } => assert_eq!(card, "D-2", "must fall through to the next card"),
-            Advance::None { reason, detail } => panic!("expected D-2, got {reason}: {detail}"),
         }
     }
 
