@@ -244,6 +244,16 @@ jobs:
       # replaced by something equally green. Its cells prove the detector
       # catches a 100KB/min leak, does not call a warm-up plateau a leak, and
       # refuses a verdict on a run too short to have reached steady state.
+      # AF-336 via AMUX-4759. Wired rather than baselined because it is
+      # CI-safe by construction: its own header says it runs against a fully
+      # synthetic fixture — a temp repo with a bare temp `origin` and
+      # AMUX_SESSIONS_DIR pointed at a temp dir — and never the real checkout
+      # or a real ~/.amux/sessions/*.env. Exercised on this box from a detached
+      # worktree at origin/main before wiring: exit 0, 19 cells, 0 failures.
+      - name: lane-worktree-migrate holds its contract (AF-336)
+        run: |
+          set -uo pipefail
+          ./scripts/test-lane-worktree-migrate.sh
       - name: the soak leak detector can actually fail (AMUX-4810)
         run: |
           set -uo pipefail
