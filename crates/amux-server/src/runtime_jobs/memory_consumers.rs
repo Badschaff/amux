@@ -79,6 +79,12 @@ fn parse_top(raw: &str) -> Result<Vec<Consumer>, String> {
     Ok(rows)
 }
 
+/// The one reason an unmeasured snapshot is the HOST's fault rather than this
+/// module's. Named here so the producer below and the test that tolerates it
+/// read the same string instead of two copies that can drift (AMUX-4787).
+#[cfg(target_os = "macos")]
+const PROBE_TIMEOUT_REASON: &str = "memory probe timed out after 5s";
+
 #[cfg(target_os = "macos")]
 fn bounded_output(cmd: &mut Command) -> Result<String, String> {
     // Only the top five rows are requested, keeping output below pipe capacity.
@@ -98,7 +104,7 @@ fn bounded_output(cmd: &mut Command) -> Result<String, String> {
             let _ = child.wait();
             return Err(match result {
                 Err(error) => format!("memory probe wait failed: {error}"),
-                _ => "memory probe timed out after 5s".into(),
+                _ => PROBE_TIMEOUT_REASON.into(),
             });
         }
     }
@@ -206,20 +212,78 @@ mod tests {
         assert_eq!(size_bytes("0B"), Some(0));
     }
 
+    /// The ONE host condition that excuses an unmeasured snapshot.
+    ///
+    /// Two cfg'd definitions rather than one function with cfg'd blocks, so
+    /// each platform's body is the whole function and the Linux build cannot
+    /// trip over a macOS-only constant.
+    #[cfg(target_os = "macos")]
+    fn tolerable_unmeasured_reason() -> Option<&'static str> {
+        Some(PROBE_TIMEOUT_REASON)
+    }
+
+    /// `None`: `ps` here takes no timeout, so nothing legitimate produces an
+    /// unmeasured snapshot and that arm stays a hard failure.
+    #[cfg(not(target_os = "macos"))]
+    fn tolerable_unmeasured_reason() -> Option<&'static str> {
+        None
+    }
+
+    /// AMUX-4787. This asserted `measured == true`, which on a busy box is an
+    /// assertion about the HOST, in the one module whose whole purpose is to
+    /// publish whether the measurement ran. `top -l 1` was timed at 28-36s
+    /// against its own 5s deadline on this machine at load 38, so the test
+    /// reddened for load and read as a regression in whatever was being
+    /// changed at the time.
+    ///
+    /// THE RELAXATION IS NARROW ON PURPOSE. The unmeasured arm is admitted
+    /// only for the producer's own timeout string; a malformed parse, a
+    /// non-zero exit and a spawn failure all land in the same arm and all
+    /// still fail. Without that, "tolerate unmeasured" would turn this into a
+    /// test that passes when the parser is broken.
     #[test]
     fn native_memory_snapshot_is_measured_and_names_its_metric() {
         let result = snapshot();
-        assert!(result.measured, "{result:?}");
-        assert!(result.n_considered > 0);
-        assert_eq!(result.n_considered, result.consumers.len());
-        assert!(result.consumers.iter().any(|r| r.bytes > 0));
+        // UNCONDITIONAL: the metric names which probe ran, which is a property
+        // of this code and never of the host, so no load excuses it.
         #[cfg(target_os = "macos")]
-        {
-            assert_eq!(result.metric, "macos_top_mem_includes_compressed");
-            assert!(result
+        assert_eq!(
+            result.metric, "macos_top_mem_includes_compressed",
+            "{result:?}"
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(result.metric, "rss_only", "{result:?}");
+
+        if !result.measured {
+            let why = result.why_unmeasured.as_deref().unwrap_or_default();
+            assert_eq!(
+                Some(why),
+                tolerable_unmeasured_reason(),
+                "an unmeasured snapshot is excusable ONLY when the probe ran out of time: {result:?}"
+            );
+            // Still not a free pass: an unmeasured snapshot must carry no data.
+            // The pair (measured=false, consumers non-empty) is the shape this
+            // module exists to make impossible.
+            assert_eq!(result.n_considered, 0, "{result:?}");
+            assert!(result.consumers.is_empty(), "{result:?}");
+            eprintln!("host probe timed out, so the measured assertions below did not run: {why}");
+            return;
+        }
+
+        assert!(result.n_considered > 0, "{result:?}");
+        assert_eq!(result.n_considered, result.consumers.len(), "{result:?}");
+        assert!(result.consumers.iter().any(|r| r.bytes > 0), "{result:?}");
+        assert!(
+            result.why_unmeasured.is_none(),
+            "a measured snapshot must not also carry a reason it failed: {result:?}"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            result
                 .consumers
                 .iter()
-                .all(|r| r.compressed_bytes.is_some()));
-        }
+                .all(|r| r.compressed_bytes.is_some()),
+            "{result:?}"
+        );
     }
 }

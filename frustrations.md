@@ -3316,3 +3316,36 @@ FIX: Gate the reader on the provider that WRITES the file, derived from
   source could belong to this worker, so the field that existed to make a doubtful
   value auditable is the field that made it look accounted for. A provenance
   label is not a provenance CHECK, and the two read identically in a payload.
+
+## A test that asserts a probe SUCCEEDED is asserting the host is idle
+AREA: tests
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-09-18
+SESSION: amux
+CARD: AMUX-4787
+SYMPTOM: Two lib tests ran a native host probe under a hard 5s deadline and
+  treated anything else as a defect: `native_memory_snapshot_is_measured_and_
+  names_its_metric` asserted `measured == true`, and `native_open_file_probe_
+  works_with_launchd_path_and_observes_held_file` unwrapped the deadline and
+  panicked "deadline has elapsed". Measured on this box: `top -l 1` takes 8.1s
+  at load 14 and 28-36s at load 38; `lsof` takes 5.5-6.7s enumerating ~182,000
+  open files. Neither is a statement about the code.
+COST: Two separate investigations in one day, each to prove a red suite was not
+  mine. Both times the tests appeared alongside genuine contention flakes, and
+  both times they survived the isolated rerun that cleared the others, which is
+  exactly the signature of a real regression. Establishing otherwise meant
+  timing the two probes by hand. CLAUDE.md already warns that a red suite here
+  is not automatically a regression; these two made the reader re-derive that
+  from scratch every time.
+FIX: Assert the SHAPE either way, and admit exactly one host excuse. The
+  memory test now admits an unmeasured snapshot only when the reason equals the
+  producer's own timeout constant, so a malformed parse, a non-zero exit and a
+  spawn failure all still fail; the lsof test matches tokio's `Elapsed` by TYPE
+  rather than by message, so every other error still fails.
+  The generalisation worth keeping: the `measured` / `why_unmeasured` contract
+  this repo applies to every diagnostic ENDPOINT had not been applied to the
+  TESTS of those diagnostics. `memory_consumers` exists to publish whether its
+  measurement ran, and its own test said a probe that could not run is a
+  failure. When a module's contract says "could not measure" is a legitimate
+  answer, a test that forbids that answer is testing the machine.

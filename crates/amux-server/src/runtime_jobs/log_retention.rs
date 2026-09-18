@@ -379,21 +379,46 @@ mod tests {
         .is_err());
     }
 
+    /// AMUX-4787. This unwrapped a 5s deadline, so it panicked with "deadline
+    /// has elapsed" whenever the box was busy. `lsof` was timed at 5.5-6.7s
+    /// here at load 38, enumerating ~182,000 open files, which is a fact about
+    /// the machine and not about this probe.
+    ///
+    /// The deadline below is THE TEST'S, not production's: `open_paths` keeps
+    /// its 5s budget, which is the right cost for a background tick that must
+    /// not stall one. What this test claims is that the absolute lsof path
+    /// works under the launchd PATH and that the parser sees a held file, and
+    /// neither claim needs a stopwatch.
+    ///
+    /// Widening alone would have MOVED the flake rather than removed it, so
+    /// the timeout also stops being a panic. The tolerated failure is exactly
+    /// one: `tokio`'s `Elapsed`, matched by TYPE rather than by its message.
+    /// A missing binary, a non-zero exit, truncated output and a parse that
+    /// found no paths all still fail here.
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn native_open_file_probe_works_with_launchd_path_and_observes_held_file() {
+        const TEST_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
         let home = tempfile::tempdir().unwrap();
         let path = home.path().join("held.txt");
         let _held = std::fs::File::create(&path).unwrap();
         let mut command = open_file_command();
         command.env("PATH", "/usr/bin:/bin");
-        let paths = probe_open_paths(&mut command, Duration::from_secs(5), 8 * 1024 * 1024)
-            .await
-            .unwrap();
-        assert!(
-            paths.contains(&path) || paths.contains(&path.canonicalize().unwrap()),
-            "held file missing from native probe"
-        );
+        match probe_open_paths(&mut command, TEST_PROBE_TIMEOUT, 8 * 1024 * 1024).await {
+            Ok(paths) => assert!(
+                paths.contains(&path) || paths.contains(&path.canonicalize().unwrap()),
+                "held file missing from native probe"
+            ),
+            Err(error) => {
+                assert!(
+                    error.downcast_ref::<tokio::time::error::Elapsed>().is_some(),
+                    "the native probe failed for a reason that is not host load: {error}"
+                );
+                eprintln!(
+                    "lsof exceeded {TEST_PROBE_TIMEOUT:?} on this host, so the held-file assertion did not run"
+                );
+            }
+        }
     }
 
     #[tokio::test]
