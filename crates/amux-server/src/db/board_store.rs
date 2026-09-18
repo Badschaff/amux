@@ -2486,15 +2486,64 @@ pub fn planning_tasks(
     Ok(rows.into_iter().map(|(_, _, _, r)| r).collect())
 }
 
+/// Every RAW status spelling that canonicalises to `wanted` (AMUX-4757).
+///
+/// `parse_status` is a closed alias table, so this set is exact rather than a
+/// guess: `doing` is also stored as `wip`, `in_progress` and `inprogress`, and
+/// a filter for `doing` has always matched all four because `list_issues`
+/// canonicalises both sides before comparing. An UNMODELLED status (an operator
+/// column `parse_status` does not know) canonicalises to its own trimmed
+/// lowercase, so it matches only itself.
+///
+/// This exists so the status filter can be pushed into SQL. It must stay
+/// EXACT in one direction specifically: missing a spelling here would silently
+/// drop rows the Rust filter would have kept, which is why every alias in the
+/// table has a cell.
+fn raw_spellings_for(wanted: &str) -> Vec<String> {
+    let want = wanted.trim().to_lowercase();
+    let Some(target) = parse_status(&want) else {
+        return vec![want];
+    };
+    const ALIASES: &[&str] = &[
+        "backlog", "todo", "doing", "wip", "in_progress", "inprogress", "review",
+        "in_review", "inreview", "in review", "needsyou", "needs_you", "blocked",
+        "done", "resolved", "complete", "completed", "closed", "verified",
+        "discarded", "armed", "quarantined",
+    ];
+    ALIASES
+        .iter()
+        .filter(|a| parse_status(a) == Some(target))
+        .map(|a| a.to_string())
+        .collect()
+}
+
 pub fn list_issues(
     conn: &Connection,
     status_filter: &[String],
     session_filter: &[String],
     archived: ArchivedFilter,
 ) -> rusqlite::Result<Vec<IssueRow>> {
+    // PUSH THE STATUS FILTER INTO SQL (AMUX-4757). The Rust filter below is
+    // unchanged and remains the authority; this only stops the query
+    // materialising rows it is about to discard. board-drive calls this SIX
+    // times per tick with a status filter, and each call was reading all 19,632
+    // active rows across ~55 columns — 113 MB materialised, measured on the
+    // live board, per call.
+    //
+    // The narrowing is exact, not conservative: `raw_spellings_for` enumerates
+    // the closed alias table `parse_status` matches on, so SQL selects exactly
+    // the rows the Rust comparison would keep.
+    let sql_status: Vec<String> =
+        status_filter.iter().flat_map(|s| raw_spellings_for(s)).collect();
+    let where_status = if sql_status.is_empty() {
+        String::new()
+    } else {
+        let marks = vec!["?"; sql_status.len()].join(",");
+        format!(" AND LOWER(TRIM(i.status)) IN ({marks})")
+    };
     let mut stmt = conn.prepare(&format!(
         "SELECT {COLS} FROM issues i LEFT JOIN issue_tags t ON t.issue_id = i.id \
-         WHERE i.deleted IS NULL GROUP BY i.id"
+         WHERE i.deleted IS NULL{where_status} GROUP BY i.id"
     ))?;
     let canon = |s: &str| -> String {
         parse_status(s)
@@ -2503,7 +2552,7 @@ pub fn list_issues(
     };
     let want_status: Vec<String> = status_filter.iter().map(|s| canon(s)).collect();
     let mut rows = Vec::new();
-    for row in stmt.query_map([], issue_from_row)? {
+    for row in stmt.query_map(rusqlite::params_from_iter(sql_status.iter()), issue_from_row)? {
         let row = row?;
         if !want_status.is_empty() && !want_status.contains(&canon(&row.status)) {
             continue;
@@ -4365,6 +4414,87 @@ mod tests {
                  board down fleet-wide over 3 such cells). Got: {line}"
             );
         }
+    }
+
+    /// AMUX-4757. Every alias `parse_status` accepts must survive the SQL
+    /// status filter, because that filter now decides which rows are read at
+    /// all.
+    ///
+    /// ENUMERATED FROM THE TABLE ITSELF rather than spot-checked. Missing one
+    /// spelling here drops rows silently: `list_issues(&["doing"])` would stop
+    /// seeing a card stored as `wip`, the Rust filter below would never get the
+    /// chance to keep it, and the only symptom would be board-drive quietly
+    /// ignoring a lane.
+    #[test]
+    fn the_sql_status_filter_keeps_every_spelling_the_rust_filter_kept() {
+        let mut conn = Connection::open_in_memory().expect("memdb");
+        crate::db::migrate::apply_all(&mut conn).expect("schema");
+        // One row per raw spelling the parser accepts, plus an unmodelled
+        // operator column, plus a spelling with stray case and whitespace.
+        let spellings = [
+            "backlog", "todo", "doing", "wip", "in_progress", "inprogress", "review",
+            "in_review", "inreview", "in review", "needsyou", "needs_you", "blocked",
+            "done", "resolved", "complete", "completed", "closed", "verified",
+            "discarded", "armed", "quarantined", "some-operator-column", "  DoInG  ",
+        ];
+        for (i, sp) in spellings.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO issues (id, title, status, type, created, updated)
+                 VALUES (?1, ?2, ?3, 'code', 1760000000, 1760000000)",
+                rusqlite::params![format!("S-{i}"), format!("card {i}"), sp],
+            ).expect("insert");
+        }
+        // For every canonical status, the SQL-narrowed read must return exactly
+        // the rows whose spelling canonicalises to it.
+        for canon in ["backlog", "todo", "doing", "review", "needsyou", "blocked",
+                      "done", "verified", "discarded", "armed", "quarantined",
+                      "some-operator-column"] {
+            let got = list_issues(&conn, &[canon.to_string()], &[], ArchivedFilter::ActiveOnly)
+                .expect("list");
+            let want: Vec<&str> = spellings
+                .iter()
+                .copied()
+                .filter(|sp| {
+                    parse_status(sp)
+                        .map(|st| db_status_spelling(st).to_string())
+                        .unwrap_or_else(|| sp.trim().to_lowercase())
+                        == canon
+                })
+                .collect();
+            assert_eq!(
+                got.len(),
+                want.len(),
+                "filter {canon:?} returned {} rows, expected the {} spelling(s) {want:?}",
+                got.len(),
+                want.len()
+            );
+        }
+        // `doing` specifically: four aliases plus the padded/mixed-case one.
+        let doing = list_issues(&conn, &["doing".to_string()], &[], ArchivedFilter::ActiveOnly)
+            .expect("list");
+        assert_eq!(doing.len(), 5, "doing must match wip/in_progress/inprogress/  DoInG  too");
+        // An empty filter still reads everything.
+        let all = list_issues(&conn, &[], &[], ArchivedFilter::ActiveOnly).expect("list");
+        assert_eq!(all.len(), spellings.len());
+
+        // A MIXED FILTER, modelled plus unmodelled, which is where a wrong
+        // enumeration actually bites and a single-status test cannot see it.
+        // With one status in the filter, contributing no spellings leaves the
+        // SQL list empty, the narrowing turns itself off and the Rust filter
+        // still gets the right answer; with two, the modelled one's aliases
+        // narrow the query and the unmodelled one's rows are dropped before
+        // Rust ever sees them. Found by mutation: removing the unmodelled arm
+        // left the suite green until this leg existed.
+        let mixed = list_issues(
+            &conn,
+            &["todo".to_string(), "some-operator-column".to_string()],
+            &[],
+            ArchivedFilter::ActiveOnly,
+        )
+        .expect("list");
+        assert_eq!(mixed.len(), 2, "a mixed filter must keep BOTH, got {mixed:?}");
+        assert!(mixed.iter().any(|r| r.status == "some-operator-column"));
+        assert!(mixed.iter().any(|r| r.status == "todo"));
     }
 
     /// AMUX-4757. `planning_tasks` must produce exactly what
