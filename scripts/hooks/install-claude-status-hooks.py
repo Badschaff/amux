@@ -83,6 +83,45 @@ def canonical_read_guard(hook_path: str) -> list[dict[str, Any]]:
     return [group(command, "Read"), group(command, "Bash")]
 
 
+# What an event's HANDLER must contain for the wiring to mean anything
+# (AMUX-4783). This script writes settings.json; only install.sh copies
+# hook-report.sh. Those are two different commands, and on 2026-09-18 they came
+# apart: Notification was wired at 04:27 against a 2026-09-04 script with no
+# notification_type discriminator, so every notification type reported
+# `blocked`, pinning lanes for the 600s trust window for about four hours.
+#
+# settings.json passes the literal argument `blocked`, so the SCRIPT is what
+# decides which notification types actually mean blocked. Wiring the event
+# while the handler cannot discriminate is not a partial install, it is an
+# active fault — worse than not wiring it at all.
+HANDLER_REQUIREMENTS = {"Notification": "notification_type"}
+
+
+def unsupported_events(hook_source: str | None) -> list[str]:
+    """Canonical events whose handler cannot answer them.
+
+    An unreadable handler returns nothing: this refuses on what it can SEE, and
+    a missing file is already the caller's problem to report. Returning [] for
+    "I could not look" would be the same false-negative the invariant that
+    checks this wiring used to have.
+    """
+    if hook_source is None:
+        return []
+    return [event for event, token in HANDLER_REQUIREMENTS.items() if token not in hook_source]
+
+
+def read_hook_source(hook_path: str) -> str | None:
+    """The INSTALLED handler's bytes, resolving the shell-style $HOME the
+    settings command uses. Never the recorded .sha256 beside it: on this box
+    that record read 840a65d4 against an installed 4ba44266 and nothing ever
+    compared the two, so it certified a file it had not seen."""
+    resolved = Path(os.path.expandvars(hook_path))
+    try:
+        return resolved.read_text()
+    except OSError:
+        return None
+
+
 def merge(
     data: dict[str, Any],
     hook_path: str,
@@ -164,7 +203,28 @@ def main() -> int:
         "--read-guard-path",
         default="$HOME/.amux/hooks/large-read-guard.py",
     )
+    parser.add_argument(
+        "--allow-unsupported-events",
+        action="store_true",
+        help="wire canonical events even when the installed handler cannot answer them",
+    )
     args = parser.parse_args()
+
+    # REFUSE BEFORE WRITING. The failure this prevents is not a missing hook,
+    # it is a wired hook backed by a handler that answers every notification
+    # with `blocked`. Checked against the installed bytes, and the remedy names
+    # the command that ships the handler, because that is the half a caller
+    # running this script has not run.
+    unsupported = unsupported_events(read_hook_source(args.hook_path))
+    if unsupported and not args.allow_unsupported_events:
+        raise SystemExit(
+            f"refusing to wire {', '.join(unsupported)}: the installed handler at "
+            f"{args.hook_path} does not support "
+            f"{', '.join(HANDLER_REQUIREMENTS[e] for e in unsupported)}. "
+            "This script writes settings.json only; run install.sh to ship the handler, "
+            "then re-run. (--allow-unsupported-events overrides, and is how AMUX-4783 "
+            "happened by accident.)"
+        )
 
     if args.settings.exists():
         try:

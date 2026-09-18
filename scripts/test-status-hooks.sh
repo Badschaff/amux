@@ -462,4 +462,51 @@ assert " idle " in c["Stop"]["hooks"][0]["command"], c["Stop"]
 print("ok   Notification is installed as the blocked producer, with both clearing edges intact")
 PY2
 
+# AMUX-4783. Wiring an event and shipping its handler are two different
+# commands, and on 2026-09-18 they came apart for ~4h: Notification wired
+# against a 2026-09-04 script with no notification_type, so every notification
+# type reported blocked. The installer now refuses that combination.
+/usr/bin/python3 - <<'PY2'
+import importlib.util, json, subprocess, sys, tempfile
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("inst", "scripts/hooks/install-claude-status-hooks.py")
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+
+# The pure seam, both directions. A handler missing the discriminator is
+# unsupported; one carrying it is not.
+assert m.unsupported_events("case $notification_type in") == [], "a handler WITH the discriminator must be accepted"
+assert m.unsupported_events("no discriminator here") == ["Notification"], "a handler without it must be refused"
+# Unreadable is not silently 'fine': read_hook_source reports None and the
+# caller decides, rather than this function inventing an empty source.
+assert m.read_hook_source("/nonexistent/hook-report.sh") is None
+print("ok   the handler-support seam accepts and refuses on the discriminator")
+
+with tempfile.TemporaryDirectory() as d:
+    d = Path(d)
+    settings = d / "settings.json"
+    old, new = d / "old.sh", d / "new.sh"
+    old.write_text("#!/bin/sh\necho old\n")
+    new.write_text("#!/bin/sh\ncase $notification_type in permission_prompt) : ;; esac\n")
+
+    settings.write_text("{}")
+    r = subprocess.run([sys.executable, "scripts/hooks/install-claude-status-hooks.py",
+                        "--settings", str(settings), "--hook-path", str(old)],
+                       capture_output=True, text=True)
+    assert r.returncode != 0, r
+    assert "refusing to wire Notification" in r.stderr, r.stderr
+    assert "install.sh" in r.stderr, "the remedy must name the command that ships the handler"
+    assert settings.read_text() == "{}", "a refusal must not half-write settings"
+    print("ok   an unsupported handler is refused BEFORE settings are written")
+
+    settings.write_text("{}")
+    r = subprocess.run([sys.executable, "scripts/hooks/install-claude-status-hooks.py",
+                        "--settings", str(settings), "--hook-path", str(new)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r
+    hooks = json.loads(settings.read_text())["hooks"]
+    assert "Notification" in hooks, sorted(hooks)
+    print("ok   a supported handler still wires Notification")
+PY2
+
 echo "ok   all shipped status-hook durability regressions passed"

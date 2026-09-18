@@ -2785,7 +2785,9 @@ pub struct ReportHookEntry {
 /// ethos rule 7, certified by its own incident report.
 ///
 /// INVARIANT: every report hook configured in settings.json actually INVOKES
-/// `hook-report.sh`; all six lifecycle edges are present with the right mode;
+/// `hook-report.sh`; every edge in [`CANONICAL_REPORT_HOOKS`] is present with
+/// the right mode (the count lives in that list, not in this sentence — it read
+/// "six" while the set was seven, AMUX-4783);
 /// and (the documented second trap, AMUX-2538) a tool event's entry carries a
 /// matcher that is a valid REGEX — `"*"` is not one, and an entry without one is
 /// silently ignored. A Stop-only config used to pass this check while prompt
@@ -2794,6 +2796,41 @@ pub struct ReportHookEntry {
 /// Selection is by "does this command mention the report script or the report
 /// ENDPOINT", so a fork is INSIDE the denominator rather than filtered out of
 /// it — a wiring check that only looks at correctly-wired entries can only pass.
+/// The canonical status hooks, as `(event, required mode arguments)`.
+///
+/// A SECOND COPY of `canonical()` in
+/// `scripts/hooks/install-claude-status-hooks.py`, and it drifted exactly as
+/// you would expect (AMUX-4783). AMUX-4723 added `Notification` to the
+/// installer; this list stayed at six, so once the hook was correctly
+/// installed the invariant reported the CORRECT configuration as broken:
+/// "Notification: amux report command is on a non-canonical lifecycle event",
+/// failing continuously in production. In the other direction, while
+/// Notification was MISSING, this list could only pass — a check cannot notice
+/// the absence of an event it has never heard of.
+///
+/// It stays a Rust copy on purpose: the invariant has to run on a box with no
+/// repo (the cloud image), so it cannot read the Python at check time. The
+/// drift is closed at TEST time instead, where the repo is always present:
+/// `canonical_report_hooks_match_the_installer` parses the installer and
+/// requires the two to agree in both directions. That is the same placement
+/// rule the byte-identity checks use — compare where the source exists, and
+/// degrade honestly where it does not.
+/// A SLICE, not `[_; 7]`. With the length in the type, adding a hook is three
+/// edits (installer, list, count) and removing one is a compile error that
+/// never reaches the drift test below — so the count would be doing the
+/// checking, badly, in the one place a reader is least likely to read. The
+/// length lives in the list, and `canonical_report_hooks_match_the_installer`
+/// is what holds it to the installer.
+pub const CANONICAL_REPORT_HOOKS: &[(&str, &str)] = &[
+    ("SessionStart", "subagent-reset session-start-hook"),
+    ("UserPromptSubmit", "active prompt-hook"),
+    ("PostToolUse", "active tool-hook"),
+    ("Stop", "idle stop-hook"),
+    ("Notification", "blocked notification-hook"),
+    ("SubagentStart", "subagent-start subagent-start-hook"),
+    ("SubagentStop", "subagent-stop subagent-stop-hook"),
+];
+
 pub fn report_hooks_wired(entries: Result<Vec<ReportHookEntry>, String>) -> Vec<InvariantResult> {
     const ID: &str = "hooks.report_hooks_wired";
     let entries = match entries {
@@ -2813,14 +2850,7 @@ pub fn report_hooks_wired(entries: Result<Vec<ReportHookEntry>, String>) -> Vec<
     }
     let mut broken: Vec<String> = Vec::new();
     let mut rows: Vec<serde_json::Value> = Vec::new();
-    let required = [
-        ("SessionStart", "subagent-reset session-start-hook"),
-        ("UserPromptSubmit", "active prompt-hook"),
-        ("PostToolUse", "active tool-hook"),
-        ("Stop", "idle stop-hook"),
-        ("SubagentStart", "subagent-start subagent-start-hook"),
-        ("SubagentStop", "subagent-stop subagent-stop-hook"),
-    ];
+    let required = CANONICAL_REPORT_HOOKS;
     for e in &entries {
         let wired = e.command.contains("hook-report.sh");
         // A tool event without a valid regex matcher is INERT — it parses, it
@@ -2873,7 +2903,7 @@ pub fn report_hooks_wired(entries: Result<Vec<ReportHookEntry>, String>) -> Vec<
         }
         rows.push(row);
     }
-    for (event, args) in required {
+    for &(event, args) in required {
         let covered = entries.iter().any(|e| {
             e.event == event
                 && e.command.contains("hook-report.sh")
@@ -2893,8 +2923,14 @@ pub fn report_hooks_wired(entries: Result<Vec<ReportHookEntry>, String>) -> Vec<
     } else {
         vec![InvariantResult::fail(
             ID,
-            "all six lifecycle hooks invoke ~/.amux/hook-report.sh with canonical modes, \
-             and tool events carry a valid regex matcher",
+            // COUNTED, not spelled. This read "all six lifecycle hooks" while
+            // the set was seven, so the sentence disagreed with the list
+            // directly beneath it and a reader could not tell which was stale.
+            format!(
+                "all {} lifecycle hooks invoke ~/.amux/hook-report.sh with canonical modes, \
+                 and tool events carry a valid regex matcher",
+                required.len()
+            ),
             broken.join("; "),
         )
         .evidence(evidence)]
@@ -6298,6 +6334,59 @@ mod negative_controls {
         assert_eq!(reports_are_attributed(0, 0)[0].status, Status::Unknown);
     }
 
+    /// AMUX-4783: [`CANONICAL_REPORT_HOOKS`] and the installer's `canonical()`
+    /// are one fact, so they are compared rather than trusted.
+    ///
+    /// This is the check that was missing when it mattered. AMUX-4723 added
+    /// `Notification` to the installer and nothing required the invariant's copy
+    /// to follow, so for three days the check could not see the event whose
+    /// absence it existed to catch, and once the hook WAS installed it began
+    /// failing in production on a correct configuration. Both directions are
+    /// asserted, because each catches a different drift: an event added to the
+    /// installer and not here goes unchecked, and one removed there but left
+    /// here fails every correctly-configured box.
+    ///
+    /// `include_str!` reads the installer AT BUILD TIME, so this cannot quietly
+    /// pass because the repo was absent — the crate would not compile.
+    #[test]
+    fn canonical_report_hooks_match_the_installer() {
+        const INSTALLER: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/hooks/install-claude-status-hooks.py"
+        ));
+        // `canonical()` only — `canonical_read_guard()` below it wires a
+        // different script and must not be swept in.
+        let body = INSTALLER
+            .split_once("def canonical(")
+            .expect("installer must define canonical()")
+            .1;
+        let body = body.split_once("\ndef ").map(|(head, _)| head).unwrap_or(body);
+        let re = regex::Regex::new(r#""(\w+)": group\(f"\{base\} ([^"]+)""#).unwrap();
+        let from_installer: Vec<(String, String)> = re
+            .captures_iter(body)
+            .map(|c| (c[1].to_string(), c[2].to_string()))
+            .collect();
+        assert!(
+            from_installer.len() >= 7,
+            "parsed {} entries from canonical(); the regex has stopped matching the installer, \
+             which would make this test vacuous: {from_installer:?}",
+            from_installer.len()
+        );
+        let ours: Vec<(String, String)> = CANONICAL_REPORT_HOOKS
+            .iter()
+            .map(|(e, a)| (e.to_string(), a.to_string()))
+            .collect();
+        let mut a = from_installer.clone();
+        let mut b = ours.clone();
+        a.sort();
+        b.sort();
+        assert_eq!(
+            a, b,
+            "CANONICAL_REPORT_HOOKS has drifted from install-claude-status-hooks.py's canonical(). \
+             installer={from_installer:?} invariant={ours:?}"
+        );
+    }
+
     fn ent(event: &str, command: &str, matcher: Option<&str>) -> ReportHookEntry {
         ReportHookEntry {
             event: event.into(),
@@ -6317,35 +6406,39 @@ mod negative_controls {
         const GOOD: &str = r#"bash "$HOME/.amux/hook-report.sh" idle stop-hook"#;
         const INLINE: &str = r#"curl -sk -m 3 -X POST -H 'Content-Type: application/json' -d "{\"state\":\"idle\",\"source\":\"stop-hook\"}" "$AMUX_URL/api/sessions/$AMUX_SESSION/report""#;
 
-        let healthy = report_hooks_wired(Ok(vec![
-            ent(
-                "SessionStart",
-                r#"bash "$HOME/.amux/hook-report.sh" subagent-reset session-start-hook"#,
-                None,
-            ),
-            ent("Stop", r#"bash "$HOME/.amux/hook-report.sh" idle stop-hook"#, None),
-            ent(
-                "UserPromptSubmit",
-                r#"bash "$HOME/.amux/hook-report.sh" active prompt-hook"#,
-                None,
-            ),
-            ent(
-                "PostToolUse",
-                r#"bash "$HOME/.amux/hook-report.sh" active tool-hook"#,
-                Some(".*"),
-            ),
-            ent(
-                "SubagentStart",
-                r#"bash "$HOME/.amux/hook-report.sh" subagent-start subagent-start-hook"#,
-                None,
-            ),
-            ent(
-                "SubagentStop",
-                r#"bash "$HOME/.amux/hook-report.sh" subagent-stop subagent-stop-hook"#,
-                None,
-            ),
-        ]));
+        // Built FROM the canonical list, so adding an eighth hook cannot leave
+        // this fixture behind the way the six-entry literal did. `ent` takes
+        // a matcher only for tool events, which is the same rule the check
+        // applies.
+        let wired_entry = |(event, args): &(&str, &str)| {
+            let matcher = matches!(*event, "PreToolUse" | "PostToolUse").then_some(".*");
+            ent(event, &format!(r#"bash "$HOME/.amux/hook-report.sh" {args}"#), matcher)
+        };
+        let healthy =
+            report_hooks_wired(Ok(CANONICAL_REPORT_HOOKS.iter().map(wired_entry).collect()));
         assert_eq!(healthy[0].status, Status::Pass, "correct wiring must pass: {healthy:?}");
+
+        // AMUX-4783, THE HISTORICAL SHAPE. Exactly the six hooks this fixture
+        // used to assert as healthy, which is what the box ran while
+        // `Notification` was absent and `blocked` had been reported 0 times
+        // ever. The old six-entry required list could only PASS on it: a check
+        // cannot notice the absence of an event it has never heard of.
+        let without_notification: Vec<_> = CANONICAL_REPORT_HOOKS
+            .iter()
+            .filter(|(event, _)| *event != "Notification")
+            .map(wired_entry)
+            .collect();
+        let missing_producer = report_hooks_wired(Ok(without_notification));
+        assert_eq!(
+            missing_producer[0].status,
+            Status::Fail,
+            "settings without Notification leaves `blocked` with no producer: {missing_producer:?}"
+        );
+        assert!(
+            missing_producer[0].observed.contains("Notification"),
+            "the refusal must NAME the missing event: {}",
+            missing_producer[0].observed
+        );
 
         let the_incident = report_hooks_wired(Ok(vec![
             ent("Stop", INLINE, None),

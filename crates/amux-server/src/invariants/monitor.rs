@@ -1621,22 +1621,31 @@ mod report_hook_wiring_tests {
 
     #[test]
     fn the_extractor_selects_both_the_wired_and_the_forked_shape() {
-        let wired = serde_json::json!({"hooks": {
-            "SessionStart": [{"hooks": [{"type": "command",
-                "command": "bash \"$HOME/.amux/hook-report.sh\" subagent-reset session-start-hook"}]}],
-            "Stop": [{"hooks": [{"type": "command",
-                "command": "bash \"$HOME/.amux/hook-report.sh\" idle stop-hook"}]}],
-            "UserPromptSubmit": [{"hooks": [{"type": "command",
-                "command": "bash \"$HOME/.amux/hook-report.sh\" active prompt-hook"}]}],
-            "PostToolUse": [{"matcher": ".*", "hooks": [{"type": "command",
-                "command": "bash \"$HOME/.amux/hook-report.sh\" active tool-hook"}]}],
-            "SubagentStart": [{"hooks": [{"type": "command",
-                "command": "bash \"$HOME/.amux/hook-report.sh\" subagent-start subagent-start-hook"}]}],
-            "SubagentStop": [{"hooks": [{"type": "command",
-                "command": "bash \"$HOME/.amux/hook-report.sh\" subagent-stop subagent-stop-hook"}]}]
-        }});
+        // BUILT from the canonical list, not spelled out beside it. This
+        // fixture was a THIRD copy of the six-event set (after the invariant's
+        // and the installer's) and it drifted with them: when AMUX-4723 added
+        // Notification, this one kept asserting Pass on a set that no longer
+        // was one, and it only surfaced when the invariant's copy was corrected
+        // (AMUX-4783). The matcher still rides on the GROUP for tool events,
+        // which is the thing this test exists to pin.
+        let mut events = serde_json::Map::new();
+        for (event, args) in checks::CANONICAL_REPORT_HOOKS {
+            let mut group = serde_json::json!({"hooks": [{
+                "type": "command",
+                "command": format!("bash \"$HOME/.amux/hook-report.sh\" {args}"),
+            }]});
+            if matches!(*event, "PreToolUse" | "PostToolUse") {
+                group["matcher"] = serde_json::json!(".*");
+            }
+            events.insert((*event).to_string(), serde_json::json!([group]));
+        }
+        let wired = serde_json::json!({ "hooks": events });
         let got = extract_report_hooks(&wired);
-        assert_eq!(got.len(), 6, "all six report hooks must be selected");
+        assert_eq!(
+            got.len(),
+            checks::CANONICAL_REPORT_HOOKS.len(),
+            "every canonical report hook must be selected"
+        );
         assert_eq!(
             got.iter().find(|e| e.event == "PostToolUse").unwrap().matcher.as_deref(),
             Some(".*"),
