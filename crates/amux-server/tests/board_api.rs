@@ -3327,6 +3327,99 @@ async fn force_accepts_x_amux_worker_attribution_like_every_other_module() {
     );
 }
 
+/// AMUX-4316. A foreign lane may not move a card OUT of `needsyou`.
+///
+/// Measured 2026-09-15: a caller identifying as `amux-3`, not a registered
+/// fleet session, PATCHed 181 needsyou cards to `todo` in one pass at 13:48,
+/// across at least 12 owning teams, and nothing refused it. The owning lanes
+/// could not notice either — a card that leaves `needsyou` leaves the view they
+/// would have noticed it in.
+///
+/// The guard mirrors the cross-lane ARCHIVE guard below, including its
+/// `authorized_by` escape, because AF-701 already gates archiving a needsyou
+/// card for the stated reason that it "hides an unanswered ask instead of
+/// resolving it". This is that rule applied to the other verb that hides it.
+#[tokio::test]
+async fn a_foreign_lane_cannot_move_a_needsyou_card_out_of_needsyou() {
+    let (app, _d) = app();
+    let item = create(&app, json!({
+        "title": "lane-a needs a decision", "session": "lane-a", "status": "needsyou",
+        "ask_type": "decision", "ask_question": "Ship it or hold?", "ask_actor": "Ethan",
+        "ask_unblocks": "Ethan answers ship or hold, in this card",
+    })).await;
+    let id = item["id"].as_str().unwrap().to_string();
+    assert_eq!(item["status"], json!("needsyou"), "fixture must start in needsyou: {item}");
+
+    // THE CASE: a different lane sweeps it to todo, exactly as amux-3 did.
+    let (st, _, v) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "todo" })),
+        &[("x-amux-worker", "lane-b")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "lane-b must not hide lane-a's ask: {v}");
+    assert_eq!(v["error"], json!("cross-lane needsyou move requires authorized_by"), "{v}");
+
+    // CONTROL A: a guard that refuses AND writes is not a guard.
+    let (_, _, row) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert_eq!(row["status"], json!("needsyou"), "refused move must not write: {row}");
+
+    // CONTROL B: an ANONYMOUS caller is refused too. That is the shape the
+    // incident actually had, and the archive guard's own history (AF-701) is
+    // that an empty caller_lane used to read as "skip the check" — the caller
+    // that most needs the guard waved through for being unnamed.
+    let (st, _, v) = send(&app, "PATCH", &format!("/api/board/{id}"), Some(json!({ "status": "todo" }))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "an unnamed caller must not be exempt: {v}");
+
+    // CONTROL C: the OWNER may still answer its own ask, or the guard has just
+    // broken needsyou for everyone rather than protecting it.
+    let (st, _, v) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "todo" })),
+        &[("x-amux-worker", "lane-a")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "the owner may move its own needsyou card: {v}");
+
+    // CONTROL D: `authorized_by` is a REAL path, not decoration — a lane acting
+    // on the owner's behalf must be able to say so and proceed.
+    let second = create(&app, json!({
+        "title": "lane-a needs another decision", "session": "lane-a", "status": "needsyou",
+        "ask_type": "decision", "ask_question": "And this one?", "ask_actor": "Ethan",
+        "ask_unblocks": "Ethan answers this one too, in this card",
+    })).await;
+    let sid = second["id"].as_str().unwrap().to_string();
+    let (st, _, v) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{sid}"),
+        Some(json!({ "status": "todo", "authorized_by": "Ethan, asked directly" })),
+        &[("x-amux-worker", "lane-b")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "authorized_by must actually work: {v}");
+
+    // CONTROL E: the guard is NARROW. Moving a foreign card between other
+    // statuses is untouched, so board-drive, promotion and reassignment keep
+    // working — a guard on every transition would have been a different and
+    // much larger change.
+    let plain = create(&app, json!({ "title": "lane-a backlog", "session": "lane-a", "status": "backlog" })).await;
+    let pid = plain["id"].as_str().unwrap().to_string();
+    let (st, _, v) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{pid}"),
+        Some(json!({ "status": "todo" })),
+        &[("x-amux-worker", "lane-b")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "only needsyou is guarded; backlog->todo must still pass: {v}");
+}
+
 /// EFFECT 2 — the cross-lane ARCHIVE guard stops being blind.
 ///
 /// `caller_lane` derives from the same resolver, and an EMPTY caller_lane

@@ -11029,6 +11029,94 @@ pub async fn patch_item(
                     );
                 };
                 let from = bs::parse_status(&next.status);
+                // MOVING ANOTHER LANE'S CARD OUT OF `needsyou` IS A CROSS-LANE
+                // HIDE, and requires the same `authorized_by` the archive guard
+                // above already demands (AMUX-4316).
+                //
+                // Measured 2026-09-15: a caller identifying as `amux-3`, which
+                // is not a registered fleet session, PATCHed 181 needsyou cards
+                // to `todo` in one pass at 13:48, spanning at least 12 owning
+                // teams. Nothing refused it. The owning lanes could not notice
+                // either, because a card that leaves `needsyou` leaves the view
+                // they would have noticed it in.
+                //
+                // THE PRECEDENT IS TWELVE HUNDRED LINES UP IN THIS SAME
+                // FUNCTION. AF-701 already gates ARCHIVING a `needsyou` card,
+                // in its own words, because it "hides an unanswered ask instead
+                // of resolving it". This hides the identical ask by a different
+                // verb, and was ungated only because nobody had reached for
+                // that verb yet. So this is the existing rule applied
+                // consistently, not a new policy.
+                //
+                // NARROW ON PURPOSE. `needsyou` is the one status that means a
+                // human still owes an answer; every other transition stays open
+                // so board-drive, promotion and reassignment keep working
+                // unchanged. The exemptions match the archive guard exactly: the
+                // owning lane, and a verified local member (Ethan, from the
+                // dashboard). `authorized_by` is the truthful path for a lane
+                // that legitimately answers another team's ask (ethos rule 3),
+                // and it is the same key, so there is one thing to learn.
+                if from == Some(TaskStatus::NeedsYou) && target != TaskStatus::NeedsYou {
+                    let owner = row.session.clone().unwrap_or_default().trim().to_string();
+                    let authorized = map
+                        .get("authorized_by")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .unwrap_or("");
+                    if !is_local_member
+                        && !owner.is_empty()
+                        && owner != caller_lane
+                        && authorized.is_empty()
+                    {
+                        let caller_desc = if caller_lane.is_empty() {
+                            "An anonymous caller"
+                        } else {
+                            &caller_lane
+                        };
+                        // Named marker: a 400 here would otherwise group with
+                        // every other board-PATCH 400 in /api/logs/analyze, and
+                        // "who is still sweeping other lanes' asks" is exactly
+                        // the question the 181-card pass went unasked for.
+                        tracing::warn!(
+                            marker = "cross_lane_needsyou_move",
+                            card = %row.id,
+                            actor = %actor_name,
+                            owner = %owner,
+                            target = ?target,
+                            "refused: a foreign caller tried to move a needsyou card out of \
+                             needsyou without authorized_by (AMUX-4316)"
+                        );
+                        return finish(
+                            &slot_w,
+                            PatchOut::Refused(
+                                StatusCode::BAD_REQUEST,
+                                json!({
+                                    "error": "cross-lane needsyou move requires authorized_by",
+                                    "why": format!(
+                                        "{caller_desc} is moving {} out of needsyou, and it \
+                                         belongs to {owner}. needsyou means a human still owes \
+                                         an answer; moving it out removes it from the view where \
+                                         that answer is tracked, so the ask is hidden rather than \
+                                         resolved. 181 cards across 12+ teams were hidden this \
+                                         way in one pass on 2026-09-15.",
+                                        row.id
+                                    ),
+                                    "how": format!(
+                                        "answer the ask and let {owner} move it, or add \
+                                         {{\"authorized_by\": \"<who asked>\"}} if you are acting \
+                                         on their behalf. An anonymous caller (no \
+                                         X-Amux-Session/X-Amux-Worker header) must send that \
+                                         header or authorized_by — there is no exemption for an \
+                                         unnamed caller."
+                                    ),
+                                    "card_owner": owner,
+                                    "attempted_status": target_in,
+                                }),
+                            ),
+                            no_write(),
+                        );
+                    }
+                }
                 let rechecking_verified = from == Some(TaskStatus::Verified) && target == TaskStatus::Verified
                     && map.get("reverify").and_then(Value::as_bool) == Some(true);
                 if from != Some(target) || rechecking_verified {
