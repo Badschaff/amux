@@ -12734,6 +12734,18 @@ pub async fn patch_item(
                             body["blocked"] = json!(true);
                             body["attempted_status"] = json!(target_raw);
                             body["item"] = json!(row.id);
+                            // AF-460: the remedy ("restore it first") was exactly
+                            // right and reached NOWHERE the workaround was
+                            // documented -- a caller had to already know
+                            // `amux board unarchive` existed. Named here, once,
+                            // in the body every caller of this refusal already
+                            // reads.
+                            if matches!(e, TransitionError::ArchivedTaskImmutable) {
+                                body["how_to_fix"] = json!(format!(
+                                    "amux board unarchive {} (or PATCH archived:false), then apply {target_raw} as usual",
+                                    row.id
+                                ));
+                            }
                             return finish(
                                 &slot_w,
                                 PatchOut::Refused(StatusCode::CONFLICT, body),

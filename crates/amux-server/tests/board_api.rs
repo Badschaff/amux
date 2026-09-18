@@ -1378,6 +1378,13 @@ async fn archive_restore_round_trip_preserves_every_field() {
     .await;
     assert_eq!(st, StatusCode::CONFLICT);
     assert!(v3["error"].as_str().unwrap().contains("archived"));
+    // AF-460: the remedy ("restore it first") used to live only in the error
+    // STRING, and the actual command that does it (`amux board unarchive`,
+    // not "restore") was documented nowhere a caller of this refusal would
+    // see it. `how_to_fix` must name the real verb and this card's own id.
+    let how_to_fix = v3["how_to_fix"].as_str().unwrap_or_default();
+    assert!(how_to_fix.contains("unarchive"), "how_to_fix: {v3}");
+    assert!(how_to_fix.contains(id.as_str()), "how_to_fix must name the card: {v3}");
 
     // Restore: back exactly where it was, every field intact.
     let (st, _, r) = send(&app, "POST", &format!("/api/board/{id}/restore"), None).await;

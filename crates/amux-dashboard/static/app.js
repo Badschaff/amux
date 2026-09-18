@@ -11359,7 +11359,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.986';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.987';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -29901,6 +29901,24 @@ function _renderBoardCard(item) {
   // for and re-wording it here would be the second spelling the comment warns
   // against.
   if (item.owner_isolated) h += '<div class="board-card-isolated" title="' + esc(item.owner_reach || 'The owning session is an isolated raw agent.') + '">&#x1F512; isolated owner</div>';
+  // ARCHIVED WITH A LIVE STATUS (AF-460/AF-461). `archived` is a boolean flag,
+  // not a status, so a card can be archived AND still show `backlog`/`doing`/
+  // `needsyou` with no visible difference from an ordinary actionable card —
+  // until you try to close it and every closing verb refuses with
+  // `archived_task_immutable`. AF-461 marked this in `amux board ls`; it never
+  // reached the dashboard's own kanban card, which is the surface GE-564 and
+  // AF-224 actually hit it on. Same class as `owner_isolated` above: the
+  // standard advice this card would otherwise imply ("drain it") is
+  // unfollowable, and the card should say so where it is listed.
+  //
+  // Only the PATHOLOGICAL subset, matching `amux board ls`'s own distinction
+  // (amux:4345): an archived card already at done/verified/discarded is
+  // archived correctly and nobody wants to close it — flagging those too
+  // would put the marker on every archived row instead of the ~15% that are
+  // actually stuck, which reads as decoration (ethos rule 5).
+  if (item.archived && !['done', 'verified', 'discarded'].includes(item.status)) {
+    h += '<div class="board-card-archived-live" title="Archived, but still shows status \'' + esc(item.status || '') + '\'. Every closing verb refuses with archived_task_immutable until you unarchive it first (amux board unarchive ' + esc(item.id) + ', then done/discard as usual).">&#x1F4E6; archived, cannot close</div>';
+  }
   h += _leaseChip(item);
   h += _blockedByChip(item);
   h += '<div class="board-card-title">';

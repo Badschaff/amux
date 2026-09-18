@@ -3911,6 +3911,12 @@
      chip stays one line at 375px. */
   .board-card-isolated { display:inline-block; font-size:0.62rem; font-weight:700; padding:1px 6px; margin-bottom:4px; margin-left:4px;
     border-radius:4px; background:rgba(210,153,34,0.15); color:var(--warn,#d29922); border:1px solid rgba(210,153,34,0.45); }
+  /* ARCHIVED WITH A LIVE STATUS (AF-460). Same shape and same amber as
+     .board-card-isolated -- a constraint on what you can do with this card,
+     not a bug on the card itself: it must be unarchived before any closing
+     verb will touch it. */
+  .board-card-archived-live { display:inline-block; font-size:0.62rem; font-weight:700; padding:1px 6px; margin-bottom:4px; margin-left:4px;
+    border-radius:4px; background:rgba(210,153,34,0.15); color:var(--warn,#d29922); border:1px solid rgba(210,153,34,0.45); }
   .board-card-shepherd { font-size:0.62rem; padding:1px 6px; border-radius:4px; background:rgba(137,87,229,0.15);
     color:var(--purple,#8957e5); border:1px dashed rgba(137,87,229,0.5); }
   /* LEASE (RR-0052 / AMUX-4529). Same chip shape as its neighbours because it
