@@ -3284,3 +3284,35 @@ FIX: `"codex" | "ollama" => "--dangerously-bypass-approvals-and-sandbox"` — th
   `/api/logs` sweep instead of waiting to be read by hand. The general shape
   worth keeping: when a function answers "which flag does X take", a `_ =>` arm
   is a wrong answer for every X nobody listed, and it cannot fail loudly.
+
+## The session row said provider ollama and active_model claude-opus-5, in the same payload
+AREA: attribution
+SEVERITY: wrong-state
+STATUS: fixed
+DATE: 2026-09-18
+SESSION: amux
+CARD: AMUX-4788
+SYMPTOM: `GET /api/sessions/desktop` answered `provider: "ollama"`, `model:
+  "qwen3-coder:30b-65k"` and `active_model: "claude-opus-5"` at once, with
+  `tokens.total: 869632` and both `model_source` and `tokens_source` reading
+  `"transcript"`. The transcript was the worker's PRE-SWITCH claude
+  conversation, last written at the minute of the switch and frozen since.
+  `transcript_evidence` parses the Claude Code JSONL shape and had no provider
+  test, so it faithfully reported a conversation that had stopped being that
+  worker's two hours earlier.
+COST: A wrong reading I nearly shipped. Having just switched that worker, the
+  obvious conclusion from `active_model: claude-opus-5` is that the switch did
+  not take — and the tmux argv said it plainly had. Establishing which of the
+  two was lying meant reading three functions across two modules. The token half
+  is worse and I did not measure it firing: `session_report` uses the same value
+  as its context-size fallback, and the comment directly above that call says a
+  wrong count there produces a forced compaction of a healthy lane rather than a
+  wrong badge.
+FIX: Gate the reader on the provider that WRITES the file, derived from
+  `launch_base_binary` rather than restated as a second list, and return the
+  honest empty otherwise. The general shape worth keeping is the disclosure
+  problem, not the missing test: `model_source: "transcript"` was TRUE and
+  useless. It named where the value came from and never asked whether that
+  source could belong to this worker, so the field that existed to make a doubtful
+  value auditable is the field that made it look accounted for. A provenance
+  label is not a provenance CHECK, and the two read identically in a payload.
