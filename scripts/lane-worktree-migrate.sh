@@ -100,13 +100,13 @@ step "lane '$lane': shared checkout is $cc_dir, target worktree is $dest"
 IFS=',' read -r -a claimed <<<"${claim_csv:-}"
 # Trim empties from a trailing/leading comma or an entirely empty --claim.
 claimed_clean=()
-for p in "${claimed[@]:-}"; do
+for p in ${claimed[@]+"${claimed[@]}"}; do
   [ -n "$p" ] && claimed_clean+=("$p")
 done
 
 IFS=',' read -r -a acked <<<"${acknowledge_csv:-}"
 acked_clean=()
-for p in "${acked[@]:-}"; do
+for p in ${acked[@]+"${acked[@]}"}; do
   [ -n "$p" ] && acked_clean+=("$p")
 done
 
@@ -124,7 +124,7 @@ while IFS= read -r line; do
   [ -z "$line" ] && continue
   path="${line:3}"
   found=0
-  for c in "${claimed_clean[@]:-}" "${acked_clean[@]:-}"; do
+  for c in ${claimed_clean[@]+"${claimed_clean[@]}"} ${acked_clean[@]+"${acked_clean[@]}"}; do
     [ "$c" = "$path" ] && found=1 && break
   done
   [ "$found" -eq 0 ] && unclaimed="$unclaimed  $line"$'\n'
@@ -155,7 +155,7 @@ tracked_patch="$snap/tracked.patch"
 untracked_dir="$snap/untracked"
 mkdir -p "$untracked_dir"
 have_tracked_patch=0
-for p in "${claimed_clean[@]:-}"; do
+for p in ${claimed_clean[@]+"${claimed_clean[@]}"}; do
   status="$(git -C "$cc_dir" status --porcelain --untracked-files=all -- "$p" | head -1)"
   case "$status" in
     "??"*)

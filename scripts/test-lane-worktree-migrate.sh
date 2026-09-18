@@ -222,5 +222,34 @@ else
   ok "F: no destination worktree created"
 fi
 
+# ── CASE G: EMPTY --claim on a tree already clean for this lane ─────────────
+# The documented common case ("omit entirely when the tree is already clean")
+# and the one path none of A-F exercised. bash 3.2 + `set -u` treats a
+# zero-element array specially: `"${arr[@]}"` is an unbound-variable error,
+# and the naive fix `"${arr[@]:-}"` is WORSE inside a `for` loop -- it does
+# not avoid the crash by iterating zero times, it iterates ONCE with an empty
+# string, which downstream (`git status -- ""`) is "fatal: empty string is
+# not a valid pathspec". Caught live piloting this on a real lane with
+# nothing of its own to claim. The fix is the double-expansion idiom already
+# used elsewhere in this repo (scripts/reap-amux-debris.sh) --
+# `${arr[@]+"${arr[@]}"}` -- which is what this case pins.
+lane_g="lane-g"
+shared_g="$TMP/shared-g"
+new_lane_fixture "$lane_g" "$shared_g"
+# tree is clean: no edits, nothing untracked.
+dest_g="$TMP/dest-g"
+if out_g="$(bash "$SCRIPT" "$lane_g" --dest "$dest_g" 2>&1)"; then
+  ok "G: empty --claim on a clean tree exits 0"
+else
+  bad "G: empty --claim on a clean tree failed"
+  printf '%s\n' "$out_g" | sed 's/^/       /' >&2
+fi
+g_dirty="$(git -C "$dest_g" status --porcelain --untracked-files=all 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$g_dirty" = "0" ]; then
+  ok "G: new worktree is clean, nothing phantom-claimed"
+else
+  bad "G: new worktree has $g_dirty unexpected dirty path(s)"
+fi
+
 [ "$fail" -eq 0 ] && echo "lane-worktree-migrate suite: PASS" || echo "lane-worktree-migrate suite: FAIL" >&2
 exit "$fail"
