@@ -131,11 +131,14 @@ pub fn report_applies(state: &str, ts: f64, started: f64, now: f64) -> bool {
     // flight paints. Silence past the heartbeat means the claim outlived its
     // evidence — a Stop hook that never fired, a crashed turn, an interrupt.
     let stale_active = state == "active" && age > env_secs("AMUX_ACTIVE_HEARTBEAT_S", 120.0);
-    // `idle` and `blocked` survive silence (an idle lane has nothing to report
-    // until its next prompt; a blocked lane is parked on a dialog until a human
-    // answers it); every other state has a much shorter trust window.
-    let trust_window = if state == "idle" || state == "blocked" {
+    // `idle` survives silence (an idle lane has nothing to report until its
+    // next prompt). `blocked` gets a shorter window: a permission dialog is
+    // transient (seconds to minutes), and a stale blocked report that outlives
+    // it prevents message delivery and hides the real state for up to 24h.
+    let trust_window = if state == "idle" {
         env_secs("AMUX_HOOKS_LIVE_IDLE_S", 86400.0)
+    } else if state == "blocked" {
+        env_secs("AMUX_HOOKS_LIVE_BLOCKED_S", 600.0)
     } else {
         env_secs("AMUX_HOOKS_LIVE_S", 1800.0)
     };
@@ -6131,8 +6134,8 @@ CLAUDE-POSTFIX-COMPLETE
             ("idle", 90_000.0, false, "past the 24h idle window"),
             ("waiting", 60.0, true, "a fresh selector report"),
             ("blocked", 50.0, true, "a fresh blocked report — permission dialog"),
-            ("blocked", 40_000.0, true, "blocked survives silence inside its 24h window"),
-            ("blocked", 90_000.0, false, "past the 24h blocked window"),
+            ("blocked", 500.0, true, "blocked survives 8 minutes of the 10m window"),
+            ("blocked", 700.0, false, "past the 10m blocked window — stale permission dialog"),
             ("compacting", 5.0, false, "a state no rule knows is not evidence"),
         ];
         for (st, age, want, why) in cells {
