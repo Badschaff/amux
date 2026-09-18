@@ -3221,3 +3221,33 @@ FIX: The script already knows how to say it cannot measure — it emits
   in a shared pane scope takes the whole session down. The point is that a
   supervisor which fails exactly when the box is loaded fails exactly when peers
   are most active and a lane most needs its commit to land.
+
+## `POST /api/board` appended to another card and the reply was shaped exactly like a create
+AREA: board
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-17
+SESSION: amux
+CARD: AMUX-4776
+SYMPTOM: Four creates with distinct titles, four 200s, four `id` values, zero
+  cards created. Semantic intake matched all four to the open card the caller
+  was working and appended each title to THAT card's `desc` as a
+  "### Additional request" block; every reply returned the existing card's id.
+  The dedupe decision is defensible (the titles did describe the same work, and
+  its reasons are on the card's log). The caller cannot tell: same status code
+  as a create, and `id` is the only field the sanctioned recipe in CLAUDE.md
+  reads. The disclosure does exist — `intake.action` is "append" rather than
+  "create" — in a SIBLING field nobody was told to read, which is the
+  `ignored_fields` and `slim` shape already recorded twice in CLAUDE.md.
+  The sharper half is that the call MUTATED A CARD THE CALLER DID NOT NAME: a
+  request to create produced an edit to another record's desc, under the
+  caller's attribution, with no signal.
+COST: One wasted live-verification round — the bulk-migrate under test refused
+  every id with `Stale { actual: "doing", expected: "backlog" }` because the
+  four "new" cards were all the caller's own in-progress card — plus four junk
+  blocks appended to the card being closed, which had to be noticed and stripped
+  by hand before it could be read by anyone else. About 6 minutes and a polluted
+  desc on a card under review.
+FIX: Say it in a field the caller already reads. `"created": false` beside the
+  id, or a distinct `code` on the append path. A caller that checks nothing
+  must not be able to read an append as a create. Keep the dedupe.
