@@ -3251,3 +3251,36 @@ COST: One wasted live-verification round — the bulk-migrate under test refused
 FIX: Say it in a field the caller already reads. `"created": false` beside the
   id, or a distinct `code` on the append path. A caller that checks nothing
   must not be able to read an append as a create. Keep the dedupe.
+
+## A provider swap strips a flag and writes the same flag back, and nothing can tell
+AREA: providers
+SEVERITY: wrong-state
+STATUS: fixed
+DATE: 2026-09-18
+SESSION: amux
+CARD: AMUX-4785
+SYMPTOM: `PATCH /api/sessions/desktop/config {"provider":"ollama"}` returned 200
+  "provider set to Ollama" and left `CC_FLAGS="--dangerously-skip-permissions"`,
+  which is CLAUDE's yolo flag, on a worker that now launches codex. The swap
+  really did call `strip_provider_yolo_flags` and really did remove the flag;
+  the next line called `provider_yolo_flag("ollama")`, whose match had no ollama
+  arm, so the default handed back the identical string. Strip and re-add
+  cancelled out and the response could not say so.
+COST: Nothing broke, and that is the whole entry. The ollama launch arm tests
+  `PROVIDER_YOLO_FLAGS.iter().any(...)`, which matches all three spellings, so
+  it emitted codex's `--dangerously-bypass-approvals-and-sandbox` and the worker
+  ran correctly. The LAUNCH was right and the STORED value was wrong, so
+  `GET /api/sessions/desktop` reported `flags: "--dangerously-skip-permissions"`
+  for `provider: "ollama"` and every CC_FLAGS-reading view agreed with it. This
+  had been shipping since ollama became a provider and was found only because a
+  human happened to read the env file during an unrelated switch (AMUX-4606). A
+  permissive consumer downstream of a wrong writer does not fix the writer, it
+  removes the only symptom anyone would have noticed.
+FIX: `"codex" | "ollama" => "--dangerously-bypass-approvals-and-sandbox"` — the
+  arm is keyed on the BINARY that gets exec'd, since an ollama worker is a codex
+  process. Plus the signal the two-fix rule owes: the launch arm now WARNs when
+  CC_FLAGS carries a yolo flag codex would reject, naming stored_yolo_flag and
+  launched_yolo_flag, so residual pre-fix workers announce themselves to a
+  `/api/logs` sweep instead of waiting to be read by hand. The general shape
+  worth keeping: when a function answers "which flag does X take", a `_ =>` arm
+  is a wrong answer for every X nobody listed, and it cannot fail loudly.

@@ -3681,9 +3681,28 @@ fn set_effort_flag(flags: &str, effort: &str) -> Result<String, String> {
     Ok(if base.is_empty() { format!("--effort {effort}") } else { format!("{base} --effort {effort}") })
 }
 
+/// The yolo flag a provider's BINARY accepts — so the arm is keyed on what
+/// gets exec'd, not on the provider label.
+///
+/// `ollama` is codex (AMUX-4785). The launch arm below builds
+/// `codex --oss --local-provider ollama --model <CC_MODEL>`, so an ollama
+/// worker takes codex's spelling; the default arm handed it claude's, which
+/// that binary never accepts. Found live switching the desktop worker: the
+/// provider swap stripped `--dangerously-skip-permissions` and the next line
+/// put the same flag straight back, a no-op that looks like a change.
+///
+/// It had broken nothing, and that is the reason to fix it rather than not.
+/// The launch arm tests `PROVIDER_YOLO_FLAGS.iter().any(...)`, which matches
+/// all three spellings, so the LAUNCH was right while the STORED value was
+/// wrong and every CC_FLAGS-reading view reported claude's flag on a codex
+/// process. Same divergence, same env var, as the `--model` WARN thirty lines
+/// into the ollama arm.
+///
+/// `iterm2` stays on the default arm deliberately: it is not codex, and
+/// nothing here measured what it takes.
 fn provider_yolo_flag(provider: &str) -> &'static str {
     match provider {
-        "codex" => "--dangerously-bypass-approvals-and-sandbox",
+        "codex" | "ollama" => "--dangerously-bypass-approvals-and-sandbox",
         "gemini" => "--yolo",
         _ => "--dangerously-skip-permissions",
     }
@@ -9248,6 +9267,26 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
                 );
             }
             let ollama_yolo = PROVIDER_YOLO_FLAGS.iter().any(|f| flags.contains(f));
+            // The same divergence one field over (AMUX-4785). `ollama_yolo`
+            // above matches ALL THREE spellings, so a worker carrying claude's
+            // or gemini's yolo flag still launches with codex's — right
+            // behaviour, wrong stored value, and every CC_FLAGS-reading view
+            // then shows a flag this binary would reject. pre-AMUX-4785
+            // provider swaps and toggle_yolo wrote exactly that shape, so this
+            // WARN is how a residual worker announces itself to a /api/logs
+            // sweep instead of waiting to be noticed (the two-fixes rule).
+            if let Some(f) = PROVIDER_YOLO_FLAGS
+                .iter()
+                .find(|f| **f != "--dangerously-bypass-approvals-and-sandbox" && flags.contains(*f))
+            {
+                tracing::warn!(
+                    session = %name,
+                    cc_flags = %flags,
+                    stored_yolo_flag = %f,
+                    launched_yolo_flag = "--dangerously-bypass-approvals-and-sandbox",
+                    "ollama worker's CC_FLAGS carries a yolo flag codex does not accept (launch substitutes codex's) — pre-AMUX-4785 provider swap or toggle_yolo"
+                );
+            }
             let mut opts = format!(" --oss --local-provider ollama --model {}", sh_quote(&model));
             if !opts.contains("--dangerously-bypass") && !opts.contains("-a ") {
                 opts += if ollama_yolo { " --dangerously-bypass-approvals-and-sandbox" } else { " -a never" };
@@ -27699,6 +27738,76 @@ CLAUDE-POSTFIX-COMPLETE
         let e = envf("olla");
         assert!(!e.contains("CC_MODEL"), "swapping off ollama must clear CC_MODEL, got:\n{e}");
         assert!(e.contains("--model"), "claude takes its model in CC_FLAGS, got:\n{e}");
+    }
+
+    /// AMUX-4785: an ollama worker's yolo flag is the one CODEX accepts,
+    /// because an ollama worker IS a codex process.
+    ///
+    /// Both cells drive the shipped route and then read the env file, for the
+    /// reason the AMUX-4607 test above gives: asserting on `provider_yolo_flag`
+    /// directly would pass whether or not the swap calls it.
+    ///
+    /// The pre-fix shape is a SILENT one, which is why it needs its own test.
+    /// `strip_provider_yolo_flags` removed claude's flag and the next line put
+    /// the same flag back, so the swap wrote a value it had just rejected and
+    /// nothing failed: the launch arm matches all three spellings, so the
+    /// LAUNCH was right and only the stored value was wrong.
+    #[tokio::test]
+    async fn an_ollama_workers_yolo_flag_is_the_one_codex_accepts() {
+        const CODEX_YOLO: &str = "--dangerously-bypass-approvals-and-sandbox";
+        const CLAUDE_YOLO: &str = "--dangerously-skip-permissions";
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        // The exact live shape this was found in: desktop.env, 2026-09-18.
+        std::fs::write(
+            sessions.join("yolo.env"),
+            format!("CC_DIR=\"/tmp\"\nCC_FLAGS=\"--model claude-opus-5 {CLAUDE_YOLO}\"\nCC_AUTO_CONTINUE=\"1\"\n"),
+        )
+        .unwrap();
+        // Same swap, yolo OFF. Without this the cell below passes for a fix
+        // that appends codex's flag to every worker it touches.
+        std::fs::write(sessions.join("tame.env"), "CC_DIR=\"/tmp\"\nCC_FLAGS=\"--model claude-opus-5\"\n").unwrap();
+        // Already ollama, yolo off: exercises the OTHER call site, the
+        // toggle_yolo verb, which had the identical bug.
+        std::fs::write(sessions.join("tgl.env"), "CC_DIR=\"/tmp\"\nCC_PROVIDER=\"ollama\"\nCC_MODEL=\"qwen3:4b\"\n").unwrap();
+        // Provider control: gemini keeps its own spelling, so this change is
+        // about ollama rather than about collapsing the match.
+        std::fs::write(
+            sessions.join("gem.env"),
+            format!("CC_DIR=\"/tmp\"\nCC_FLAGS=\"--model opus {CLAUDE_YOLO}\"\n"),
+        )
+        .unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (state, _dir) = state();
+        let app: Router = routes().with_state(state);
+        let envf = |n: &str| std::fs::read_to_string(home.path().join(format!("sessions/{n}.env"))).unwrap();
+
+        let (st, v) = call(&app, "PATCH", "/api/sessions/yolo/config", Some(json!({"provider": "ollama"}))).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let e = envf("yolo");
+        assert!(e.contains(CODEX_YOLO), "an ollama worker launches codex, so it takes codex's yolo flag, got:\n{e}");
+        assert!(
+            !e.contains(&format!("{CLAUDE_YOLO}\"")) && !e.contains(&format!("{CLAUDE_YOLO} ")),
+            "claude's yolo flag must not survive a swap to ollama — codex does not accept it, got:\n{e}"
+        );
+
+        let (st, v) = call(&app, "PATCH", "/api/sessions/tame/config", Some(json!({"provider": "ollama"}))).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let e = envf("tame");
+        assert!(!e.contains(CODEX_YOLO), "a non-yolo worker must not acquire yolo by changing provider, got:\n{e}");
+
+        let (st, v) = call(&app, "PATCH", "/api/sessions/tgl/config", Some(json!({"toggle_yolo": true}))).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let e = envf("tgl");
+        assert!(e.contains(CODEX_YOLO), "toggle_yolo on ollama must write codex's flag, got:\n{e}");
+        assert!(!e.contains(CLAUDE_YOLO), "toggle_yolo on ollama must not write claude's flag, got:\n{e}");
+
+        let (st, v) = call(&app, "PATCH", "/api/sessions/gem/config", Some(json!({"provider": "gemini"}))).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let e = envf("gem");
+        assert!(e.contains("--yolo"), "gemini keeps its own yolo spelling, got:\n{e}");
+        assert!(!e.contains(CODEX_YOLO), "gemini must not take codex's yolo flag, got:\n{e}");
     }
 
     /// AMUX-4729. An ollama worker's reasoning effort comes from its model's
