@@ -569,6 +569,10 @@ pub async fn index_once_at(
 /// every later turn on that lane, which is not.
 const MAX_CLAIM_WINDOW_S: i64 = 24 * 3600;
 
+/// Claim windows applied per writer acquisition (AMUX-4750). See the loop that
+/// uses it for why the hold matters more than the total.
+const UPDATES_PER_WRITE: usize = 500;
+
 /// Fill `token_ledger.task` for turns that fall inside a card's claim window on
 /// the SAME lane. Only touches unattributed rows.
 ///
@@ -715,19 +719,28 @@ pub async fn attribute_tasks(store: &SharedStore) -> anyhow::Result<()> {
     if pending.is_empty() {
         return Ok(());
     }
-    store
-        .write_async(move |conn| {
-            let mut stmt = conn.prepare_cached(
-                "UPDATE token_ledger SET task=?1 \
-                 WHERE task='' AND session=?2 AND COALESCE(session,'') <> '' \
-                   AND ts>=?3 AND ts<=?4",
-            )?;
-            for (task, session, from, to) in &pending {
-                stmt.execute(rusqlite::params![task, session, from, to])?;
-            }
-            Ok(WriteOutcome { applied: true, events: vec![] })
-        })
-        .await?;
+    // BOUND THE HOLD, not the total work (AMUX-4750). Moving the derivation out
+    // left ~10,000 UPDATEs, and at ~0.4ms each that is still a ~4s hold on the
+    // single writer, which is a floor under every non-GET request in the fleet.
+    // Chunking does not make the job cheaper; it stops any one interactive write
+    // being stuck behind all of it. 500 x ~0.4ms is ~200ms, inside the 250ms
+    // this card asks for, and the loop yields the writer between chunks.
+    for chunk in pending.chunks(UPDATES_PER_WRITE) {
+        let chunk: Vec<(String, String, i64, i64)> = chunk.to_vec();
+        store
+            .write_async(move |conn| {
+                let mut stmt = conn.prepare_cached(
+                    "UPDATE token_ledger SET task=?1 \
+                     WHERE task='' AND session=?2 AND COALESCE(session,'') <> '' \
+                       AND ts>=?3 AND ts<=?4",
+                )?;
+                for (task, session, from, to) in &chunk {
+                    stmt.execute(rusqlite::params![task, session, from, to])?;
+                }
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .await?;
+    }
     Ok(())
 }
 

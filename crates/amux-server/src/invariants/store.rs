@@ -29,6 +29,26 @@ const PASS_RETAIN_SECS: f64 = 3600.0;
 /// a capped trim drains the backlog in hours anyway.
 const TRIM_BATCH_ROWS: i64 = 20_000;
 
+/// Results per writer acquisition (AMUX-4750).
+///
+/// A LONG HOLD IS THE FAULT, NOT THE TOTAL WORK. Every non-GET request in the
+/// fleet awaits `record_receipt` in `policy::enforce` before its handler runs,
+/// so the single writer's hold is a floor under every write anyone makes: a
+/// 2.5s hold is 2.5s added to somebody's POST. Chunking does not reduce the
+/// work, it bounds how long any one interactive write can be stuck behind it.
+///
+/// This deliberately walks back part of the "one write per pass" decision above,
+/// and the reason that decision was right still holds: a write PER RESULT would
+/// be 727 lock acquisitions. This is ~8, each releasing the writer so anything
+/// queued behind it can go.
+///
+/// Sized from the measurement: ~1,150 statements per pass at ~2ms each, so 100
+/// results is roughly 150 statements and well inside the 250ms the card asks
+/// for. Every row of a pass still carries the SAME `ts`, computed once, so a
+/// batch remains identifiable even though a reader can now catch one half
+/// written.
+const RESULTS_PER_WRITE: usize = 100;
+
 fn now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -62,10 +82,18 @@ pub async fn record(store: &SharedStore, results: Vec<InvariantResult>, duration
     // Also hoisted: it is the same value for every row and was a call per row.
     let build = crate::build_hash();
     let opened = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let opened_w = opened.clone();
-    let _ = store
+    // ONE TIMESTAMP FOR THE WHOLE PASS, computed before the first chunk. The
+    // batch has to stay identifiable now that it is written across several
+    // transactions instead of one.
+    let ts = now();
+    let mut remaining = results;
+    while !remaining.is_empty() {
+        let rest = remaining.split_off(remaining.len().min(RESULTS_PER_WRITE));
+        let results = std::mem::replace(&mut remaining, rest);
+        let opened_w = opened.clone();
+        let build = build.clone();
+        let _ = store
         .write_async(move |conn| {
-            let ts = now();
             for (r, evidence) in &results {
                 // PREPARE ONCE, not once per row. `conn.execute(sql, ..)`
                 // compiles its SQL every call: at 727 results with an incident
@@ -194,21 +222,44 @@ pub async fn record(store: &SharedStore, results: Vec<InvariantResult>, duration
                     ])?;
                 }
             }
-            // Opportunistic trim of the evaluation log only. The predicate is
-            // range-bound on ts first so idx_inv_result_ts drives it, and the
-            // rowid-IN shape is because DELETE..LIMIT needs a nonstandard
-            // SQLite build flag.
-            let _ = conn.execute(
-                "DELETE FROM _amux_invariant_result WHERE rowid IN (
-                    SELECT rowid FROM _amux_invariant_result
-                     WHERE ts < ?2 AND (status = 'pass' OR ts < ?1)
-                     LIMIT ?3)",
-                rusqlite::params![
-                    ts - RESULT_RETAIN_SECS,
-                    ts - PASS_RETAIN_SECS,
-                    TRIM_BATCH_ROWS
-                ],
-            );
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        })
+        .await;
+    }
+    // The trim is once per pass, in its own short write, not once per chunk.
+    let _ = store
+        .write_async(move |conn| {
+            // Opportunistic trim of the evaluation log only. The rowid-IN shape
+            // is because DELETE..LIMIT needs a nonstandard SQLite build flag.
+            //
+            // TWO STATEMENTS, ONE PER RETENTION RULE (AMUX-4750). This was one
+            // DELETE whose predicate read `ts < pass_cut AND (status = 'pass'
+            // OR ts < fail_cut)`. `idx_inv_result_ts` can only serve that by
+            // walking the entire tail older than the pass cut and testing
+            // `status` on every row — and the fleet's rows are overwhelmingly
+            // FAIL rows younger than the fail cut, so the walk deletes nothing.
+            // Measured on the live distribution, 311k rows: 377ms per monitor
+            // cycle to delete 0, with the single writer held throughout.
+            //
+            // Split, each arm seeks: the pass arm on idx_inv_result_status_ts
+            // (migration 0080) straight to (status='pass', ts < cut), the age
+            // arm on idx_inv_result_ts. Same rows deleted, 0.1ms.
+            let _ = conn
+                .prepare_cached(
+                    "DELETE FROM _amux_invariant_result WHERE rowid IN (
+                        SELECT rowid FROM _amux_invariant_result
+                         WHERE status = 'pass' AND ts < ?1
+                         LIMIT ?2)",
+                )
+                .and_then(|mut s| s.execute(rusqlite::params![ts - PASS_RETAIN_SECS, TRIM_BATCH_ROWS]));
+            let _ = conn
+                .prepare_cached(
+                    "DELETE FROM _amux_invariant_result WHERE rowid IN (
+                        SELECT rowid FROM _amux_invariant_result
+                         WHERE ts < ?1
+                         LIMIT ?2)",
+                )
+                .and_then(|mut s| s.execute(rusqlite::params![ts - RESULT_RETAIN_SECS, TRIM_BATCH_ROWS]));
             Ok(WriteOutcome { applied: true, events: vec![] })
         })
         .await;
