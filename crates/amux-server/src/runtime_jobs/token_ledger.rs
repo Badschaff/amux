@@ -580,8 +580,11 @@ const MAX_CLAIM_WINDOW_S: i64 = 24 * 3600;
 /// directly, and it is what the card actually asks about.
 ///
 /// The hold is this budget plus at most one UPDATE, because the check happens
-/// after each one rather than before.
-const HOLD_BUDGET_MS: u128 = 200;
+/// after each one rather than before. That overshoot is real and measured: at a
+/// 200ms budget the worst hold was 292ms, so a single UPDATE can cost ~90ms.
+/// 120 + ~90 is ~210ms, inside the 250ms this card asks for, at roughly 33
+/// acquisitions for a full pass.
+const HOLD_BUDGET_MS: u128 = 120;
 
 /// Fill `token_ledger.task` for turns that fall inside a card's claim window on
 /// the SAME lane. Only touches unattributed rows.
