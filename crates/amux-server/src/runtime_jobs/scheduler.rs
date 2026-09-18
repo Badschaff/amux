@@ -932,6 +932,34 @@ fn due_schedules(conn: &Connection, now_str: &str) -> rusqlite::Result<Vec<Durab
 }
 
 /// INSERT with Python's exact column list (create parity).
+///
+/// A COLUMN THE CALLER DID NOT SET IS OMITTED, NOT WRITTEN AS NULL (AMUX-4769).
+/// This listed all 27 columns unconditionally and filled each with
+/// `to_sql(raw.get(col))`, which maps a missing key to SQL NULL — and a DEFAULT
+/// only applies to a column left OUT of the INSERT. So any `DurableSchedule`
+/// built without a key hit `NOT NULL constraint failed` on that column.
+///
+/// That went red on main when migration 0079 added `worktree INTEGER NOT NULL
+/// DEFAULT 0` and `fan_out` likewise: 17 of 34 scheduler tests failed, in
+/// isolation rather than under load, because the fixtures do not set the new
+/// keys. Production was unaffected only because the HTTP create path fills both
+/// in before calling here (api/schedules.rs, `body.worktree.unwrap_or(0)`).
+///
+/// FIXED AT THE SEAM RATHER THAN AT THE CALLERS, because this is a class and
+/// not two columns. `schedules` has TEN `NOT NULL DEFAULT` columns — sched_type,
+/// enabled, run_count, watch, watch_timeout, done_action, kind,
+/// trigger_cooldown, worktree, fan_out — and every one of them breaks exactly
+/// this way for a caller that omits it. Defaulting the two newest at each
+/// construction site would fix today's red and leave the next `ALTER TABLE ...
+/// NOT NULL DEFAULT` to do it again.
+///
+/// An explicit JSON `null` is treated as absent for the same reason: for a
+/// nullable column omitting it still stores NULL, and for a defaulted one the
+/// default is what "no value" means.
+///
+/// Parity is on the stored ROW, which is unchanged: every column the caller set
+/// is still written, and the only behavioural difference is that an unset
+/// defaulted column now gets its default instead of failing the insert.
 pub fn insert_schedule(conn: &Connection, s: &DurableSchedule) -> rusqlite::Result<()> {
     const COLS: [&str; 27] = [
         "id", "title", "session", "command", "kind", "sched_type", "recurrence", "run_at",
@@ -939,13 +967,19 @@ pub fn insert_schedule(conn: &Connection, s: &DurableSchedule) -> rusqlite::Resu
         "done_pattern", "done_action", "trigger_on", "trigger_cooldown", "trigger_sessions",
         "exit_actions", "created", "updated", "deleted", "worktree", "fan_out", "fan_out_model",
     ];
-    let placeholders: Vec<String> = (1..=COLS.len()).map(|i| format!("?{i}")).collect();
+    let present: Vec<&str> = COLS
+        .iter()
+        .copied()
+        .filter(|c| !matches!(s.raw.get(*c), None | Some(Value::Null)))
+        .collect();
+    let placeholders: Vec<String> = (1..=present.len()).map(|i| format!("?{i}")).collect();
     let sql = format!(
         "INSERT INTO schedules ({}) VALUES ({})",
-        COLS.join(","),
+        present.join(","),
         placeholders.join(",")
     );
-    let vals: Vec<rusqlite::types::Value> = COLS.iter().map(|c| to_sql(s.raw.get(*c))).collect();
+    let vals: Vec<rusqlite::types::Value> =
+        present.iter().map(|c| to_sql(s.raw.get(*c))).collect();
     conn.execute(&sql, rusqlite::params_from_iter(vals))?;
     Ok(())
 }
@@ -2624,6 +2658,63 @@ mod tests {
         m.insert("updated".into(), Value::from(now_ts));
         m.insert("deleted".into(), Value::Null);
         DurableSchedule::from_map(m)
+    }
+
+    /// AMUX-4769. A column the caller did not set gets its DB DEFAULT; a column
+    /// the caller DID set is stored as given.
+    ///
+    /// Both directions, because they fail in opposite ways and only one of them
+    /// is loud. Omitting a `NOT NULL DEFAULT` column used to abort the insert —
+    /// that is the 17 red tests this card was filed for, and any fixture here
+    /// would catch it. Dropping a column the caller SET would be silent: a
+    /// schedule created with `worktree: 1` would quietly store 0 and simply
+    /// never run in a worktree, with nothing to notice. Nothing tested that
+    /// direction before, and the fix moved exactly the code that decides it.
+    #[tokio::test]
+    async fn an_unset_column_takes_its_default_and_a_set_one_is_stored_as_given() {
+        let (store, _dir) = store();
+        store
+            .write_async(|conn| {
+                // Built WITHOUT worktree/fan_out, like every fixture here and
+                // like any caller written before migration 0079.
+                let unset = make_row("SCHED-4769A", "amux", None, "2026-09-18T04:00");
+                assert!(unset.raw.get("worktree").is_none(), "fixture must not set it");
+                insert_schedule(conn, &unset)?;
+
+                // Set explicitly, like the HTTP create path.
+                let mut set = make_row("SCHED-4769B", "amux", None, "2026-09-18T04:00");
+                set.raw.insert("worktree".into(), Value::from(1));
+                set.raw.insert("fan_out".into(), Value::from(1));
+                insert_schedule(conn, &set)?;
+
+                // And explicitly null, which means "no value" and so the default.
+                let mut nulled = make_row("SCHED-4769C", "amux", None, "2026-09-18T04:00");
+                nulled.raw.insert("worktree".into(), Value::Null);
+                insert_schedule(conn, &nulled)?;
+
+                let read = |id: &str, col: &str| -> rusqlite::Result<i64> {
+                    conn.query_row(
+                        &format!("SELECT {col} FROM schedules WHERE id=?1"),
+                        [id],
+                        |r| r.get(0),
+                    )
+                };
+                assert_eq!(read("SCHED-4769A", "worktree")?, 0, "unset must take the default");
+                assert_eq!(read("SCHED-4769A", "fan_out")?, 0);
+                // THE SILENT DIRECTION: a value the caller set must survive.
+                assert_eq!(read("SCHED-4769B", "worktree")?, 1, "a set value was dropped");
+                assert_eq!(read("SCHED-4769B", "fan_out")?, 1, "a set value was dropped");
+                assert_eq!(read("SCHED-4769C", "worktree")?, 0, "explicit null means the default");
+
+                // The same rule covers every other NOT NULL DEFAULT column on
+                // this table, which is why the fix is at the seam: these were
+                // one `ALTER TABLE` away from the identical failure.
+                assert_eq!(read("SCHED-4769A", "watch_timeout")?, 120);
+                assert_eq!(read("SCHED-4769A", "trigger_cooldown")?, 120);
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
