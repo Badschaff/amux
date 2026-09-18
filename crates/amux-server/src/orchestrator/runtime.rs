@@ -655,10 +655,15 @@ impl Runtime {
     /// tasks assign only under pickup_unowned.
     fn load_board_tasks(&self, workers: &[Worker]) -> anyhow::Result<Vec<amux_core::board::Task>> {
         let conn = self.store.read()?;
-        let rows = crate::db::board_store::list_issues(
+        // PLANNING PROJECTION, not the full row (AMUX-4757). Every active
+        // board row rides in the slice, and the full `COLS` list carries ~55
+        // columns of which planning reads a dozen: measured on the live board,
+        // 113 MB materialised per tick against 3.1 MB here, at roughly one tick
+        // every 3 seconds. `task.desc` is EMPTY on these rows by construction;
+        // the assignment path re-reads the card by id for its text.
+        let rows = crate::db::board_store::planning_tasks(
             &conn,
-            &[], // ALL statuses: dependencies live in done/verified
-            &[],
+            // ALL statuses: dependencies live in done/verified.
             crate::db::board_store::ArchivedFilter::ActiveOnly,
         )?;
         let mut names: BTreeMap<String, amux_core::ids::WorkerId> = BTreeMap::new();
@@ -678,17 +683,17 @@ impl Runtime {
             // name is a card that reads as a dependency wait and will be
             // debugged as one, so the raw status is named here where the row
             // still has it.
-            let Some(mut task) = row.to_task() else { continue };
-            if amux_server_parse_status_is_unmodelled(&row.status) {
+            let crate::db::board_store::PlanningRow { mut task, raw_status, session } = row;
+            if amux_server_parse_status_is_unmodelled(&raw_status) {
                 tracing::warn!(
-                    card = %row.id,
-                    column = %row.status,
+                    card = %task.id,
+                    column = %raw_status,
                     "card sits in an unmodelled column — visible to the orchestrator as BLOCKED \
                      on configuration, not actionable until the column is modelled or the card \
                      is moved"
                 );
             }
-            match row.session.as_deref().filter(|s| !s.trim().is_empty()) {
+            match session.as_deref().filter(|s| !s.trim().is_empty()) {
                 Some(owner_name) => match names.get(&owner_name.to_lowercase()) {
                     Some(wid) => task.worker = Some(wid.clone()),
                     None => task.worker = Some(foreign_worker_id(owner_name)),

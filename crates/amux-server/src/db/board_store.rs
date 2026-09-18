@@ -2364,6 +2364,128 @@ pub fn probe_board_read(conn: &Connection) -> rusqlite::Result<usize> {
     Ok(mapped)
 }
 
+/// Columns the PLANNER needs, and no others (AMUX-4757).
+///
+/// `COLS` above carries ~55 columns including `desc`, `log`, `evidence`,
+/// `acceptance_criteria` and the whole `decision_*` and `callback_*` families.
+/// The orchestrator tick loads every active board row through it and uses none
+/// of that text: `to_task` copies `desc` into the Task and nothing in the
+/// planning path reads it, because the assignment path re-reads the card by id
+/// (`context::task_by_internal_id`) to build a worker's context.
+///
+/// Measured on the live board, 2026-09-18: the full projection materialises
+/// ~113 MB per tick against ~3.1 MB here, and the tick runs roughly every 3
+/// seconds. That is the CPU `runtime_job_blocking_poll` was reporting.
+const PLANNING_COLS: &str = "i.id, i.title, i.status, i.session, i.creator, \
+     i.created, i.updated, i.type, COALESCE(i.archived,0), COALESCE(i.pinned,0), \
+     COALESCE(i.pos,0), i.depends_on, i.reviewer, COALESCE(i.version,0), \
+     i.lease_owner, GROUP_CONCAT(t.tag)";
+
+/// A board row reduced to what planning needs.
+///
+/// `task.desc` IS ALWAYS EMPTY on rows from [`planning_tasks`]. That is not a
+/// card with no description; it is a column this query does not read. Anything
+/// that needs the text must load the card by id. The field cannot be made
+/// absent — `Task::desc` is a `String` — so the name of the constructor and
+/// this paragraph are the only warning available, which is why it is stated
+/// twice.
+pub struct PlanningRow {
+    pub task: Task,
+    /// The RAW status string, kept because `to_task` maps an unmodelled column
+    /// to `Blocked` and the caller warns using the original spelling.
+    pub raw_status: String,
+    /// The owning lane as stored, before the caller maps it to a `WorkerId`.
+    pub session: Option<String>,
+}
+
+/// Every board row as a planning `Task`, without the heavy text columns.
+///
+/// Ordering, filtering and the `to_task` mapping match [`list_issues`] exactly;
+/// only the column list differs. A divergence here would be a planner that
+/// disagrees with the board about which cards exist, so the shared pieces
+/// (`board_order`, `parse_status`, `core_item_type`, `internal_id`) are called
+/// rather than restated.
+pub fn planning_tasks(
+    conn: &Connection,
+    archived: ArchivedFilter,
+) -> rusqlite::Result<Vec<PlanningRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {PLANNING_COLS} FROM issues i LEFT JOIN issue_tags t ON t.issue_id = i.id \
+         WHERE i.deleted IS NULL GROUP BY i.id"
+    ))?;
+    let mut rows: Vec<(i64, f64, i64, PlanningRow)> = Vec::new();
+    let mapped = stmt.query_map([], |r| {
+        let archived_flag: i64 = r.get(8)?;
+        let pinned: i64 = r.get(9)?;
+        let pos: f64 = r.get(10)?;
+        let updated = ts_i64(r, 6)?;
+        let depends_raw: Option<String> = r.get(11)?;
+        let depends_on: Vec<String> = depends_raw
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(s).ok())
+            .map(|v| v.into_iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        let tags_csv: Option<String> = r.get(15)?;
+        let tags: Vec<String> = tags_csv
+            .unwrap_or_default()
+            .split(',')
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect();
+        let id: String = r.get(0)?;
+        let raw_status: String = r.get(2)?;
+        let creator: String = r.get(4)?;
+        let reviewer: Option<String> = r.get(12)?;
+        let lease_owner: Option<String> = r.get(14)?;
+        let item_type: String = r.get(7)?;
+        let task = Task {
+            id: internal_id(&id),
+            title: r.get(1)?,
+            // NOT LOADED. See PlanningRow.
+            desc: String::new(),
+            status: parse_status(&raw_status).unwrap_or(TaskStatus::Blocked),
+            worker: lease_owner
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(crate::orchestrator::runtime::foreign_worker_id),
+            item_type: core_item_type(&item_type),
+            creator: if creator.trim().is_empty() {
+                Actor::System { component: "python-board".into() }
+            } else {
+                Actor::Human { name: creator }
+            },
+            created_at: ts(ts_i64(r, 5)?),
+            updated_at: ts(updated),
+            archived: archived_flag != 0,
+            pinned: pinned != 0,
+            depends_on: depends_on.iter().map(|d| internal_id(d)).collect(),
+            reviewer: reviewer.map(|n| Actor::Human { name: n }),
+            gate_override: None,
+            tags,
+            version: u64::try_from(r.get::<_, i64>(13)?).unwrap_or(0),
+        };
+        Ok((
+            pinned,
+            pos,
+            updated,
+            PlanningRow { task, raw_status, session: r.get(3)? },
+        ))
+    })?;
+    for row in mapped {
+        let row = row?;
+        match archived {
+            ArchivedFilter::ActiveOnly if row.3.task.archived => continue,
+            ArchivedFilter::ArchivedOnly if !row.3.task.archived => continue,
+            _ => {}
+        }
+        rows.push(row);
+    }
+    rows.sort_by(|a, b| board_order(a.0, a.1, a.2, b.0, b.1, b.2));
+    Ok(rows.into_iter().map(|(_, _, _, r)| r).collect())
+}
+
 pub fn list_issues(
     conn: &Connection,
     status_filter: &[String],
@@ -4243,6 +4365,80 @@ mod tests {
                  board down fleet-wide over 3 such cells). Got: {line}"
             );
         }
+    }
+
+    /// AMUX-4757. `planning_tasks` must produce exactly what
+    /// `list_issues` + `to_task` produced, minus the one field it declares it
+    /// does not load.
+    ///
+    /// A DIFFERENTIAL TEST, because the change is an equivalence claim. Writing
+    /// expectations by hand against the new projection would pass just as
+    /// happily if the narrow column list had quietly dropped `reviewer`,
+    /// mis-ordered the rows, or parsed `depends_on` differently — all of which
+    /// are one-character mistakes in a 16-column index-addressed query, and all
+    /// of which would show up as a planner that silently disagrees with the
+    /// board about which cards exist.
+    #[test]
+    fn the_planning_projection_matches_the_full_read_except_for_the_desc_it_declares() {
+        let mut conn = Connection::open_in_memory().expect("memdb");
+        crate::db::migrate::apply_all(&mut conn).expect("schema");
+        let add = |id: &str, status: &str, session: Option<&str>, archived: i64,
+                       pinned: i64, pos: f64, deps: &str, reviewer: Option<&str>| {
+            conn.execute(
+                "INSERT INTO issues (id, title, \"desc\", status, session, creator, created,
+                    updated, type, archived, pinned, pos, depends_on, reviewer, version,
+                    lease_owner)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                rusqlite::params![
+                    id, format!("title of {id}"), format!("a long description for {id}"),
+                    status, session, "someone", 1_760_000_000i64, 1_760_000_100i64,
+                    "code", archived, pinned, pos, deps, reviewer, 3i64,
+                    if session.is_none() { Some("leaseholder") } else { None },
+                ],
+            ).expect("insert");
+        };
+        // The shapes that distinguish the two reads: ordering by pinned/pos/
+        // updated, an archived row, an unowned row whose worker comes from the
+        // LEASE rather than the session, dependencies, tags, and a status the
+        // board does not model.
+        add("P-1", "todo", Some("alpha"), 0, 0, 0.0, "[\"P-2\"]", Some("rev"));
+        add("P-2", "done", Some("beta"), 0, 0, 0.0, "", None);
+        add("P-3", "todo", None, 0, 1, 0.0, "", None);
+        add("P-4", "todo", Some("alpha"), 1, 0, 0.0, "", None);
+        add("P-5", "some-operator-column", Some("beta"), 0, 0, -5.0, "", None);
+        conn.execute("INSERT INTO issue_tags (issue_id, tag) VALUES ('P-1','urgent')", [])
+            .expect("tag");
+
+        let full = list_issues(&conn, &[], &[], ArchivedFilter::ActiveOnly).expect("full");
+        let narrow = planning_tasks(&conn, ArchivedFilter::ActiveOnly).expect("narrow");
+        assert_eq!(full.len(), narrow.len(), "row counts differ");
+        assert!(!full.is_empty());
+
+        for (row, planned) in full.iter().zip(narrow.iter()) {
+            let mut expected = row.to_task().expect("to_task");
+            // The ONE declared difference. Asserted explicitly rather than
+            // skipped, so a future change that starts loading desc here is a
+            // failure rather than a silent cost.
+            assert!(!expected.desc.is_empty(), "fixture must have a desc to omit");
+            assert_eq!(planned.task.desc, "", "planning_tasks must not load desc");
+            expected.desc = String::new();
+            // SERIALISED, not field-by-field. A hand-written comparison only
+            // covers the fields someone remembered; this covers every field
+            // Task has, including any added later.
+            assert_eq!(
+                serde_json::to_value(&expected).expect("expected"),
+                serde_json::to_value(&planned.task).expect("planned"),
+                "task mismatch for {}",
+                row.id
+            );
+            assert_eq!(planned.raw_status, row.status, "raw status for {}", row.id);
+            assert_eq!(planned.session, row.session, "session for {}", row.id);
+        }
+        // The unmodelled column still reaches the caller by its raw spelling,
+        // which is what the orchestrator's warning prints.
+        assert!(narrow.iter().any(|p| p.raw_status == "some-operator-column"));
+        // And the archived row is excluded by both.
+        assert!(!narrow.iter().any(|p| p.task.id == internal_id("P-4")));
     }
 
     #[test]
