@@ -1877,6 +1877,74 @@ fn detect_latency_with_scan_cap(
         /// quiet box is an endpoint defect and 30.3s on 28 cores carrying 37 is
         /// a queue. `None` for a row predating migration 0034.
         worst_load1: Option<f64>,
+        /// AMUX-4818: the same latency split by whether the CLIENT was local.
+        ///
+        /// `latency_ms` covers a whole request, so it cannot separate time
+        /// spent SERVING one from time spent WAITING for one to arrive. For a
+        /// beacon endpoint that inverts the measurement's meaning, and the
+        /// detector reads a reporter's bad network as a server fault. This
+        /// split is the discriminator, using columns the log already has.
+        ///
+        /// Measured over 48h when this was added:
+        ///   /api/board         local 5,158ms  remote 3,471ms   0.7x
+        ///   /api/sessions      local 2,712ms  remote 3,069ms   1.1x
+        ///   /api/history       local    14ms  remote    15ms   1.1x
+        ///   /api/client-debug  local   671ms  remote 6,603ms   9.8x
+        /// A real server fault is slow for everyone; a client-side artifact is
+        /// slow only from off-box. /api/client-debug cost a full investigation
+        /// (AMUX-4751 -> AMUX-4816) to reach that conclusion by hand.
+        ///
+        /// REPORTED, NOT ACTED ON. It rides the card as evidence and suppresses
+        /// nothing: a wrong suppression rule hides real faults silently, which
+        /// is strictly worse than the false card it would prevent. Decide the
+        /// threshold from cards that carry this line, not from this sample.
+        local_n: u64,
+        remote_n: u64,
+    }
+    /// Outlier RATE per client population, which is the statistic that
+    /// separates a server fault from a reporting client's bad network.
+    ///
+    /// NOT the mean latency of outlier rows. That was the first version of this
+    /// and it does not work: restricted to rows already over the threshold,
+    /// /api/client-debug scores 0.57x and /api/board 0.76x, so the two are
+    /// indistinguishable. The signal is in how OFTEN each population is slow,
+    /// not how slow the slow ones are. Measured over 48h:
+    ///   /api/board         local  8.38% (149/1779)  remote  3.82% (90/2355)   0.5x
+    ///   /api/sessions      local  2.13% (7/328)     remote  2.91% (153/5261)  1.4x
+    ///   /api/client-debug  local  0.88% (11/1247)   remote 15.29% (814/5325) 17.3x
+    ///
+    /// REPORTED, NOT ACTED ON (AMUX-4818). It rides the card as evidence and
+    /// suppresses nothing: a wrong suppression rule hides real faults silently,
+    /// which is worse than the false card it would prevent. Pick a threshold
+    /// from cards that carry this line, not from that one sample.
+    fn describe_client_split(lo: u64, lt: u64, ro: u64, rt: u64) -> String {
+        if lt == 0 && rt == 0 {
+            return "not measured: no rows in this window carried a client_ip (AMUX-4818)."
+                .to_string();
+        }
+        let pct = |o: u64, t: u64| if t == 0 { None } else { Some(o as f64 * 100.0 / t as f64) };
+        match (pct(lo, lt), pct(ro, rt)) {
+            (Some(l), Some(r)) if l > 0.0 => format!(
+                "on-box {l:.2}% of requests slow ({lo}/{lt}) | off-box {r:.2}% ({ro}/{rt}) | \
+                 off-box is {:.1}x more likely. Near 1x means the endpoint is slow for EVERYONE, \
+                 which is a server fault. Well above 1x means the time is the reporting client's \
+                 network rather than this server's work (AMUX-4818).",
+                r / l
+            ),
+            (Some(l), Some(r)) => format!(
+                "on-box {l:.2}% of requests slow ({lo}/{lt}) | off-box {r:.2}% ({ro}/{rt}). No \
+                 on-box outliers, so the ratio is undefined rather than infinite (AMUX-4818)."
+            ),
+            (Some(l), None) => format!(
+                "on-box {l:.2}% of requests slow ({lo}/{lt}) | no off-box requests in this \
+                 window, so there is nothing to compare against (AMUX-4818)."
+            ),
+            (None, Some(r)) => format!(
+                "off-box {r:.2}% of requests slow ({ro}/{rt}) | no on-box requests in this \
+                 window, so there is no local baseline (AMUX-4818)."
+            ),
+            (None, None) => "not measured (AMUX-4818).".to_string(),
+        }
     }
     let mut seen: BTreeMap<(String, String), OutlierGroup> = BTreeMap::new();
     // AF-175: THIS shape is where the reported incident came from, and it had no
@@ -1893,7 +1961,7 @@ fn detect_latency_with_scan_cap(
     let mut outliers_considered = 0usize;
     let mut outliers_failed = 0usize;
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT method, path, latency_ms, ts, status, boot_at, load1 FROM _amux_request_log \
+        "SELECT method, path, latency_ms, ts, status, boot_at, load1, client_ip FROM _amux_request_log \
          WHERE ts >= ?1 AND latency_ms >= ?2 \
            AND (req_meta IS NULL OR req_meta NOT LIKE '%\"slow_ok\"%') \
          ORDER BY latency_ms DESC LIMIT 2000",
@@ -1907,9 +1975,10 @@ fn detect_latency_with_scan_cap(
                 r.get::<_, i64>(4)?,
                 r.get::<_, Option<f64>>(5)?,
                 r.get::<_, Option<f64>>(6)?,
+                r.get::<_, Option<String>>(7)?,
             ))
         }) {
-            for (method, path, ms, ts, status, row_boot, row_load) in rows.flatten() {
+            for (method, path, ms, ts, status, row_boot, row_load, row_ip) in rows.flatten() {
                 outliers_considered += 1;
                 if spans_own_restart(ts, ms, row_boot, boot) {
                     outliers_spanned += 1;
@@ -1977,8 +2046,19 @@ fn detect_latency_with_scan_cap(
                         sample: format!("{method} {path} → {status}"),
                         worst_since_boot: None,
                         worst_load1: None,
+                        local_n: 0,
+                        remote_n: 0,
                     });
                 e.n += 1;
+                // AMUX-4818. Loopback is the only thing that means "no client
+                // network in this number"; an absent client_ip is counted as
+                // neither, so a missing column reads as unmeasured rather than
+                // as local.
+                match row_ip.as_deref() {
+                    Some("127.0.0.1") | Some("::1") => e.local_n += 1,
+                    Some(_) => e.remote_n += 1,
+                    None => {}
+                }
                 // The age travels WITH the worst latency, so the evidence line
                 // describes the request the title quotes rather than whichever
                 // row happened to be last.
@@ -2056,6 +2136,38 @@ fn detect_latency_with_scan_cap(
     // predicate the invariant rollup already uses and it is right for the
     // general case too — if a deploy genuinely made every endpoint slow, that
     // is also ONE fault and also belongs in one card.
+    // AMUX-4818: total requests per target, split by client population, so the
+    // outlier counts collected above can be expressed as a RATE.
+    //
+    // Raw counts cannot discriminate. An endpoint called mostly from off-box
+    // will have mostly off-box outliers whatever the cause, which is why
+    // /api/client-debug's 11-local-vs-814-remote looks alarming and
+    // /api/board's 149-vs-90 looks fine when both are just traffic mix. As
+    // rates they separate: 0.88% vs 15.29% against 8.38% vs 3.82%.
+    //
+    // Grouped by PATH, not by (method, path): the question is what fraction of
+    // a population's calls to this endpoint were slow, and the client
+    // population does not differ by verb.
+    let mut totals: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    if let Ok(mut tstmt) = conn.prepare(
+        "SELECT path, CASE WHEN client_ip IN ('127.0.0.1','::1') THEN 1 ELSE 0 END AS is_local, \
+                COUNT(*) FROM _amux_request_log WHERE ts >= ?1 GROUP BY path, is_local",
+    ) {
+        if let Ok(trows) = tstmt.query_map(rusqlite::params![w_start], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+        }) {
+            for (tpath, is_local, cnt) in trows.flatten() {
+                let e = totals
+                    .entry(rl::normalize_target_verb(&tpath))
+                    .or_insert((0u64, 0u64));
+                if is_local == 1 {
+                    e.0 += cnt.max(0) as u64;
+                } else {
+                    e.1 += cnt.max(0) as u64;
+                }
+            }
+        }
+    }
     let candidates: Vec<_> = seen
         .iter()
         .filter(|((_, target), g)| g.worst_ms > design_budget_ms(target))
@@ -2156,6 +2268,33 @@ fn detect_latency_with_scan_cap(
                 // average of 36.86, and nothing in the payload could say so, so
                 // the reader got five innocent endpoint names and no trace of
                 // the one fact explaining all five.
+                // AMUX-4818. The per-target local/remote split, on the card
+                // that groups them. AMUX-4751 named twelve endpoints and cost a
+                // full investigation to establish that one of them
+                // (/api/client-debug, 9.8x) was a client-network artifact while
+                // the rest (~1x) were genuinely slow for everyone. That is one
+                // line of arithmetic over columns this row already carries.
+                ("client_split".into(), {
+                    let mut by_target: BTreeMap<&String, (u64, u64)> = BTreeMap::new();
+                    for ((_, t), g) in candidates.iter() {
+                        let e = by_target.entry(t).or_insert((0, 0));
+                        e.0 += g.local_n;
+                        e.1 += g.remote_n;
+                    }
+                    let rows: Vec<String> = by_target
+                        .iter()
+                        .map(|(t, (lo, ro))| {
+                            let (lt, rt) = totals.get(*t).copied().unwrap_or((0, 0));
+                            format!("{t}: {}", describe_client_split(*lo, lt, *ro, rt))
+                        })
+                        .collect();
+                    format!(
+                        "{}\n  A target whose off-box multiple is near 1x is slow for everyone and \
+                         belongs to this fault. One well above 1x is probably a reporting client's \
+                         network and not part of it (AMUX-4818).",
+                        rows.join("\n  ")
+                    )
+                }),
                 ("host_load".into(), describe_window_load(&mut window_load)),
                 ("rollup_threshold".into(), format!(
                     "{} distinct targets (AMUX_OUTLIER_ROLLUP_AT)", outlier_rollup_at()
@@ -2195,6 +2334,8 @@ fn detect_latency_with_scan_cap(
             sample,
             worst_since_boot,
             worst_load1,
+            local_n,
+            remote_n,
         },
     ) in seen
     {
@@ -2334,6 +2475,10 @@ fn detect_latency_with_scan_cap(
                 // on 28 cores carrying 37 is a queue. This card could not tell
                 // the reader which, and the verdict above sends them to "look at
                 // the request" either way.
+                ("client_split".into(), {
+                    let (lt, rt) = totals.get(&target).copied().unwrap_or((0, 0));
+                    describe_client_split(local_n, lt, remote_n, rt)
+                }),
                 ("host_load_at_worst".into(), match (worst_load1, host_ncpu()) {
                     (Some(l), Some(cores)) => format!(
                         "1-minute load {l:.1} on {cores} cores ({:.2}x). Stated as a fact, not \
@@ -11764,6 +11909,87 @@ mod tests {
     /// sentence deliberately does not spell the whole string: an earlier
     /// version of this doc did, which put a second copy in the file and made
     /// `mutate.sh` refuse its own instructions as an ambiguous revert.
+    #[tokio::test]
+    /// AMUX-4818: the outlier card must say whether the slowness is the
+    /// SERVER's or the reporting CLIENT's. Those are different faults and the
+    /// card could not tell them apart, which is how AMUX-4751 named twelve
+    /// endpoints and cost a full investigation to conclude one of them was a
+    /// client-network artifact.
+    ///
+    /// Both fixtures are slow by the SAME 20s latency on purpose. The mean
+    /// latency of outlier rows cannot separate them — that was this feature's
+    /// first implementation and it scored 0.57x for the artifact against 0.76x
+    /// for the real fault on live data. Only the RATE per population separates
+    /// them, so the fixture differs only in how much fast on-box traffic each
+    /// endpoint carries.
+    async fn an_outlier_card_reports_the_off_box_multiple_not_just_the_latency() {
+        let (st, _d) = state();
+        let now = unix_now();
+        fn log_ip(st: &AppState, ts: f64, path: &str, ms: f64, ip: &str) {
+            let (pa, ia) = (path.to_string(), ip.to_string());
+            st.store
+                .write(move |conn| {
+                    conn.execute(
+                        "INSERT INTO _amux_request_log (ts, method, path, family, status, \
+                         latency_ms, client_ip, user_agent, amux_session, worker, answered_by, \
+                         error_body) VALUES (?1,'POST',?2,?2,200,?3,?4,'ua','','','native','')",
+                        rusqlite::params![ts, pa, ms, ia],
+                    )?;
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                })
+                .unwrap();
+        }
+        // A REAL SERVER FAULT: every call is slow, from both populations.
+        for k in 0..6 {
+            log_ip(&st, now - 100.0 - k as f64, "/api/serverfault", 20_000.0, "127.0.0.1");
+            log_ip(&st, now - 200.0 - k as f64, "/api/serverfault", 20_000.0, "10.0.0.5");
+        }
+        // A CLIENT ARTIFACT: the server answers on-box calls instantly and
+        // almost never stalls locally; off-box calls stall every time.
+        for k in 0..59 {
+            log_ip(&st, now - 300.0 - k as f64, "/api/beacon", 5.0, "127.0.0.1");
+        }
+        log_ip(&st, now - 380.0, "/api/beacon", 20_000.0, "127.0.0.1");
+        for k in 0..6 {
+            log_ip(&st, now - 400.0 - k as f64, "/api/beacon", 20_000.0, "10.0.0.5");
+        }
+
+        let (found, _sup) = detect_latency_at(&st.store.read().unwrap(), now, None);
+        let split_for = |needle: &str| -> String {
+            found
+                .iter()
+                .find(|f| f.signature.contains(needle))
+                .unwrap_or_else(|| panic!("no finding for {needle}: {:?}",
+                    found.iter().map(|f| f.signature.clone()).collect::<Vec<_>>()))
+                .evidence
+                .iter()
+                .find(|(k, _)| k == "client_split")
+                .unwrap_or_else(|| panic!("{needle} carries no client_split evidence"))
+                .1
+                .clone()
+        };
+        let server = split_for("/api/serverfault");
+        assert!(
+            server.contains("off-box is 1.0x more likely"),
+            "a fault that is slow for everyone must read near 1x: {server}"
+        );
+        let beacon = split_for("/api/beacon");
+        assert!(
+            beacon.contains("more likely"),
+            "the client artifact must report a multiple: {beacon}"
+        );
+        let mult: f64 = beacon
+            .split("off-box is ")
+            .nth(1)
+            .and_then(|t| t.split('x').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("could not read the multiple out of: {beacon}"));
+        assert!(
+            mult >= 10.0,
+            "an endpoint slow only off-box must stand out sharply, got {mult}x: {beacon}"
+        );
+    }
+
     #[tokio::test]
     async fn outlier_evidence_all_describes_the_worst_request_not_merely_the_first_seen() {
         let (st, _d) = state();
