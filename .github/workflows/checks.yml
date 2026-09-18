@@ -237,6 +237,17 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-mac-pressure-tripwire.sh
+      # AMUX-4810. The soak's leak verdict used to be peak-minus-a-30-second
+      # baseline, which measured warm-up: it failed on 100% of runs that ever
+      # executed, including one whose second HALF was negative. The replacement
+      # is a steady-state slope, and this step is what stops it from being
+      # replaced by something equally green. Its cells prove the detector
+      # catches a 100KB/min leak, does not call a warm-up plateau a leak, and
+      # refuses a verdict on a run too short to have reached steady state.
+      - name: the soak leak detector can actually fail (AMUX-4810)
+        run: |
+          set -uo pipefail
+          ./scripts/test-soak-slope.sh
       # AF-561, THE RATCHET. A scripts/test-*.sh that prints a verdict without
       # `set -e` will report PASS after calling a helper that does not exist —
       # bash writes "command not found" to stderr and the suite carries on, and
