@@ -106,6 +106,17 @@ async fn open_paths() -> anyhow::Result<Vec<PathBuf>> {
     .await
 }
 
+/// The probe hit the OUTPUT cap rather than the time budget. Named so the
+/// producer below and the test that tolerates it read one string instead of
+/// two copies that can drift (AMUX-4787, same reason as `PROBE_TIMEOUT_REASON`
+/// in `memory_consumers`).
+///
+/// This is the SECOND host-sized dimension, and it is the one that caught me
+/// out: the card was written about deadlines, and a busy host is also a BIG
+/// host. `lsof` here emits 8,565,894 bytes against the 8 MiB production cap,
+/// 2.1% over, so the probe truncates and the job defers every tick.
+const PROBE_TRUNCATED_REASON: &str = "open-file probe truncated";
+
 async fn probe_open_paths(
     command: &mut tokio::process::Command,
     timeout: Duration,
@@ -130,7 +141,7 @@ async fn probe_open_paths(
     let mut data = Vec::new();
     tokio::time::timeout(timeout, async {
         stdout.take(max + 1).read_to_end(&mut data).await?;
-        anyhow::ensure!(data.len() <= max as usize, "open-file probe truncated");
+        anyhow::ensure!(data.len() <= max as usize, "{PROBE_TRUNCATED_REASON}");
         anyhow::ensure!(child.wait().await?.success(), "open-file probe failed");
         Ok::<_, anyhow::Error>(())
     })
@@ -391,31 +402,50 @@ mod tests {
     /// neither claim needs a stopwatch.
     ///
     /// Widening alone would have MOVED the flake rather than removed it, so
-    /// the timeout also stops being a panic. The tolerated failure is exactly
-    /// one: `tokio`'s `Elapsed`, matched by TYPE rather than by its message.
-    /// A missing binary, a non-zero exit, truncated output and a parse that
-    /// found no paths all still fail here.
+    /// the budgets stop being a panic as well. A missing binary, a non-zero
+    /// exit and a parse that found no paths all still fail here.
+    ///
+    /// THERE ARE TWO HOST-SIZED DIMENSIONS, NOT ONE, and the first version of
+    /// this fix only handled time. A busy host is also a BIG host: `lsof` here
+    /// emits 8,565,894 bytes, 2.1% over the 8 MiB cap this test used to pass
+    /// through from production, so the probe truncated and the test failed
+    /// with "open-file probe truncated" on the very run that was meant to
+    /// confirm the deadline fix. Both budgets are the TEST'S now, and both
+    /// host conditions are tolerated by name.
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn native_open_file_probe_works_with_launchd_path_and_observes_held_file() {
+        // Both generous, for the same reason: `open_paths` keeps production's
+        // 5s and 8 MiB, which are the right costs for a background tick. What
+        // this test claims is that the absolute lsof path works under the
+        // launchd PATH and that the parser sees a held file, and neither claim
+        // needs a stopwatch or a byte budget.
         const TEST_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+        const TEST_PROBE_MAX_BYTES: u64 = 256 * 1024 * 1024;
         let home = tempfile::tempdir().unwrap();
         let path = home.path().join("held.txt");
         let _held = std::fs::File::create(&path).unwrap();
         let mut command = open_file_command();
         command.env("PATH", "/usr/bin:/bin");
-        match probe_open_paths(&mut command, TEST_PROBE_TIMEOUT, 8 * 1024 * 1024).await {
+        match probe_open_paths(&mut command, TEST_PROBE_TIMEOUT, TEST_PROBE_MAX_BYTES).await {
             Ok(paths) => assert!(
                 paths.contains(&path) || paths.contains(&path.canonicalize().unwrap()),
                 "held file missing from native probe"
             ),
             Err(error) => {
+                // The tolerated set is exactly two, both meaning "this machine
+                // is bigger than the budget": tokio's `Elapsed`, matched by
+                // TYPE, and the producer's own truncation constant. Anything
+                // else is a defect and still fails.
+                let elapsed = error.downcast_ref::<tokio::time::error::Elapsed>().is_some();
+                let truncated = error.to_string() == PROBE_TRUNCATED_REASON;
                 assert!(
-                    error.downcast_ref::<tokio::time::error::Elapsed>().is_some(),
-                    "the native probe failed for a reason that is not host load: {error}"
+                    elapsed || truncated,
+                    "the native probe failed for a reason that is not host size: {error}"
                 );
                 eprintln!(
-                    "lsof exceeded {TEST_PROBE_TIMEOUT:?} on this host, so the held-file assertion did not run"
+                    "lsof exceeded {TEST_PROBE_TIMEOUT:?} / {TEST_PROBE_MAX_BYTES} bytes on this host, \
+                     so the held-file assertion did not run: {error}"
                 );
             }
         }

@@ -3349,3 +3349,11 @@ FIX: Assert the SHAPE either way, and admit exactly one host excuse. The
   measurement ran, and its own test said a probe that could not run is a
   failure. When a module's contract says "could not measure" is a legitimate
   answer, a test that forbids that answer is testing the machine.
+  AND A BOUNDED PROBE HAS TWO HOST DIMENSIONS, NOT ONE. The first version of
+  this fix handled TIME only, and the very suite run meant to confirm it failed
+  with "open-file probe truncated": a busy host is also a BIG host, and `lsof`
+  here emits 8,565,894 bytes against an 8 MiB cap. The size dimension was
+  invisible until the time one was removed. That second discovery is also
+  AMUX-4791, because the same cap defers real log retention on this box every
+  tick — so the test was not merely flaky, it was the only thing reporting a
+  production job that has silently not run.
