@@ -67,7 +67,18 @@ jobs:
           SOAK_RSS_GROWTH: ${{ github.event.inputs.rss_growth || '0.20' }}
           SOAK_FD_GROWTH: ${{ github.event.inputs.fd_growth || '50' }}
           SOAK_CONCURRENCY: '8'
-        run: bash scripts/soak-probe.sh | tee soak.log
+        # `set -o pipefail` is load-bearing, not tidiness. GitHub's default
+        # shell for `run:` is `bash -e {0}`, WITHOUT pipefail, so a pipeline
+        # exits with the status of its LAST command. `tee` always succeeds, so
+        # soak-probe.sh's `exit 1` was discarded and this gate could not fail.
+        # Measured 2026-09-18: five consecutive weekly runs (08-16 through
+        # 09-13) printed "FAIL: RSS grew ..." and reported success, growth
+        # 0.76-1.47 against a 0.20 threshold. The next step below already sets
+        # `set -euo pipefail` inside its own block, which is why this one read
+        # as deliberate. See AMUX-4742.
+        run: |
+          set -o pipefail
+          bash scripts/soak-probe.sh | tee soak.log
 
       - name: Database growth under churn
         # DB growth/compaction from the plan's soak list. A WAL that never
