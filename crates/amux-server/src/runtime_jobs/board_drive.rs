@@ -671,6 +671,7 @@ pub struct DriveReport {
     /// only ever scanned `backlog`, so a dependency-blocked card stayed blocked
     /// after its blocker finished; this count is how that pass is watched.
     pub unblocked_blocked: usize,
+    pub ephemeral_reaper: EphemeralReaperReport,
     pub lanes: Vec<LaneTrace>,
 }
 
@@ -2388,6 +2389,175 @@ mod epic_completion_unit_tests {
         assert_eq!(got[0].0, "E-1");
         assert_eq!(got[0].1.len(), 2);
     }
+}
+
+// ── Ephemeral worker reaper ──────────────────────────────────────────────
+//
+// Ephemeral workers (CC_EPHEMERAL=1) exist for exactly one fan-out card.
+// Once the work is done or parked, the worker has no purpose. This reaper
+// runs every drive_tick and handles two cases:
+//
+// 1. ALL cards terminal -> stop worker, archive env file, clean worktree
+// 2. Worker idle, only card in backlog/todo, no doing cards -> stop worker
+//    (the card stays on the board for the parent to handle)
+
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct EphemeralReaperReport {
+    pub measured: bool,
+    pub n_considered: usize,
+    pub reaped_done: usize,
+    pub reaped_parked: usize,
+    pub errors: usize,
+}
+
+pub(crate) async fn reap_ephemeral_workers(state: &AppState) -> EphemeralReaperReport {
+    let home = crate::config::amux_home();
+    let sessions_dir = home.join("sessions");
+    let mut report = EphemeralReaperReport { measured: true, ..Default::default() };
+
+    let entries = match std::fs::read_dir(&sessions_dir) {
+        Ok(rd) => rd,
+        Err(_) => return report,
+    };
+
+    let terminal: std::collections::HashSet<&str> =
+        ["done", "verified", "discarded", "cancelled"].iter().copied().collect();
+
+    let mut ephemeral_sessions: Vec<(String, String)> = Vec::new(); // (name, parent)
+    for entry in entries.flatten() {
+        let fname = entry.file_name();
+        let fname_s = fname.to_string_lossy();
+        if !fname_s.ends_with(".env") { continue; }
+        let name = fname_s.trim_end_matches(".env").to_string();
+        let env = crate::config::parse_env_file(&entry.path());
+        if env.get("CC_EPHEMERAL").map(|v| v == "1").unwrap_or(false) {
+            let parent = env.get("CC_PARENT").cloned().unwrap_or_default();
+            ephemeral_sessions.push((name, parent));
+        }
+    }
+
+    report.n_considered = ephemeral_sessions.len();
+    if ephemeral_sessions.is_empty() { return report; }
+
+    let cards_by_session: HashMap<String, Vec<(String, String)>> = match state.store.read() {
+        Ok(conn) => {
+            let mut map: HashMap<String, Vec<(String, String)>> = HashMap::new();
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT id, session, status FROM issues WHERE session IN \
+                 (SELECT DISTINCT session FROM issues WHERE session LIKE '%-eph-%')"
+            ) {
+                let rows = stmt.query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+                });
+                if let Ok(rows) = rows {
+                    for row in rows.flatten() {
+                        map.entry(row.1).or_default().push((row.0, row.2));
+                    }
+                }
+            }
+            map
+        }
+        Err(_) => return report,
+    };
+
+    for (name, parent) in &ephemeral_sessions {
+        let cards = cards_by_session.get(name.as_str());
+        let card_list = match cards {
+            Some(c) if !c.is_empty() => c,
+            _ => continue,
+        };
+
+        let all_terminal = card_list.iter().all(|(_, st)| terminal.contains(st.as_str()));
+        let has_doing = card_list.iter().any(|(_, st)| st == "doing");
+        let all_parked = card_list.iter().all(|(_, st)| st == "backlog" || st == "todo");
+
+        let action = if all_terminal {
+            "done"
+        } else if !has_doing && all_parked {
+            "parked"
+        } else {
+            continue;
+        };
+
+        let is_idle = !crate::api::session_verbs::is_running(name).await;
+        if !is_idle && action == "parked" {
+            continue;
+        }
+
+        let card_ids: Vec<String> = card_list.iter().map(|(id, _)| id.clone()).collect();
+        let card_summary = card_list.iter()
+            .map(|(id, st)| format!("{id}={st}"))
+            .collect::<Vec<_>>().join(", ");
+
+        tracing::info!(
+            target: "amux::board",
+            session = %name,
+            parent = %parent,
+            action = action,
+            cards = %card_summary,
+            verdict = "ephemeral_reap",
+            measured = true,
+            n_considered = card_list.len(),
+            "reaping ephemeral worker"
+        );
+
+        // Stop the tmux session
+        let stq = format!("={name}");
+        let _ = tokio::process::Command::new("tmux")
+            .args(["kill-session", "-t", &stq])
+            .output()
+            .await;
+
+        // Archive the env file (rename to .env.reaped)
+        let env_path = sessions_dir.join(format!("{name}.env"));
+        let archive_path = sessions_dir.join(format!("{name}.env.reaped"));
+        if let Err(e) = std::fs::rename(&env_path, &archive_path) {
+            tracing::warn!(
+                session = %name,
+                error = %e,
+                "ephemeral reaper: failed to archive env file"
+            );
+            report.errors += 1;
+        }
+
+        // Clean up worktree if present
+        let wt_path = home.join("worktrees").join(name);
+        if wt_path.exists() {
+            let _ = tokio::process::Command::new("git")
+                .args(["worktree", "remove", "--force"])
+                .arg(&wt_path)
+                .output()
+                .await;
+        }
+
+        // Log the card back to the parent if parked
+        if action == "parked" && !parent.is_empty() {
+            let stamp = chrono::Local::now().format("%H:%M").to_string();
+            for card_id in &card_ids {
+                let cid = card_id.clone();
+                let par = parent.clone();
+                let stamp_w = stamp.clone();
+                let _ = state.store.write_async(move |conn| {
+                    if let Some(mut card) = bs::get_issue(conn, &cid)? {
+                        card.session = Some(par);
+                        card.log = Some(bs::append_log(
+                            card.log.as_deref(), &stamp_w,
+                            "ephemeral worker reaped (card parked); returned to parent session",
+                        ));
+                        card.updated = chrono::Utc::now().timestamp();
+                        card.rev += 1;
+                        bs::save_patched(conn, &mut card)?;
+                    }
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                }).await;
+            }
+            report.reaped_parked += 1;
+        } else {
+            report.reaped_done += 1;
+        }
+    }
+
+    report
 }
 
 /// The revisit-date arm: promote `backlog` cards whose own due date arrived,
@@ -5749,6 +5919,7 @@ pub async fn drive_tick<F: Fleet>(state: &AppState, fleet: &F) -> DriveReport {
     // Complete root epics before dispatch so the Messages chip and the board
     // agree that a command is finished as soon as all of its leaves are.
     report.completed_epics = complete_finished_epics(state).await;
+    report.ephemeral_reaper = reap_ephemeral_workers(state).await;
     // DRIVE TO VERIFIED, BEFORE DISPATCH. A card parked in `backlog` on a
     // `depends_on` dependency re-activates to `todo` the moment every dependency
     // reaches a terminal status, so a "do B after A" command completes instead

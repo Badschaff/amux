@@ -6455,7 +6455,6 @@ async fn fan_out_item(
                 env.set("CC_PROVIDER", &provider);
                 env.set("CC_TAGS", "ephemeral");
                 env.set("CC_CREATOR", &format!("fan-out:{actor}"));
-                env.set("AMUX_DISPATCH_BACKLOG_WHEN_IDLE", "0");
                 env.set("AMUX_BOARD_DELEGATION", "0");
 
                 let model_flag = format!("--model {} --dangerously-skip-permissions", model);
