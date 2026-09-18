@@ -10,7 +10,14 @@
 #   --live: actually start Haiku workers (requires API key, costs money)
 #   default: API-only validation, no real workers spawned
 
-set -uo pipefail
+set -euo pipefail
+# `-e` needs the counters below to be ASSIGNMENTS, not `((n++))` (AF-562).
+# `((n++))` yields the counter's OLD value as its exit status, so the first
+# increment from 0 returns 1. As the last statement of `check`, that becomes
+# the FUNCTION's status and `set -e` aborts at the call site: the harness ran
+# 1 cell instead of 26 and exited 1, which is the "reported a clean result for
+# cells that never ran" failure the guard exists to catch, reintroduced by the
+# fix for it.
 
 AMUX_API="${AMUX_URL:-https://localhost:8824}"
 SESSION="${AMUX_SESSION:-test-fanout}"
@@ -24,10 +31,10 @@ check() {
   local label="$1" ok="$2"
   if [[ "$ok" == "true" || "$ok" == "0" ]]; then
     echo "  PASS: $label"
-    ((pass++))
+    pass=$((pass + 1))
   else
     echo "  FAIL: $label"
-    ((fail++))
+    fail=$((fail + 1))
   fi
 }
 
