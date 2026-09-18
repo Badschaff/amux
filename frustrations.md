@@ -3291,3 +3291,45 @@ FIX: Assert the SHAPE either way, and admit exactly one host excuse. The
   AMUX-4791, because the same cap defers real log retention on this box every
   tick — so the test was not merely flaky, it was the only thing reporting a
   production job that has silently not run.
+
+  ## A create can silently fold into an active card, with no visible signal, and a routine cleanup then lands on the wrong card
+  AREA: board
+  SEVERITY: blocks
+  STATUS: open
+  DATE: 2026-09-18
+  SESSION: amux-frustrations
+  CARD: AF-922
+  SYMPTOM: sent a plain `POST /api/board` to create a throwaway verification card
+   (title "af460 verify probe") while my own AF-460 was `doing`. The response was an
+   ordinary-looking 2xx with an `id` field — no error, nothing that read as a
+   refusal — except the `id` it returned was `AF-460` itself: a model-judged
+   "semantic intake" classifier (92% confidence, ~4.7s) had decided the new title
+   was "the same work" and folded it (`intake.action: "append"`) instead of
+   creating anything new. The fold signal was real and present in the response
+   body (`intake.comparison.decision.reason`), just buried where nobody creating
+   a routine test card would think to check it. Treating the returned id as a
+   disposable probe, I archived it, force-PATCHed its status (correctly refused,
+   `archived_task_immutable`), restored it, then DELETEd it — every one of those
+   calls actually landed on my real, in-progress AF-460 work card. Caught only
+   because the DELETE produced a 404 on a card I knew should still exist.
+  COST: a live work card carrying ~50 log lines of investigation, decisions and a
+   shipped fix came within one missed double-check of being permanently gone from
+   every normal read path. Recovery required leaving the sanctioned API entirely —
+   a direct `sqlite3` UPDATE clearing `issues.deleted` on the live production DB —
+   because no undelete endpoint or CLI verb exists for a soft-deleted card
+   (confirmed: `board.rs::delete_item` calls `bs::soft_delete`, which only sets a
+   timestamp; nothing clears it back). Ten minutes, plus the risk of a manual raw
+   SQL write against the fleet's shared database, for what should have been a
+   disposable throwaway create.
+  FIX: not chosen. Two independent fixes, and they are not the same one: (1) a
+   fold this consequential should not resolve to a bare 2xx — the response should
+   make it unmistakable that no new resource was created (a distinct status code,
+   or `applied: false`-shaped body, the way other non-mutations in this API
+   already signal a no-op rather than dressing it as success). (2) `soft_delete`
+   has no inverse anywhere in the API or CLI — a mistaken delete on ANY card, fold
+   or not, currently has no sanctioned recovery path at all; a plain `amux board
+   undelete <ID>` (clearing `deleted` the same way `unarchive` clears `archived`)
+   would have made this a 5-second fix instead of a raw DB write. Neither is mine
+   to ship unilaterally — (1) changes the create contract every caller reads, (2)
+   is a new recovery primitive — but leaving (2) missing means the NEXT accidental
+   delete on this fleet has the same only-option: raw SQL against production.
