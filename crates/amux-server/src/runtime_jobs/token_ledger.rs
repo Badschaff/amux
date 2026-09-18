@@ -586,6 +586,20 @@ const MAX_CLAIM_WINDOW_S: i64 = 24 * 3600;
 /// acquisitions for a full pass.
 const HOLD_BUDGET_MS: u128 = 120;
 
+/// Ledger rows one UPDATE may attribute (AMUX-4750).
+///
+/// THE TIME BUDGET CANNOT BOUND A HOLD BELOW ITS SLOWEST SINGLE STATEMENT, and
+/// at a 120ms budget the worst hold measured 563ms, so one UPDATE took ~440ms.
+/// That one is not waste: a 24-hour window over a busy lane genuinely matches
+/// thousands of rows, and each is a write plus an index update.
+///
+/// So the statement gets a cap too. A window with more rows than this attributes
+/// the rest on a later cycle, which is safe here for a reason specific to this
+/// job: it re-derives every window from scratch every 120 seconds and only ever
+/// fills rows still unattributed, so an interrupted window is resumed rather
+/// than lost. A job without that property would need a cursor instead.
+const ROWS_PER_UPDATE: i64 = 2_000;
+
 /// Fill `token_ledger.task` for turns that fall inside a card's claim window on
 /// the SAME lane. Only touches unattributed rows.
 ///
@@ -746,14 +760,17 @@ pub async fn attribute_tasks(store: &SharedStore) -> anyhow::Result<()> {
         store
             .write_async(move |conn| {
                 let started = std::time::Instant::now();
+                // rowid-IN, because a plain UPDATE..LIMIT needs a nonstandard
+                // SQLite build flag — the same shape the retention trims use.
                 let mut stmt = conn.prepare_cached(
-                    "UPDATE token_ledger SET task=?1 \
-                     WHERE task='' AND session=?2 AND COALESCE(session,'') <> '' \
-                       AND ts>=?3 AND ts<=?4",
+                    "UPDATE token_ledger SET task=?1 WHERE rowid IN ( \
+                       SELECT rowid FROM token_ledger \
+                        WHERE task='' AND session=?2 AND COALESCE(session,'') <> '' \
+                          AND ts>=?3 AND ts<=?4 LIMIT ?5)",
                 )?;
                 let mut n = 0usize;
                 for (task, session, from, to) in &windows[start_at..] {
-                    stmt.execute(rusqlite::params![task, session, from, to])?;
+                    stmt.execute(rusqlite::params![task, session, from, to, ROWS_PER_UPDATE])?;
                     n += 1;
                     if started.elapsed().as_millis() >= HOLD_BUDGET_MS {
                         break;
