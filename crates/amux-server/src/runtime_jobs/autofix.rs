@@ -3934,7 +3934,26 @@ type InvRow = (
     String,
     String,
     String,
+    // episode: which unbroken failing run this is (AMUX-4798).
+    i64,
 );
+
+/// The episode component of a dedupe signature.
+///
+/// EMPTY FOR EPISODE 1, and that is the whole migration strategy rather than a
+/// cosmetic choice. Every incident that existed when `episode` was added got
+/// the DEFAULT 1, so they must keep producing the signature their existing card
+/// already carries — 82 live incidents re-signatured at once would mint a card
+/// storm on the next sweep, which is the opposite of the fault being fixed.
+/// Only a genuine reopen, after this shipped, moves an incident to 2 and earns
+/// a new card.
+fn episode_sig(episode: i64) -> String {
+    if episode <= 1 {
+        String::new()
+    } else {
+        format!("|e{episode}")
+    }
+}
 
 /// How many distinct entities one invariant must be failing for before it is
 /// filed as a SINGLE rollup card instead of one card per entity.
@@ -4017,7 +4036,7 @@ pub fn detect_invariants(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Supp
         // what separates "held red on purpose until Tuesday" from "a fault that
         // is getting worse". Without it the two file identical cards.
         "SELECT invariant_id, entity_key, status, first_seen, last_seen, occurrences, \
-                expected, observed, COALESCE(evidence, '') \
+                expected, observed, COALESCE(evidence, ''), COALESCE(episode, 1) \
          FROM _amux_invariant_incident WHERE resolved_at IS NULL AND status = 'fail' \
          AND last_seen >= ?1 \
          ORDER BY occurrences DESC LIMIT 200",
@@ -4035,6 +4054,7 @@ pub fn detect_invariants(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Supp
             r.get::<_, String>(6)?,
             r.get::<_, String>(7)?,
             r.get::<_, String>(8)?,
+            r.get::<_, i64>(9)?,
         ))
     }) else {
         return (out, suppressed);
@@ -4080,6 +4100,18 @@ pub fn detect_invariants(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Supp
         let worst = filing.iter().max_by_key(|r| r.5).unwrap();
         let first_seen = filing.iter().map(|r| r.3).fold(f64::MAX, f64::min);
         let last_seen = filing.iter().map(|r| r.4).fold(0.0f64, f64::max);
+        // MIN, not max, and deliberately the conservative one. A rollup fires
+        // for an invariant failing across >= INVARIANT_ROLLUP_AT entities, and
+        // those are the chronic fleet-wide checks; taking `max` would re-mint
+        // the rollup card whenever ANY single member flapped, which is the card
+        // storm this change is explicitly required not to cause. `min` advances
+        // only once the whole filing set has moved on.
+        //
+        // It costs little here: the case this work came from is single-entity
+        // (`fleet`), which never reaches the rollup arm at all. If a rollup
+        // turns out to freeze the way per-entity did, that is a measurement to
+        // bring back, not a guess to make now.
+        let episode = filing.iter().map(|r| r.9).min().unwrap_or(1);
         let n = entities.len();
         out.push(Finding {
             kind: DetectorKind::InvariantBreach,
@@ -4088,11 +4120,29 @@ pub fn detect_invariants(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Supp
             // every time the set changes by one.
             //
             // EPISODE IDENTITY (AMUX-3633), the same shape AMUX-3472 gave
-            // outliers and AMUX-3591 gave 5xx. `first_seen` is the start of the
-            // current UNBROKEN failing run: `_amux_invariant_incident` rows are
-            // per-episode and get a `resolved_at` when the invariant recovers,
-            // so a recovery-then-refail opens a NEW row with a NEW first_seen.
-            signature: format!("invariant|{id}|ROLLUP|{}", first_seen as i64),
+            // outliers and AMUX-3591 gave 5xx.
+            //
+            // CORRECTED (AMUX-4798). This comment used to read: "`first_seen`
+            // is the start of the current UNBROKEN failing run:
+            // `_amux_invariant_incident` rows are per-episode and get a
+            // `resolved_at` when the invariant recovers, so a recovery-then-
+            // refail opens a NEW row with a NEW first_seen." Every clause of
+            // that is false. store.rs keeps ONE row per (invariant, entity) and
+            // reopens it in place by setting `resolved_at = NULL`; `first_seen`
+            // is the first failure EVER and never moves. So this signature was
+            // frozen for the lifetime of the pair and filed one card per
+            // invariant forever. 77 incidents were already in that state, still
+            // failing up to 25 days after their card was minted.
+            //
+            // The wrong comment is why review never caught it: it described a
+            // contract the reader had no reason to go and verify. `episode` is
+            // now the fact, written by the statement that actually performs the
+            // reopen, so the two components cannot disagree again.
+            signature: format!(
+                "invariant|{id}|ROLLUP|{}{}",
+                first_seen as i64,
+                episode_sig(episode)
+            ),
             title: format!("invariant {id} failing across {n} entities — one fault, not {n} tasks"),
             evidence: vec![
                 ("verdict".into(), format!(
@@ -4149,14 +4199,15 @@ pub fn detect_invariants(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Supp
         });
     }
 
-    for (id, entity, _status, first, last, occ, expected, observed, evidence) in flat {
+    for (id, entity, _status, first, last, occ, expected, observed, evidence, episode) in flat {
         let sig_entity = if entity.is_empty() {
             "fleet".to_string()
         } else {
             entity.clone()
         };
         // Episode identity, same reason as the ROLLUP arm above (AMUX-3633).
-        let signature = format!("invariant|{id}|{sig_entity}|{}", first as i64);
+        let signature =
+            format!("invariant|{id}|{sig_entity}|{}{}", first as i64, episode_sig(episode));
         if occ < min_occ {
             suppressed.push(sup(
                 DetectorKind::InvariantBreach,
@@ -14429,6 +14480,13 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn inv_row(id: &str, entity: &str, occ: i64) -> InvRow {
+        inv_row_in_episode(id, entity, occ, 1)
+    }
+
+    /// The same row in a NAMED episode (AMUX-4798). Episode 1 is the shape
+    /// every pre-existing incident carries, so `inv_row` keeps meaning exactly
+    /// what it did and the episode cells below have to ask for a reopen.
+    fn inv_row_in_episode(id: &str, entity: &str, occ: i64, episode: i64) -> InvRow {
         (
             id.into(),
             entity.into(),
@@ -14439,6 +14497,7 @@ mod tests {
             "expected".into(),
             "observed".into(),
             String::new(),
+            episode,
         )
     }
 
@@ -14462,19 +14521,66 @@ mod tests {
             // queueing it (AMUX-3645); a fixture without the column would make
             // every dwell cell below unrunnable rather than red, which is the
             // worse of the two failures.
+            // `episode` likewise mirrors migration 0081 (AMUX-4798), with the
+            // same DEFAULT 1, so a fixture row that does not name one behaves
+            // like every incident that predates the column.
             "CREATE TABLE _amux_invariant_incident (invariant_id TEXT, entity_key TEXT, \
              status TEXT, first_seen REAL, last_seen REAL, occurrences INTEGER, \
-             resolved_at REAL, expected TEXT, observed TEXT, evidence TEXT);",
+             resolved_at REAL, expected TEXT, observed TEXT, evidence TEXT, \
+             episode INTEGER NOT NULL DEFAULT 1);",
         )
         .unwrap();
         for r in rows {
             conn.execute(
-                "INSERT INTO _amux_invariant_incident VALUES (?1,?2,?3,?4,?5,?6,NULL,?7,?8,?9)",
-                rusqlite::params![r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7, r.8],
+                "INSERT INTO _amux_invariant_incident VALUES (?1,?2,?3,?4,?5,?6,NULL,?7,?8,?9,?10)",
+                rusqlite::params![r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7, r.8, r.9],
             )
             .unwrap();
         }
         detect_invariants(&conn, 9999.0).0
+    }
+
+    /// AMUX-4798: a RECURRENCE earns a new card; a continuing failure does not.
+    ///
+    /// Both directions, because either alone passes for a broken dedupe: a
+    /// signature that never repeats files on every sweep, and one that never
+    /// changes files once per invariant forever. The second is what actually
+    /// shipped — 77 incidents frozen, still failing up to 25 days after their
+    /// card was minted, including the one that pinned three lanes for four
+    /// hours on 2026-09-18.
+    #[test]
+    fn a_reopened_incident_earns_a_new_card_and_a_continuing_one_does_not() {
+        let id = "hooks.report_hook_matches_committed";
+        let sig = |episode: i64| {
+            let f = invariant_findings(&[inv_row_in_episode(id, "", 61, episode)]);
+            assert_eq!(f.len(), 1, "one entity, one card: {f:?}");
+            f[0].signature.clone()
+        };
+
+        // SAME episode, later in the run: the incident is the same fact, so the
+        // signature must not move or every sweep mints a duplicate.
+        assert_eq!(sig(1), sig(1), "a continuing failure keeps its signature");
+
+        // EPISODE 1 IS UNCHANGED FROM THE PRE-4798 FORMAT. This is the
+        // migration cell: every incident alive when `episode` was added got the
+        // DEFAULT 1, so if this signature moved, the next sweep would re-file
+        // all 82 of them at once.
+        assert_eq!(
+            sig(1),
+            "invariant|hooks.report_hook_matches_committed|fleet|1000",
+            "episode 1 must produce exactly the legacy signature"
+        );
+
+        // A REOPEN earns a new one. This is the case that was impossible
+        // before: the incident row is reused and `first_seen` never moves, so
+        // without the episode component these two are byte-identical.
+        assert_ne!(sig(1), sig(2), "a recurrence must not dedupe against the old card");
+        assert_ne!(sig(2), sig(3), "and each later episode is distinct again");
+        assert!(
+            sig(2).starts_with(&sig(1)),
+            "the episode is a SUFFIX, so the old signature stays readable inside the new: {}",
+            sig(2)
+        );
     }
 
     #[test]

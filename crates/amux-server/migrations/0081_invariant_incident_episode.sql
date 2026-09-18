@@ -1,0 +1,17 @@
+-- AMUX-4798. An incident's EPISODE: which unbroken failing run this is.
+--
+-- `_amux_invariant_incident` keeps ONE row per (invariant_id, entity_key) and
+-- reopens it on a refail by setting `resolved_at = NULL`, deliberately, so a
+-- flap reads as one incident and "broken since" survives thousands of
+-- occurrences. autofix meanwhile keyed its dedupe signature on `first_seen`,
+-- documenting it as the start of the current run. It is not — it is the first
+-- failure EVER — so the signature froze for the lifetime of the pair and one
+-- card was filed per invariant forever. 77 incidents were already in that
+-- state, still failing up to 25 days after their card was minted.
+--
+-- DEFAULT 1, and that value is load-bearing rather than incidental: the
+-- signature appends an episode component only above 1, so every existing row
+-- keeps the signature its existing card already carries. Backfilling anything
+-- else here would re-signature 82 live incidents at once and mint a card storm
+-- on the next sweep, which is the failure this change exists to avoid.
+ALTER TABLE _amux_invariant_incident ADD COLUMN episode INTEGER NOT NULL DEFAULT 1;

@@ -146,7 +146,31 @@ pub async fn record(store: &SharedStore, results: Vec<InvariantResult>, duration
                            -- REOPENS rather than staying closed, so a flap is
                            -- visible as one incident with a resolved_at that
                            -- went back to NULL.
-                           resolved_at = NULL
+                           resolved_at = NULL,
+                           -- EPISODE IDENTITY (AMUX-4798), advanced on exactly
+                           -- the transition above: only when this row WAS
+                           -- resolved and is now failing again. A continuing
+                           -- failure leaves it alone, so an episode is one
+                           -- unbroken failing run.
+                           --
+                           -- autofix keys its dedupe on this. It used to key on
+                           -- `first_seen`, which its own comment described as
+                           -- the start of the current run; `first_seen` is the
+                           -- first failure EVER and this statement is why. The
+                           -- signature therefore froze for the lifetime of the
+                           -- pair and one card was filed per invariant forever
+                           -- — 77 incidents were in that state, still failing up
+                           -- to 25 days after their card was minted, including
+                           -- the one that pinned three lanes for four hours on
+                           -- 2026-09-18.
+                           --
+                           -- first_seen is deliberately NOT reset: it is what
+                           -- makes \"broken since\" answerable after 2880
+                           -- occurrences, and resetting it would buy a
+                           -- per-episode signature by destroying the flap
+                           -- history this table exists to hold.
+                           episode = _amux_invariant_incident.episode
+                               + CASE WHEN _amux_invariant_incident.resolved_at IS NULL THEN 0 ELSE 1 END
                          RETURNING occurrences",
                         )?
                         .query_row(
