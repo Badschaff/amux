@@ -6816,6 +6816,100 @@ async fn review_and_done_are_refused_with_every_unmet_check_listed_together() {
     assert_eq!(v["status"], json!("review"), "{v}");
 }
 
+// ---- AMUX-4786: the refusal names the DEPENDENCY's type, not a constant -----
+
+/// Park a dependency at `done` carrying an exact type.
+///
+/// Status is set with SQL, as `doing_ack_cannot_bypass_readiness` below does:
+/// the dependency's OWN done-gate is not what is under test here, and driving
+/// it would make this red whenever that table changes.
+async fn dep_done_with_type(
+    app: &axum::Router,
+    store: &std::sync::Arc<Store>,
+    item_type: &str,
+) -> String {
+    let v = create(app, json!({ "title": format!("prerequisite ({item_type})"),
+        "session": "lane-4786", "type": item_type, "status": "backlog" })).await;
+    let id = v["id"].as_str().unwrap().to_string();
+    let w = id.clone();
+    store.write(move |conn| {
+        conn.execute("UPDATE issues SET status='done' WHERE id=?1", [w])?;
+        Ok(amux_server::db::WriteOutcome { applied: true, events: vec![] })
+    }).unwrap();
+    id
+}
+
+async fn dependent_on(app: &axum::Router, dep_id: &str) -> String {
+    let v = create(app, json!({ "title": format!("dependent on {dep_id}"), "session": "lane-4786",
+        "type": "chore", "status": "backlog", "next_action": "Do the scoped work" })).await;
+    let id = v["id"].as_str().unwrap().to_string();
+    let (st, _, v) = send(app, "PATCH", &format!("/api/board/{id}"),
+        Some(json!({ "depends_on": [dep_id] }))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    id
+}
+
+/// AMUX-4786: the parenthetical explaining a dependency refusal names the
+/// DEPENDENCY'S type. It used to read "code-type work completes at verified"
+/// for every dependency, including the ops and blocker cards the same rule
+/// covers, so the sentence described a card it had never looked at.
+///
+/// BOTH types are asserted, and that is the whole design of this test: a single
+/// cell passes for a message that hardcodes whichever type that cell happens to
+/// use, which is exactly how the original defect survived.
+#[tokio::test]
+async fn a_dependency_refusal_names_the_dependencys_own_type() {
+    let (app, store, _dir) = app_with_store();
+
+    for (item_type, other) in [("ops", "code"), ("code", "ops")] {
+        let dep = dep_done_with_type(&app, &store, item_type).await;
+        let card = dependent_on(&app, &dep).await;
+        let (st, _, v) = send(&app, "PATCH", &format!("/api/board/{card}"),
+            Some(json!({ "status": "doing" }))).await;
+        assert_eq!(st, StatusCode::CONFLICT, "a {item_type} dependency at done must refuse: {v}");
+        assert_eq!(v["code"], json!("acceptance_checks_failed"), "{v}");
+        let m = v["missing"].as_array().unwrap().iter()
+            .find(|m| m["check"] == "dependency_resolved")
+            .unwrap_or_else(|| panic!("no dependency_resolved check for a {item_type} dependency: {v}"));
+        assert_eq!(m["card"], json!(dep), "{v}");
+        assert_eq!(m["type"], json!(item_type), "the refusal must carry the dependency's own type: {v}");
+        let fix = m["fix"].as_str().unwrap_or_default();
+        assert!(
+            fix.contains(&format!("({item_type} work completes at verified)")),
+            "the fix line must name {item_type}: {fix}"
+        );
+        // The ABSENCE is the half that catches a constant. Naming `ops` means
+        // nothing unless `code` is gone from the same sentence.
+        assert!(
+            !fix.contains(&format!("({other} work")) && !fix.contains("code-type"),
+            "the fix line still names {other}: {fix}"
+        );
+    }
+
+    // A `doc` dependency at `done` IS resolved, so this message is never
+    // reached for it and no cell may claim otherwise.
+    //
+    // Asserted in two steps on purpose. The unacked PATCH names THIS rule when
+    // it breaks; leaving it to `move_as` reports "only a gate refusal is
+    // expected here" from inside a helper, which is true and tells the reader
+    // nothing about doc dependencies.
+    let doc = dep_done_with_type(&app, &store, "doc").await;
+    let card = dependent_on(&app, &doc).await;
+    let (_, _, v) = send(&app, "PATCH", &format!("/api/board/{card}"),
+        Some(json!({ "status": "doing" }))).await;
+    let dep_checks = v["missing"].as_array()
+        .map(|a| a.iter().filter(|m| m["check"] == "dependency_resolved").count())
+        .unwrap_or(0);
+    assert_eq!(
+        dep_checks, 0,
+        "a doc dependency at done RESOLVES, so the refusal this card is about must never be reached for it: {v}"
+    );
+    // And the claim really does go through, so the cell above is not passing
+    // because something else refused first.
+    let v = move_as(&app, &card, "doing", "lane-4786").await;
+    assert_eq!(v["status"], json!("doing"), "a doc dependency at done resolves: {v}");
+}
+
 
 #[tokio::test]
 async fn doing_ack_cannot_bypass_readiness_and_repairs_are_atomic() {

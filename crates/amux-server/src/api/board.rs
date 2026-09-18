@@ -11407,28 +11407,61 @@ pub async fn patch_item(
                             // listed and does not block: refusing would strand
                             // the card with no truthful move. Dispatch stays
                             // conservative and does not promote over it.
-                            let dep_status: Option<String> = match conn.query_row(
-                                "SELECT status FROM issues WHERE id=?1 AND deleted IS NULL",
+                            // TYPE comes back with status, in the one query, and
+                            // the predicate is then evaluated from those two
+                            // values rather than re-read (AMUX-4786). The
+                            // message explaining a refusal and the rule
+                            // producing it now read the SAME row, so they cannot
+                            // describe different cards.
+                            let dep_state: Option<(String, String)> = match conn.query_row(
+                                "SELECT status, COALESCE(type, '') FROM issues WHERE id=?1 AND deleted IS NULL",
                                 [dep],
-                                |r| r.get(0),
+                                |r| Ok((r.get(0)?, r.get(1)?)),
                             ) {
-                                Ok(status) => Some(status),
+                                Ok(v) => Some(v),
                                 Err(rusqlite::Error::QueryReturnedNoRows) => None,
                                 Err(e) => return Err(e),
                             };
-                            match dep_status {
+                            match dep_state {
                                 None => missing.push(json!({
                                     "check": "dependency_exists",
                                     "blocking": target == TaskStatus::Doing,
                                     "card": dep,
                                     "fix": format!("{dep} names no card; remove it from depends_on with a reason"),
                                 })),
-                                Some(status) if !bs::dependency_resolved(conn, dep)? => missing.push(json!({
-                                    "check": "dependency_resolved",
-                                    "card": dep,
-                                    "status": status,
-                                    "fix": format!("finish {dep} (code-type work completes at verified), or remove it from depends_on with a reason if {} does not need it", next.id),
-                                })),
+                                Some((status, item_type)) if !bs::dependency_is_resolved(&status, &item_type) => {
+                                    // NAMED, not hardcoded. This parenthetical
+                                    // read "code-type work completes at
+                                    // verified" for every dependency, including
+                                    // the ops and blocker cards the same rule
+                                    // covers, so the sentence described a card
+                                    // it had never looked at.
+                                    //
+                                    // A wrong type here is expensive out of
+                                    // proportion to its size, because the two
+                                    // reactions it invites are both wrong and
+                                    // one is destructive: re-type the
+                                    // dependency until the sentence fits, or
+                                    // conclude the board has the wrong type
+                                    // recorded. The `wrong_type?` hint that
+                                    // rides on the same response object
+                                    // actively points at the first.
+                                    //
+                                    // Resolved through `core_item_type`, the
+                                    // same normalisation `dependency_is_resolved`
+                                    // applies, so an unset or unrecognised type
+                                    // is named as what the rule actually treated
+                                    // it as rather than as something a reader
+                                    // would have to look up.
+                                    let named = bs::core_item_type(&item_type).as_str();
+                                    missing.push(json!({
+                                        "check": "dependency_resolved",
+                                        "card": dep,
+                                        "status": status,
+                                        "type": named,
+                                        "fix": format!("finish {dep} ({named} work completes at verified), or remove it from depends_on with a reason if {} does not need it", next.id),
+                                    }))
+                                }
                                 Some(_) => {}
                             }
                         }
