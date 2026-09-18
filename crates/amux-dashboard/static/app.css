@@ -220,6 +220,7 @@
      2026-09-14), so it takes Archived's side padding and spaces itself from the
      cards above rather than below. */
   #paused-section { padding: 0 12px; }
+  #expired-section { padding: 0 12px; }
   .paused-footer {
     display: flex; align-items: center; gap: 8px;
     padding: 9px 12px; border-radius: 8px; cursor: pointer;
@@ -272,6 +273,22 @@
     .paused-resume-btn { min-height: 44px; min-width: 44px; padding: 6px 14px; font-size: 0.82rem; }
     .paused-archive-btn { min-height: 44px; min-width: 44px; padding: 6px 10px; font-size: 0.82rem; }
     .paused-footer { min-height: 44px; padding: 10px 14px; font-size: 0.85rem; }
+  }
+
+  /* Expired ephemeral workers */
+  .expired-footer {
+    display: flex; align-items: center; gap: 8px;
+    padding: 9px 12px; border-radius: 8px; cursor: pointer;
+    border: 1px solid var(--red, #f85149); color: var(--red, #f85149);
+    font-size: 0.82rem; font-weight: 600; user-select: none; margin-top: 8px;
+    background: var(--card);
+  }
+  .expired-footer:hover { border-color: color-mix(in srgb, var(--red, #f85149) 80%, white); }
+  .expired-chevron { font-size: 0.65rem; transition: transform 0.15s; color: var(--red, #f85149); }
+  .expired-chevron.open { transform: rotate(90deg); }
+  .expired-body { margin-top: 6px; display: flex; flex-direction: column; gap: 5px; }
+  @media (max-width: 600px) {
+    .expired-footer { min-height: 44px; padding: 10px 14px; font-size: 0.85rem; }
   }
 
   /* Archived sessions */
@@ -2721,6 +2738,11 @@
     font-weight: 600; text-transform: uppercase; flex-shrink: 0;
     letter-spacing: 0.3px;
   }
+  button.status-badge {
+    border: 0; cursor: pointer; font-family: inherit;
+    -webkit-tap-highlight-color: transparent;
+  }
+  button.status-badge:hover { filter: brightness(1.15); }
   .status-badge.active { background: rgba(63,185,80,0.2); color: var(--green); }
   .status-badge.blocked { background: rgba(227,134,37,0.22); color: #e38625; }
   .status-badge.waiting { background: rgba(210,153,34,0.2); color: var(--yellow); }

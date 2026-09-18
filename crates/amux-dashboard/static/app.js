@@ -577,6 +577,7 @@ let sessions = [];
 // old task attribution back on screen.
 let _sessionsSnapshotEpoch = 0;
 let pausedExpanded = false;
+let expiredExpanded = false;
 let archivedExpanded = false;
 let gitInfo = {};  // {sessionName: {branch, repo, _conflict}}
 let _sessionLoadError = null; // Last failed worker read; a response is not necessarily data.
@@ -4785,6 +4786,58 @@ function _stalledChip(s) {
     + w.ready + ' ready</span>';
 }
 
+async function _openStatusDetail(name) {
+  document.getElementById('status-detail-dialog')?.close();
+  document.getElementById('status-detail-dialog')?.remove();
+  const dialog = document.createElement('dialog');
+  dialog.id = 'status-detail-dialog';
+  dialog.className = 'work-queue-dialog';
+  dialog.innerHTML = '<div class="work-queue-header"><h2>' + esc(name) + ' · Status detail</h2>'
+    + '<button type="button" class="btn" data-close aria-label="Close">Close</button></div>'
+    + '<div class="work-queue-body" aria-live="polite">Loading…</div>';
+  document.body.appendChild(dialog);
+  dialog.querySelector('[data-close]').onclick = () => dialog.close();
+  dialog.addEventListener('keydown', e => e.stopPropagation());
+  const esc_ = e => { if (e.key === 'Escape' && dialog.open) { e.preventDefault(); e.stopPropagation(); dialog.close(); } };
+  window.addEventListener('keydown', esc_, true);
+  dialog.addEventListener('click', e => { if (e.target === dialog) dialog.close(); });
+  dialog.addEventListener('close', () => { window.removeEventListener('keydown', esc_, true); dialog.remove(); }, { once: true });
+  dialog.showModal();
+  const body = dialog.querySelector('.work-queue-body');
+  try {
+    const [peekRes, boardRes] = await Promise.all([
+      fetch('/api/sessions/' + encodeURIComponent(name) + '/peek?lines=15').then(r => r.json()).catch(() => null),
+      fetch('/api/board?session=' + encodeURIComponent(name) + '&status=doing&slim=0').then(r => r.json()).catch(() => []),
+    ]);
+    if (!dialog.open) return;
+    let html = '';
+    const cards = Array.isArray(boardRes) ? boardRes : [];
+    const blocked = cards.filter(c => c.blocked_on || (c.depends_on && c.depends_on.length));
+    if (blocked.length) {
+      html += '<h3>Blocked cards</h3>';
+      for (const c of blocked) {
+        html += '<div style="margin-bottom:8px;padding:8px;border-radius:6px;background:var(--surface)">'
+          + '<strong>' + esc(c.id) + '</strong> ' + esc(c.title || '') + '<br>';
+        if (c.blocked_on) html += '<span style="color:var(--red)">Blocked on: ' + esc(c.blocked_on) + '</span><br>';
+        if (c.depends_on && c.depends_on.length) html += '<span style="color:var(--orange,var(--yellow))">Waiting on: ' + c.depends_on.map(d => esc(d)).join(', ') + '</span><br>';
+        html += '</div>';
+      }
+    }
+    if (peekRes) {
+      const lines = (peekRes.output || '').split('\n').filter(l => l.trim());
+      const last = lines.slice(-12);
+      if (last.length) {
+        html += '<h3>Terminal</h3><pre style="font-size:0.8rem;max-height:200px;overflow:auto;padding:8px;border-radius:6px;background:var(--surface);white-space:pre-wrap;word-break:break-all;margin:0">'
+          + esc(last.join('\n')) + '</pre>';
+      }
+    }
+    if (!html) html = '<p>No specific blocker information available. Check the worker terminal directly.</p>';
+    body.innerHTML = html;
+  } catch (e) {
+    if (dialog.open) body.innerHTML = '<p role="alert">Could not load status details.</p>';
+  }
+}
+
 const _workerLifecyclePending = new Map();
 function _workerExecutionBadge(s, runtimeBoard) {
   const pending = _workerLifecyclePending.get(s.name);
@@ -4795,16 +4848,16 @@ function _workerExecutionBadge(s, runtimeBoard) {
   let badge = '';
   if (s.status === 'starting') badge = '<span class="status-badge idle">starting</span>';
   else if (!s.running) badge = '<span class="status-badge idle">stopped</span>';
-  else if (s.status === 'error') badge = '<span class="status-badge blocked" title="' + esc(s.error_detail || s.state_detail || 'Worker failed; inspect the terminal for the provider error') + '">error</span>';
+  else if (s.status === 'error') badge = '<button type="button" class="status-badge blocked" title="' + esc(s.error_detail || s.state_detail || 'Worker failed; inspect the terminal for the provider error') + '" onclick="event.stopPropagation();_openStatusDetail(\'' + escJs(s.name) + '\')">error ▾</button>';
   else if (s.status === 'active')  badge = runtimeBoard.syncing
     ? _runtimeBoardSyncBadge()
     : '<span class="status-badge active">working</span>' + _agentsChip(s)
       + (runtimeBoard.cardless ? _runtimeBoardCardlessBadge() : '');
   else if (s.status === 'unattributed') badge = _runtimeBoardSplitBadge(s);
-  else if (s.status === 'blocked') badge = '<span class="status-badge blocked" title="Agent is waiting on a permission decision. Do not send automated messages.">blocked</span>';
+  else if (s.status === 'blocked') badge = '<button type="button" class="status-badge blocked" title="Agent is waiting on a permission decision. Click for details." onclick="event.stopPropagation();_openStatusDetail(\'' + escJs(s.name) + '\')">blocked ▾</button>';
   else if (s.status === 'waiting') badge = '<span class="status-badge waiting"' + _waitingTitle(s) + '>' + _waitingLabel(s) + '</span>';
   else if (s.status === 'rate_limited') badge = '<span class="status-badge rate-limited">rate limited</span>';
-  else if (s.status === 'api_error') badge = `<span class="status-badge rate-limited" title="API Error ${esc(s.api_error_code || '5xx')} — server-side and retryable. Send &quot;continue&quot;.">API ${esc(s.api_error_code || '5xx')}</span>`;
+  else if (s.status === 'api_error') badge = `<button type="button" class="status-badge rate-limited" title="API Error ${esc(s.api_error_code || '5xx')} — server-side and retryable. Send &quot;continue&quot;." onclick="event.stopPropagation();_openStatusDetail('${escJs(s.name)}')">API ${esc(s.api_error_code || '5xx')} ▾</button>`;
   else if (s.status === 'idle')    badge = '<span class="status-badge idle">idle</span>';
 
   return badge;
@@ -5445,6 +5498,7 @@ function render() {
         (!online ? '<br><span style="color:var(--yellow)">You\'re offline — workers created now will sync when connected.</span>' : '') + '</div>';
     }
     _renderPausedSection();
+    _renderExpiredSection();
     _renderArchivedSection();
     _restoreCardFocus(focusedId);
     return;
@@ -5485,6 +5539,7 @@ function render() {
   if ((q || activeTag || filterProviders.size || filterModels.size || filterStatuses.size) && !filtered.length) {
     el.innerHTML = '<div class="empty">No matching workers.</div>';
     _renderPausedSection();
+    _renderExpiredSection();
     _renderArchivedSection();
     _restoreCardFocus(focusedId);
     return;
@@ -5651,6 +5706,7 @@ function render() {
     for (const [id, d] of Object.entries(savedInputs)) { const inp = document.getElementById(id); if (inp) { inp.value = d.value; autoGrow(inp); } }
     _restoreCardFocus(focusedId, savedInputs);
     _renderPausedSection();
+    _renderExpiredSection();
     _renderArchivedSection();
     requestAnimationFrame(initSortable);
     requestAnimationFrame(() => { document.querySelectorAll('.chips[id^="card-chips-"]').forEach(el => { const name = el.id.replace('card-chips-', ''); if (name) renderChips(el, name, false); }); });
@@ -5666,6 +5722,7 @@ function render() {
     for (const [id, d] of Object.entries(savedInputs)) { const inp = document.getElementById(id); if (inp) { inp.value = d.value; autoGrow(inp); } }
     _restoreCardFocus(focusedId, savedInputs);
     _renderPausedSection();
+    _renderExpiredSection();
     _renderArchivedSection();
     requestAnimationFrame(initSortable);
     requestAnimationFrame(() => {
@@ -5744,7 +5801,7 @@ function render() {
   _restoreCardFocus(focusedId, savedInputs);
 
   _renderPausedSection();
-
+  _renderExpiredSection();
   _renderArchivedSection();
 
   // Hydrate customizable chip bars on all session cards
@@ -7055,6 +7112,80 @@ function _renderPausedSection() {
         ${meta.length ? `<div class="paused-card-meta">${meta.join('<span style="opacity:0.4;">&middot;</span>')}</div>` : ''}
         ${body ? `<div class="paused-card-preview">${body}</div>` : ''}
       </div>`;
+    });
+    html += '</div>';
+  }
+  if (el.innerHTML !== html) el.innerHTML = html;
+}
+
+function toggleExpired() {
+  expiredExpanded = !expiredExpanded;
+  _renderExpiredSection();
+}
+
+function _renderExpiredSection() {
+  const el = document.getElementById('expired-section');
+  if (!el) return;
+  const sessNames = new Set(sessions.map(s => s.name));
+  const ephCards = boardItems.filter(c =>
+    (c.session || '').includes('-eph-') && !sessNames.has(c.session)
+  );
+  if (!ephCards.length) { el.innerHTML = ''; return; }
+  const byWorker = {};
+  ephCards.forEach(c => {
+    const w = c.session;
+    if (!byWorker[w]) byWorker[w] = { name: w, cards: [], parent: '' };
+    byWorker[w].cards.push(c);
+    if (!byWorker[w].parent) {
+      const m = w.match(/^(.+?)-eph-/);
+      if (m) byWorker[w].parent = m[1];
+    }
+  });
+  const workers = Object.values(byWorker);
+  workers.sort((a, b) => {
+    const la = Math.max(...a.cards.map(c => c.updated || 0));
+    const lb = Math.max(...b.cards.map(c => c.updated || 0));
+    return lb - la;
+  });
+  const q = searchQuery.toLowerCase().trim();
+  const filtered = q ? workers.filter(w =>
+    w.name.toLowerCase().includes(q) ||
+    w.parent.toLowerCase().includes(q) ||
+    w.cards.some(c => (c.title || '').toLowerCase().includes(q))
+  ) : workers;
+  const label = q && filtered.length !== workers.length
+    ? `${filtered.length} of ${workers.length} expired`
+    : `${workers.length} expired`;
+  const chevron = `<span class="expired-chevron${expiredExpanded ? ' open' : ''}">&#x25B6;</span>`;
+  let html = `<div class="expired-footer" onclick="toggleExpired()">${chevron} ${label}</div>`;
+  if (expiredExpanded) {
+    const TERMINAL = new Set(['done', 'verified', 'discarded', 'cancelled']);
+    const STATUS_DOT = { doing: 'var(--accent)', todo: 'var(--dim)', backlog: 'var(--dim)', done: '#4ade80', verified: '#4ade80', discarded: '#888', cancelled: '#888' };
+    html += '<div class="expired-body">';
+    filtered.forEach(w => {
+      const doneCt = w.cards.filter(c => TERMINAL.has(c.status)).length;
+      const total = w.cards.length;
+      const epicCard = boardItems.find(c => w.cards.some(ch => ch.epic === c.id));
+      const epicTitle = epicCard ? epicCard.title : w.name;
+      html += `<div class="paused-card" data-session="${esc(w.name)}">
+        <div class="paused-card-top">
+          <span class="paused-card-name">${esc(epicTitle)}</span>
+          <span class="paused-card-chip model" style="opacity:0.6">${doneCt}/${total} done</span>
+          <span class="paused-card-spacer"></span>
+        </div>
+        <div class="paused-card-meta"><code>${esc(w.name)}</code>
+          ${w.parent ? `<span style="opacity:0.4;">&middot;</span> parent: <code>${esc(w.parent)}</code>` : ''}</div>
+        <div style="margin-top:4px;">`;
+      w.cards.forEach(c => {
+        const st = c.status || 'todo';
+        const dot = STATUS_DOT[st] || 'var(--dim)';
+        html += `<div style="display:flex;align-items:center;gap:6px;padding:2px 0;cursor:pointer;font-size:.8rem;" onclick="switchView('board');setTimeout(function(){openBoardDetail('${escJs(c.id)}')},300)">
+          <span style="width:8px;height:8px;border-radius:50%;background:${dot};flex-shrink:0;"></span>
+          <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(c.title)}</span>
+          <span style="color:var(--dim);font-size:.7rem;">${esc(st)}</span>
+        </div>`;
+      });
+      html += '</div></div>';
     });
     html += '</div>';
   }
@@ -11228,7 +11359,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.983';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.984';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
