@@ -112,7 +112,20 @@ class CargoBudgetTests(unittest.TestCase):
         for expected in (0, 7):
             with patch.object(budget, 'group_rss',
                               side_effect=subprocess.TimeoutExpired(['ps'], 5)):
-                rc, log = self.run_budget(f'import sys; sys.exit({expected})')
+                # THE SLEEP IS LOAD-BEARING (AMUX-4759). `cargo_budget_unenforced`
+                # is emitted the first time a probe RAISES, so the probe has to
+                # tick at least once — and a bare `sys.exit()` can finish inside
+                # the .02s interval, with the whole probe loop never running.
+                # Then no probe failed, nothing was unenforced, and the assertion
+                # below fails on scheduling rather than on behaviour: measured
+                # 3 of 6 red locally, in isolation, before this line.
+                #
+                # Same remedy the sibling test already carries for the same race,
+                # where its comment records "2 of 6 suite runs red, green every
+                # time in isolation". The exit code is still the command's, which
+                # is what this cell is actually about.
+                rc, log = self.run_budget(
+                    f'import sys, time; time.sleep(.15); sys.exit({expected})')
             self.assertEqual(rc, expected, log)
             self.assertNotIn('probe_failed', log)
             # SAID SO, not silently. A run with every probe broken and a run with
