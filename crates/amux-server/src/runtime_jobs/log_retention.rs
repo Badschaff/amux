@@ -3,6 +3,16 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
+/// Cap on the reference snapshot. The SECOND probe in this module with the
+/// AMUX-4791 shape: breach it and retention defers entirely, exactly as the
+/// open-file cap did, and the board only ever grows.
+///
+/// Measured 2026-09-18 on this box, worst marker: `/logs/` at 4,575,537 bytes
+/// over 1042 rows, 27.3% of this cap. Headroom today. `/evidence/` 18.4%,
+/// `/audits/` 5.9%. The number is recorded because "it is fine" ages badly and
+/// a percentage tells the next reader whether it still is.
+const REFERENCE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Read reference-bearing durable records, including undelivered attachments.
 /// Missing tables/columns and oversized snapshots are failures, not empty sets.
 pub(super) fn reference_texts(
@@ -26,11 +36,17 @@ pub(super) fn reference_texts(
         for row in stmt.query_map(rusqlite::params![marker], |row| row.get::<_, String>(0))? {
             let text = row?;
             bytes += text.len();
-            anyhow::ensure!(bytes <= 16 * 1024 * 1024, "reference snapshot exceeds 16 MiB; retention deferred");
+            anyhow::ensure!(
+                bytes as u64 <= REFERENCE_MAX_BYTES,
+                "reference snapshot exceeds 16 MiB; retention deferred"
+            );
             // Decode percent-escaped file URLs and JSON-escaped separators.
             texts.push(decode_reference(&text));
         }
     }
+    // Same signal as the open-file probe, for the same reason: this cap also
+    // defers retention outright when breached, and the board only grows.
+    warn_on_thin_headroom(bytes, REFERENCE_MAX_BYTES);
     Ok(texts)
 }
 
@@ -97,11 +113,53 @@ fn open_file_command() -> tokio::process::Command {
     command
 }
 
+/// Cap on the open-file probe's output (AMUX-4791).
+///
+/// 8 MiB, until this box quietly grew past it. `lsof` here emits 8,565,894
+/// bytes across ~182,000 open files, 2.1% over, and because the job defers
+/// whenever it cannot enumerate open files, retention stopped running
+/// altogether: three directories deferring every tick, indefinitely, with
+/// nothing pruned from logs, evidence or audits on the machine that runs amux
+/// 24/7. A 2% overshoot bought a total outage.
+///
+/// 128 MiB is ~15x the current measurement. The number is not the interesting
+/// part though: ANY fixed cap converts into this same silent outage on the day
+/// a host grows past it, so a bigger constant only moves the cliff. What
+/// removes the silence is `warn_on_thin_headroom` below, which announces the
+/// approach rather than the arrival.
+const PROBE_MAX_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Announce a probe whose output is closing on the cap, while it still works.
+///
+/// The failure this comes from had no early signal at all: the probe succeeded
+/// at 7.9 MiB and failed completely at 8.2 MiB, and the only difference a
+/// reader saw was a WARN that had been steady-state long enough to stop being
+/// news. Half the cap is arbitrary; announcing BEFORE the cliff is not.
+///
+/// Shared by BOTH capped probes in this module (the open-file enumeration and
+/// the reference snapshot), because a cap whose breach defers retention is one
+/// shape, not two.
+/// Returns whether it warned, so a test can exercise THIS function rather than
+/// restate its threshold — a re-typed predicate passes even when the shipped
+/// one is wrong.
+fn warn_on_thin_headroom(used: usize, max: u64) -> bool {
+    if (used as u64).saturating_mul(2) <= max {
+        return false;
+    }
+    tracing::warn!(
+        probe_bytes = used,
+        cap_bytes = max,
+        pct_of_cap = (used as u64 * 100).checked_div(max).unwrap_or(0),
+        "open-file probe is past half its output cap; retention defers entirely once it is exceeded (AMUX-4791)"
+    );
+    true
+}
+
 async fn open_paths() -> anyhow::Result<Vec<PathBuf>> {
     probe_open_paths(
         &mut open_file_command(),
         Duration::from_secs(5),
-        8 * 1024 * 1024,
+        PROBE_MAX_BYTES,
     )
     .await
 }
@@ -142,6 +200,7 @@ async fn probe_open_paths(
     tokio::time::timeout(timeout, async {
         stdout.take(max + 1).read_to_end(&mut data).await?;
         anyhow::ensure!(data.len() <= max as usize, "{PROBE_TRUNCATED_REASON}");
+        warn_on_thin_headroom(data.len(), max);
         anyhow::ensure!(child.wait().await?.success(), "open-file probe failed");
         Ok::<_, anyhow::Error>(())
     })
@@ -449,6 +508,56 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// AMUX-4791: the cap still REFUSES, and the approach is announced.
+    ///
+    /// Both halves in one test because they are one decision. Raising the cap
+    /// without an early signal only moves the cliff — this box failed at 2.1%
+    /// over 8 MiB with no warning at all — and adding the signal while
+    /// removing the refusal would let a truncated enumeration authorise a
+    /// delete, which is the one outcome this job exists to prevent.
+    #[tokio::test]
+    async fn the_output_cap_still_refuses_and_its_approach_is_announced() {
+        // One byte over the cap is still a hard refusal, carrying the shared
+        // reason the test in this module tolerates by name.
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", "printf 'n/tmp/a\\nn/tmp/bbbb\\n'"]);
+        let err = probe_open_paths(&mut command, Duration::from_secs(5), 8)
+            .await
+            .expect_err("output over the cap must refuse");
+        assert_eq!(err.to_string(), PROBE_TRUNCATED_REASON, "{err}");
+
+        // Comfortably under the cap: the probe measures, and nothing about the
+        // headroom warning changes the returned value.
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", "printf 'p1\\nn/tmp/a\\n'"]);
+        assert_eq!(
+            probe_open_paths(&mut command, Duration::from_secs(5), 1024)
+                .await
+                .unwrap(),
+            vec![PathBuf::from("/tmp/a")],
+        );
+
+        // The SHIPPED predicate, called rather than restated: strictly more
+        // than half the cap, so an exactly-half probe stays quiet and the
+        // signal cannot be read as "any large probe". The 8,565,894-against-
+        // 8-MiB row is the real measurement that opened this card.
+        for (used, max, want) in [
+            (4usize, 8u64, false),
+            (5, 8, true),
+            (0, 8, false),
+            (129, 256, true),
+            (8_565_894, 8 * 1024 * 1024, true),
+            (8_565_894, PROBE_MAX_BYTES, false),
+        ] {
+            assert_eq!(warn_on_thin_headroom(used, max), want, "used={used} max={max}");
+        }
+        // No bare `assert!(PROBE_MAX_BYTES > ...)` here: clippy rejects it as a
+        // constant assertion, and it is right — a comparison of two literals
+        // cannot fail, so it would read as coverage while testing nothing. The
+        // last two rows above make the same claim through the shipped
+        // predicate, where a regressed cap really does change the answer.
     }
 
     #[tokio::test]
