@@ -10011,3 +10011,91 @@ CARD: AF-755
 SYMPTOM: The live audit counted six entries with absent authors and unresolved card namespaces, then said they could never leave the ledger because originating-session sign-off was mandatory. AF-352 had already authorized independent evidence-based retirement of objective claims, and the written protocol was updated, but its executable audit still contradicted it.
 COST: The AF-746 retirement review encountered a false permanent blocker; checking the rule, adding a failing fixture and correcting the audit required another review cycle.
 FIX: The audit names AF-352, preserves subjective author decisions and actual-verifier/archive requirements, and emits retirement_review with measured population. Four new assertions failed on the old policy; all 33 existing/new fixture checks pass after correction. No automatic archival or structural-gate change.
+
+## A process killed before it can log leaves the fleet no diagnostic surface for the failure that removes the diagnostic surface
+VALIDATED: amux-frustrations | Re-verified live, 2026-09-18 (AF-458 blocker-recovery pass). The entry's own later
+NOTE already corrected the mechanism from codesign/LWCR to a port race: gemini-shell
+hand-started amux-server-rs on 8824 (pid 20191), holding the port while launchd's
+managed copy exited clean(78)/KeepAlive-looped forever.
+
+Confirmed now: pid 20191 no longer exists (`ps -p 20191` empty). `launchctl print
+gui/501/com.amux.server-rs` shows state=running, pid=60444, runs=31, no port
+contention (`lsof -i :8824` shows exactly one LISTENer, the launchd-managed pid).
+The rogue process died with its own parent shell exactly as the entry's diagnosis
+predicted ("dies with its parent shell") -- nobody had to act on the NEEDS-YOU ask,
+it became moot on its own. AF-458 closed done with this evidence.
+
+The "durable fix" this entry originally proposed (builder re-bootstraps the agent
+after a swap) was aimed at the WRONG (superseded) codesign diagnosis and was never
+built; not needed for the actual port-race cause, which has no recurrence mechanism
+once the rogue process is gone. The INSTRUMENT half of this entry -- a bind-fail
+loop logs nothing distinguishable from healthy idle without cross-referencing
+launchctl's own runs counter against crash reports -- is still real and not
+addressed by anything shipped since. Leaving that open rather than filing a fresh
+card on no current evidence of it recurring; if it bites again, the diagnosis this
+entry already contains (count crash reports, don't trust runs alone) is the fix to
+reapply.
+
+AREA: instruments
+SEVERITY: wrong-conclusion
+STATUS: open
+DATE: 2026-09-03
+SESSION: amux-frustrations
+CARD: AF-458
+SYMPTOM: the server is in a launchd crash loop and NOTHING in its own logs says so.
+ macOS SIGKILLs it at exec for `Code Signature Invalid` / `Launch Constraint
+ Violation`, so it dies before any of our code can write a shutdown line. Both
+ StandardOutPath and StandardErrorPath point at ~/.amux/logs/server-rs.log, and the
+ last line before each death is an ordinary WARN. The only honest record is
+ ~/Library/Logs/DiagnosticReports/*.ips plus `launchctl print`, where `runs` went
+ 10 -> 18 -> 23 in about two minutes and `properties` reads "needs LWCR update".
+COST: this is the flap the whole fleet is hitting, and it presents as five unrelated
+ problems. It forced gtm-engine's send onto the unstamped fallback (see the two
+ entries above), made `amux board retitle` exit 7 with no message, broke a `git
+ commit` with "unable to write new_index file", and made two /api/board reads
+ return empty. Each looks like its own bug. Worse, the log carries an ERROR-level
+ line 24 seconds before a death — "migration VERSION COLLISION at 35" — which is
+ loud, adjacent, and irrelevant: migrate.rs:636 documents it as deliberately
+ non-fatal ("this reports rather than refuses ... a gate with no truthful path,
+ ethos rule 3") and it appears identically on runs that stayed healthy. A wrong
+ cause was one step away and I nearly filed it. Fifth AF-445-shaped near-miss in
+ this session.
+FIX: not actioned — the remedy touches a launchd agent and ~/Dev/CLAUDE.md requires
+ explicit owner approval ("This machine runs 24/7. Do NOT restart launchd agents").
+ One-shot is `launchctl bootout gui/501/com.amux.server-rs` then `bootstrap`, since
+ the binary itself verifies clean on disk and it is launchd's cached Lightweight
+ Code Requirement that is stale. The durable fix is the builder re-bootstrapping the
+ agent after it swaps the binary; until then every deploy on this box reopens the
+ window. The INSTRUMENT half is the part that belongs here: a process killed before
+ it can log needs its death reported somewhere a lane already looks. /health going
+ unreachable and `/api/debug/*` being unreachable at the same moment means the fleet
+ has no diagnostic surface for exactly the failure that removes the diagnostic
+ surface.
+NOTE: gtm-engine independently confirmed this from the other end and bounded it
+ (origin-stamped, 2026-09-03). They closed five cards inside a flap window trusting
+ a "-> done" line, re-read all five at the FIELD, and found two gaps that were their
+ own omissions rather than the crash loop. Their conclusion: "on this lane the flap
+ degraded loudly every time and silently never." Every symptom seen so far is
+ fail-loud (curl rc 7, empty body, refused index write, a verb exiting non-zero with
+ no message); nothing yet shows a write that REPORTED success and did not land. So
+ the failure mode is availability, not silent corruption, which is the difference
+ between a degraded fleet and one whose records are suspect. Not a reason to leave
+ it running; it is a reason not to re-verify every board write made today.
+NOTE: CAUSE CORRECTED, 2026-09-03, same session. The codesign SIGKILL is real
+ (crash report 160828.ips) but it is NOT what drives the climbing run counter, and
+ I recommended a fix that would not have worked. Three facts I should have checked
+ before recommending anything: only ONE crash report all day against 76 runs (a
+ codesign kill writes one per death), the binary unchanged since 16:10 so there is
+ no swap-kill-swap cycle, and `codesign --verify` clean right now. What is actually
+ happening is a port race: an agent session started `AMUX_RS_PORT=8824
+ amux-server-rs` by hand in a gemini-shell background job (pid 20191, parent a
+ /bin/bash -c with `trap 'jobs -p > "$_bgpids_file"' EXIT`), it holds 8824, and
+ launchd's managed copy cannot bind, exits cleanly with 78, and KeepAlive respawns
+ it forever. Clean exit, hence no .ips. So `bootout`/`bootstrap` would have resumed
+ losing the same race. The entry's INSTRUMENT argument survives intact and is if
+ anything stronger: a process that exits before binding logs nothing either, both
+ halves of `runs`-climbing-with-a-silent-log look identical, and I distinguished
+ them only by counting crash reports, which is not a thing any lane would think to
+ do. The deeper problem this exposed: the fleet's live server is an UNSUPERVISED
+ background job that dies with its parent shell, while the supervisor that should
+ own it is locked out of the port.
