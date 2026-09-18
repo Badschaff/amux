@@ -2480,7 +2480,9 @@ pub(crate) async fn reap_ephemeral_workers(state: &AppState) -> EphemeralReaperR
         };
 
         let is_idle = !crate::api::session_verbs::is_running(name).await;
-        if !is_idle && action == "parked" {
+        if !is_idle {
+            // Worker is actively processing (someone sent it a message).
+            // Let it finish before reaping, regardless of card state.
             continue;
         }
 
