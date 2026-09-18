@@ -60,6 +60,16 @@ fn rig() -> Rig {
     std::env::set_var("AMUX_NEEDSYOU_ASK_REQUIRED", "0");
     std::env::set_var("AMUX_TODO_WIP_LIMIT", "0");
     std::env::set_var("AMUX_CONTINUATION_REQUIRED", "0");
+    // AF-921: golden_dependency_chain deliberately builds a cross-worker
+    // dependency chain (a parent owned by one session depending on children
+    // owned by three others) to exercise the orchestrator's own resolution
+    // logic -- the parent must stay Waiting(Dependency) until all three
+    // cross-owner leases complete. board.rs::foreign_dependencies refuses
+    // that at create time by default (cross_board_dependency_forbidden,
+    // b18789f9); its own refusal has separate coverage in
+    // tests/board_ownership.rs. Same escape hatch tests/board_request.rs
+    // already uses to opt a rig out of the create-time policy.
+    std::env::set_var("AMUX_BOARD_DELEGATION", "1");
     let dir = tempfile::tempdir().unwrap();
     let store: SharedStore = Arc::new(Store::open(&dir.path().join("golden.db")).unwrap());
     let state = AppState {
