@@ -51,6 +51,15 @@
 #     checkout keeps its own copy until someone explicitly cleans it up, so a
 #     bad migration is a re-run, not a loss.
 #   - Does not restart any tmux pane or touch any other lane.
+#
+# PILOTED LIVE (AF-336 acceptance criterion 1), 2026-09-18: amux-frustrations
+# migrated itself to ~/Dev/amux-lanes/amux-frustrations with
+# --acknowledge-unclaimed covering two peer files it found dirty and did not
+# own, then edited, committed and pushed THIS line from the new worktree --
+# the pre-commit/staged-guard/pre-push hooks ran unchanged, resolved via the
+# shared checkout's common .git/hooks dir, no CC_DIR flip performed (this
+# pilot verifies the mechanism; switching the lane's default checkout over
+# permanently is a separate, deliberate step).
 set -euo pipefail
 
 lane=""
