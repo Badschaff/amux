@@ -6456,6 +6456,9 @@ async fn fan_out_item(
                 env.set("CC_TAGS", "ephemeral");
                 env.set("CC_CREATOR", &format!("fan-out:{actor}"));
                 env.set("AMUX_BOARD_DELEGATION", "0");
+                // Ephemeral workers have exactly their own cards; they must
+                // drain backlog when idle or a self-parked card sits forever.
+                env.set("AMUX_DISPATCH_BACKLOG_WHEN_IDLE", "1");
 
                 let model_flag = format!("--model {} --dangerously-skip-permissions", model);
                 let flags = if extra_flags.is_empty() {
