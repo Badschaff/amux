@@ -2403,10 +2403,10 @@ mod epic_completion_unit_tests {
 // 3. Worker idle with a doing card that hasn't progressed -> re-drive it
 //    (AMUX-4900: the three anti-repetition mechanisms in drive_lane all
 //    correctly suppress re-nudging for long-lived lanes, but an ephemeral
-//    worker that goes idle on its only card is stuck forever. 30min cooldown.)
+//    worker that goes idle on its only card is stuck forever. 5min cooldown.)
 
 /// Cooldown for re-driving a stalled ephemeral worker (case 3).
-const EPHEMERAL_REDRIVE_COOLDOWN_S: f64 = 1800.0;
+const EPHEMERAL_REDRIVE_COOLDOWN_S: f64 = 300.0;
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct EphemeralReaperReport {
@@ -2479,7 +2479,12 @@ pub(crate) async fn reap_ephemeral_workers(state: &AppState) -> EphemeralReaperR
         let has_doing = card_list.iter().any(|(_, st)| st == "doing");
         let all_parked = card_list.iter().all(|(_, st)| st == "backlog" || st == "todo");
 
-        let is_idle = !crate::api::session_verbs::is_running(name).await;
+        // Use pane-based detection, not is_running. is_running returns true
+        // for workers at the Claude ❯ prompt (tmux alive + process alive),
+        // so idle ephemeral workers look "running" forever.
+        let pane_output = crate::api::session_verbs::tmux_capture(name, 30).await;
+        let pane_status = crate::api::session_verbs::detect_claude_status(&pane_output);
+        let is_idle = pane_status == "idle" || pane_status.is_empty();
         if !is_idle {
             continue;
         }
