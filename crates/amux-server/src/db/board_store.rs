@@ -1746,6 +1746,77 @@ pub fn append_log(existing: Option<&str>, hhmm: &str, line: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// AF-510: fleet-wide needs:you digest producer
+// ---------------------------------------------------------------------------
+
+/// One row of the fleet-wide needs:you digest -- what would be shown to the
+/// owner, regardless of which channel eventually carries it there.
+pub struct NeedsYouDigestCard {
+    pub id: String,
+    pub session: String,
+    pub title: String,
+    pub ask_question: Option<String>,
+    pub ask_actor: Option<String>,
+    pub archived: bool,
+    pub asked_at: f64,
+    pub age_days: f64,
+}
+
+/// AF-510. Fleet-wide needs:you digest: every non-terminal card that is
+/// waiting on a human, aged by the SAME clock `board_drive.rs`'s per-lane
+/// renag uses -- `MIN(issue_tags.added_at)` for a tagged ask, falling back to
+/// `i.updated` only when no tag row exists (AC-178: `updated` alone is
+/// last-touch, so the most-commented asks would look youngest) -- so a
+/// fleet-wide view and the per-lane renag never disagree about how old the
+/// same ask is.
+///
+/// Returns the OLDEST `cap` cards fleet-wide, plus the TRUE total before
+/// capping. Age is the ordering signal on purpose (AF-510's own
+/// recommendation: a week-old queue is what costs the owner, not today's
+/// newest asks), and the true total travels separately so a digest can never
+/// repeat the 92-cards-in-one-SMS mistake (autofix.rs's own comment on why
+/// broadcasts get capped) while still saying what it could not show (ethos
+/// rule 4 -- a capped list that does not report its own population reads as
+/// complete).
+///
+/// Caller decides delivery; this function decides nothing about a channel.
+pub fn needsyou_digest(
+    conn: &Connection,
+    now: f64,
+    cap: usize,
+) -> rusqlite::Result<(Vec<NeedsYouDigestCard>, usize)> {
+    let mut all: Vec<NeedsYouDigestCard> = conn
+        .prepare(
+            "SELECT i.id, i.session, i.title, i.ask_question, i.ask_actor, \
+                    COALESCE(i.archived,0), COALESCE(MIN(t.added_at), i.updated) AS asked_at \
+             FROM issues i LEFT JOIN issue_tags t \
+                  ON t.issue_id = i.id AND lower(t.tag) LIKE 'needs:you%' \
+             WHERE i.deleted IS NULL AND i.owner_type='agent' \
+             AND (t.tag IS NOT NULL OR i.status='needsyou') \
+             AND i.status NOT IN ('done','verified','discarded') \
+             GROUP BY i.id HAVING asked_at IS NOT NULL \
+             ORDER BY asked_at ASC",
+        )?
+        .query_map([], |r| {
+            let asked_at: f64 = r.get(6)?;
+            Ok(NeedsYouDigestCard {
+                id: r.get(0)?,
+                session: r.get(1)?,
+                title: r.get(2)?,
+                ask_question: r.get(3)?,
+                ask_actor: r.get(4)?,
+                archived: r.get::<_, i64>(5)? != 0,
+                asked_at,
+                age_days: (now - asked_at) / 86400.0,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let total = all.len();
+    all.truncate(cap);
+    Ok((all, total))
+}
+
+// ---------------------------------------------------------------------------
 // Id minting (shared issue_counters table)
 // ---------------------------------------------------------------------------
 
@@ -6132,6 +6203,109 @@ mod tests {
         );
         // Ungated statuses stay ungated.
         assert!(default_gates_for("code", TaskStatus::Todo).is_empty());
+    }
+
+    /// AF-510. The whole point of the digest: oldest asks first, fleet-wide,
+    /// regardless of which lane holds them -- the queue that actually costs
+    /// the owner is the week-old backlog, not today's newest card.
+    #[test]
+    fn needsyou_digest_orders_oldest_first_fleet_wide() {
+        let conn = crate::db::migrate::test_memdb();
+        for (id, session, updated) in [
+            ("NY-NEW", "lane-a", 1_900_000_000i64),
+            ("NY-OLD", "lane-b", 1_000_000_000i64),
+            ("NY-MID", "lane-a", 1_500_000_000i64),
+        ] {
+            conn.execute(
+                "INSERT INTO issues (id,title,status,session,owner_type,created,updated) \
+                 VALUES (?1,?1,'needsyou',?2,'agent',?3,?3)",
+                params![id, session, updated],
+            )
+            .unwrap();
+        }
+        let (rows, total) = needsyou_digest(&conn, 2_000_000_000.0, 10).unwrap();
+        assert_eq!(total, 3);
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["NY-OLD", "NY-MID", "NY-NEW"], "must be oldest-asked-first, not insertion or session order");
+        assert!(rows[0].age_days > rows[1].age_days && rows[1].age_days > rows[2].age_days);
+    }
+
+    /// AF-510. autofix.rs's own lesson: "the owner digest emitted 92 cards in
+    /// one SMS" is what makes a cap mandatory. This pins BOTH halves — the cap
+    /// actually truncates, AND the true population survives the cap instead of
+    /// disappearing with it (ethos rule 4: a capped list that does not report
+    /// its own size reads as complete).
+    #[test]
+    fn needsyou_digest_caps_but_reports_the_true_total() {
+        let conn = crate::db::migrate::test_memdb();
+        for i in 0..5i64 {
+            conn.execute(
+                "INSERT INTO issues (id,title,status,session,owner_type,created,updated) \
+                 VALUES (?1,?1,'needsyou','lane',   'agent',?2,?2)",
+                params![format!("NY-{i}"), 1_000_000_000i64 + i],
+            )
+            .unwrap();
+        }
+        let (rows, total) = needsyou_digest(&conn, 2_000_000_000.0, 2).unwrap();
+        assert_eq!(total, 5, "the true population must survive the cap");
+        assert_eq!(rows.len(), 2, "the returned list must actually be capped");
+        // And it must be the OLDEST two that survive the cut, not an arbitrary two.
+        assert_eq!(rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), vec!["NY-0", "NY-1"]);
+    }
+
+    /// AF-510. Mirrors the per-lane renag's own predicate exactly: a
+    /// human-owned card is never renagged to a lane (there is no lane to
+    /// renag), and a terminal card is not a live ask regardless of how it got
+    /// tagged. Both must stay invisible to the digest for the same reason.
+    #[test]
+    fn needsyou_digest_excludes_human_owned_and_terminal_cards() {
+        let conn = crate::db::migrate::test_memdb();
+        conn.execute(
+            "INSERT INTO issues (id,title,status,session,owner_type,created,updated) \
+             VALUES ('NY-HUMAN','t','needsyou','lane','human',1000000000,1000000000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO issues (id,title,status,session,owner_type,created,updated) \
+             VALUES ('NY-DONE','t','done','lane','agent',1000000000,1000000000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO issue_tags (issue_id,tag,added_at) VALUES ('NY-DONE','needs:you',1000000000)",
+            [],
+        )
+        .unwrap();
+        let (rows, total) = needsyou_digest(&conn, 2_000_000_000.0, 10).unwrap();
+        let leaked_ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(total, 0, "neither a human-owned nor a terminal card is a live agent ask: {leaked_ids:?}");
+    }
+
+    /// AF-510 / AC-178. The ask clock is the TAG's `added_at` when a tag
+    /// exists, never `updated` — `updated` is last-touch, so a heavily
+    /// commented-on ask would otherwise look newest right when it is most
+    /// overdue. Matches board_drive.rs's own renag query byte for byte in
+    /// intent: MIN(tag.added_at), falling back to `i.updated` only when no
+    /// tag row exists at all.
+    #[test]
+    fn needsyou_digest_ages_by_the_tag_not_the_last_touch() {
+        let conn = crate::db::migrate::test_memdb();
+        // Asked long ago (tag), but touched (commented on) recently.
+        conn.execute(
+            "INSERT INTO issues (id,title,status,session,owner_type,created,updated) \
+             VALUES ('NY-TAGGED','t','doing','lane','agent',1000000000,1_950_000_000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO issue_tags (issue_id,tag,added_at) VALUES ('NY-TAGGED','needs:you-review',1_000_000_000)",
+            [],
+        )
+        .unwrap();
+        let (rows, _) = needsyou_digest(&conn, 2_000_000_000.0, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].asked_at, 1_000_000_000.0, "asked_at must be the TAG's added_at, not the recent `updated` touch");
     }
 }
 

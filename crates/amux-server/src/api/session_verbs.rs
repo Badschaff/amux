@@ -15269,6 +15269,9 @@ pub fn routes() -> Router<AppState> {
         // where a sweep or an autofix loop asks "did anything get delivered
         // twice, and to whom" without grepping a pane log.
         .route("/api/debug/duplicate-deliveries", axum::routing::get(debug_duplicate_deliveries))
+        // AF-510: the fleet-wide needs:you digest producer. Read-only, no
+        // channel wired to it — see the handler doc comment.
+        .route("/api/debug/needsyou-digest", axum::routing::get(debug_needsyou_digest))
         .route("/api/sessions/{name}/{*verb}", any(session_verb_handler))
         // Why steering is or is not moving. See `steering_debug`.
         .route("/api/debug/steering", axum::routing::get(steering_debug))
@@ -15639,6 +15642,79 @@ fn json_str_after(blob: &str, key: &str) -> Option<String> {
     (!v.is_empty() && v.len() <= 200).then(|| v.to_string())
 }
 
+/// GET /api/debug/needsyou-digest — the fleet-wide needs:you queue, oldest
+/// first, capped.
+///
+/// AF-510: 506 needs:you cards named Ethan as the blocker and nothing told
+/// him — the only reminder that exists (`needsyou.renag` in board_drive.rs)
+/// nags the LANE that filed the ask, never the human who owes the answer.
+/// This is the PRODUCER half of the fix: what the digest would say, computed
+/// and testable, independent of which channel eventually carries it to him.
+///
+/// DELIBERATELY NOT WIRED TO A DELIVERY CHANNEL. Which channel — email,
+/// dashboard, push once it is repaired — is Ethan's call (ethos rule 8), and
+/// per CLAUDE.md both urgent channels are currently degraded, so the choice
+/// is not a detail to default past. This endpoint is read-only and pull-based
+/// on purpose: it changes nothing about what reaches him until that decision
+/// lands and something is pointed at it.
+///
+/// `cap` defaults to 20 (`AMUX_NEEDSYOU_DIGEST_CAP`) — small enough to skim,
+/// which matters because autofix.rs's own comment records what "show
+/// everything newly visible" costs: "the owner digest emitted 92 cards in one
+/// SMS". `n_considered` is the TRUE fleet-wide total before capping, not the
+/// length of the array returned, so a capped digest never quietly reads as
+/// complete (ethos rule 4).
+async fn debug_needsyou_digest(State(state): State<AppState>, RawQuery(q): RawQuery) -> Response {
+    let params = parse_qs(q.as_deref().unwrap_or(""));
+    let cap = qs_get(&params, "cap")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or_else(|| crate::config::env_i64("AMUX_NEEDSYOU_DIGEST_CAP", 20))
+        .clamp(1, 500) as usize;
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(e) => return jresp(StatusCode::SERVICE_UNAVAILABLE, json!({"error": e.to_string()})),
+    };
+    let now = crate::config::now_f64();
+    let (rows, total) = match crate::db::board_store::needsyou_digest(&conn, now, cap) {
+        Ok(v) => v,
+        Err(e) => return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})),
+    };
+    // GROUPED FOR DISPLAY, ORDERED FOR TRIAGE. The underlying rows are already
+    // oldest-first (recommendation c on the card: age is the ordering signal
+    // that costs him, not today's newest asks) — grouping by lane afterward
+    // must not silently re-sort within a lane, or the "oldest first" property
+    // this endpoint exists to provide would be true of the flat list and false
+    // of the thing a reader actually looks at.
+    let mut by_lane: Vec<(String, Vec<Value>)> = Vec::new();
+    for r in &rows {
+        let entry = json!({
+            "id": r.id,
+            "title": r.title,
+            "ask_question": r.ask_question,
+            "ask_actor": r.ask_actor,
+            "archived": r.archived,
+            "age_days": (r.age_days * 10.0).round() / 10.0,
+        });
+        match by_lane.iter_mut().find(|(s, _)| s == &r.session) {
+            Some((_, v)) => v.push(entry),
+            None => by_lane.push((r.session.clone(), vec![entry])),
+        }
+    }
+    j200(crate::api::measured::measured(
+        json!({
+            "cap": cap,
+            "truncated": total > rows.len(),
+            "shown": rows.len(),
+            "by_lane": by_lane.into_iter().map(|(s, cards)| json!({"session": s, "cards": cards})).collect::<Vec<_>>(),
+            "note": "oldest needs:you ask fleet-wide first, per lane below it. `shown` can be \
+                     less than `n_considered` when `truncated` is true -- that is the cap \
+                     working, not the count being wrong (autofix.rs: a prior digest emitted 92 \
+                     cards in one SMS). No delivery channel is wired to this endpoint; which one \
+                     to use is Ethan's call, still open on AF-510.",
+        }),
+        total,
+    ))
+}
 
 /// GET /api/debug/duplicate-deliveries?since_h=24 — every lane that received
 /// the SAME text twice inside the detector's window, newest first.

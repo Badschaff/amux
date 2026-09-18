@@ -1257,6 +1257,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/debug/legacy-port", methods: &["GET"] },
     RouteEntry { path: "/api/debug/routes", methods: &["GET"] },
     RouteEntry { path: "/api/debug/duplicate-deliveries", methods: &["GET"] },
+    RouteEntry { path: "/api/debug/needsyou-digest", methods: &["GET"] },
     RouteEntry { path: "/api/system-jobs", methods: &["GET"] },
     RouteEntry { path: "/api/system-jobs/{id}/run", methods: &["POST"] },
     RouteEntry { path: "/api/health/invariants", methods: &["GET"] },
