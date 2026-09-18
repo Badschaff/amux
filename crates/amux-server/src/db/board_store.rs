@@ -1353,7 +1353,9 @@ pub fn effective_gate_trail(
             }
         }
     }
-    let column = configured_gate(conn, target);
+    let column_raw = configured_gate(conn, target);
+    let column_additive = column_raw.as_ref().map(|(_, a)| *a).unwrap_or(false);
+    let column = column_raw.map(|(c, _)| c);
     // `default_gates_for`, NOT `effective_gate`: the latter returns the CARD
     // OVERRIDE when one exists, so using it here made the type tier report the
     // card's criteria as its own — a tier claiming a rule it does not hold, in
@@ -1394,6 +1396,7 @@ pub fn effective_gate_trail(
             "group",
         )
     } else if let Some(c) = column.clone() {
+        let c = if column_additive { union_with_type(c) } else { c };
         (c, GateSource::Column, "column")
     } else {
         (type_default.clone(), GateSource::TypeDefault, "type_default")
@@ -1579,13 +1582,23 @@ fn scoped_gate(
     (!list.is_empty()).then_some((list, additive))
 }
 
-/// The operator-authored gate for a column, or None.
+/// The operator-authored gate for a column, plus whether it is ADDITIVE
+/// (AF-393), or None.
 ///
 /// Returns None for a seeded row, an empty list, or unreadable JSON — every
 /// "cannot tell" answer falls back to the type defaults rather than to an empty
 /// gate. An empty gate would mean NO gate, so a malformed row must never read as
 /// permission (it would silently open the strictest transitions on the board).
-pub fn configured_gate(conn: &rusqlite::Connection, target: TaskStatus) -> Option<Vec<String>> {
+///
+/// Mirrors [`scoped_gate`] exactly (same marker, same empty-after-marker
+/// fallthrough) so the column tier can opt into the same union-with-type-default
+/// behaviour the worker and group tiers already have — AF-393 found this tier
+/// was the one place a fleet-wide gate could only REPLACE each type's own
+/// criteria, never add to them.
+pub fn configured_gate(
+    conn: &rusqlite::Connection,
+    target: TaskStatus,
+) -> Option<(Vec<String>, bool)> {
     let id = status_to_db(target, "");
     let (gate, custom): (Option<String>, Option<i64>) = conn
         .query_row(
@@ -1598,12 +1611,21 @@ pub fn configured_gate(conn: &rusqlite::Connection, target: TaskStatus) -> Optio
         return None;
     }
     let list: Vec<String> = serde_json::from_str(&gate?).ok()?;
+    let mut additive = false;
     let list: Vec<String> = list
         .into_iter()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+        .filter(|s| {
+            if s.eq_ignore_ascii_case(GATE_ADDITIVE_MARKER) {
+                additive = true;
+                false // the marker is a directive, never a criterion to acknowledge
+            } else {
+                true
+            }
+        })
         .collect();
-    (!list.is_empty()).then_some(list)
+    (!list.is_empty()).then_some((list, additive))
 }
 
 pub fn effective_gate(row: &IssueRow, target: TaskStatus) -> Vec<String> {
@@ -5951,6 +5973,25 @@ mod configured_gate_tests {
         c
     }
 
+    /// Same shape as `conn_with`, seeded at `verified` instead of `done` — for
+    /// tests exercising the code-type Verified defaults ("Deployed to prod",
+    /// "Zero regressions", etc.), which `done` does not carry.
+    fn conn_with_verified(gate: Option<&str>, custom: Option<i64>) -> rusqlite::Connection {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE statuses (id TEXT PRIMARY KEY, label TEXT, position INTEGER,
+             is_builtin INTEGER, gate TEXT, mode TEXT, gate_custom INTEGER);",
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO statuses (id,label,position,is_builtin,gate,mode,gate_custom)
+             VALUES ('verified','Verified',5,1,?1,'implicit',?2)",
+            rusqlite::params![gate, custom],
+        )
+        .unwrap();
+        c
+    }
+
     // TRAP 1, and the reason this is not "prefer statuses.gate when set".
     // The table is TYPE-BLIND and was seeded from the CODE defaults. Honouring a
     // seeded row would put "Implemented and merged / Tests / lint pass" on a doc
@@ -6766,6 +6807,99 @@ everything to a clean machine.";
                 .iter()
                 .any(|g| g == "Confirmed working in prod (if this card has no deployment target, note why)"),
             "a marker-only gate holds no rule and must fall through, not open the gate: {only_marker:?}"
+        );
+    }
+
+    /// AF-393. The column tier (`statuses.gate_custom`) is the fleet-wide
+    /// default and, until this fix, could only REPLACE each type's own
+    /// criteria — worker and group already had the additive escape hatch
+    /// (AF-570) but the tier every card falls back to when no scope has an
+    /// opinion did not. Same three cells as the worker/group test above, for
+    /// the same reason: a hardcoded union would pass the additive cells
+    /// without proving the flag is read, and cell 2 is where a fleet-wide
+    /// gate quietly overwriting a type's own bar would hide.
+    #[test]
+    fn an_additive_column_gate_unions_with_the_type_default_and_a_plain_one_replaces() {
+        let peer = r#"["@additive","Peer-reviewed by a DIFFERENT worker","That peer verified it themselves"]"#;
+
+        // CELL 1: an investigation card, no worker/group gate at all, must
+        // still gain the column's peer criteria on top of its own type bar.
+        let c = conn_with_verified(Some(peer), Some(1));
+        add_session_gates(&c);
+        let inv = effective_gate_scoped(
+            &c,
+            &row_for("amux-frustrations", "investigation", None),
+            TaskStatus::Verified,
+            &groups(&[]),
+        );
+        assert!(
+            inv.iter().any(|g| g == "Outcome confirmed to still hold"),
+            "an investigation must keep its own type bar under an additive column gate: {inv:?}"
+        );
+        assert!(
+            inv.iter().any(|g| g.starts_with("Peer-reviewed")),
+            "and still carry the column's peer criteria: {inv:?}"
+        );
+
+        // CELL 2: a code card must NOT lose its own criteria to the same
+        // fleet-wide column gate.
+        let code = effective_gate_scoped(
+            &c,
+            &row_for("backend", "code", None),
+            TaskStatus::Verified,
+            &groups(&[]),
+        );
+        for want in [
+            "Deployed to prod (if this card has no deployment target, note why)",
+            "Confirmed working in prod (if this card has no deployment target, note why)",
+            "Zero regressions",
+        ] {
+            assert!(
+                code.iter().any(|g| g == want),
+                "code must NOT lose {want:?} to an additive column gate: {code:?}"
+            );
+        }
+        assert!(
+            code.iter().any(|g| g.starts_with("Peer-reviewed")),
+            "and code still answers to the column's peer criteria: {code:?}"
+        );
+
+        // CELL 3: NO marker, so replacement is unchanged — the column tier's
+        // pre-existing behaviour for every gate that never opts in.
+        let c2 = conn_with_verified(Some(r#"["Column rule"]"#), Some(1));
+        add_session_gates(&c2);
+        let plain = effective_gate_scoped(
+            &c2,
+            &row_for("backend", "code", None),
+            TaskStatus::Verified,
+            &groups(&[]),
+        );
+        assert_eq!(
+            plain,
+            vec!["Column rule"],
+            "a column gate WITHOUT the marker must still REPLACE the type default: {plain:?}"
+        );
+
+        // CELL 4: the marker is a directive, never a criterion, and a
+        // marker-only column gate holds no rule so it must fall through to
+        // the type default rather than opening the transition.
+        assert!(
+            !inv.iter().any(|g| g == GATE_ADDITIVE_MARKER),
+            "the marker must not surface as a criterion: {inv:?}"
+        );
+        let c3 = conn_with_verified(Some(r#"["@additive"]"#), Some(1));
+        add_session_gates(&c3);
+        let only_marker = effective_gate_scoped(
+            &c3,
+            &row_for("backend", "code", None),
+            TaskStatus::Verified,
+            &groups(&[]),
+        );
+        assert!(
+            only_marker
+                .iter()
+                .any(|g| g == "Confirmed working in prod (if this card has no deployment target, note why)"),
+            "a marker-only column gate holds no rule and must fall through, not open the gate: {only_marker:?}"
         );
     }
 

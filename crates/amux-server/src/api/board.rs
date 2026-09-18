@@ -1215,7 +1215,7 @@ async fn get_contract(
     if let Ok(conn) = state.store.read() {
         for &st in &statuses {
             if let Some(target) = bs::parse_status(st) {
-                if let Some(g) = bs::configured_gate(&conn, target) {
+                if let Some((g, _additive)) = bs::configured_gate(&conn, target) {
                     global_gates.insert(st.to_string(), json!(g));
                 }
             }
