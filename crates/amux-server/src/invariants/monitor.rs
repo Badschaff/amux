@@ -2079,6 +2079,10 @@ const REPEAT_OFFER_THRESHOLD: i64 = 4;
 /// another language that got it wrong and silently suppressed a page. A status
 /// added to the enum now joins this list automatically, and cannot be added to
 /// one and forgotten in the other.
+///
+/// AMUX-4801 moved the SQL-ready form to `board_store::live_work_status_list`,
+/// because autofix needed the same fact and hand-wrote its inverse five times.
+/// This stays as the Vec form its own callers want, derived identically.
 fn non_terminal_statuses() -> Vec<&'static str> {
     amux_core::board::TaskStatus::ALL
         .iter()

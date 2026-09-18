@@ -1558,3 +1558,61 @@ fn the_mdai_viewer_resolves_paths_against_the_scan_root() {
          _AMUX_HOME, or every open under a mdai_root sub-vault hits 'no such path' (AMUX-4477)"
     );
 }
+
+/// AMUX-4801: the UI's closed-status set and the server's derivation are one
+/// fact, so they are compared rather than trusted.
+///
+/// This fact previously lived in NINE places in app.js in four spellings, all
+/// of them wrong in at least one way: every copy omitted `quarantined` (what
+/// `amux board fail` produces, parked for the OWNER, so it rendered as still
+/// open), two invented `cancelled` (not in TaskStatus at all, an arm that could
+/// never match), and one was `['done','verified']`, treating discarded cards as
+/// open. Consolidating without pinning would leave one copy that is merely
+/// wrong in one place instead of nine.
+///
+/// Compared against `claims_live_work` by COMPLEMENT: a status is closed here
+/// exactly when the server says a lane can no longer act on it. Deliberately
+/// NOT `is_terminal`, which excludes `done` because done still awaits
+/// verification; the two predicates disagree on `done` and `armed`, and sharing
+/// the word "terminal" is how a reader picks the wrong one.
+#[test]
+fn the_ui_closed_statuses_match_the_servers_derivation() {
+    let app = asset("app.js");
+    let line = app
+        .lines()
+        .find(|l| l.trim_start().starts_with("const _CLOSED_STATUSES"))
+        .expect("app.js must declare `const _CLOSED_STATUSES`");
+    let inner = line
+        .split_once('[')
+        .and_then(|(_, r)| r.split_once(']'))
+        .map(|(v, _)| v)
+        .expect("_CLOSED_STATUSES must be an array literal");
+    let mut from_js: Vec<String> = inner
+        .split(',')
+        .map(|p| p.trim().trim_matches('\'').trim_matches('"').to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+
+    let mut from_server: Vec<String> = amux_core::board::TaskStatus::ALL
+        .iter()
+        .filter(|s| !s.claims_live_work())
+        .map(|s| {
+            // The DB spelling, which is what the API returns and what the UI
+            // compares against after `_statusCanon`.
+            format!("{s:?}").to_lowercase()
+        })
+        .collect();
+
+    from_js.sort();
+    from_server.sort();
+    assert_eq!(
+        from_js, from_server,
+        "app.js's _CLOSED_STATUSES has drifted from TaskStatus::claims_live_work's complement"
+    );
+    // The two the old literals got wrong, named so a regression says which.
+    assert!(from_js.contains(&"quarantined".to_string()), "{from_js:?}");
+    assert!(from_js.contains(&"armed".to_string()), "{from_js:?}");
+    assert!(!from_js.contains(&"cancelled".to_string()), "cancelled is not a status: {from_js:?}");
+    // And the count is not a coincidence of two short lists.
+    assert!(from_js.len() >= 5, "{from_js:?}");
+}

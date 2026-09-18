@@ -885,6 +885,24 @@ function _schedulePeekPoll(delay) {
 // got sent twice. One store cannot disagree with itself.
 
 // ═══════ ZOOM ═══════
+// AMUX-4801. THE statuses a card can hold while a lane can NO LONGER act on
+// it. One list, because this fact previously lived in nine places here in four
+// different spellings, and every one of them was wrong:
+//   - all of them omitted `quarantined`, which is what `amux board fail`
+//     produces and is parked FOR THE OWNER, so it rendered as still-open;
+//   - two invented `cancelled`, which is not in the server's TaskStatus enum
+//     at all and could never match;
+//   - one was ['done','verified'], treating discarded cards as open.
+// Mirrors the server's `board_store::live_work_status_list()` by complement;
+// `dashboard_assets.rs` fails the build if the two ever disagree.
+//
+// NOT the same question as "is the lifecycle finished" (`is_terminal` there),
+// which excludes `done` because done still awaits verification. The two
+// predicates disagree on `done` and `armed`, which is exactly how a reader
+// picks the wrong one.
+const _CLOSED_STATUSES = new Set(['done', 'verified', 'discarded', 'armed', 'quarantined']);
+const _isClosedStatus = (st) => _CLOSED_STATUSES.has(_statusCanon(st));
+
 const ZOOM_STEPS = [50, 60, 70, 75, 80, 85, 90, 95, 100, 110, 120, 130, 150, 175, 200];
 let _zoomLevel = parseInt(localStorage.getItem('amux_zoom')) || 100;
 if (!ZOOM_STEPS.includes(_zoomLevel)) _zoomLevel = 100;
@@ -7159,7 +7177,7 @@ function _renderExpiredSection() {
   const chevron = `<span class="expired-chevron${expiredExpanded ? ' open' : ''}">&#x25B6;</span>`;
   let html = `<div class="expired-footer" onclick="toggleExpired()">${chevron} ${label}</div>`;
   if (expiredExpanded) {
-    const TERMINAL = new Set(['done', 'verified', 'discarded', 'cancelled']);
+    const TERMINAL = _CLOSED_STATUSES;
     const STATUS_DOT = { doing: 'var(--accent)', todo: 'var(--dim)', backlog: 'var(--dim)', done: '#4ade80', verified: '#4ade80', discarded: '#888', cancelled: '#888' };
     html += '<div class="expired-body">';
     filtered.forEach(w => {
@@ -11359,7 +11377,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.987';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.988';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -28696,7 +28714,7 @@ function _statusCanon(s) {
   return _STATUS_ALIAS[k] || k;
 }
 
-const _BQ_CLOSED = new Set(['done', 'verified', 'discarded']);
+const _BQ_CLOSED = _CLOSED_STATUSES;
 // Dormant item types: armed and waiting, never dispatchable work. Kept in sync
 // with the server-side exclusion in the auto-pickup queries (`type NOT IN
 // ('tripwire','watch')`) — if a type is added there, add it here or armed cards
@@ -28763,7 +28781,7 @@ function _bqIs(item, val, ix) {
       if (_bqIs(item, 'needsyou', ix) || _bqIs(item, 'rotting', ix)) return true;
       const deps = Array.isArray(item.depends_on) ? item.depends_on : [];
       return deps.some(d => { const dc = (boardItems||[]).find(x => x.id === d);
-        return dc && !['done','verified','discarded'].includes(_statusCanon(dc.status)); });
+        return dc && !_isClosedStatus(dc.status); });
     }
     // Derived card whose producer hasn't re-checked its source in 24h+
     // (AMUX-2204): it may be ASSERTING a state (breach, blocker) its source
@@ -29477,7 +29495,7 @@ function renderBoardFilters() {
   // open cards (machine/namespaced tags — anything with ':' or '@', like
   // hrsla:someone@x.com — stay reachable via + Filter and typed queries, but
   // do not earn toolbar real estate), ranked by open-card count, capped.
-  const openItems = boardItems.filter(i => !i.archived && !['done','verified','discarded'].includes(_statusCanon(i.status)));
+  const openItems = boardItems.filter(i => !i.archived && !_isClosedStatus(i.status));
   const tagCount = {};
   openItems.forEach(i => (i.tags || []).forEach(t => {
     if (t.includes(':') || t.includes('@')) return;
@@ -29916,7 +29934,7 @@ function _renderBoardCard(item) {
   // archived correctly and nobody wants to close it — flagging those too
   // would put the marker on every archived row instead of the ~15% that are
   // actually stuck, which reads as decoration (ethos rule 5).
-  if (item.archived && !['done', 'verified', 'discarded'].includes(item.status)) {
+  if (item.archived && !_isClosedStatus(item.status)) {
     h += '<div class="board-card-archived-live" title="Archived, but still shows status \'' + esc(item.status || '') + '\'. Every closing verb refuses with archived_task_immutable until you unarchive it first (amux board unarchive ' + esc(item.id) + ', then done/discard as usual).">&#x1F4E6; archived, cannot close</div>';
   }
   h += _leaseChip(item);
@@ -29986,13 +30004,13 @@ function _leaseChip(item) {
 // about a card it cannot see (the same trap the capped board list already has).
 function _blockedByChip(item) {
   const deps = Array.isArray(item && item.depends_on) ? item.depends_on : [];
-  if (!deps.length || ['done', 'verified', 'discarded'].includes(item.status)) return '';
+  if (!deps.length || _isClosedStatus(item.status)) return '';
   const known = new Map((Array.isArray(boardItems) ? boardItems : []).map(i => [i.id, i.status]));
   const blocking = [], unknown = [];
   deps.forEach(id => {
     const st = known.get(id);
     if (st === undefined) unknown.push(id);
-    else if (!['done', 'verified', 'discarded'].includes(st)) blocking.push(id);
+    else if (!_isClosedStatus(st)) blocking.push(id);
   });
   if (!blocking.length && !unknown.length) return '';
   const shown = blocking.slice(0, 3).join(', ') + (blocking.length > 3 ? ' +' + (blocking.length - 3) : '');
@@ -32351,7 +32369,7 @@ async function _orchLoad() {
       if ((c.title || '').startsWith('[EPIC]')) addEpic(c);
     });
 
-    const TERMINAL = new Set(['done', 'verified', 'discarded', 'cancelled']);
+    const TERMINAL = _CLOSED_STATUSES;
     orchEpics.forEach(epic => {
       const children = childByEpic[epic.id] || [];
       const allDone = children.length > 0 && children.every(c => TERMINAL.has(c.status));
@@ -38306,7 +38324,7 @@ function _trendsRender() {
     const cards = [...g.cards].map(id => byId[id]).filter(Boolean);
     const verified = cards.filter(c => c.status==='verified').length;
     const done = cards.filter(c => c.status==='done').length;
-    const openC = cards.filter(c => !['done','verified','discarded'].includes(_statusCanon(c.status)));
+    const openC = cards.filter(c => !_isClosedStatus(c.status));
     const blocked = openC.filter(c => (c.tags||[]).some(x=>_NEEDS_HUMAN_TAGS.has(String(x).toLowerCase())));
     const exp = _trendsExpanded[g.key];
     const inProg = openC.length - blocked.length;
@@ -38349,7 +38367,7 @@ function _trendsRender() {
     + '<span style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;color:var(--accent);font-weight:600;">\uD83D\uDCC8 Weekly task-theme summary</span>'
     + '<select id="trends-week" onchange="_trendsLoadSummary(this.value)" style="font-size:0.76rem;padding:3px 6px;margin-left:auto;"></select></div>'
     + '<div id="trends-digest" class="rv-digest md-content"><span style="color:var(--dim);">Loading summary\u2026</span></div></div>';
-  const totalNeed = groups.reduce((a,g)=>a + [...g.cards].map(id=>byId[id]).filter(c=>c && (c.tags||[]).some(x=>_NEEDS_HUMAN_TAGS.has(String(x).toLowerCase())) && !['done','verified','discarded'].includes(_statusCanon(c.status))).length, 0);
+  const totalNeed = groups.reduce((a,g)=>a + [...g.cards].map(id=>byId[id]).filter(c=>c && (c.tags||[]).some(x=>_NEEDS_HUMAN_TAGS.has(String(x).toLowerCase())) && !_isClosedStatus(c.status)).length, 0);
   const answerBar = '<div class="tr-answer">'
     + (totalNeed ? '<span style="color:var(--red);font-weight:600;">\u26A1 ' + totalNeed + ' item(s) need you</span> <button class="btn" style="font-size:0.74rem;min-height:34px;margin-left:6px;" onclick="_focusStart(\'is:blocked\')">Clear them</button>'
                  : '<span style="color:var(--green);font-weight:600;">\u2713 Nothing needs you — it\'s all moving.</span>')

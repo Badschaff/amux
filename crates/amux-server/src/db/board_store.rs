@@ -95,6 +95,39 @@ pub fn parse_status(raw: &str) -> Option<TaskStatus> {
     }
 }
 
+/// The DB spellings a card can hold while A LANE CAN STILL ACT ON IT, as a
+/// SQL-ready quoted list.
+///
+/// DERIVED from `TaskStatus::claims_live_work`, so a status added to the enum
+/// joins every query automatically (AF-555's lesson: a predicate every consumer
+/// must reimplement is a predicate that will be wrong somewhere).
+///
+/// AMUX-4801. Five call sites in autofix.rs hand-wrote the INVERSE of this as
+/// `status NOT IN ('done','verified','discarded')`, and that literal is wrong
+/// in two ways a reader cannot see:
+///
+/// 1. It counts `armed` and `quarantined` as live. A lane cannot act on
+///    either: `is_dormant` says an armed card waits for an event and is never
+///    auto-picked, and a quarantined card is parked FOR THE OWNER by
+///    `amux board fail`. Those sites' own comment says "only cards a lane can
+///    still act on count", so the literal contradicts the sentence above it,
+///    and a quarantined card silently suppressed re-filing of a live fault.
+/// 2. `NOT IN` is open-world: any status outside the three, including a legacy
+///    spelling, reads as LIVE. The board holds exactly one such card, MVS-163
+///    at `resolved`, which `parse_status` maps to Done. The literal calls it
+///    live; this list correctly does not.
+///
+/// Safe to interpolate: every element is a fixed ASCII identifier from the
+/// enum, never user input, and a test pins that.
+pub fn live_work_status_list() -> String {
+    amux_core::board::TaskStatus::ALL
+        .iter()
+        .filter(|s| s.claims_live_work())
+        .map(|s| format!("'{}'", db_status_spelling(*s)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// The Python DB spelling for each status (what a FRESH write uses). Note
 /// `needsyou` — the live board's own spelling, NOT core's `needs_you`.
 pub fn db_status_spelling(s: TaskStatus) -> &'static str {
@@ -4118,6 +4151,45 @@ pub fn dependency_path(
 
 #[cfg(test)]
 mod tests {
+    /// AMUX-4801: the live-work list is DERIVED and SQL-safe.
+    ///
+    /// The literal it replaced, `NOT IN ('done','verified','discarded')`, was
+    /// wrong on `armed`, `quarantined` and on any status outside the enum. The
+    /// cells below pin the difference rather than the spelling.
+    #[test]
+    fn live_work_status_list_is_derived_and_sql_safe() {
+        let list = live_work_status_list();
+        // DERIVED: every status claiming live work is present, and nothing else.
+        for st in amux_core::board::TaskStatus::ALL {
+            let quoted = format!("'{}'", db_status_spelling(st));
+            assert_eq!(
+                list.contains(&quoted),
+                st.claims_live_work(),
+                "{st:?} membership must follow claims_live_work, got list {list}"
+            );
+        }
+        // The two the old literal got wrong, named so a regression says which.
+        assert!(!list.contains("'quarantined'"), "a quarantined card is parked for the OWNER: {list}");
+        assert!(!list.contains("'armed'"), "an armed card waits for an event and is never auto-picked: {list}");
+        assert!(list.contains("'todo'") && list.contains("'doing'"), "{list}");
+        // And `done` is absent here even though it is NOT is_terminal: the two
+        // predicates disagree on `done` on purpose, which is the trap this
+        // whole card is about.
+        assert!(!list.contains("'done'"), "{list}");
+
+        // SQL-SAFE: interpolated, so this must be a comma-separated list of
+        // single-quoted lowercase identifiers and nothing else.
+        for part in list.split(',') {
+            assert!(part.starts_with('\'') && part.ends_with('\''), "{part:?} in {list}");
+            let inner = &part[1..part.len() - 1];
+            assert!(
+                !inner.is_empty()
+                    && inner.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{inner:?} is not a bare identifier, so interpolating it is unsafe"
+            );
+        }
+    }
+
     use super::*;
 
     /// AF-332. The probe must catch what `current_rev()` cannot.

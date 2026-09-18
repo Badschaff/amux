@@ -6337,12 +6337,13 @@ fn fault_identity(signature: &str) -> Option<&str> {
 fn open_rollup_coverage(conn: &Connection) -> Vec<(std::collections::BTreeSet<String>, f64)> {
     const PREFIX: &str = "|ROLLUP|";
     let mut out = Vec::new();
-    let Ok(mut stmt) = conn.prepare(
+    let Ok(mut stmt) = conn.prepare(&format!(
         "SELECT source_ref, created FROM issues \
           WHERE source_ref LIKE 'autofix:latency|outlier|ROLLUP|%' \
-            AND status NOT IN ('done','verified','discarded') \
+            AND status IN ({live}) \
             AND archived = 0 AND deleted IS NULL",
-    ) else {
+        live = crate::db::board_store::live_work_status_list()
+    )) else {
         return out;
     };
     let Ok(rows) = stmt.query_map([], |r| {
@@ -6393,11 +6394,14 @@ fn covered_by_open_rollup(
 fn open_card_for_fault(conn: &Connection, signature: &str) -> Option<String> {
     let ident = fault_identity(signature)?;
     conn.query_row(
-        "SELECT id FROM issues \
-          WHERE source_ref LIKE ?1 \
-            AND status NOT IN ('done','verified','discarded') \
-            AND archived = 0 AND deleted IS NULL \
-          ORDER BY id DESC LIMIT 1",
+        &format!(
+            "SELECT id FROM issues \
+              WHERE source_ref LIKE ?1 \
+                AND status IN ({live}) \
+                AND archived = 0 AND deleted IS NULL \
+              ORDER BY id DESC LIMIT 1",
+            live = crate::db::board_store::live_work_status_list()
+        ),
         rusqlite::params![format!("autofix:{ident}|%")],
         |r| r.get::<_, String>(0),
     )
@@ -6430,12 +6434,17 @@ fn open_card_for_fault(conn: &Connection, signature: &str) -> Option<String> {
 fn released_predecessor(conn: &Connection, signature: &str) -> Option<(String, String)> {
     let ident = fault_identity(signature)?;
     conn.query_row(
-        "SELECT id, CASE WHEN archived = 1 THEN 'archived' ELSE status END \
-           FROM issues \
-          WHERE source_ref LIKE ?1 \
-            AND deleted IS NULL \
-            AND (archived = 1 OR status IN ('done','verified','discarded')) \
-          ORDER BY id DESC LIMIT 1",
+        // The COMPLEMENT of the four "still open" sites, from the same source,
+        // so the two directions cannot drift apart (AMUX-4801).
+        &format!(
+            "SELECT id, CASE WHEN archived = 1 THEN 'archived' ELSE status END \
+               FROM issues \
+              WHERE source_ref LIKE ?1 \
+                AND deleted IS NULL \
+                AND (archived = 1 OR status NOT IN ({live})) \
+              ORDER BY id DESC LIMIT 1",
+            live = crate::db::board_store::live_work_status_list()
+        ),
         rusqlite::params![format!("autofix:{ident}|%")],
         |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
     )
@@ -7416,16 +7425,17 @@ async fn note_resolved_incidents(state: &AppState) -> anyhow::Result<Vec<(String
     }
     let candidates: Vec<Note> = {
         let conn = state.store.read()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT i.board_issue, i.invariant_id, i.entity_key, i.status, i.resolved_at \
                FROM _amux_invariant_incident i \
                JOIN issues c ON c.id = i.board_issue \
               WHERE i.resolved_at IS NOT NULL \
                 AND i.board_issue != '' \
-                AND c.status NOT IN ('done','verified','discarded') \
+                AND c.status IN ({live}) \
                 AND c.archived = 0 \
               LIMIT 50",
-        )?;
+            live = crate::db::board_store::live_work_status_list()
+        ))?;
         let rows = stmt
             .query_map([], |r| {
                 Ok((
@@ -7557,12 +7567,13 @@ async fn note_quiet_signatures(
     let mut candidates: Vec<Note> = Vec::new();
     {
         let conn = state.store.read()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT id, source_ref FROM issues \
              WHERE source_ref LIKE 'autofix:%' AND deleted IS NULL \
-               AND status NOT IN ('done','verified','discarded') \
+               AND status IN ({live}) \
                AND COALESCE(archived,0)=0 LIMIT 500",
-        )?;
+            live = crate::db::board_store::live_work_status_list()
+        ))?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         for (id, sref) in rows.flatten() {
             let sig = sref.trim_start_matches("autofix:").to_string();
