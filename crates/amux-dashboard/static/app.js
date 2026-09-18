@@ -11359,7 +11359,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.985';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.986';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -32202,8 +32202,9 @@ function _peekFanoutLoad() {
     const cardId = child.runtime_board && child.runtime_board.card_id ? child.runtime_board.card_id : '';
     const cardStatus = child.runtime_board && child.runtime_board.runtime_status ? child.runtime_board.runtime_status : '';
     html += '<div class="fanout-worker-row">'
-      + '<span class="fanout-worker-name" onclick="showSession(\'' + escJs(child.name) + '\')">' + esc(child.name) + '</span>'
+      + '<span class="fanout-worker-name" onclick="openPeek(\'' + escJs(child.name) + '\')">' + esc(child.name) + '</span>'
       + '<span class="bd-fanout-status ' + statusCls + '">' + esc(statusLabel) + '</span>'
+      + _fanoutStartBtn(child.name, !!child.running)
       + (cardId ? '<span class="fanout-worker-card" onclick="_openIssue(\'' + escJs(cardId) + '\')" style="cursor:pointer;text-decoration:underline;">' + esc(cardId) + (cardStatus ? ' (' + esc(cardStatus) + ')' : '') + '</span>' : '')
       + '</div>';
   });
@@ -32245,9 +32246,17 @@ function _bdRenderFanoutChildren(item) {
     html += '<span class="status-badge">' + esc(c.status || 'todo') + '</span>';
     if (isEphemeral && workerStatus) {
       html += '<span class="bd-fanout-status ' + statusCls + '" title="Worker: ' + esc(childSession) + '">' + esc(workerStatus) + '</span>';
-      html += '<span class="bd-fanout-worker" onclick="showSession(\'' + escJs(childSession) + '\')">' + esc(childSession) + '</span>';
+      html += '<span class="bd-fanout-worker" onclick="openPeek(\'' + escJs(childSession) + '\')">' + esc(childSession) + '</span>';
+      html += _fanoutStartBtn(childSession, !!(sess && sess.running));
     } else if (childSession) {
+      // The card still names a worker, but it is not in the live sessions
+      // list at all -- a reaped/expired ephemeral worker (AMUX-4682, Ethan
+      // 2026-09-18: "the ephemeral worker was expired again"). Give it the
+      // SAME Start affordance rather than rendering a dead label: doStart's
+      // own /start call re-provisions it from the still-registered env file,
+      // or fails honestly (via showAlert) if that is gone too.
       html += '<span style="font-size:.72rem;color:var(--dim);">' + esc(childSession) + '</span>';
+      html += _fanoutStartBtn(childSession, false);
     }
     html += '</div>';
   });
@@ -32266,6 +32275,20 @@ function _orchSetFilter(f) {
     p.classList.toggle('active', p.dataset.filter === f);
   });
   if (_orchData) _orchRender(_orchData);
+}
+
+// A fan-out worker (epic-level or child-level) that is not currently running
+// gets a Start button beside its name, everywhere its name is rendered
+// clickable (Ethan, 2026-09-18: "I should be able to start workers that have
+// been paused, archived or expired... from the accordions"). Reuses doStart,
+// the same function the normal Sessions list's Start button calls -- it polls
+// for the session to come up and surfaces a real error via showAlert rather
+// than silently doing nothing, so a worker that is genuinely gone (no env
+// file left to start from, e.g. a reaped ephemeral worker) fails honestly
+// instead of the button looking broken.
+function _fanoutStartBtn(name, running) {
+  if (running) return '';
+  return '<button class="bd-fanout-start-btn" onclick="event.stopPropagation();doStart(\'' + escJs(name) + '\');" title="Start ' + esc(name) + '">&#x25B6; Start</button>';
 }
 
 async function _orchLoad() {
@@ -32411,7 +32434,9 @@ function _orchRender(data) {
     }
     html += '<span class="status-badge ' + (epic.status || 'todo') + '" style="font-size:.62rem;">' + esc(epic.status || 'todo') + '</span>';
     if (epic.session) {
-      html += '<span class="orch-node-worker" onclick="event.stopPropagation();showSession(\'' + escJs(epic.session) + '\')">' + esc(epic.session) + '</span>';
+      const epicSess = sessMap[epic.session];
+      html += '<span class="orch-node-worker" onclick="event.stopPropagation();openPeek(\'' + escJs(epic.session) + '\')">' + esc(epic.session) + '</span>';
+      html += _fanoutStartBtn(epic.session, !!(epicSess && epicSess.running));
     }
     html += '</div>';
 
@@ -32441,7 +32466,8 @@ function _orchRender(data) {
           html += '<span class="bd-fanout-status ' + (workerStatus === 'busy' ? 'running' : 'idle') + '" style="font-size:.58rem;">' + esc(workerStatus) + '</span>';
         }
         if (child.session) {
-          html += '<span class="orch-node-worker" onclick="event.stopPropagation();showSession(\'' + escJs(child.session) + '\')">' + esc(child.session) + '</span>';
+          html += '<span class="orch-node-worker" onclick="event.stopPropagation();openPeek(\'' + escJs(child.session) + '\')">' + esc(child.session) + '</span>';
+          html += _fanoutStartBtn(child.session, !!(sess && sess.running));
         }
         html += '</div>';
 
