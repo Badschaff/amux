@@ -75,6 +75,21 @@ macro_rules! cached_re {
 
 const OP_TIMEOUT: Duration = Duration::from_secs(5);
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
+/// `git worktree add` checks out the WHOLE tree into a new directory --
+/// tens of thousands of files on this repo (Ethan, 2026-09-18: "the ephemeral
+/// worker was expired again"). OP_TIMEOUT (5s) is sized for a quick metadata
+/// query, not a full checkout under real box contention (measured this
+/// session: 47,223 files; other lanes' cargo builds have SIGKILLed under the
+/// same load). A `git worktree add` killed mid-checkout by a too-short
+/// timeout is exactly what left three ephemeral workers' worktrees
+/// "locked initializing" and one "prunable: gitdir file points to a
+/// non-existent location" (AMUX-4767's leaked-lock report only ever saw the
+/// SYMPTOM, never traced it to this) -- and since `git worktree add`'s own
+/// exit status is separately checked against `materialized` before this
+/// timeout was widened, a killed process was ALREADY refused correctly; it
+/// just kept getting killed on every retry, so isolation could never
+/// actually establish itself, only fail loudly and leave a fresh corpse.
+const WORKTREE_ADD_TIMEOUT: Duration = Duration::from_secs(120);
 /// Python: MAX_LOG_BYTES = 10MB (py:892).
 const MAX_LOG_BYTES: usize = 10 * 1024 * 1024;
 
@@ -9120,7 +9135,7 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
         let added = run_cmd(
             "git",
             &["-C", &work_dir, "worktree", "add", "--detach", &wt_path, pinned_at],
-            OP_TIMEOUT,
+            WORKTREE_ADD_TIMEOUT,
         )
         .await;
         // A `git worktree add` that exits 0 is not proof the directory is
@@ -10209,6 +10224,19 @@ pub(crate) async fn reclaim_worktree(repo: &str, wt_path: &str) -> bool {
     let dir = std::path::Path::new(wt_path);
     let _ = run_cmd("git", &["-C", repo, "worktree", "unlock", wt_path], OP_TIMEOUT).await;
     let _ = run_cmd("git", &["-C", repo, "worktree", "remove", "--force", wt_path], OP_TIMEOUT).await;
+    // PRUNE TOO, not just remove (Ethan, 2026-09-18: "the ephemeral worker was
+    // expired again"). Confirmed live on the exact worktree that report was
+    // about: `git worktree add` killed mid-checkout by the too-short
+    // WORKTREE_ADD_TIMEOUT this same fix widens can leave a registration whose
+    // gitdir file points to a directory that never finished materializing --
+    // `git worktree list` calls that state `prunable`, and `worktree remove
+    // --force` alone does NOT clear it (verified: ran unlock + remove --force
+    // by hand against that exact prunable entry, it was still registered
+    // afterward; `git worktree prune` cleared it on the next line). Without
+    // this, every start attempt after one killed checkout reclaims nothing,
+    // `git worktree add` refuses the still-registered path, and the worker can
+    // never come back up on its own.
+    let _ = run_cmd("git", &["-C", repo, "worktree", "prune"], OP_TIMEOUT).await;
     if dir.exists() {
         let _ = tokio::fs::remove_dir_all(dir).await;
     }
@@ -33586,6 +33614,62 @@ mod amux4770_worktree_isolation_tests {
                 listed(&repo)
             );
         }
+    }
+
+    /// AMUX-4682 (Ethan, 2026-09-18: "the ephemeral worker was expired
+    /// again"). A DIFFERENT leaked state from the locked one above, and the
+    /// one that actually reproduced against a real fan-out worker's worktree
+    /// today: `git worktree add` interrupted (in production: killed by a
+    /// timeout too short for a large checkout) can leave a registration whose
+    /// gitdir file points at a directory that was never finished / no longer
+    /// exists. `git worktree list` calls this `prunable`, and it needs
+    /// `worktree prune`, not `worktree remove --force` -- confirmed as the
+    /// control below, against a real corrupted registration, not a
+    /// description of one.
+    #[tokio::test]
+    async fn reclaiming_clears_a_prunable_worktree_whose_gitdir_points_nowhere() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = seeded_repo(tmp.path());
+        let wt = tmp.path().join("wt");
+        let wt_s = wt.to_string_lossy().to_string();
+        let repo_s = repo.to_string_lossy().to_string();
+        assert!(git(&repo, &["worktree", "add", "--detach", &wt_s, "HEAD"]).status.success());
+        // Simulate the interrupted-checkout state precisely: removing the
+        // WHOLE directory reproduces nothing (git deregisters a cleanly-gone
+        // worktree on `remove --force` without complaint, verified). What a
+        // checkout killed partway through actually leaves is the directory
+        // present but the worktree's OWN `.git` file (the backlink to the
+        // repo's `.git/worktrees/<name>/` admin dir) missing or never
+        // written -- confirmed against a real git binary: this is what
+        // flips `git worktree list` to `prunable`.
+        std::fs::remove_file(wt.join(".git")).unwrap();
+
+        assert!(
+            listed(&repo).contains("prunable"),
+            "reproduction failed: this is not the state the fix targets:\n{}",
+            listed(&repo)
+        );
+
+        // THE CONTROL: `remove --force` alone, the pre-fix behaviour, must NOT
+        // clear a prunable entry, or this test is not exercising the gap.
+        // Confirmed against a real git binary: it exits 128, "fatal:
+        // validation failed, cannot remove working tree: '<wt>/.git' does
+        // not exist" -- git refuses to remove a worktree it cannot validate.
+        let _ = git(&repo, &["worktree", "remove", "--force", &wt_s]);
+        assert!(
+            listed(&repo).contains(&wt_s),
+            "remove --force alone cleared it, so this cell is not testing a real obstruction"
+        );
+
+        assert!(
+            super::reclaim_worktree(&repo_s, &wt_s).await,
+            "reclaim reported failure against a prunable worktree"
+        );
+        assert!(
+            !listed(&repo).contains(&wt_s),
+            "still registered after reclaim:\n{}",
+            listed(&repo)
+        );
     }
 
     /// Reclaiming something already gone must report success, not failure.
