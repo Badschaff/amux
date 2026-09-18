@@ -508,16 +508,35 @@ test('new input during a replay starts next tick instead of waiting for outage b
 });
 
 test('post-input terminal polling is lightweight, serial and bounded', async () => {
-  const {ctx,timers,timerDelays}=fixture(['_peekPollInterval','_stopPeekPoll','_schedulePeekPoll','_peekKickFast','_refreshPeekSoon']);
-  let now=1000;const refreshes=[];
+  const {ctx,timers,timerDelays}=fixture(['_peekPollInterval','_stopPeekPoll','_schedulePeekPoll','_peekKickFast','_refreshPeekSoon','_peekPollNow']);
+  let now=1000;const refreshes=[];let requestMs=0;let duringRequest=null;
   Object.assign(ctx,{performance:{now:()=>now},peekSession:'lane',peekTimer:null,_peekUrgentUntil:0,_peekLastChangeMs:0,
     _peekPollGen:0,_peekPollActive:false,_peekPollSession:null,_peekPrevStatus:'active',_peekFullPending:false,_peekLastFullMs:900,_PEEK_HISTORY_REFRESH_MS:30000,
-    sessions:[{name:'lane',status:'waiting'}],_peekPollBeacon(){},_peekUpdateBranch(){},refreshPeek:async live=>refreshes.push(live)});
+    _peekPollInFlight:false,_peekPollAgain:false,
+    sessions:[{name:'lane',status:'waiting'}],_peekPollBeacon(){},_peekUpdateBranch(){},
+    refreshPeek:async live=>{refreshes.push(live);if(duringRequest)duringRequest();now+=requestMs;}});
   ctx._refreshPeekSoon();assert.equal(timerDelays.get(ctx.peekTimer),40);
   await timers.get(ctx.peekTimer)();assert.deepEqual(refreshes,[true]);
   assert.equal(timerDelays.get(ctx.peekTimer),100);
   now=3000;await timers.get(ctx.peekTimer)();assert.deepEqual(refreshes,[true,false]);
   assert.ok(timerDelays.get(ctx.peekTimer)>100);
+  // AMUX-4802: the cadence is a PERIOD. A 1500ms setting with a 200ms request
+  // waits 1300, not 1500. The request's duration used to be added on top.
+  now=20000;requestMs=200;await timers.get(ctx.peekTimer)();
+  assert.equal(timerDelays.get(ctx.peekTimer),1300);
+  // A request slower than the period still leaves a gap: serial and bounded.
+  now=40000;requestMs=5000;await timers.get(ctx.peekTimer)();
+  assert.equal(timerDelays.get(ctx.peekTimer),40);
+  // A caller asking for a tick WHILE one is in flight starts no second fetch.
+  // It gets one more tick straight after, so nothing is dropped or reordered.
+  now=60000;requestMs=0;const before=refreshes.length;
+  duringRequest=()=>{assert.equal(ctx._peekPollInFlight,true);ctx._peekPollNow();};
+  await timers.get(ctx.peekTimer)();duringRequest=null;
+  assert.equal(refreshes.length,before+1,'no concurrent fetch was started');
+  assert.equal(timerDelays.get(ctx.peekTimer),40);
+  // Idle, with the loop waiting on its timer, the same call pulls the tick forward.
+  await timers.get(ctx.peekTimer)();assert.ok(timerDelays.get(ctx.peekTimer)>40);
+  ctx._peekPollNow();assert.equal(timerDelays.get(ctx.peekTimer),0);
   ctx.document.hidden=true;ctx._schedulePeekPoll();assert.equal(ctx.peekTimer,null);
 });
 

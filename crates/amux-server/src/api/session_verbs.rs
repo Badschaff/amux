@@ -3377,10 +3377,65 @@ fn last_assistant_message(name: &str, max_chars: usize) -> String {
     last.chars().take(max_chars).collect()
 }
 
+/// Rendered transcripts, keyed by file and cap, valid while the file's length
+/// and mtime are unchanged (AMUX-4802).
+///
+/// The port dropped Python's cache with a note to "reintroduce a cache if the
+/// SPA's poll cadence lands here". It landed: `_amux_request_log` holds 40,832
+/// real-browser peek requests in one day, and EVERY one of them, the 350ms live
+/// poll included, re-read the last 5MB of the JSONL, parsed each record and
+/// re-ran the render, to trim an overlap against text that had not changed.
+/// Measured as `live=1` against `live=1&notrim=1` on a 106MB transcript: p50
+/// 164ms against 111ms, a third of the request. A transcript is append-only,
+/// so (len, mtime) moving is exactly "there is something new to render".
+type TranscriptStamp = (u64, Option<std::time::SystemTime>);
+type TranscriptRenders = std::collections::HashMap<(PathBuf, usize), (TranscriptStamp, Arc<str>)>;
+static TRANSCRIPT_RENDERS: std::sync::OnceLock<std::sync::Mutex<TranscriptRenders>> =
+    std::sync::OnceLock::new();
+static TRANSCRIPT_RENDER_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TRANSCRIPT_RENDER_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn render_session_transcript(name: &str, max_chars: usize) -> String {
     let Some(path) = session_jsonl_path(name) else { return String::new() };
+    render_transcript_file(&path, max_chars)
+}
+
+fn render_transcript_file(path: &Path, max_chars: usize) -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let stamp: Option<TranscriptStamp> =
+        std::fs::metadata(path).ok().map(|m| (m.len(), m.modified().ok()));
+    let key = (path.to_path_buf(), max_chars);
+    let cache = TRANSCRIPT_RENDERS.get_or_init(Default::default);
+    if let Some(stamp) = stamp {
+        if let Some((cached, text)) = cache.lock().unwrap().get(&key) {
+            if *cached == stamp {
+                TRANSCRIPT_RENDER_HITS.fetch_add(1, Relaxed);
+                return text.to_string();
+            }
+        }
+    }
     let max_read = std::cmp::max(max_chars * 5, 5_000_000) as u64;
-    render_transcript_records(iter_jsonl_tail(&path, max_read), max_chars)
+    let rendered = render_transcript_records(iter_jsonl_tail(path, max_read), max_chars);
+    let misses = TRANSCRIPT_RENDER_MISSES.fetch_add(1, Relaxed) + 1;
+    // The signal that says the cache is doing its job, or has stopped. A ratio
+    // near zero on a busy fleet means the key is churning (a path or stamp
+    // that never repeats) and every poll is paying the full render again.
+    if misses.is_multiple_of(500) {
+        tracing::info!(target: "amux::peek", verdict = "transcript_render_cache",
+            hits = TRANSCRIPT_RENDER_HITS.load(Relaxed), misses, measured = true,
+            n_considered = TRANSCRIPT_RENDER_HITS.load(Relaxed) + misses,
+            "transcript render cache: hits against full re-renders since boot");
+    }
+    // Stamped BEFORE the read, so an append that lands mid-render leaves a
+    // stale stamp behind and the next call re-renders rather than serving it.
+    if let Some(stamp) = stamp {
+        let mut guard = cache.lock().unwrap();
+        if guard.len() >= 64 {
+            guard.clear();   // bounded: one entry per open view, a few dozen at most
+        }
+        guard.insert(key, (stamp, rendered.as_str().into()));
+    }
+    rendered
 }
 
 fn render_transcript_records(records: Vec<Value>, max_chars: usize) -> String {
@@ -11546,16 +11601,32 @@ fn parse_pane_geometry(raw: &str) -> Option<(i64, i64)> {
     Some((cols, rows))
 }
 
+/// [`render_session_transcript`] on the blocking pool. A panic in the render
+/// degrades to "no transcript", which every caller already handles as the
+/// worker simply having none yet.
+async fn render_session_transcript_off_thread(name: &str, max_chars: usize) -> String {
+    let owned = name.to_owned();
+    tokio::task::spawn_blocking(move || render_session_transcript(&owned, max_chars))
+        .await
+        .unwrap_or_default()
+}
+
 async fn peek_response(name: &str, lines: i64, live_only: bool, no_trim: bool) -> Value {
     let provider = provider_of(&parse_env(name));
     if live_only {
-        let output = strip_scroll_pill(&tmux_capture(name, lines).await);
+        // The capture is a subprocess and the transcript is file work, and
+        // neither needs the other to start, so they run together. The render
+        // goes to the blocking pool: on a miss it parses megabytes of JSONL,
+        // which is what `runtime_job_blocking_poll` was reporting from here.
+        let wants_trim = !no_trim && provider == "claude";
+        let (captured, transcript) = tokio::join!(tmux_capture(name, lines), async {
+            if wants_trim { render_session_transcript_off_thread(name, 120_000).await } else { String::new() }
+        });
+        let output = strip_scroll_pill(&captured);
         let live = if output.is_empty() { String::new() } else { strip_launch_noise(output.trim()) };
-        // The live=1 trim needs the transcript the CLIENT is displaying; the
-        // rust origin re-renders it (bounded) instead of a process cache.
-        let live = if !live.is_empty() && !no_trim && provider == "claude" {
-            let tr = render_session_transcript(name, 120_000);
-            if tr.is_empty() { live } else { trim_live_overlap(&tr, &live) }
+        // The live=1 trim needs the transcript the CLIENT is displaying.
+        let live = if !live.is_empty() && !transcript.is_empty() {
+            trim_live_overlap(&transcript, &live)
         } else {
             live
         };
@@ -11589,7 +11660,7 @@ async fn peek_response(name: &str, lines: i64, live_only: bool, no_trim: bool) -
         } else if provider != "claude" {
             (String::new(), clean_gemini_frame(&tmux_capture(name, 0).await))
         } else {
-            (render_session_transcript(name, 120_000), output)
+            (render_session_transcript_off_thread(name, 120_000).await, output)
         };
         let mut live = if output.is_empty() { String::new() } else { strip_launch_noise(output.trim()) };
         if !transcript.is_empty() && !live.is_empty() {
@@ -15445,6 +15516,12 @@ async fn dispatch(
         return share_handler(&state, &name, &method, &headers, &body).await;
     }
 
+    if method == Method::GET && action == "peek" {
+        // The one GET verb the dashboard polls conditionally; the dispatcher
+        // below has no headers to answer that with.
+        let sent = headers.get(axum::http::header::IF_NONE_MATCH).and_then(|v| v.to_str().ok());
+        return peek_verb_conditional(&name, &qs, sent).await;
+    }
     if method == Method::GET || method == Method::HEAD {
         return get_dispatch(&state, &name, &action, &subid, &qs).await;
     }
@@ -19212,6 +19289,24 @@ pub(crate) fn lane_env_exists(name: &str) -> bool {
 /// it was asked about. `send` never had the problem because it falls back to
 /// the key and lands here; this is the same landing spot for peek.
 pub(crate) async fn peek_verb(name: &str, qs: &[(String, String)]) -> Response {
+    peek_verb_conditional(name, qs, None).await
+}
+
+/// `peek`, answering `If-None-Match` (AMUX-4802).
+///
+/// The dashboard has always sent it. Its poll cadence is written around "idle
+/// ticks are 304s, near-free" and it keeps one ETag per payload shape. This
+/// origin never sent an ETag, so there was nothing to send back: 0 of 40,832
+/// real-browser peek requests in a day were a 304, and the ~135KB history
+/// payload crossed the wire whole on every refresh of an unchanged worker.
+///
+/// Weak validator: the compression layer re-encodes the body, so the bytes on
+/// the wire are equivalent to the hashed ones, not identical to them.
+pub(crate) async fn peek_verb_conditional(
+    name: &str,
+    qs: &[(String, String)],
+    if_none_match: Option<&str>,
+) -> Response {
     let lines: i64 = qs_first(qs, "lines", "80").parse().unwrap_or(80);
     let live_only = qs_flag(qs, "live");
     let no_trim = qs_flag(qs, "notrim");
@@ -19219,14 +19314,46 @@ pub(crate) async fn peek_verb(name: &str, qs: &[(String, String)]) -> Response {
     // that function has six return points (live_only, alt-screen, normal,
     // short-output, empty…) and a key added to one of them is a key the
     // reader cannot rely on. One injection site covers every shape.
-    let mut resp = peek_response(name, lines, live_only, no_trim).await;
-    if let (Some((cols, rows)), Some(obj)) =
-        (tmux_pane_geometry(name).await, resp.as_object_mut())
-    {
+    //
+    // Concurrently with the capture, not after it: both are tmux subprocesses
+    // at ~70-120ms each on this box, and run in series they were most of a
+    // live poll.
+    let (mut resp, geometry) =
+        tokio::join!(peek_response(name, lines, live_only, no_trim), tmux_pane_geometry(name));
+    if let (Some((cols, rows)), Some(obj)) = (geometry, resp.as_object_mut()) {
         obj.insert("pane_cols".into(), json!(cols));
         obj.insert("pane_rows".into(), json!(rows));
     }
-    j200(resp)
+    let Ok(body) = serde_json::to_vec(&resp) else { return j200(resp) };
+    let etag = peek_etag(&body);
+    if if_none_match.is_some_and(|sent| etag_matches(sent, &etag)) {
+        return (StatusCode::NOT_MODIFIED, [(axum::http::header::ETAG, etag)]).into_response();
+    }
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/json".to_string()),
+            (axum::http::header::ETAG, etag),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+fn peek_etag(body: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    body.hash(&mut h);
+    format!("W/\"{:016x}\"", h.finish())
+}
+
+/// Weak comparison over a possibly comma-separated `If-None-Match`. A proxy or
+/// the compression layer may hand a weak tag back as strong or the reverse, so
+/// the `W/` prefix is ignored on both sides, which is what weak comparison is.
+fn etag_matches(sent: &str, ours: &str) -> bool {
+    let bare = |t: &str| t.trim().trim_start_matches("W/").trim_matches('"').to_string();
+    let ours = bare(ours);
+    sent.split(',').any(|t| t.trim() == "*" || bare(t) == ours)
 }
 
 /// `duplicate` as a callable verb, so the canonical `/api/workers/{id}/duplicate`
@@ -26950,6 +27077,49 @@ CLAUDE-POSTFIX-COMPLETE
         assert_eq!(parse_pane_geometry("0x50"), None);
         assert_eq!(parse_pane_geometry("220x0"), None);
         assert_eq!(parse_pane_geometry("-1x50"), None);
+    }
+
+    #[test]
+    fn peek_etag_names_the_body_and_compares_weakly() {
+        let a = peek_etag(br#"{"live":"x"}"#);
+        assert_eq!(a, peek_etag(br#"{"live":"x"}"#), "same frame, same tag, or no poll is ever a 304");
+        assert_ne!(a, peek_etag(br#"{"live":"y"}"#), "a changed frame must not be answered 304");
+        assert!(a.starts_with("W/\""), "weak: the compression layer re-encodes the body");
+        let strengthened = a.trim_start_matches("W/").to_string();
+        assert!(etag_matches(&a, &a));
+        assert!(etag_matches(&strengthened, &a), "a hop that drops W/ still matches");
+        assert!(etag_matches(&format!("\"other\", {a}"), &a), "list form");
+        assert!(etag_matches("*", &a));
+        assert!(!etag_matches("W/\"0000000000000000\"", &a));
+        assert!(!etag_matches("", &a));
+    }
+
+    #[test]
+    fn a_transcript_render_is_reused_until_the_file_changes() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conv.jsonl");
+        let record = |text: &str| {
+            json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":text}]}}).to_string()
+        };
+        std::fs::write(&path, format!("{}\n", record("first reply"))).unwrap();
+        let cold = render_transcript_file(&path, 120_000);
+        assert!(cold.contains("first reply"), "{cold}");
+        let hits = TRANSCRIPT_RENDER_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(render_transcript_file(&path, 120_000), cold);
+        assert!(
+            TRANSCRIPT_RENDER_HITS.load(std::sync::atomic::Ordering::Relaxed) > hits,
+            "an unchanged file must be served from the cache, which is the whole change"
+        );
+        // An append moves len, so the next poll sees the new turn. Serving the
+        // cached render here would freeze the peek on the previous reply.
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{}", record("second reply")).unwrap();
+        drop(f);
+        let warm = render_transcript_file(&path, 120_000);
+        assert!(warm.contains("second reply"), "{warm}");
+        // A different cap is a different render, not a hit on the first one.
+        assert!(render_transcript_file(&path, 5).chars().count() <= cold.chars().count());
     }
 
     #[test]

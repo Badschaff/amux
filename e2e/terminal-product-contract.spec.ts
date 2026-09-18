@@ -1,6 +1,6 @@
 import { type Route } from '@playwright/test';
 import { test, expect, type Page, allowUnusedRoute } from './fixtures';
-import { readEarlier } from './reader-scroll';
+import { readEarlier, touchDrag } from './reader-scroll';
 
 const worker = 'terminal-contract';
 
@@ -200,6 +200,59 @@ test('a downward or sideways wheel at the bottom keeps the terminal following ne
     await expect(page.locator('.scroll-lock-badge')).toBeHidden();
   }
   expect(await page.evaluate('_peekFollowBottom && !_peekScrollLocked')).toBe(true);
+});
+
+test('a tap, an upward swipe and a sideways drag at the bottom keep the terminal following', async ({ page }, testInfo) => {
+  // AMUX-4802, the touch and click half of AMUX-4601. Every touchmove and every
+  // mousedown stopped following: 73 of 96 follow pauses in one day of beacons
+  // fired at gap_px <= 0, a reader already on the newest output. Only a finger
+  // travelling DOWN the screen asks for earlier output.
+  const transcript = Array.from({ length: 220 }, (_, i) => `terminal output row ${i}`).join('\n');
+  const state = await boot(page, { transcript, live: 'latest output\n' });
+  const body = page.locator('#peek-body');
+  await expect.poll(() => page.evaluate('_peekFollowBottom')).toBe(true);
+  const drag = (dx: number, dy: number) => touchDrag(body, dx, dy);
+  if (testInfo.project.use.hasTouch) await body.tap({ position: { x: 5, y: 5 } });
+  else await body.click({ position: { x: 5, y: 5 } });
+  await drag(0, -60);   // finger up: toward NEWER output
+  await drag(80, 0);    // sideways, as over a wide table
+  expect(await page.evaluate('_peekFollowBottom && !_peekScrollLocked')).toBe(true);
+  for (let i = 1; i <= 3; i++) {
+    state.setLive(Array.from({ length: i * 3 }, (_, j) => `grown output ${i}.${j}`).join('\n') + '\n');
+    await page.evaluate(async () => {
+      await (window as any).refreshPeek(true);
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    });
+    const gap = await body.evaluate(el => el.scrollHeight - el.scrollTop - el.clientHeight);
+    expect(gap, `frame ${i} stays on the newest output`).toBeLessThanOrEqual(2);
+    await expect(page.locator('.scroll-lock-badge')).toBeHidden();
+  }
+  // The gesture that DOES ask for earlier output still relinquishes, from its
+  // first pixels (e331c213: small upward gestures escape bottom following).
+  await drag(0, 6);
+  expect(await page.evaluate('_peekFollowBottom')).toBe(false);
+});
+
+test('clearing a selection made at the bottom resumes following', async ({ page }, testInfo) => {
+  // AMUX-4802. Selecting pauses following so text does not move under the
+  // cursor. It never came back: copy one line and the view stopped tracking.
+  test.skip(!!testInfo.project.use.hasTouch, 'mouse drag-selection is a pointer-device contract');
+  await page.setViewportSize({ width: 1280, height: 800 });
+  const transcript = Array.from({ length: 220 }, (_, i) => `terminal output row ${i}`).join('\n');
+  const state = await boot(page, { transcript, live: 'latest output\n' });
+  const body = page.locator('#peek-body');
+  await expect.poll(() => page.evaluate('_peekFollowBottom')).toBe(true);
+  const box = (await body.boundingBox())!;
+  await page.mouse.move(box.x + 40, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(box.x + 400, box.y + box.height / 2, { steps: 4 });
+  await page.mouse.up();
+  await expect.poll(() => page.evaluate('_peekFollowBottom')).toBe(false);
+  await page.evaluate(() => window.getSelection()!.removeAllRanges());
+  await expect.poll(() => page.evaluate('_peekFollowBottom && !_peekScrollLocked')).toBe(true);
+  state.setLive('output that arrived after the copy\n');
+  await page.evaluate(() => (window as any).refreshPeek(true));
+  await expect.poll(() => body.evaluate(el => el.scrollHeight - el.scrollTop - el.clientHeight)).toBeLessThanOrEqual(2);
 });
 
 test('terminal chrome cannot inject navigation or slash-picker keys', async ({ page }) => {

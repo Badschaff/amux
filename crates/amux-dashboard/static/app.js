@@ -781,6 +781,18 @@ let _peekHistoryRaw = '';
 let _peekHistoryHTML = '';
 let _peekEtag = null;    // ETag of last FULL peek response — enables conditional 304 fetches
 let _peekLiveEtag = null; // ETag of last live=1 response — keeps idle polls a cheap 304
+// REQUEST ORDER, not arrival order, decides which live frame is on screen
+// (AMUX-4802). Two peek requests are routinely in flight at once: open races
+// live against full, and resume overlaps the poll loop. The full payload is
+// ~135KB against ~3KB, so it finishes LAST while carrying the OLDER terminal.
+// Painting by arrival put that older frame over the newer one, and the next
+// live poll then got a 304 and left it there. Measured on localhost, 45s on an
+// active worker: 36 overlapping pairs, 5 out-of-order completions.
+let _peekReqSeq = 0;          // issued per refreshPeek request
+let _peekLivePaintedSeq = 0;  // seq of the request whose live frame is painted
+let _peekLastRawLive = null;  // that frame, untrimmed, so newer history can re-trim it
+let _peekStaleDropped = 0, _peekStaleBeaconMs = 0;
+let _peekPollInFlight = false, _peekPollAgain = false;
 // Adaptive peek polling: fast while the session generates, back off when idle
 // (each idle poll is a cheap 304 anyway), and pause entirely when the tab is hidden.
 let _peekUrgentUntil = 0;    // bounded low-latency window after local input
@@ -800,7 +812,11 @@ function _peekPollInterval() {
   if (sinceChange < 6000) return 650;    // just settled → still brisk
   if (st === 'active') return 900;       // model working, no visible output yet
   if (st === 'waiting') return 1500;
-  return 3000;   // idle ticks are 304s — near-free
+  // Idle ticks are 304s. 1500, not 3000: a quiet worker that starts printing on
+  // its own (a board pickup, a scheduled prompt) has no local input to kick the
+  // fast cadence, and the status that would is ~2s late, so this number IS the
+  // wait for its first new frame.
+  return 1500;
 }
 // After a send/keystroke, treat the session as "just changed" and re-arm the poll
 // loop immediately so the streaming RESPONSE is picked up at the fast cadence —
@@ -857,6 +873,8 @@ function _schedulePeekPoll(delay) {
   peekTimer = setTimeout(async () => {
     peekTimer = null;
     if (gen !== _peekPollGen) return;
+    const tickStart = performance.now();
+    _peekPollInFlight = true;
     try {
       const _s = (typeof sessions !== 'undefined' && sessions.find) ? sessions.find(x => x.name === peekSession) : null;
       const _st = (_s && _s.status) || '';
@@ -874,9 +892,36 @@ function _schedulePeekPoll(delay) {
       // flip to "needs input" shows without closing and reopening the view.
       if (typeof updatePeekStatus === 'function') updatePeekStatus();
     } catch(e) {}
-    if (gen !== _peekPollGen) return;
-    _schedulePeekPoll();
+    _peekPollInFlight = false;
+    if (gen !== _peekPollGen) { _peekPollAgain = false; return; }
+    // The cadence is a PERIOD, so the request's own duration comes out of the
+    // wait. It used to be added on top: a 350ms setting with a ~200ms request
+    // polled every ~500ms (measured p50 504ms). The 40ms floor keeps a slow
+    // link strictly serial and bounded, never back-to-back.
+    const again = _peekPollAgain; _peekPollAgain = false;
+    _schedulePeekPoll(again ? 40 : Math.max(40, _peekPollInterval() - (performance.now() - tickStart)));
   }, delay ?? _peekPollInterval());
+}
+// Ask the serial loop for a live tick NOW, instead of starting a second fetch
+// beside it. Callers that only need "the frame may have changed" go through
+// here, so there is one request in flight and frames paint in order.
+function _peekPollNow() {
+  if (!peekSession || document.hidden) return;
+  if (_peekPollInFlight) { _peekPollAgain = true; return; }
+  if (_peekPollActive) _schedulePeekPoll(0);
+  else refreshPeek(true);   // embedded peek has no loop; still the ~3KB frame
+}
+// The log signal for the ordering guard (two-fix rule). One beacon per 10s
+// carrying the count since the last one, so a regression that reintroduces
+// concurrent fetches shows up as a rate in /api/client-debug, not as a flood.
+function _peekStaleFrame(name, kind, behind) {
+  _peekStaleDropped++;
+  const now = performance.now();
+  if (now - _peekStaleBeaconMs < 10000) return;
+  _peekStaleBeaconMs = now;
+  _peekPollBeacon('stale-frame-not-painted', name, { frame: kind, requests_behind: behind,
+    count_since_last: _peekStaleDropped, verdict: 'older_request_lost_to_newer', measured: true, n_considered: _peekStaleDropped });
+  _peekStaleDropped = 0;
 }
 // Composer drafts live in ONE place: _draftGet/_draftSave, keyed by session.
 // There used to be three stores (this in-memory map, the peekState snapshot's
@@ -4511,13 +4556,20 @@ function _scheduleSessionReadRetry() {
 // and i have to refresh page to see it"). The peek-refresh that DID exist lived
 // only in the now-unused direct-payload SSE branch. One helper, called from both
 // the fetch path and that branch, so the two never drift again (ethos rule 1).
-// The frame refetch is a cheap 304 when the peeked frame is unchanged.
+//
+// A LIVE TICK THROUGH THE POLL LOOP, NOT A FULL FETCH BESIDE IT (AMUX-4802).
+// This called refreshPeek() bare, which is the FULL payload, and "a cheap 304
+// when unchanged" was only true of an idle worker. `sessions` invalidates on
+// any worker's change, fleet-wide, so with ~140 workers it fired every ~2s:
+// measured 24 full fetches of 135KB in 45s on an active worker (3.2MB), each
+// unordered against the live poll. The loop still pulls history on its own
+// terms (turn end, which this tick is what detects promptly, or every 30s).
 function _refreshOpenPeekOnSessions() {
   try {
     const pov = document.getElementById('peek-overlay');
     if (typeof peekSession !== 'undefined' && peekSession && pov && pov.classList.contains('active')) {
       if (typeof updatePeekStatus === 'function') updatePeekStatus();
-      if (!document.hidden && typeof refreshPeek === 'function') refreshPeek();
+      if (!document.hidden) _peekPollNow();
     }
   } catch (e) {}
 }
@@ -11377,7 +11429,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.988';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.989';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -11699,6 +11751,7 @@ function openPeek(name, opts) {
   lastPeekHTML = '';
   _lastPeekRaw = '';
   _peekEtag = null; _peekLiveEtag = null;   // new session → drop the old session's ETags
+  _peekLastRawLive = null;   // and its live frame; the seq counter stays monotonic across opens
   _peekLastFullMs = 0; _peekPrevStatus = '';   // force a fresh history cycle for this session
   _peekHistoryRaw = ''; _peekHistoryHTML = '';   // and its transcript history
   // CRITICAL: also drop the previous session's rendered live frame — the region
@@ -13133,12 +13186,17 @@ function _peekStopBottomWatch() {
   if (_peekBottomMutation) _peekBottomMutation.disconnect();
   cancelAnimationFrame(_peekBottomFrame); _peekBottomFrame = 0;
 }
-function _peekStopFollowing(e) {
+// `why` names the non-event causes. They all used to report input:'navigation',
+// so a selection, a scrollbar press and a plain click were one number and the
+// beacon could not say which of them had parked a reader at gap_px 0.
+let _peekFollowStoppedBy = '';
+function _peekStopFollowing(e, why) {
   if (_peekFollowBottom) {
     const body = document.getElementById('peek-body');
     _peekLastScrollTop = body.scrollTop;
+    _peekFollowStoppedBy = why || 'gesture';
     _peekPollBeacon('bottom-follow-paused', peekSession, {
-      verdict: 'reader_scrolling', input: e?.type || 'navigation',
+      verdict: why === 'selection' ? 'reader_selecting' : 'reader_scrolling', input: e?.type || why || 'navigation',
       gap_px: Math.round(body.scrollHeight - body.scrollTop - body.clientHeight),
       measured: true, n_considered: 1,
     });
@@ -13519,6 +13577,7 @@ async function refreshPeek(liveOnly, bypassTrim) {
     // transcript history) follows and fills in scrollback. Only the full response
     // carries the ETag the poll conditions on.
     const _et = liveOnly ? _peekLiveEtag : _peekEtag;
+    const seq = ++_peekReqSeq;
     const r = await fetch(API + '/api/sessions/' + encodeURIComponent(name) + '/peek?lines=300' + (liveOnly ? '&live=1' : '') + (bypassTrim ? '&notrim=1' : ''),
       { ...(_et ? { headers: { 'If-None-Match': _et } } : {}), signal: _peekAc.signal });
     if (!_peekIdentityCurrent(identity)) return;
@@ -13576,14 +13635,25 @@ async function refreshPeek(liveOnly, bypassTrim) {
       const b = document.getElementById('peek-body');
       if (b) b.style.setProperty('--peek-cols', data.pane_cols);
     }
-    const rawOutput = (data.live != null) ? data.live : (data.output || '(no output)');
+    const rawLive = (data.live != null) ? data.live : (data.output || '(no output)');
     const histRaw = (data.history != null) ? data.history : null;   // null ⇒ live-only poll
-    if (typeof rawOutput !== 'string' || (histRaw !== null && typeof histRaw !== 'string')) throw new Error('Malformed terminal frame');
+    if (typeof rawLive !== 'string' || (histRaw !== null && typeof histRaw !== 'string')) throw new Error('Malformed terminal frame');
+    // A request that STARTED before the one already painted carries an older
+    // terminal. A stale live-only frame has nothing else to offer and is
+    // dropped without taking its ETag. A stale FULL response still holds the
+    // newest history, so keep that and re-trim the newer live frame against it.
+    const staleLive = seq < _peekLivePaintedSeq && _peekLastRawLive !== null;
+    if (staleLive) {
+      _peekStaleFrame(name, liveOnly ? 'live' : 'full', _peekLivePaintedSeq - seq);
+      if (liveOnly) { hidePeekLoading(); return; }
+    }
+    const rawOutput = staleLive ? _peekLastRawLive : rawLive;
     const overlapBase = histRaw !== null ? histRaw : _peekHistoryRaw;
     const output = _trimPeekLiveOverlap(overlapBase, rawOutput);
     const acceptFrame = () => {
       if (liveOnly) _peekLiveEtag = r.headers.get('ETag');
       else { _peekEtag = r.headers.get('ETag'); _peekLastFullMs = performance.now(); }
+      if (!staleLive) { _peekLivePaintedSeq = seq; _peekLastRawLive = rawLive; }
       hidePeekLoading();
     };
     // Skip re-render when nothing we'd paint changed — saves ansiToHtml work on every
@@ -24113,7 +24183,7 @@ function _peekHasSelection() {
 function peekCheckSelection(event) {
   clearTimeout(peekSelectTimer);
   if (_peekHasSelection()) {
-    _peekStopFollowing();
+    _peekStopFollowing(null, 'selection');
     peekSelecting = true;
     peekSelectTimer = setTimeout(peekCheckSelection, 500);
   } else {
@@ -24122,9 +24192,27 @@ function peekCheckSelection(event) {
         verdict: 'no_terminal_selection', measured: true, n_considered: 1 });
     }
     peekSelecting = false;
+    _peekResumeAfterSelection();
   }
 }
-document.getElementById('peek-body').addEventListener('mousedown', () => { _peekStopFollowing(); peekSelecting = true; clearTimeout(peekSelectTimer); });
+// A selection pauses following so the text does not move under the cursor. It
+// is not a request to read history, so when it clears and the reader never
+// scrolled, following comes back. Without this the pause was permanent: copy
+// one line and the view stopped tracking the worker until a manual scroll.
+// A reader who DID scroll is locked or off the end, and keeps their place.
+function _peekResumeAfterSelection() {
+  if (_peekFollowBottom || _peekFollowStoppedBy !== 'selection' || _peekScrollLocked) return;
+  const body = document.getElementById('peek-body');
+  if (!body || !_isScrolledToBottom(body, 2)) return;
+  _peekFollowBottom = true;
+  _peekFollowStoppedBy = '';
+  _peekPollBeacon('bottom-follow-resumed', peekSession, { verdict: 'selection_cleared_at_bottom', measured: true, n_considered: 1 });
+  _peekPollNow();   // frames were skipped while selecting and their ETags never taken
+}
+// mousedown holds refresh for a possible drag-selection and nothing more. It
+// used to stop following too, so a plain click in the terminal (to focus it, to
+// open a link) parked the view for good with the reader at gap_px 0.
+document.getElementById('peek-body').addEventListener('mousedown', () => { peekSelecting = true; clearTimeout(peekSelectTimer); });
 document.getElementById('peek-body').addEventListener('touchstart', () => { peekSelecting = true; clearTimeout(peekSelectTimer); }, {passive: true});
 const _peekScrollBody = document.getElementById('peek-body');
 // ONLY A GESTURE TOWARD EARLIER OUTPUT relinquishes following (AMUX-4601).
@@ -24135,13 +24223,26 @@ const _peekScrollBody = document.getElementById('peek-body');
 // (Ethan's recording, 2026-09-14, tubescience). bottom-follow-paused still
 // reports every real pause with its input and gap.
 _peekScrollBody.addEventListener('wheel', e => { if (e.deltaY < 0) _peekStopFollowing(e); }, {passive: true});
-_peekScrollBody.addEventListener('touchmove', _peekStopFollowing, {passive: true});
+// TOUCH GETS THE SAME RULE THE WHEEL GOT (AMUX-4802). Every touchmove stopped
+// following, in any direction: 26 of 27 touch pauses in one day's beacons fired
+// with gap_px <= 0, a reader already at the newest output. A finger travelling
+// DOWN the screen drags earlier output into view, and that alone is the
+// gesture. It relinquishes from the first pixel past rounding, so a slow swipe
+// toward history is never fought. A swipe up, a sideways drag over a wide
+// table and a resting thumb all leave following alone.
+let _peekTouchStartY = null;
+_peekScrollBody.addEventListener('touchstart', e => { _peekTouchStartY = e.touches.length === 1 ? e.touches[0].clientY : null; }, {passive: true});
+_peekScrollBody.addEventListener('touchmove', e => {
+  const t = e.touches && e.touches[0];
+  if (_peekTouchStartY === null || !t) { _peekStopFollowing(e); return; }   // multi-touch or no origin: keep the old conservative rule
+  if (t.clientY - _peekTouchStartY > 1) _peekStopFollowing(e);
+}, {passive: true});
 _peekScrollBody.addEventListener('keydown', e => {
   if (['ArrowUp','PageUp','Home'].includes(e.key)) _peekStopFollowing(e);
 });
 _peekScrollBody.addEventListener('pointerdown', e => {
   const bounds = _peekScrollBody.getBoundingClientRect();
-  if (e.clientX >= bounds.right - 18) _peekStopFollowing();
+  if (e.clientX >= bounds.right - 18) _peekStopFollowing(null, 'scrollbar');
 });
 document.getElementById('peek-body').addEventListener('scroll', function() {
   const movedDown = this.scrollTop > _peekLastScrollTop + 0.5;
