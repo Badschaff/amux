@@ -39,6 +39,25 @@ const MODEL_PRICES_DEFAULT: &[(&str, [f64; 4])] = &[
     ("sonnet", [3.0, 0.30, 3.75, 15.0]),
     ("haiku", [0.80, 0.08, 1.00, 4.0]),
     ("fable", [3.0, 0.30, 3.75, 15.0]),
+    // LOCAL INFERENCE IS A KNOWN RATE THAT HAPPENS TO BE ZERO, not a missing
+    // one (AMUX-4806). An ollama model runs on this Mac and produces no vendor
+    // bill, so $0 is a measured fact and belongs IN the table. Being in the
+    // table is also what stops it reading as "rate unknown": the two states
+    // are different claims and the ledger now keeps them apart.
+    //
+    // Before this, `qwen3.8:27b` carried $223.32 of Anthropic Sonnet pricing
+    // for 551 turns that cost nothing at all.
+    //
+    // Substring match, so a tag like `qwen3-coder:30b-65k` is covered without
+    // an entry per tag. A local family absent from this list is UNMETERED,
+    // which is the safe direction: it withholds a number rather than inventing
+    // a zero, and ~/.amux/prices.json can add it with no redeploy.
+    ("qwen", [0.0, 0.0, 0.0, 0.0]),
+    ("llama", [0.0, 0.0, 0.0, 0.0]),
+    ("mistral", [0.0, 0.0, 0.0, 0.0]),
+    ("gemma", [0.0, 0.0, 0.0, 0.0]),
+    ("deepseek", [0.0, 0.0, 0.0, 0.0]),
+    ("phi", [0.0, 0.0, 0.0, 0.0]),
 ];
 const PRICE_DEFAULT: [f64; 4] = [3.0, 0.30, 3.75, 15.0];
 
@@ -84,18 +103,35 @@ pub(crate) fn prices(home: &Path) -> Vec<(String, [f64; 4])> {
     table
 }
 
-fn price_for_model(table: &[(String, [f64; 4])], model: &str) -> [f64; 4] {
+/// The rate for a model, or `None` when nobody has told us one.
+///
+/// AMUX-4806. This used to fall back to `PRICE_DEFAULT` for EVERY unknown
+/// model, and `PRICE_DEFAULT` is Anthropic Sonnet's rate. The result landed in
+/// the same column as measured Claude spend: 116,966 rows across gpt-*,
+/// gemini-* and a local qwen carried $6,942.14 that nobody spent.
+///
+/// THE FALLBACK IS KEPT, BUT SCOPED TO THE VENDOR IT BELONGS TO. AMUX-4583
+/// defended it for a good reason -- "that is right for a new Claude model" --
+/// and a brand-new `claude-*` really is better approximated by Sonnet's rate
+/// than withheld. That reasoning does not reach a different vendor's model, so
+/// the fallback now applies only where it was ever true. Everything else is
+/// UNMETERED: the tokens are kept, the number is withheld.
+///
+/// An explicit `_default` in ~/.amux/prices.json still wins for everything,
+/// because that is the owner saying "price the unknowns like this", which is a
+/// decision they are entitled to make.
+fn price_for_model(table: &[(String, [f64; 4])], model: &str) -> Option<[f64; 4]> {
     let m = model.to_lowercase();
     for (key, rates) in table {
         if key != "_default" && m.contains(key.as_str()) {
-            return *rates;
+            return Some(*rates);
         }
     }
-    table
-        .iter()
-        .find(|(k, _)| k == "_default")
-        .map(|(_, r)| *r)
-        .unwrap_or(PRICE_DEFAULT)
+    if let Some((_, r)) = table.iter().find(|(k, _)| k == "_default") {
+        return Some(*r);
+    }
+    // Same vendor, unlisted model: approximate rather than withhold.
+    m.contains("claude").then_some(PRICE_DEFAULT)
 }
 
 /// Does the price table actually name this model?
@@ -107,12 +143,24 @@ fn price_for_model(table: &[(String, [f64; 4])], model: &str) -> [f64; 4] {
 /// that took it is now reportable, so a guessed dollar figure cannot pass as a
 /// measured one.
 pub(crate) fn model_is_priced(table: &[(String, [f64; 4])], model: &str) -> bool {
-    let m = model.to_lowercase();
-    table.iter().any(|(k, _)| m.contains(k.as_str()))
+    price_for_model(table, model).is_some()
 }
 
+/// The rate itself, for a caller that must tell a zero RATE from a missing one
+/// (AMUX-4806). `model_is_priced` collapses that distinction, and the cost
+/// surface needs it: a local model priced at a real zero still carries legacy
+/// dollars in the table from before this existed.
+pub(crate) fn model_rate(table: &[(String, [f64; 4])], model: &str) -> Option<[f64; 4]> {
+    price_for_model(table, model)
+}
+
+/// Cost for a turn. ZERO WHEN NO RATE IS KNOWN, and `model_is_priced` is what
+/// tells a reader which kind of zero it is: a genuinely free local turn, or a
+/// number we declined to invent (AMUX-4806).
 pub(crate) fn turn_cost_usd(table: &[(String, [f64; 4])], model: &str, t: [i64; 4]) -> f64 {
-    let p = price_for_model(table, model);
+    let Some(p) = price_for_model(table, model) else {
+        return 0.0;
+    };
     (t[0] as f64 * p[0] + t[1] as f64 * p[1] + t[2] as f64 * p[2] + t[3] as f64 * p[3])
         / 1_000_000.0
 }
@@ -987,13 +1035,50 @@ mod tests {
         );
     }
 
+    /// AMUX-4806: a rate is applied only where one is actually known, and the
+    /// three outcomes are kept apart.
+    ///
+    /// The fallback used to catch EVERY unknown model and it is Anthropic
+    /// Sonnet's rate, so 116,966 rows of gpt-*, gemini-* and a local qwen
+    /// carried $6,942.14 nobody spent, in the same column as measured Claude
+    /// cost. The fallback is kept for the case AMUX-4583 defended, a new model
+    /// from the SAME vendor, and reaches no further.
     #[test]
-    fn pricing_matches_the_family_and_falls_back() {
+    fn a_rate_is_applied_only_where_one_is_known() {
         let t = table();
-        assert_eq!(price_for_model(&t, "claude-opus-5"), [15.0, 1.50, 18.75, 75.0]);
-        assert_eq!(price_for_model(&t, "claude-haiku-4-5-20251001"), [0.80, 0.08, 1.00, 4.0]);
-        // An unknown model must PRICE, not zero — a 0 here reads as a free turn.
-        assert_eq!(price_for_model(&t, "some-future-model"), PRICE_DEFAULT);
+        assert_eq!(price_for_model(&t, "claude-opus-5"), Some([15.0, 1.50, 18.75, 75.0]));
+        assert_eq!(
+            price_for_model(&t, "claude-haiku-4-5-20251001"),
+            Some([0.80, 0.08, 1.00, 4.0])
+        );
+        // SAME VENDOR, unlisted: still approximated, which is AMUX-4583's case
+        // and the reason the fallback survives at all. The name must not
+        // contain an existing family keyword or the cell tests the family
+        // match instead of the fallback -- `claude-opus-6` would match `opus`
+        // and pass while proving nothing, which is how I first wrote it.
+        assert_eq!(price_for_model(&t, "claude-nova-1"), Some(PRICE_DEFAULT));
+        assert!(model_is_priced(&t, "claude-nova-1"));
+        for fam in ["opus", "sonnet", "haiku", "fable"] {
+            assert!(!"claude-nova-1".contains(fam), "fixture must not match {fam}");
+        }
+
+        // DIFFERENT VENDOR, no rate: UNMETERED. Not Sonnet's price, which is
+        // the live defect, and the cost is 0 because the column is NOT NULL —
+        // `model_is_priced` is what says this zero is "withheld", not "free".
+        for m in ["gpt-5.5", "gpt-6-astra", "gemini-3.5-flash", "gpt-5-codex"] {
+            assert_eq!(price_for_model(&t, m), None, "{m} must not take a Claude rate");
+            assert!(!model_is_priced(&t, m), "{m} must read as unmetered");
+            assert_eq!(turn_cost_usd(&t, m, [1_000_000, 0, 0, 1_000_000]), 0.0, "{m}");
+        }
+
+        // LOCAL: a known rate that happens to be zero. $0 is a FACT here, so it
+        // must read as PRICED, which is what separates it from the rows above.
+        for m in ["qwen3.8:27b", "qwen3-coder:30b-65k", "llama3.3:70b"] {
+            assert_eq!(price_for_model(&t, m), Some([0.0; 4]), "{m}");
+            assert!(model_is_priced(&t, m), "{m} is free, not unknown");
+            assert_eq!(turn_cost_usd(&t, m, [9_000_000, 0, 0, 9_000_000]), 0.0, "{m}");
+        }
+
         // 1M output tokens on opus = $75 exactly.
         assert!((turn_cost_usd(&t, "opus", [0, 0, 0, 1_000_000]) - 75.0).abs() < 1e-9);
     }
@@ -1007,10 +1092,38 @@ mod tests {
         )
         .unwrap();
         let t = prices(dir.path());
-        assert_eq!(price_for_model(&t, "claude-opus-5"), [1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(price_for_model(&t, "newmodel-x"), [9.0, 9.0, 9.0, 9.0]);
+        assert_eq!(price_for_model(&t, "claude-opus-5"), Some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(price_for_model(&t, "newmodel-x"), Some([9.0, 9.0, 9.0, 9.0]));
         // A malformed row is ignored, not fatal, and must not shadow anything.
-        assert_eq!(price_for_model(&t, "sonnet"), [3.0, 0.30, 3.75, 15.0]);
+        assert_eq!(price_for_model(&t, "sonnet"), Some([3.0, 0.30, 3.75, 15.0]));
+    }
+
+    /// AMUX-4806, criterion 5: the owner's answer to AMUX-4680 arrives as
+    /// config, and an unmetered family starts metering the moment it lands.
+    #[test]
+    fn a_rate_added_to_prices_json_meters_a_previously_unmetered_family() {
+        let dir = tempfile::tempdir().unwrap();
+        // Before: no entry, so no number is invented.
+        let t = prices(dir.path());
+        assert_eq!(price_for_model(&t, "gpt-5.5"), None);
+        assert!(!model_is_priced(&t, "gpt-5.5"));
+
+        std::fs::write(dir.path().join("prices.json"), r#"{"gpt-5.5": [1.25, 0.125, 1.5, 10.0]}"#)
+            .unwrap();
+        let t = prices(dir.path());
+        assert_eq!(price_for_model(&t, "gpt-5.5"), Some([1.25, 0.125, 1.5, 10.0]));
+        assert!(model_is_priced(&t, "gpt-5.5"));
+        // 1M in + 1M out at those rates.
+        assert!((turn_cost_usd(&t, "gpt-5.5", [1_000_000, 0, 0, 1_000_000]) - 11.25).abs() < 1e-9);
+        // And its sibling families are untouched: one line prices one family.
+        assert_eq!(price_for_model(&t, "gpt-6-astra"), None);
+
+        // An explicit `_default` is the owner saying "price the unknowns like
+        // this", which is theirs to decide and still honoured.
+        std::fs::write(dir.path().join("prices.json"), r#"{"_default": [2.0, 2.0, 2.0, 2.0]}"#)
+            .unwrap();
+        let t = prices(dir.path());
+        assert_eq!(price_for_model(&t, "gpt-6-astra"), Some([2.0, 2.0, 2.0, 2.0]));
     }
 
     fn line(model: &str, ts: &str, inp: i64, cr: i64, cw: i64, out: i64) -> String {
