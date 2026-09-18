@@ -2395,11 +2395,18 @@ mod epic_completion_unit_tests {
 //
 // Ephemeral workers (CC_EPHEMERAL=1) exist for exactly one fan-out card.
 // Once the work is done or parked, the worker has no purpose. This reaper
-// runs every drive_tick and handles two cases:
+// runs every drive_tick and handles three cases:
 //
 // 1. ALL cards terminal -> stop worker, archive env file, clean worktree
 // 2. Worker idle, only card in backlog/todo, no doing cards -> stop worker
 //    (the card stays on the board for the parent to handle)
+// 3. Worker idle with a doing card that hasn't progressed -> re-drive it
+//    (AMUX-4900: the three anti-repetition mechanisms in drive_lane all
+//    correctly suppress re-nudging for long-lived lanes, but an ephemeral
+//    worker that goes idle on its only card is stuck forever. 30min cooldown.)
+
+/// Cooldown for re-driving a stalled ephemeral worker (case 3).
+const EPHEMERAL_REDRIVE_COOLDOWN_S: f64 = 1800.0;
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct EphemeralReaperReport {
@@ -2407,6 +2414,7 @@ pub struct EphemeralReaperReport {
     pub n_considered: usize,
     pub reaped_done: usize,
     pub reaped_parked: usize,
+    pub redriven: usize,
     pub errors: usize,
 }
 
@@ -2471,6 +2479,80 @@ pub(crate) async fn reap_ephemeral_workers(state: &AppState) -> EphemeralReaperR
         let has_doing = card_list.iter().any(|(_, st)| st == "doing");
         let all_parked = card_list.iter().all(|(_, st)| st == "backlog" || st == "todo");
 
+        let is_idle = !crate::api::session_verbs::is_running(name).await;
+        if !is_idle {
+            continue;
+        }
+
+        // Case 3: idle with a doing card. Re-drive it instead of reaping.
+        // The three anti-repetition mechanisms in drive_lane (active-claim-current,
+        // unchanged-reminder, continue-nudge termination) all correctly prevent
+        // re-nudging long-lived lanes. But an ephemeral worker exists for exactly
+        // one card, so when it goes idle without finishing, it is stuck forever.
+        if has_doing && !all_terminal && !all_parked {
+            let doing_card_id = card_list.iter()
+                .find(|(_, st)| st == "doing")
+                .map(|(id, _)| id.clone());
+            if let Some(card_id) = doing_card_id {
+                let now = crate::config::now_f64();
+                let recent_redrive = match state.store.read() {
+                    Ok(conn) => conn
+                        .query_row(
+                            "SELECT 1 FROM session_events WHERE session=?1 \
+                             AND type='ephemeral.redrive' AND ts > ?2 LIMIT 1",
+                            rusqlite::params![name, now - EPHEMERAL_REDRIVE_COOLDOWN_S],
+                            |_| Ok(true),
+                        )
+                        .optional()
+                        .ok()
+                        .flatten()
+                        .unwrap_or(false),
+                    Err(_) => false,
+                };
+                if !recent_redrive {
+                    let prompt = match state.store.read() {
+                        Ok(conn) => bs::get_issue(&conn, &card_id).ok().flatten().map(|row| {
+                            format!(
+                                "You went idle while card {} was still in doing. \
+                                 Continue driving it to completion.\n\n\
+                                 Card: {}\n{}",
+                                card_id,
+                                row.title,
+                                row.desc.chars().take(2000).collect::<String>(),
+                            )
+                        }),
+                        Err(_) => None,
+                    };
+                    if let Some(prompt) = prompt {
+                        let delivered = crate::api::session_verbs::steer_enqueue(
+                            state, name, &prompt, GUARD, "ephemeral-redrive",
+                        ).await;
+                        if delivered.is_ok() {
+                            crate::api::session_verbs::emit_event(
+                                state,
+                                name,
+                                "ephemeral.redrive",
+                                Some(serde_json::json!({ "card": card_id })),
+                                None,
+                                "ephemeral-reaper",
+                            ).await;
+                            tracing::info!(
+                                target: "amux::board",
+                                session = %name,
+                                card = %card_id,
+                                verdict = "ephemeral_redrive",
+                                measured = true,
+                                n_considered = 1,
+                                "ephemeral reaper: re-drove idle worker on stalled doing card"
+                            );
+                            report.redriven += 1;
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
         let action = if all_terminal {
             "done"
         } else if !has_doing && all_parked {
@@ -2478,13 +2560,6 @@ pub(crate) async fn reap_ephemeral_workers(state: &AppState) -> EphemeralReaperR
         } else {
             continue;
         };
-
-        let is_idle = !crate::api::session_verbs::is_running(name).await;
-        if !is_idle {
-            // Worker is actively processing (someone sent it a message).
-            // Let it finish before reaping, regardless of card state.
-            continue;
-        }
 
         let card_ids: Vec<String> = card_list.iter().map(|(id, _)| id.clone()).collect();
         let card_summary = card_list.iter()
