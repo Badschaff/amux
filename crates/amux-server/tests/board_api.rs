@@ -3659,6 +3659,178 @@ async fn a_gate_that_asks_you_to_name_the_peer_refuses_until_a_peer_is_named() {
     assert_eq!(v["status"], json!("verified"));
 }
 
+// ---- AF-345: a gate that says the peer verified it THEMSELVES must be acted
+// on by the peer -------------------------------------------------------------
+
+/// AF-160 fixed the adjacent criterion (a reviewer must be named and cannot
+/// be the card's own owner). It left this one alone: naming someone and that
+/// person having actually re-derived the claim are different facts. Before
+/// this fix the OWNER could name a real peer as reviewer and then, still
+/// acting as the owner, ack "that peer verified it themselves" on the peer's
+/// behalf — an assertion about another agent's internal process the owner
+/// cannot know.
+///
+/// Evidence is deliberately NOT exercised here: AF-321's evidence_verdict
+/// already runs unconditionally on every done/verified transition, so a
+/// reviewer with no evidence is refused by that pre-existing check, not this
+/// one — confirmed by mutation (forcing this criterion's evidence to always
+/// pass left the suite green, because the general gate was already catching
+/// every case). This test isolates what is actually new: the caller must BE
+/// the reviewer.
+#[tokio::test]
+async fn a_gate_that_says_the_peer_verified_it_themselves_needs_the_peer_acting_not_the_owner() {
+    let (app, _dir) = app();
+    let gate = json!([
+        "Functionality change is live and exercised, not just merged",
+        "That peer verified it themselves rather than taking the author's word",
+    ]);
+    let card = create(
+        &app,
+        json!({
+            "title": "peer-verification gate",
+            "status": "review",
+            "session": "amux",
+            "desc": "artifact: crates/amux-server/src/api/board.rs",
+            "gate": gate,
+        }),
+    )
+    .await;
+    let id = card["id"].as_str().unwrap().to_string();
+    let ack = json!([
+        "Functionality change is live and exercised, not just merged",
+        "That peer verified it themselves rather than taking the author's word",
+    ]);
+
+    // 0. Name a real, different reviewer, exactly as AF-160 already requires.
+    let (st, _, _) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "reviewer": "amux-frustrations" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // 1. THE GAP THIS CARD IS ABOUT: the OWNER acts, not the named reviewer.
+    //    A real, distinct reviewer is on file — AF-160 is satisfied — and this
+    //    must still be refused, because the owner cannot truthfully ack a
+    //    claim about the reviewer's own reasoning.
+    let (st, _, v) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "verified", "gate_checked": ack, "evidence": EV })),
+        &[("X-Amux-Session", "amux")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], json!("verified_requires_peer_actor"));
+    assert!(
+        v["error"].as_str().unwrap().contains("not the recorded reviewer"),
+        "the refusal must name the real reason, not AF-160's (which already passed): {v}"
+    );
+
+    // 2. THE MIRROR CASE: the reviewer acts themselves, with real evidence —
+    //    AF-160 and AF-345 both satisfied, and this must pass.
+    let (st, _, v) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "verified", "gate_checked": ack, "evidence": EV })),
+        &[("X-Amux-Session", "amux-frustrations")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "the peer signing off themselves must pass: {v}");
+    assert_eq!(v["status"], json!("verified"));
+}
+
+/// A reviewer acting themselves, with no evidence at all, is still refused —
+/// by AF-321's pre-existing, unconditional evidence gate, not by AF-345's own
+/// check. Exercised here so a future refactor that accidentally weakens
+/// EITHER check is still caught by this suite, even though the two checks
+/// are independent (ethos rule 7: redundant coverage is not zero coverage).
+#[tokio::test]
+async fn the_reviewer_acting_with_no_evidence_is_still_refused_by_the_evidence_gate() {
+    let (app, _dir) = app();
+    let gate = json!(["That peer verified it themselves rather than taking the author's word"]);
+    let card = create(
+        &app,
+        json!({
+            "title": "peer-verification gate, no evidence",
+            "status": "review",
+            "session": "amux",
+            "desc": "artifact: crates/amux-server/src/api/board.rs",
+            "gate": gate,
+        }),
+    )
+    .await;
+    let id = card["id"].as_str().unwrap().to_string();
+    let (st, _, _) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "reviewer": "amux-frustrations" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let ack = json!(["That peer verified it themselves rather than taking the author's word"]);
+    let (st, _, v) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "verified", "gate_checked": ack })),
+        &[("X-Amux-Session", "amux-frustrations")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], json!("verified_requires_evidence"));
+}
+
+/// THE ORDINARY SUCCESS PATH, separated onto its own card so it is not read
+/// through preceding refusals: the peer names themselves, acts themselves,
+/// and attaches what they actually ran. This is the shape AF-345 exists to
+/// make possible again — the pile of `done` cards with nothing honest to ack
+/// becomes a queue a reviewer can work.
+#[tokio::test]
+async fn the_reviewer_acting_with_real_evidence_verifies_cleanly() {
+    let (app, _dir) = app();
+    let gate = json!(["That peer verified it themselves rather than taking the author's word"]);
+    let card = create(
+        &app,
+        json!({
+            "title": "peer-verification gate, positive path",
+            "status": "review",
+            "session": "amux",
+            "desc": "artifact: crates/amux-server/src/api/board.rs",
+            "gate": gate,
+        }),
+    )
+    .await;
+    let id = card["id"].as_str().unwrap().to_string();
+
+    let (st, _, _) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "reviewer": "amux-frustrations" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let ack = json!(["That peer verified it themselves rather than taking the author's word"]);
+    let (st, _, v) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "verified", "gate_checked": ack, "evidence": EV })),
+        &[("X-Amux-Session", "amux-frustrations")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], json!("verified"));
+}
+
 /// A gate with NO named-peer criterion is untouched — the check must not leak
 /// onto every other card on the board.
 #[tokio::test]

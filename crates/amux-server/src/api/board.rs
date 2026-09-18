@@ -9227,6 +9227,17 @@ fn criterion_wants_a_name(c: &str) -> bool {
     c.to_lowercase().contains("name them")
 }
 
+/// AF-345. A criterion asking whether the peer verified the claim THEMSELVES,
+/// as opposed to merely being named (that half is [`criterion_wants_a_name`],
+/// AF-160). Matches this board's own current `group:amux.verified` wording
+/// ("That peer verified it themselves rather than taking the author's word")
+/// and the shorter form used in tests and other scopes, so a reworded gate
+/// with the same intent still trips it.
+fn criterion_wants_peer_verification(c: &str) -> bool {
+    let l = c.to_lowercase();
+    l.contains("verified it themselves") || l.contains("rather than taking the author's word")
+}
+
 /// The exit for a card whose WORK belongs to another lane (AF-506).
 ///
 /// Reported by `backend`, hit live on MI-4155 during autonomous backlog triage.
@@ -12287,6 +12298,93 @@ pub async fn patch_item(
                                             "rule": "the reviewer must be a DIFFERENT session from \
                                                      the card's owner; the peer doing the sign-off \
                                                      acting on it themselves is correct and expected",
+                                        },
+                                    }),
+                                ),
+                                no_write(),
+                            );
+                        }
+                    }
+
+                    // A GATE THAT SAYS THE PEER VERIFIED IT THEMSELVES MUST BE
+                    // ACTED ON BY THE PEER (AF-345).
+                    //
+                    // AF-160, just above, fixed the adjacent criterion: a
+                    // reviewer must be named and cannot be the card's own
+                    // owner. It left this one alone on purpose -- naming
+                    // someone and that person having actually re-derived the
+                    // claim are different facts. Nothing before this point
+                    // stops the OWNER from setting `reviewer: <peer>`
+                    // themselves and then, still acting as the owner, checking
+                    // off "that peer verified it themselves" on the peer's
+                    // behalf -- an assertion about another agent's internal
+                    // process the owner cannot know (ethos rule 3), which is
+                    // exactly the gap this criterion exists to close.
+                    //
+                    // The fix is ONE primitive, not two. AF-160's own framing
+                    // -- "the peer signing off IS the one acting" -- is
+                    // enforced here rather than merely assumed: the CALLER
+                    // performing this transition must equal the recorded
+                    // reviewer. EVIDENCE is deliberately NOT re-checked here:
+                    // AF-321's evidence_verdict already runs, unconditionally,
+                    // on every done/verified transition (`done_evidence_gate`,
+                    // above), so requiring it again here would be the
+                    // redundant-coverage shape ethos rule 7 warns about --
+                    // confirmed live, not assumed: forcing this block's own
+                    // evidence check to always pass left the test suite fully
+                    // green, because the earlier, general check was already
+                    // catching every case it covered. Where the general check
+                    // is deliberately disabled for a session
+                    // (AMUX_DONE_EVIDENCE_REQUIRED=0), this criterion is
+                    // narrower than it looks: the caller must still be the
+                    // reviewer, but nothing here re-demands evidence that
+                    // session opted out of everywhere else.
+                    if !force && eff_gate.iter().any(|c| criterion_wants_peer_verification(c)) {
+                        let reviewer = next.reviewer.as_deref().unwrap_or("").trim().to_string();
+                        let bad = if reviewer.is_empty() {
+                            Some("no reviewer is recorded on this card".to_string())
+                        } else if caller_lane.is_empty() || !caller_lane.eq_ignore_ascii_case(&reviewer) {
+                            Some(format!(
+                                "the caller acting on this transition ({}) is not the recorded \
+                                 reviewer ({reviewer}), so \"verified it themselves\" would be the \
+                                 owner asserting it on the reviewer's behalf",
+                                if caller_lane.is_empty() { "unattributed" } else { &caller_lane }
+                            ))
+                        } else {
+                            None
+                        };
+                        if let Some(why) = bad {
+                            tracing::warn!(
+                                "verified_requires_peer_actor: blocked {} -> verified for session {} ({why})",
+                                next.id,
+                                next.session.as_deref().unwrap_or("-")
+                            );
+                            return finish(
+                                &slot_w,
+                                PatchOut::Refused(
+                                    StatusCode::CONFLICT,
+                                    json!({
+                                        "error": format!("gate asks the peer to verify it themselves, and {why}"),
+                                        "code": "verified_requires_peer_actor",
+                                        "ok": false,
+                                        "blocked": true,
+                                        "item": row.id,
+                                        "attempted_status": target_raw,
+                                        "criterion": eff_gate.iter().find(|c| criterion_wants_peer_verification(c)),
+                                        "reviewer": next.reviewer,
+                                        "caller": if caller_lane.is_empty() { None } else { Some(caller_lane.clone()) },
+                                        "why": "acking \"verified it themselves\" is an assertion about \
+                                                another agent's internal process the owner cannot know \
+                                                (AF-345); it is checkable only when the reviewer performs \
+                                                the transition themselves",
+                                        "how_to_fix": {
+                                            "cli": format!(
+                                                "as the reviewer session: amux board {} {} --checked ...",
+                                                target_raw, row.id
+                                            ),
+                                            "rule": "the caller performing this transition must be the \
+                                                     recorded reviewer, not the card's owner",
+                                            "force": "true with a reason (explicit bypass; logged and attributed)",
                                         },
                                     }),
                                 ),
