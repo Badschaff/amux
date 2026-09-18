@@ -8995,15 +8995,7 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
         // Without this the leftover registration survives every cleanup, and
         // since the creation below is now fatal rather than silently falling
         // back, one leaked lock would wedge every later start for that name.
-        let _ = run_cmd("git", &["-C", &work_dir, "worktree", "unlock", &wt_path], OP_TIMEOUT).await;
-        let _ = run_cmd("git", &["-C", &work_dir, "worktree", "remove", "--force", &wt_path], OP_TIMEOUT).await;
-        if wt_dir.exists() {
-            let _ = tokio::fs::remove_dir_all(&wt_dir).await;
-        }
-        // A registration whose directory is already gone is not removed by the
-        // two commands above; prune is what clears it, and it is a no-op when
-        // there is nothing stale.
-        let _ = run_cmd("git", &["-C", &work_dir, "worktree", "prune"], OP_TIMEOUT).await;
+        let _ = reclaim_worktree(&work_dir, &wt_path).await;
         if let Some(parent) = wt_dir.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
@@ -10068,6 +10060,83 @@ fn structured_resume_prompt(context: &StructuredResumeContext, reason: &str) -> 
 // stop_session (py:24943): record the resumable name, /exit gracefully, wait
 // for the shell, hard-kill on timeout. tmux stays alive.
 // ---------------------------------------------------------------------------
+
+/// Remove a git worktree registration AND its directory, locked or not.
+///
+/// ONE DEFINITION FOR TWO CALLERS (AMUX-4767). `start_session` clears a stale
+/// worktree before creating one; `delete_post` clears it when a worker is
+/// reaped. Those were separate, and only the start side knew the order that
+/// actually works — which is why reaping leaked and starting did not.
+///
+/// THE ORDER IS THE WHOLE THING, and each step covers a state the others cannot:
+///
+/// 1. `unlock`, because `worktree remove --force` REFUSES a locked worktree.
+///    The ephemeral creation path leaves them locked: measured 2026-09-17, 3 of
+///    3 read `locked` = "initializing", including the two whose directories
+///    materialized fine, and 7 of 18 registrations in the mixpeek repo the same
+///    way. Without this the remove below fails and the registration survives
+///    every cleanup anyone would think to run.
+/// 2. `remove --force`, the normal path: registration and directory together.
+/// 3. `remove_dir_all`, because if the registration was already gone the remove
+///    is a no-op and the directory stays. 111 MB for one worker that ran a
+///    single card; 1.2 G across ten of them.
+///
+/// There is deliberately NO `prune` step, and it was in the first draft.
+/// Mutation caught that removing it reddened nothing, and the reason turned out
+/// to be that its justification was wrong: measured directly, `remove --force`
+/// on an UNLOCKED path already clears a registration whose directory is gone,
+/// so prune covered no state the steps above miss. It is also GLOBAL where this
+/// function is per-path — it would clear other lanes' stale entries in a shared
+/// checkout as a side effect of reaping one worker, which is exactly the
+/// shared-state write AMUX-4767 declined to make by hand. What prune is NOT is
+/// a remedy for this leak: it skips locked worktrees, which is why `git
+/// worktree prune --dry-run -v` printed nothing the whole time it accumulated.
+///
+/// Returns whether the path is clear afterwards: no directory, and no entry in
+/// `git worktree list`. Verified rather than assumed, because every step here
+/// is best-effort and a silently failed cleanup is what this card is about.
+pub(crate) async fn reclaim_worktree(repo: &str, wt_path: &str) -> bool {
+    let dir = std::path::Path::new(wt_path);
+    let _ = run_cmd("git", &["-C", repo, "worktree", "unlock", wt_path], OP_TIMEOUT).await;
+    let _ = run_cmd("git", &["-C", repo, "worktree", "remove", "--force", wt_path], OP_TIMEOUT).await;
+    if dir.exists() {
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+    !dir.exists() && !worktree_is_registered(repo, wt_path).await
+}
+
+/// Is `wt_path` still listed by `git worktree list` for `repo`?
+///
+/// Reads the porcelain form and compares the `worktree ` line, rather than
+/// grepping the human output: a path that is a SUBSTRING of another registered
+/// path would otherwise read as present forever.
+pub(crate) async fn worktree_is_registered(repo: &str, wt_path: &str) -> bool {
+    let out = run_cmd("git", &["-C", repo, "worktree", "list", "--porcelain"], OP_TIMEOUT).await;
+    // Could not ask, or git refused. Say "still registered" rather than
+    // claiming clear: a cleanup that cannot verify itself must not report
+    // success. Checking only for `None` was not enough — a bad repo path exits
+    // non-zero with empty stdout, which read as "no worktrees, so clear".
+    let Some(out) = out.filter(|o| o.status.success()) else {
+        return true;
+    };
+    // CANONICALISED BOTH SIDES. git reports the realpath, and on macOS
+    // `/var/...` is a symlink to `/private/var/...`, so a raw string compare
+    // says NOT registered for a path that plainly is. That direction is the
+    // dangerous one here: `reclaim_worktree` would report failure after a
+    // successful removal and warn on every clean teardown, training readers to
+    // ignore the one warn that means something.
+    let real = |p: &str| {
+        std::fs::canonicalize(p).map(|c| c.to_string_lossy().into_owned()).unwrap_or_else(|_| p.to_string())
+    };
+    let want = real(wt_path);
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.strip_prefix("worktree "))
+        .any(|p| {
+            let p = p.trim();
+            p == wt_path || real(p) == want
+        })
+}
 
 async fn stop_session(state: &AppState, name: &str) -> (bool, String) {
     if !valid_session_name(name) {
@@ -19266,17 +19335,36 @@ async fn delete_post(state: &AppState, name: &str, headers: &HeaderMap) -> Respo
     if is_running(name).await {
         let _ = stop_session(state, name).await;
     }
-    // Worktree cleanup (py:76300).
+    // Worktree cleanup (py:76300), through the shared reclaim (AMUX-4767).
+    //
+    // This used to call `worktree remove --force` ALONE, which refuses a locked
+    // worktree — and the ephemeral path locks them. The call failed, its result
+    // was discarded, and the registration survived: measured 3 of 3 reaped
+    // ephemeral workers, with 111 MB of directory still on disk for one of
+    // them. The remedy a human would reach for, `git worktree prune`, skips
+    // locked entries and so reported the repo clean the whole time.
     if cfg.get("CC_WORKTREE") == Some("1") {
         let wt_repo = cfg.get_or("CC_WORKTREE_REPO", "").to_string();
         let wt_dir = cfg.get_or("CC_DIR", "").to_string();
-        if !wt_repo.is_empty() && !wt_dir.is_empty() {
-            let _ = run_cmd(
-                "git",
-                &["-C", &wt_repo, "worktree", "remove", "--force", &wt_dir],
-                Duration::from_secs(15),
-            )
-            .await;
+        if !wt_repo.is_empty()
+            && !wt_dir.is_empty()
+            && !reclaim_worktree(&wt_repo, &wt_dir).await
+        {
+            {
+                // LOUD, because the old failure was silent and that is why it
+                // ran for as long as it did. `git worktree list` is what a
+                // human and several guards read to learn who is working where
+                // in this shared checkout, so an entry naming a worker that no
+                // longer exists degrades it for everyone.
+                tracing::warn!(
+                    session = name,
+                    verdict = "worktree_reclaim_failed",
+                    repo = %wt_repo,
+                    worktree = %wt_dir,
+                    "reaped a worker but its git worktree survived; `git worktree list` now \
+                     names a worker that does not exist, and prune cannot clear it if it is locked"
+                );
+            }
         }
     }
     // Python leaves the tmux session alive after stop (shell only); the env
@@ -33179,6 +33267,123 @@ mod amux4770_worktree_isolation_tests {
         Command::new("git").arg("-C").arg(repo).args(args).output().expect("git runs")
     }
 
+    /// A repo with one commit, ready for `worktree add`.
+    fn seeded_repo(tmp: &std::path::Path) -> std::path::PathBuf {
+        let repo = tmp.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.email", "t@t"]);
+        git(&repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("f.txt"), "x").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "seed"]);
+        repo
+    }
+
+    fn listed(repo: &std::path::Path) -> String {
+        String::from_utf8_lossy(&git(repo, &["worktree", "list"]).stdout).to_string()
+    }
+
+    /// AMUX-4767. `reclaim_worktree` must clear BOTH leaked states, and the
+    /// teardown path now shares it with the start path.
+    ///
+    /// Measured 2026-09-17 across 3 of 3 reaped ephemeral workers, and
+    /// independently in a second repo (7 of 18 registrations locked): reaping
+    /// called `worktree remove --force` alone, which REFUSES a locked
+    /// worktree, discarded the error, and left the registration behind. One
+    /// left 111 MB of directory with it.
+    #[tokio::test]
+    async fn reclaiming_clears_a_locked_worktree_whether_or_not_its_directory_survived() {
+        for directory_survived in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo = seeded_repo(tmp.path());
+            let wt = tmp.path().join("wt");
+            let wt_s = wt.to_string_lossy().to_string();
+            let repo_s = repo.to_string_lossy().to_string();
+            assert!(git(&repo, &["worktree", "add", "--detach", &wt_s, "HEAD"]).status.success());
+            // The ephemeral creation path leaves exactly this lock reason.
+            assert!(git(&repo, &["worktree", "lock", "--reason", "initializing", &wt_s])
+                .status.success());
+            if !directory_survived {
+                std::fs::remove_dir_all(&wt).unwrap();
+            }
+
+            // THE CONTROL, re-run per case: the obstruction is real. Both of
+            // the commands anyone would reach for leave it registered, which is
+            // why the old teardown could not clear it and why `git worktree
+            // prune --dry-run -v` printed nothing while the leak accumulated.
+            let _ = git(&repo, &["worktree", "remove", "--force", &wt_s]);
+            let _ = git(&repo, &["worktree", "prune"]);
+            assert!(
+                listed(&repo).contains(&wt_s),
+                "case directory_survived={directory_survived}: remove+prune cleared it, so this \
+                 cell is not testing a real obstruction"
+            );
+
+            assert!(
+                super::reclaim_worktree(&repo_s, &wt_s).await,
+                "case directory_survived={directory_survived}: reclaim reported failure"
+            );
+            assert!(!wt.exists(), "case directory_survived={directory_survived}: directory left");
+            assert!(
+                !listed(&repo).contains(&wt_s),
+                "case directory_survived={directory_survived}: still registered:\n{}",
+                listed(&repo)
+            );
+        }
+    }
+
+    /// Reclaiming something already gone must report success, not failure.
+    /// Teardown runs on every delete, including workers that never had a
+    /// worktree, and a false alarm there would train readers to ignore the
+    /// warn that matters.
+    #[tokio::test]
+    async fn reclaiming_a_path_that_was_never_a_worktree_is_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = seeded_repo(tmp.path());
+        let missing = tmp.path().join("never-existed").to_string_lossy().to_string();
+        assert!(super::reclaim_worktree(&repo.to_string_lossy(), &missing).await);
+    }
+
+    /// The registration check compares whole paths.
+    ///
+    /// `git worktree list` output containing `/wt` would match a naive
+    /// substring test for `/wt-two`, so a reclaim of one path could report the
+    /// other as still leaked, forever.
+    #[tokio::test]
+    async fn a_registered_path_is_not_confused_with_a_longer_one_that_contains_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = seeded_repo(tmp.path());
+        let repo_s = repo.to_string_lossy().to_string();
+        let long = tmp.path().join("wt-two");
+        let long_s = long.to_string_lossy().to_string();
+        assert!(git(&repo, &["worktree", "add", "--detach", &long_s, "HEAD"]).status.success());
+
+        let short_s = tmp.path().join("wt").to_string_lossy().to_string();
+        assert!(
+            super::worktree_is_registered(&repo_s, &long_s).await,
+            "the path that IS registered must read as registered"
+        );
+        assert!(
+            !super::worktree_is_registered(&repo_s, &short_s).await,
+            "a path that is only a PREFIX of a registered one must not read as registered"
+        );
+    }
+
+    /// A reclaim that cannot ask git must not claim the path is clear.
+    /// `worktree_is_registered` answers "still registered" when the command
+    /// fails, so the caller warns rather than reporting a clean teardown it
+    /// never verified (ethos rule 4).
+    #[tokio::test]
+    async fn an_unreadable_repo_reports_still_registered_rather_than_clear() {
+        let tmp = tempfile::tempdir().unwrap();
+        let not_a_repo = tmp.path().join("nope").to_string_lossy().to_string();
+        assert!(
+            super::worktree_is_registered(&not_a_repo, "/whatever").await,
+            "a failed probe must not be read as absence"
+        );
+    }
+
     /// AMUX-4770: the exact leak that wedges a start, and the cleanup that clears it.
     ///
     /// The incident had a worktree REGISTERED, LOCKED with reason
@@ -33273,6 +33478,50 @@ mod amux4770_worktree_isolation_tests {
         );
     }
 
+    /// AMUX-4767, the card's actual subject: REAPING must reclaim the worktree.
+    ///
+    /// `delete_post` already had a worktree-cleanup block. It called `worktree
+    /// remove --force` ALONE, which refuses a locked worktree, discarded the
+    /// error, and left the registration behind on 3 of 3 reaped ephemeral
+    /// workers, one of them with 111 MB of directory still on disk.
+    ///
+    /// A source-property check because `delete_post` is an HTTP handler that
+    /// stops tmux sessions and deletes env files; the ORDER-of-steps behaviour
+    /// it must have is pinned against real git by the reclaim cells above, and
+    /// what this adds is that the teardown path is wired to them at all. Without
+    /// it, reverting the one-line call site reddens nothing.
+    #[test]
+    fn reaping_a_worker_reclaims_its_worktree_and_says_so_when_it_cannot() {
+        let src = include_str!("session_verbs.rs");
+        let body = src
+            .split_once("async fn delete_post(")
+            .expect("the delete handler exists")
+            .1;
+        let body = body.split_once("\n    j200(").expect("its end marker").0;
+        // Comments stripped: a scan that matches the prose describing the code
+        // passes on the description instead of the code.
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("reclaim_worktree(&wt_repo, &wt_dir)"),
+            "reaping must go through the shared reclaim; `worktree remove --force` alone \
+             refuses a locked worktree, which is the leak this card is about"
+        );
+        assert!(
+            !code.contains("\"worktree\", \"remove\", \"--force\""),
+            "the bare remove is back beside the reclaim; two spellings of one teardown is how \
+             the start path came to know the working order and this one did not"
+        );
+        assert!(
+            code.contains("worktree_reclaim_failed"),
+            "a failed reclaim must be announced. The old call discarded its result with `let _`, \
+             which is why a leak on every ephemeral reap went unnoticed"
+        );
+    }
+
     /// The start path must REFUSE, not fall back. Pinned at source because the
     /// behaviour lives inside `start_session`, which spawns tmux and cannot run
     /// in a unit test.
@@ -33319,9 +33568,17 @@ mod amux4770_worktree_isolation_tests {
             code.contains("&wt_path, pinned_at"),
             "the add must use the resolved pin, not a literal ref"
         );
+        // The pre-create cleanup moved into the SHARED `reclaim_worktree`
+        // (AMUX-4767), so the property to pin here is that start_session calls
+        // it; that the reclaim unlocks is pinned behaviourally, against real
+        // git, by `reclaiming_clears_a_locked_worktree_whether_or_not_its_directory_survived`.
+        // Asserting the inline `unlock` string here would have forced a
+        // duplicate of the cleanup to keep this cell green, which is how two
+        // spellings of one procedure start drifting.
         assert!(
-            code.contains("worktree\", \"unlock\"") || code.contains("\"unlock\""),
-            "the pre-create cleanup must unlock, or one leaked lock wedges every later start"
+            code.contains("reclaim_worktree(&work_dir, &wt_path)"),
+            "the pre-create cleanup must go through the shared reclaim, or one leaked lock \
+             wedges every later start"
         );
         // THE CHECK THAT CATCHES THE REPORTED INCIDENT: registered, exit 0,
         // directory absent. Exit status alone would have accepted it.
