@@ -4059,6 +4059,20 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
             };
             let doing_count = doing_counts.get(&name).copied().unwrap_or(0);
             let blocked_doing_count = blocked_doing_counts.get(&name).copied().unwrap_or(0);
+            let epic_doing_count = epic_doing_counts.get(&name).copied().unwrap_or(0);
+            // A "blocked" self-report with NO doing cards is a stale claim:
+            // the worker finished its work, so there is nothing to be blocked
+            // on. Override to idle so the dashboard does not show a misleading
+            // badge for up to the trust window.
+            let runtime_status = if runtime_status == "blocked"
+                && doing_count == 0
+                && blocked_doing_count == 0
+                && epic_doing_count == 0
+            {
+                "idle".to_string()
+            } else {
+                runtime_status
+            };
             let truth = reconcile_runtime_board(
                 running,
                 &runtime_status,
@@ -4119,7 +4133,7 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
                 "n_considered": truth.n_considered,
                 "card_count": truth.n_considered,
                 "blocked_doing_count": blocked_doing_count,
-                "epic_container_count": epic_doing_counts.get(&name).copied().unwrap_or(0),
+                "epic_container_count": epic_doing_count,
                 "verdict": truth.verdict,
                 "violation": truth.violation,
                 "runtime_status": runtime_status,
