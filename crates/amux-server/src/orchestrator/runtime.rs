@@ -409,7 +409,7 @@ impl Runtime {
             tracing::warn!(error = %e, "redistribute recommendation failed this tick");
         }
 
-        let tasks = self.load_board_tasks(&workers)?;
+        let tasks = self.load_board_tasks(&workers).await?;
         // Measure the queue the runtime actually sees, at the same seam that
         // feeds the scheduler. Each task contributes once, so repeated ticks
         // cannot manufacture evidence. Meaningful writer contention is also
@@ -653,8 +653,44 @@ impl Runtime {
     /// visible for dependency lookup but can never be assigned or counted
     /// as a stall (strangler-fig safety, see `pickup_unowned`). Unowned
     /// tasks assign only under pickup_unowned.
-    fn load_board_tasks(&self, workers: &[Worker]) -> anyhow::Result<Vec<amux_core::board::Task>> {
-        let conn = self.store.read()?;
+    /// OFF THE ASYNC THREAD (AMUX-4757). `read_async` runs its closure on the
+    /// blocking pool, so both the query and the row materialisation happen
+    /// there rather than on the maintenance async worker this job is polled on.
+    ///
+    /// That is the card's second remedy applied exactly where its own
+    /// measurement points: `runtime_job_blocking_poll` fires when a job holds
+    /// an ASYNC thread for 250ms, and it measured this job at cpu/elapsed 0.99,
+    /// so the thread is held by computation with no wait in it to move. The
+    /// projection above reduces that computation; this stops what remains
+    /// blocking the other maintenance jobs sharing the pool.
+    async fn load_board_tasks(
+        &self,
+        workers: &[Worker],
+    ) -> anyhow::Result<Vec<amux_core::board::Task>> {
+        // Everything the closure needs, owned, because it outlives this frame.
+        let pickup_unowned = self.pickup_unowned;
+        let names: BTreeMap<String, amux_core::ids::WorkerId> = {
+            let mut names = BTreeMap::new();
+            for w in workers {
+                names.insert(w.config.display_name.to_lowercase(), w.id().clone());
+                for a in &w.config.name_aliases {
+                    names.entry(a.to_lowercase()).or_insert_with(|| w.id().clone());
+                }
+            }
+            names
+        };
+        self.store
+            .read_async(move |conn| Self::board_tasks_from(conn, &names, pickup_unowned))
+            .await
+    }
+
+    /// The pure half, so the closure above stays a one-liner and this stays
+    /// readable. Takes the resolved name map rather than the workers.
+    fn board_tasks_from(
+        conn: &rusqlite::Connection,
+        names: &BTreeMap<String, amux_core::ids::WorkerId>,
+        pickup_unowned: bool,
+    ) -> anyhow::Result<Vec<amux_core::board::Task>> {
         // PLANNING PROJECTION, not the full row (AMUX-4757). Every active
         // board row rides in the slice, and the full `COLS` list carries ~55
         // columns of which planning reads a dozen: measured on the live board,
@@ -662,17 +698,10 @@ impl Runtime {
         // every 3 seconds. `task.desc` is EMPTY on these rows by construction;
         // the assignment path re-reads the card by id for its text.
         let rows = crate::db::board_store::planning_tasks(
-            &conn,
+            conn,
             // ALL statuses: dependencies live in done/verified.
             crate::db::board_store::ArchivedFilter::ActiveOnly,
         )?;
-        let mut names: BTreeMap<String, amux_core::ids::WorkerId> = BTreeMap::new();
-        for w in workers {
-            names.insert(w.config.display_name.to_lowercase(), w.id().clone());
-            for a in &w.config.name_aliases {
-                names.entry(a.to_lowercase()).or_insert_with(|| w.id().clone());
-            }
-        }
         let mut out = Vec::new();
         for row in rows {
             // `else { continue }` USED TO BE HERE, and it was the silent drop
@@ -699,7 +728,7 @@ impl Runtime {
                     None => task.worker = Some(foreign_worker_id(owner_name)),
                 },
                 None => {
-                    if !self.pickup_unowned && !task.status.is_terminal() {
+                    if !pickup_unowned && !task.status.is_terminal() {
                         // Unowned + pickup disabled: keep terminal rows for
                         // dependency lookup, drop assignable ones.
                         continue;
