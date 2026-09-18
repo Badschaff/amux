@@ -31,6 +31,15 @@ on:
       fd_growth:
         description: 'Max absolute file-descriptor growth from the post-warmup baseline'
         default: '50'
+      malloc_arena_max:
+        description: >-
+          glibc MALLOC_ARENA_MAX for this run. Empty leaves it UNSET, which is
+          the shipped behaviour. Set it to run the AMUX-4810 A/B: glibc creates
+          up to 8 x ncores per-thread arenas and rarely returns their memory to
+          the OS, which would explain in-run RSS growth that scales with
+          SOAK_CONCURRENCY (0.41-0.62 at 4, 0.76-1.47 at 8) and decelerates to a
+          plateau without leaking descriptors.
+        default: ''
 
 permissions:
   contents: read
@@ -67,6 +76,7 @@ jobs:
           SOAK_RSS_GROWTH: ${{ github.event.inputs.rss_growth || '0.20' }}
           SOAK_FD_GROWTH: ${{ github.event.inputs.fd_growth || '50' }}
           SOAK_CONCURRENCY: '8'
+          ARENA_MAX_INPUT: ${{ github.event.inputs.malloc_arena_max || '' }}
         # `set -o pipefail` is load-bearing, not tidiness. GitHub's default
         # shell for `run:` is `bash -e {0}`, WITHOUT pipefail, so a pipeline
         # exits with the status of its LAST command. `tee` always succeeds, so
@@ -78,6 +88,16 @@ jobs:
         # as deliberate. See AMUX-4742.
         run: |
           set -o pipefail
+          # Exported only when the dispatch input is non-empty, so the
+          # scheduled run's behaviour is byte-identical to before. An empty
+          # MALLOC_ARENA_MAX is NOT the same as an unset one to glibc, which is
+          # why this is a conditional export rather than a plain env: entry.
+          if [ -n "${ARENA_MAX_INPUT:-}" ]; then
+            export MALLOC_ARENA_MAX="$ARENA_MAX_INPUT"
+            echo "== MALLOC_ARENA_MAX=$MALLOC_ARENA_MAX (AMUX-4810 arena A/B)"
+          else
+            echo "== MALLOC_ARENA_MAX unset (shipped default)"
+          fi
           bash scripts/soak-probe.sh | tee soak.log
 
       - name: Database growth under churn
