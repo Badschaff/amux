@@ -79,11 +79,63 @@ fn parse_top(raw: &str) -> Result<Vec<Consumer>, String> {
     Ok(rows)
 }
 
-/// The one reason an unmeasured snapshot is the HOST's fault rather than this
-/// module's. Named here so the producer below and the test that tolerates it
-/// read the same string instead of two copies that can drift (AMUX-4787).
+/// How long `top` gets before the snapshot gives up (AMUX-4790).
+///
+/// 5s, and this host could not meet it: `/usr/bin/top -l 1` was timed at 8.1s
+/// and 8.3s at load average 14, and 36.3s / 28.2s / 34.0s at load 38. So
+/// `snapshot()` answered `measured: false` here permanently, and mac-health's
+/// memory-pressure WARN — whose entire job is to NAME the top consumers, "a
+/// human's call, not this job's" — would have named nobody, at exactly the
+/// moment it matters, since the host is slowest at `top` precisely when it is
+/// under the pressure that triggers that arm.
+///
+/// 60s, NOT the 30s AMUX-4790's own next_action proposed. That card called 30s
+/// "comfortably above the 36.3s worst case", which is simply wrong: 30 < 36.3,
+/// so the proposed replacement could not meet the measurement that motivated
+/// it. The assertion in this module's test is what caught it, which is the
+/// argument for asserting a budget against its measurement rather than against
+/// a number someone reasoned to.
+///
+/// 60s is 1.65x the 36.3s worst case and ~3.3% of the default 1800s mac-health
+/// tick, on an arm only reached under pressure. `warn_on_thin_headroom` below
+/// fires above 30s, so the next host to grow into this announces itself while
+/// the probe still answers: any fixed budget becomes a silent cliff on the day
+/// a host grows past it (the AMUX-4791 lesson, one dimension over).
+///
+/// Affordable because `one_pass` runs inside `tokio::task::spawn_blocking`
+/// (mac_health.rs), so a long probe costs a blocking-pool thread and not a
+/// runtime worker. I had this backwards at first and the card records it.
 #[cfg(target_os = "macos")]
-const PROBE_TIMEOUT_REASON: &str = "memory probe timed out after 5s";
+const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The one reason an unmeasured snapshot is the HOST's fault rather than this
+/// module's. DERIVED from the deadline: the string used to spell "5s" beside a
+/// separate `from_secs(5)`, so raising one silently made the other a lie.
+#[cfg(target_os = "macos")]
+fn probe_timeout_reason() -> String {
+    format!("memory probe timed out after {}s", PROBE_TIMEOUT.as_secs())
+}
+
+/// Announce a probe that is closing on its deadline, while it still answers.
+///
+/// Same shape as the byte-cap warning in `log_retention` (AMUX-4791): the
+/// failure this comes from had no early signal, it simply stopped measuring.
+/// Half the budget is arbitrary; announcing BEFORE the cliff is not.
+#[cfg(target_os = "macos")]
+fn warn_on_thin_headroom(elapsed: Duration, deadline: Duration) -> bool {
+    if elapsed.saturating_mul(2) <= deadline {
+        return false;
+    }
+    tracing::warn!(
+        probe_ms = elapsed.as_millis() as u64,
+        deadline_ms = deadline.as_millis() as u64,
+        pct_of_deadline = (elapsed.as_millis() as u64 * 100)
+            .checked_div(deadline.as_millis() as u64)
+            .unwrap_or(0),
+        "memory probe is past half its deadline; the snapshot stops measuring entirely once it is exceeded (AMUX-4790)"
+    );
+    true
+}
 
 #[cfg(target_os = "macos")]
 fn bounded_output(cmd: &mut Command) -> Result<String, String> {
@@ -96,7 +148,8 @@ fn bounded_output(cmd: &mut Command) -> Result<String, String> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| e.to_string())?;
-    match child.wait_timeout(Duration::from_secs(5)) {
+    let started = std::time::Instant::now();
+    match child.wait_timeout(PROBE_TIMEOUT) {
         Ok(Some(status)) if status.success() => {}
         Ok(Some(status)) => return Err(format!("memory probe exited {status}")),
         result => {
@@ -104,10 +157,11 @@ fn bounded_output(cmd: &mut Command) -> Result<String, String> {
             let _ = child.wait();
             return Err(match result {
                 Err(error) => format!("memory probe wait failed: {error}"),
-                _ => PROBE_TIMEOUT_REASON.into(),
+                _ => probe_timeout_reason(),
             });
         }
     }
+    warn_on_thin_headroom(started.elapsed(), PROBE_TIMEOUT);
     let output = child.wait_with_output().map_err(|e| e.to_string())?;
     String::from_utf8(output.stdout).map_err(|e| e.to_string())
 }
@@ -212,20 +266,77 @@ mod tests {
         assert_eq!(size_bytes("0B"), Some(0));
     }
 
+    /// AMUX-4790: the deadline is ONE fact, and its approach is announced.
+    ///
+    /// The reason string used to spell "5s" beside a separate `from_secs(5)`,
+    /// so raising the deadline would have left the message asserting a number
+    /// the code no longer used — the kind of wrong that reads as measured
+    /// because it sits inside an otherwise-computed sentence.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_probe_deadline_is_one_fact_and_its_approach_is_announced() {
+        // DERIVED: the message must name the deadline actually in force, so a
+        // future change to one cannot leave the other behind.
+        assert_eq!(
+            probe_timeout_reason(),
+            format!("memory probe timed out after {}s", PROBE_TIMEOUT.as_secs())
+        );
+        assert!(
+            probe_timeout_reason().contains(&PROBE_TIMEOUT.as_secs().to_string()),
+            "{}",
+            probe_timeout_reason()
+        );
+
+        // The deadline must clear the worst case this card was opened on:
+        // `top -l 1` at 36.3s under load average 38 on this host. This cell
+        // caught the card's own next_action, which proposed 30s and described
+        // it as "comfortably above the 36.3s worst case" — a budget must be
+        // asserted against its MEASUREMENT, not against a number reasoned to.
+        const MEASURED_WORST_CASE: Duration = Duration::from_millis(36_300);
+        assert!(
+            PROBE_TIMEOUT > MEASURED_WORST_CASE,
+            "5s could not be met here; a replacement that still cannot is not a fix: \
+             {PROBE_TIMEOUT:?} vs measured {MEASURED_WORST_CASE:?}"
+        );
+
+        // The SHIPPED headroom predicate, called rather than restated.
+        // Strictly more than half, so an exactly-half probe stays quiet and a
+        // line in the log cannot be read as "any slow probe".
+        for (elapsed_ms, deadline_ms, want) in [
+            (30_000u64, 60_000u64, false),
+            (30_001, 60_000, true),
+            (0, 60_000, false),
+            // The measurements that opened this card, against the old and new
+            // deadlines: 8.3s at load 14 and 36.3s at load 38.
+            (8_300, 5_000, true),
+            (8_300, 60_000, false),
+            (36_300, 60_000, true),
+        ] {
+            assert_eq!(
+                warn_on_thin_headroom(
+                    Duration::from_millis(elapsed_ms),
+                    Duration::from_millis(deadline_ms)
+                ),
+                want,
+                "elapsed={elapsed_ms}ms deadline={deadline_ms}ms"
+            );
+        }
+    }
+
     /// The ONE host condition that excuses an unmeasured snapshot.
     ///
     /// Two cfg'd definitions rather than one function with cfg'd blocks, so
     /// each platform's body is the whole function and the Linux build cannot
     /// trip over a macOS-only constant.
     #[cfg(target_os = "macos")]
-    fn tolerable_unmeasured_reason() -> Option<&'static str> {
-        Some(PROBE_TIMEOUT_REASON)
+    fn tolerable_unmeasured_reason() -> Option<String> {
+        Some(probe_timeout_reason())
     }
 
     /// `None`: `ps` here takes no timeout, so nothing legitimate produces an
     /// unmeasured snapshot and that arm stays a hard failure.
     #[cfg(not(target_os = "macos"))]
-    fn tolerable_unmeasured_reason() -> Option<&'static str> {
+    fn tolerable_unmeasured_reason() -> Option<String> {
         None
     }
 
@@ -255,9 +366,9 @@ mod tests {
         assert_eq!(result.metric, "rss_only", "{result:?}");
 
         if !result.measured {
-            let why = result.why_unmeasured.as_deref().unwrap_or_default();
+            let why = result.why_unmeasured.clone().unwrap_or_default();
             assert_eq!(
-                Some(why),
+                Some(why.clone()),
                 tolerable_unmeasured_reason(),
                 "an unmeasured snapshot is excusable ONLY when the probe ran out of time: {result:?}"
             );
