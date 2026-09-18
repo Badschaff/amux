@@ -683,6 +683,18 @@ fn preview_cache() -> &'static std::sync::Mutex<(f64, BTreeMap<String, String>)>
     CACHE.get_or_init(|| std::sync::Mutex::new((0.0, BTreeMap::new())))
 }
 
+/// Sticky preview: remembers the last non-empty (preview, preview_lines) per
+/// worker. During screen transitions (context compaction, model picker), the
+/// tmux capture grabs an alternate-screen buffer that `preview_of` strips to
+/// nothing. Without this, the card preview blinks blank for the duration.
+type StickyPreviewMap = BTreeMap<String, (String, Vec<String>)>;
+
+fn sticky_preview_cache() -> &'static std::sync::Mutex<StickyPreviewMap> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<StickyPreviewMap>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
 /// Sessions in `tmux list-panes -a -F '#{session_name}:#{pane_dead}'` output
 /// whose panes are ALL dead (AMUX-2644).
 ///
@@ -4466,12 +4478,19 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
             }
             raws
         };
+        let mut sticky = sticky_preview_cache().lock().unwrap_or_else(|e| e.into_inner());
         for v in out.iter_mut() {
             if let Some(name) = v["name"].as_str() {
                 if let Some(raw) = raws.get(name) {
                     let (preview, lines) = preview_of(raw);
-                    v["preview"] = json!(preview);
-                    v["preview_lines"] = json!(lines);
+                    if !lines.is_empty() {
+                        sticky.insert(name.to_string(), (preview.clone(), lines.clone()));
+                        v["preview"] = json!(preview);
+                        v["preview_lines"] = json!(lines);
+                    } else if let Some((sp, sl)) = sticky.get(name) {
+                        v["preview"] = json!(sp);
+                        v["preview_lines"] = json!(sl);
+                    }
                     apply_preview_waiting_status(v, raw);
                 }
             }
