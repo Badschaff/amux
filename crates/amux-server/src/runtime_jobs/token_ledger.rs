@@ -571,7 +571,12 @@ const MAX_CLAIM_WINDOW_S: i64 = 24 * 3600;
 
 /// Claim windows applied per writer acquisition (AMUX-4750). See the loop that
 /// uses it for why the hold matters more than the total.
-const UPDATES_PER_WRITE: usize = 500;
+///
+/// 150, not the 500 this shipped with. Sized from a live measurement rather
+/// than an estimate: at 500 the worst hold came back at 738ms, so an UPDATE is
+/// costing ~1.5ms here and not the ~0.4ms the arithmetic assumed. 150 x 1.5ms
+/// is ~225ms, inside the 250ms budget, at ~67 acquisitions per cycle.
+const UPDATES_PER_WRITE: usize = 150;
 
 /// Fill `token_ledger.task` for turns that fall inside a card's claim window on
 /// the SAME lane. Only touches unattributed rows.

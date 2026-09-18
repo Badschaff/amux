@@ -232,9 +232,21 @@ impl RequestLogger {
                                 (SELECT id FROM _amux_interactions WHERE updated_at < ?1)", [(cutoff * 1000.0) as i64])?;
                             let receipts = conn.execute("DELETE FROM _amux_interactions WHERE updated_at < ?1", [(cutoff * 1000.0) as i64])?;
                             if receipts > 0 { tracing::info!(verdict="interaction_retention", n_considered=receipts, "Expired interaction receipts removed"); }
+                            // CAPPED (AMUX-4750). This was an unbounded DELETE
+                            // over a 3.2M-row table, so the size of one writer
+                            // hold was however many rows happened to age out at
+                            // once — and every non-GET request in the fleet
+                            // waits behind that writer. The cap drains a
+                            // backlog across sweeps instead of in one hold, the
+                            // same shape the invariant-result trim already uses,
+                            // including the rowid-IN form that a plain
+                            // DELETE..LIMIT needs a nonstandard SQLite build to
+                            // accept.
                             let deleted = conn.execute(
-                                "DELETE FROM _amux_request_log WHERE ts < ?1",
-                                rusqlite::params![cutoff],
+                                "DELETE FROM _amux_request_log WHERE rowid IN (
+                                    SELECT rowid FROM _amux_request_log
+                                     WHERE ts < ?1 LIMIT ?2)",
+                                rusqlite::params![cutoff, RETENTION_BATCH_ROWS],
                             )?;
                             // The COUNT is the point (mandate: "count logged"):
                             // a sweep whose effect is invisible is a sweep
@@ -297,6 +309,12 @@ fn retain_days_config() -> f64 {
 /// runs BEFORE the alias rewrite and sees the RAW client path). Same
 /// wrapping shape as `alias_layer` — outer router whose fallback is the real
 /// app — so it provably applies to every route including fallbacks.
+/// Rows the retention sweep may delete in one writer acquisition (AMUX-4750).
+///
+/// Generous enough that ordinary daily churn clears in a single sweep, small
+/// enough that a backlog cannot turn one sweep into a multi-second hold.
+const RETENTION_BATCH_ROWS: i64 = 20_000;
+
 pub fn layer(app: Router, store: SharedStore) -> Router {
     layer_with(app, RequestLogger::spawn(store))
 }
