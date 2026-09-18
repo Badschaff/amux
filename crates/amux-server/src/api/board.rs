@@ -8152,7 +8152,10 @@ mod overlap_reconciliation_tests {
         record(db.clone(), peer_report.clone()).await;
         let corrected = bs::get_issue(&db.read().unwrap(), &peer).unwrap().unwrap().log.unwrap();
         assert!(corrected.starts_with(&wrong), "legacy history must remain intact");
-        assert_eq!(corrected.lines().count(), 2, "retry must append a correction");
+        // AF-470: `wrong` predates the date-separator convention (no `` `YYYY-MM-DD` ``
+        // line), so append_log's first append after it inserts one -- correction line
+        // count is 2 (separator + the actual correction), not 1.
+        assert_eq!(corrected.lines().count(), 3, "retry must append a correction");
         assert!(corrected.lines().last().unwrap().contains(&format!("elected owner [{owner}] (first-worker)")));
         record(db.clone(), peer_report).await;
         for id in [owner, peer] {

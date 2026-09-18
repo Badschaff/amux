@@ -1699,12 +1699,50 @@ pub fn core_gates(criteria: &[String], target: TaskStatus) -> Vec<Gate> {
 // Log convention
 // ---------------------------------------------------------------------------
 
+/// A `` `YYYY-MM-DD` `` line on its own, distinct from an ordinary
+/// `` `HH:MM` message `` entry by length and shape alone. Returns the date
+/// text when `line` is exactly that.
+fn date_separator(line: &str) -> Option<&str> {
+    let inner = line.trim().strip_prefix('`')?.strip_suffix('`')?;
+    let b = inner.as_bytes();
+    (b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && inner[..4].bytes().all(|c| c.is_ascii_digit())
+        && inner[5..7].bytes().all(|c| c.is_ascii_digit())
+        && inner[8..10].bytes().all(|c| c.is_ascii_digit()))
+    .then_some(inner)
+}
+
 /// Append one history line exactly the way Python's `_append_board_log`
-/// does: `` (log.rstrip() + "\n`HH:MM` " + line).strip() `` — so logs written
+/// did: `` (log.rstrip() + "\n`HH:MM` " + line).strip() `` — so logs written
 /// by either server interleave without corrupting each other's lines.
+///
+/// AF-470: `HH:MM` alone lost the date, so a multi-day log's time axis had
+/// to be INFERRED from where the clock visibly wraps backwards (measured on
+/// TG-3239's 74 entries) rather than read. Every option that stamped every
+/// line paid a per-line width cost this view's own mobile rules (375px)
+/// don't have room for; Ethan's call (2026-09-18) was a date only where the
+/// day actually changes: `` `YYYY-MM-DD` `` as its own line, inserted the
+/// first time an entry lands on a day the log hasn't seen a separator for
+/// yet. A log with no separator at all (every entry written before this
+/// existed) gets one on its very next append — that is the honest
+/// boundary: existing HH:MM-only entries are baked in and stay ambiguous
+/// forever, which is the same limit the card's own options all shared.
 pub fn append_log(existing: Option<&str>, hhmm: &str, line: &str) -> String {
     let base = existing.unwrap_or("").trim_end();
-    format!("{base}\n`{hhmm}` {line}").trim().to_string()
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let last_separator = base.lines().rev().find_map(date_separator);
+    let mut out = base.to_string();
+    if last_separator != Some(today.as_str()) {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push('`');
+        out.push_str(&today);
+        out.push('`');
+    }
+    format!("{out}\n`{hhmm}` {line}").trim().to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -5980,13 +6018,83 @@ mod tests {
         assert_eq!(prefix_from_session("general-canvas-apps"), "GCA");
     }
 
+    /// AF-470: `append_log`'s line SHAPE for an entry (backtick-time, space,
+    /// message) is unchanged from Python's; both cases here now also carry a
+    /// leading date separator because neither `existing` argument has one
+    /// yet. `today()` mirrors `append_log`'s own `chrono::Local::now()` call
+    /// rather than hardcoding a date, so this test does not go stale.
     #[test]
     fn append_log_matches_python_format() {
-        assert_eq!(append_log(None, "12:01", "x -> y"), "`12:01` x -> y");
+        let today = format!("`{}`", chrono::Local::now().format("%Y-%m-%d"));
+        assert_eq!(append_log(None, "12:01", "x -> y"), format!("{today}\n`12:01` x -> y"));
+        // The separator lands right before the NEW entry, not retroactively
+        // before the pre-existing one: `existing` has no separator at all,
+        // so its own date is genuinely untracked, and the marker means "from
+        // here, dates are tracked" -- it cannot honestly claim the old line
+        // shared today's date too.
         assert_eq!(
             append_log(Some("`09:00` created\n"), "12:01", "a: todo -> doing"),
-            "`09:00` created\n`12:01` a: todo -> doing"
+            format!("`09:00` created\n{today}\n`12:01` a: todo -> doing")
         );
+    }
+
+    /// AF-470. The property the card asked for: width is paid ONLY at a real
+    /// day boundary. Once a separator for today already exists, a second
+    /// same-day append must not add another one.
+    #[test]
+    fn append_log_adds_no_second_separator_on_the_same_day() {
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let after_first = append_log(None, "09:00", "created");
+        assert_eq!(after_first, format!("`{today}`\n`09:00` created"));
+        let after_second = append_log(Some(&after_first), "09:15", "a: todo -> doing");
+        assert_eq!(
+            after_second,
+            format!("`{today}`\n`09:00` created\n`09:15` a: todo -> doing"),
+            "a second entry on the SAME day must not repeat the separator: {after_second}"
+        );
+    }
+
+    /// AF-470. A log that already tracks dates, appended to on a NEW day,
+    /// gets exactly one fresh separator -- not a re-statement of the old
+    /// one, not silence.
+    #[test]
+    fn append_log_adds_a_fresh_separator_when_the_day_changes() {
+        let existing = "`2020-01-01`\n`21:20` yesterday's last entry";
+        let got = append_log(Some(existing), "08:25", "today's first entry");
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        assert_eq!(
+            got,
+            format!("{existing}\n`{today}`\n`08:25` today's first entry"),
+            "a real day change must get its own separator: {got}"
+        );
+    }
+
+    /// AF-470. Every entry written before this feature existed has no
+    /// separator at all -- TG-3239's own 74-entry log, exactly. The very
+    /// next append must add one (marking "dates are tracked from here"), not
+    /// retroactively guess at the untracked history above it.
+    #[test]
+    fn append_log_on_a_legacy_log_with_no_separator_convention_adds_one() {
+        let legacy = "`21:20` old entry one\n`08:25` old entry two (next calendar day, unmarked)";
+        let got = append_log(Some(legacy), "14:00", "first entry since the fix shipped");
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        assert_eq!(
+            got,
+            format!("{legacy}\n`{today}`\n`14:00` first entry since the fix shipped")
+        );
+    }
+
+    /// AF-470. The separator's own shape must never be mistaken for an
+    /// ordinary entry needing a separator search to skip a false match --
+    /// `date_separator` returns None for anything that is not EXACTLY
+    /// `` `YYYY-MM-DD` `` alone on the line.
+    #[test]
+    fn date_separator_recognizes_only_the_exact_shape() {
+        assert_eq!(date_separator("`2026-09-18`"), Some("2026-09-18"));
+        assert_eq!(date_separator("`09:15` message"), None, "an ordinary entry is not a separator");
+        assert_eq!(date_separator("`2026-09-18` message"), None, "trailing text disqualifies it");
+        assert_eq!(date_separator("2026-09-18"), None, "must be backtick-wrapped");
+        assert_eq!(date_separator("`26-09-18`"), None, "must be 4-digit year");
     }
 
     #[test]
