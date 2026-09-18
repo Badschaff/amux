@@ -11228,7 +11228,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.982';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.983';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -29461,8 +29461,16 @@ async function _colMigrateAll(from, to, lane) {
     // REPORT THE REFUSALS, not just the successes. "moved 480" over a column of
     // 489 leaves nine cards unexplained, and the caller cannot tell which.
     const ref = (d.refused || []).length;
+    // SAY WHEN THE SWEEP WENT UNATTRIBUTED (AMUX-4755). This window is the only
+    // place a human can notice; the server records the actor it resolved and
+    // echoes it back, and an anonymous one means this browser presented no
+    // owner credential, so the cards it just discarded carry no author.
+    const anon = d.actor === 'api-anonymous';
     showToast('Moved ' + d.moved + ' of ' + d.considered + ' to "' + tl + '"'
-      + (ref ? ' — ' + ref + ' refused (see console)' : ''));
+      + (ref ? ', ' + ref + ' refused (see console)' : '')
+      + (anon ? '. Recorded with NO actor.' : ''));
+    if (anon) console.warn('[bulk-migrate] recorded as api-anonymous: this window holds no '
+      + 'owner token, so nobody can tell afterwards who cleared "' + fl + '"');
     if (ref) console.warn('[bulk-migrate] refused:', d.refused);
     await fetchBoard();
     renderBoard();

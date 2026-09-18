@@ -854,6 +854,7 @@ fn unanimous_gate(considered: usize, moved: usize, refused: &[Value]) -> Option<
 async fn bulk_migrate(
     State(state): State<AppState>,
     headers: HeaderMap,
+    uri: axum::http::Uri,
     body: Option<Json<Value>>,
 ) -> Response {
     let body = body.map(|Json(v)| v).unwrap_or(Value::Null);
@@ -875,7 +876,20 @@ async fn bulk_migrate(
     if from == to {
         return err(StatusCode::BAD_REQUEST, json!({"error": "from and to are the same column"}));
     }
-    let actor = actor_from_headers(&headers).1;
+    // WHO IS CLEARING THE COLUMN (AMUX-4755). The dashboard is not a worker, so
+    // the ordinary resolution below answers `api-anonymous` for every click, and
+    // the biggest destructive action on the board carried no actor at all. The
+    // browser does present the owner bearer on every call, so ask for that
+    // rather than leaving the strongest available credential unread.
+    //
+    // ONLY WHEN THE ORDINARY ANSWER GAVE UP, and the order is load-bearing: a
+    // worker or a verified member keeps its own name (see `owner_token_actor`).
+    let actor = match actor_from_headers(&headers).1 {
+        a if a == "api-anonymous" => super::auth::owner_token_actor(&state, &headers, &uri)
+            .map(str::to_string)
+            .unwrap_or(a),
+        a => a,
+    };
 
     // THE GATE CHECK, once, up front, on a READ. Doing it inside the write
     // closure meant smuggling the verdict out through a fake event; a column's
@@ -925,10 +939,23 @@ async fn bulk_migrate(
             let mut moved = 0usize;
             let mut refused: Vec<Value> = Vec::new();
             let mut events = Vec::new();
+            // SAY IT WAS A SWEEP, ON THE CARD (AMUX-4755). The line used to read
+            // "bulk-migrated backlog -> discarded by <actor>", which a later
+            // reader cannot tell from a decision made about THIS card. It is the
+            // difference that matters: AF-398 and AF-640 were each read as
+            // individually retired when both were simply in a column somebody
+            // cleared, and the second was re-derived from scratch a day later.
+            //
+            // The count is the CONSIDERED population, named as such — `moved` is
+            // not known until the loop ends, and a card cannot honestly carry a
+            // number its own transition is still contributing to.
+            let scope = format!("{} cards considered", ids.len());
             for id in &ids {
                 let opts = crate::db::advance::AdvanceOpts {
                     expected_from: Some(f3.clone()),
-                    log_line: Some(format!("bulk-migrated {f3} -> {t3} by {actor3}")),
+                    log_line: Some(format!(
+                        "bulk-migrated {f3} -> {t3} by {actor3} (column sweep, {scope})"
+                    )),
                     ..Default::default()
                 };
                 match crate::db::advance::advance(conn, id, &t3, &actor3, &opts)? {
@@ -973,9 +1000,37 @@ async fn bulk_migrate(
                     }),
                 );
             }
+            // THE REGRESSION ANNOUNCER (AMUX-4755, the repo's two-fix rule). The
+            // defect was invisible for weeks because an unattributed sweep looks
+            // exactly like an attributed one from outside; nothing anywhere said
+            // "this write had no author". Now a sweep of the logs finds it by
+            // verdict, and the WARN fires on the same condition the fix targets,
+            // so if the dashboard ever stops presenting its bearer the next one
+            // announces itself instead of waiting to be noticed on a card.
+            if actor == "api-anonymous" {
+                tracing::warn!(
+                    target: "amux::board",
+                    verdict = "bulk_migrate_unattributed",
+                    from = %from, to = %to, considered, moved,
+                    "a column sweep was recorded with no actor: nobody can answer who cleared it"
+                );
+            } else {
+                tracing::info!(
+                    target: "amux::board",
+                    verdict = "bulk_migrate",
+                    actor = %actor, from = %from, to = %to, considered, moved,
+                    refused = refused.len(),
+                    "column sweep recorded"
+                );
+            }
             Json(json!({
                 "ok": true, "from": from, "to": to, "session": lane,
                 "considered": considered, "moved": moved,
+                // WHO THIS WAS RECORDED AS, back to the caller. The dashboard is
+                // the only place a human can notice the audit trail went blank,
+                // and it could not see the name the server stored (ethos rule 4:
+                // publish, beside the answer, whether the measurement ran).
+                "actor": actor,
                 // Named, not just counted: a caller that moved 480 of 489 needs
                 // to know WHICH nine and why, or the number is a mystery.
                 "refused": refused,

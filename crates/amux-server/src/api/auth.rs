@@ -162,6 +162,44 @@ pub(crate) fn has_owner_token(state: &AppState, headers: &HeaderMap, uri: &Uri) 
     })
 }
 
+/// The audit name for a caller who presented the owner bearer and no worker or
+/// member identity. `policy.rs` minted this spelling for approval provenance;
+/// it is a constant so the second user (AMUX-4755) cannot invent a third.
+pub(crate) const OWNER_TOKEN_ACTOR: &str = "owner-token";
+
+/// Name the owner when nothing else can (AMUX-4755).
+///
+/// THE DASHBOARD IS NOT A WORKER and has no `X-Amux-Session` to send, so every
+/// write it makes resolved to `api-anonymous` — including bulk-migrate, the
+/// largest destructive board action there is. Measured from the issues table:
+/// 373 cards discarded in one minute on 2026-09-15, 123 on 09-16, 202 across
+/// six minutes, all anonymous. Two of those bursts landed in the same minute on
+/// consecutive days, and with no actor on them a peer lane read the pair as a
+/// runaway daily job and re-filed on that basis. The anonymity is what made an
+/// ordinary human click look like a daemon.
+///
+/// WHAT THIS IS ALLOWED TO CLAIM. The browser sends `Authorization: Bearer
+/// <owner token>` on every API call (`static_files::inject_bootstrap` puts it
+/// in the shell, `app.js::_authHeaders` sends it), and that token is compared
+/// against `state.auth_token` in constant time. So "this request presented the
+/// owner credential" is verified, not asserted, and `owner-token` says exactly
+/// that and no more. It does NOT claim a named human: on a box with no auth
+/// token configured there is no owner credential to present, this returns
+/// `None`, and the caller stays `api-anonymous` — which is the honest answer
+/// there rather than a name nobody could check.
+///
+/// Callers apply it only where the ordinary resolution already gave up. An
+/// actor that resolved to a worker or a verified member keeps that name: the
+/// one CLI site that sends this bearer sends `X-Amux-Session` with it, so
+/// upgrading a named caller here would rename real lanes to "the owner".
+pub(crate) fn owner_token_actor(
+    state: &AppState,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> Option<&'static str> {
+    has_owner_token(state, headers, uri).then_some(OWNER_TOKEN_ACTOR)
+}
+
 /// Query-only variant used by the public shell to exchange a one-time URL
 /// credential for an HttpOnly owner session before a service worker can cache
 /// the credential-bearing URL or reload it without the query string.
@@ -339,6 +377,53 @@ mod tests {
             "error": "unauthorized", "reason": "missing_credential",
             "recovery": "open_owner_or_invite_link"
         }));
+    }
+
+    /// AMUX-4755. `owner-token` is a claim about a VERIFIED credential, so the
+    /// cell that matters is the one where there is nothing to verify.
+    ///
+    /// A server with no auth token configured has no owner credential at all.
+    /// Naming an owner there would be inventing an actor nobody could check,
+    /// which is worse than `api-anonymous`: the anonymous name is at least
+    /// true. The wrong-bearer leg is the other half — presenting A token is
+    /// not presenting THE token.
+    #[test]
+    fn only_the_real_owner_bearer_is_named_the_owner() {
+        let uri = Uri::from_static("/api/board/bulk-migrate");
+        let bearer = |t: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("authorization", format!("Bearer {t}").parse().unwrap());
+            h
+        };
+
+        let configured = state(Some("tok123"));
+        assert_eq!(
+            owner_token_actor(&configured, &bearer("tok123"), &uri),
+            Some("owner-token"),
+            "the owner's own bearer is the strongest identity a browser can present"
+        );
+        assert_eq!(
+            owner_token_actor(&configured, &bearer("not-the-token"), &uri),
+            None,
+            "a wrong bearer must not be named the owner"
+        );
+        assert_eq!(
+            owner_token_actor(&configured, &HeaderMap::new(), &uri),
+            None,
+            "no credential is not the owner"
+        );
+
+        // THE ONE THAT KEEPS THIS HONEST: nothing to verify, so nothing named.
+        // Note the bearer is the string a caller could guess from an unset
+        // config; an implementation that skipped the state check would pass
+        // every leg above and fail only here.
+        let open = state(None);
+        assert_eq!(
+            owner_token_actor(&open, &bearer("tok123"), &uri),
+            None,
+            "a server with no owner token configured has no owner to name"
+        );
+        assert_eq!(owner_token_actor(&open, &HeaderMap::new(), &uri), None);
     }
 
     #[tokio::test]

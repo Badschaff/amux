@@ -687,7 +687,7 @@ async fn create_approval(
     );
     let hash = approval_hash(&raw);
     let approved_by = if approver == "api-anonymous" && owner_token {
-        "owner-token".to_string()
+        super::auth::OWNER_TOKEN_ACTOR.to_string()
     } else {
         approver
     };
