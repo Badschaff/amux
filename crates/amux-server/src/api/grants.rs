@@ -297,8 +297,58 @@ fn is_worker_origin(headers: &HeaderMap) -> bool {
 }
 
 async fn list() -> Response {
-    Json(json!({ "pending": list_pending(&amux_home()), "ttl_s": GRANT_TTL_S as i64 }))
-        .into_response()
+    list_at(amux_home()).await
+}
+
+/// [`list`] with the home passed in rather than read from process env.
+///
+/// The seam exists so a test can drive the SHIPPED handler — including the
+/// spawn_blocking hop and the 5xx branch — over a temp directory. Without it
+/// the only testable thing is `list_pending`, and a test that calls
+/// spawn_blocking itself stays green when the handler is reverted to an inline
+/// scan, which is the paraphrase trap rather than a test. config.rs:314 splits
+/// `resolve_home` from `amux_home` for the same reason and says why: env is
+/// process-global and cargo runs tests in parallel, so an env-mutating test
+/// races every other test that reads a home.
+async fn list_at(home: PathBuf) -> Response {
+
+    // OFF THE RUNTIME (AMUX-4756). `list_pending` is blocking filesystem work:
+    // a read_dir plus one `read_to_string` PER grant file, 102 of them on this
+    // box today. Inline, that held a tokio worker thread for the whole scan.
+    //
+    // It showed up as this endpoint tracking host load while a trivial one did
+    // not. Measured over 48h from _amux_request_log, with /api/health as the
+    // control:
+    //     load <10   grants  4ms   health 24ms
+    //     load 10-30 grants  9ms   health 11ms
+    //     load 30-60 grants 22ms   health 21ms
+    //     load 60+   grants 30ms   health 37ms
+    // grants climbs monotonically 4 -> 30ms; health has no trend. Disk
+    // contention slows the scan AND the scan holds a thread while it waits.
+    //
+    // `db::interactions::spawn_blocking` rather than the raw tokio call,
+    // because it carries the interaction id into the blocking scope the way
+    // every other blocking path here does.
+    let pending = match crate::db::interactions::spawn_blocking(move || list_pending(&home)).await
+    {
+        Ok(pending) => pending,
+        // A JoinError here means the scan panicked. Say so with a 5xx rather
+        // than reporting an empty grant list, which would read as "nothing is
+        // waiting for approval" — the one answer this endpoint must never give
+        // wrongly.
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "grant scan failed",
+                    "detail": e.to_string(),
+                    "why": "an empty list would be indistinguishable from no pending grants",
+                })),
+            )
+                .into_response()
+        }
+    };
+    Json(json!({ "pending": pending, "ttl_s": GRANT_TTL_S as i64 })).into_response()
 }
 
 async fn approve(headers: HeaderMap, AxPath(id): AxPath<String>) -> Response {
@@ -405,6 +455,76 @@ mod tests {
             json!({"origin": "ts-gke", "target": "autodesk", "preview": "hello"}),
         )
         .expect("minted")
+    }
+
+    /// Moving the scan off the runtime must not change the ANSWER (AMUX-4756).
+    ///
+    /// `list` now runs `list_pending` through `db::interactions::spawn_blocking`
+    /// instead of inline, because the scan is a read_dir plus one
+    /// `read_to_string` per grant file and doing that on a tokio worker thread
+    /// made the endpoint track host load (4/9/22/30ms across load buckets
+    /// against /api/health's 24/11/21/37). A performance change that quietly
+    /// altered which grants are pending would be far worse than the latency.
+    ///
+    /// WHAT THIS DOES NOT COVER, said rather than implied: the route wiring.
+    /// `list` reads `amux_home()`, which resolves from process env at call
+    /// time, and config.rs warns in as many words that an env-mutating test
+    /// races every other test that reads a home. So this drives the same helper
+    /// with the same closure shape over a real directory, which is the part the
+    /// change actually touched, and leaves the global alone.
+    /// The behavioural test above cannot see the fix (AMUX-4756).
+    ///
+    /// An inline scan returns exactly the same body, so reverting `list_at` to
+    /// `list_pending(&home)` would leave every other test in this module green
+    /// while restoring the defect: blocking read_dir plus one read_to_string
+    /// per grant file, on a tokio worker thread. The structural change needs a
+    /// structural check.
+    ///
+    /// Comment lines are excluded because the fix's own comment names
+    /// `list_pending` while explaining what moved.
+    #[test]
+    fn the_listing_handler_does_its_filesystem_work_off_the_runtime() {
+        let src = include_str!("grants.rs");
+        let start = src.find("async fn list_at").expect("list_at not found");
+        let body = &src[start..];
+        let end = body.find("\n}\n").map(|i| i + 2).unwrap_or(body.len());
+        let code: String = body[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("spawn_blocking"),
+            "list_at must push the grants scan onto a blocking thread; it is a read_dir \
+             plus one read_to_string per file and holding a runtime thread for it is what \
+             made this endpoint track host load"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_handler_scans_off_the_runtime_and_returns_the_same_pending_set() {
+        let h = home();
+        let a = mint(h.path());
+        let b = mint(h.path());
+        assert_ne!(a, b, "two grants so the fixture is not a one-element special case");
+        // A file the scan must IGNORE, so this proves the filter survived the
+        // move rather than just that some list came back.
+        std::fs::write(grants_dir(h.path()).join("not-a-grant.txt"), b"x").unwrap();
+
+        // The SHIPPED handler, not a re-implementation of it.
+        let resp = list_at(h.path().to_path_buf()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+
+        let pending = body["pending"].as_array().expect("pending is an array");
+        assert_eq!(pending.len(), 2, "both grants are pending, the .txt is not: {body}");
+        assert_eq!(
+            serde_json::to_string(pending).unwrap(),
+            serde_json::to_string(&list_pending(h.path())).unwrap(),
+            "the handler must return exactly what a direct scan returns"
+        );
+        assert_eq!(body["ttl_s"], json!(GRANT_TTL_S as i64));
     }
 
     /// THE PROPERTY THE WHOLE MODULE EXISTS FOR: one yes opens ONE send, not a
