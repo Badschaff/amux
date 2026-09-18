@@ -94,6 +94,8 @@ pub fn routes() -> Router<AppState> {
         .route("/{id}", get(get_item).patch(patch_item).delete(delete_item))
         .route("/{id}/archive", post(archive_item))
         .route("/{id}/restore", post(restore_item))
+        // The inverse of DELETE (AF-922) — see undelete_item's own doc comment.
+        .route("/{id}/undelete", post(undelete_item))
         // The D1-exit pair — see the handlers below for why their 405 was the
         // most expensive shape available.
         .route("/{id}/status-request", post(status_request))
@@ -5227,6 +5229,22 @@ pub async fn create_item(
             let mut v = detail_body(&row);
             v["rev"] = json!(row.rev);
             v["global_rev"] = json!(reply.rev.0);
+            // AF-922: the status code already distinguishes this (200 for a
+            // fold, 201 for a genuine create, a few lines down), but a caller
+            // checking only the body -- which is most of them, this lane's
+            // own near-miss included -- saw an `id` field that looked exactly
+            // like every other create and had no reason to open `intake` to
+            // learn otherwise. One unmistakable top-level boolean, so "did
+            // this create anything new" never depends on knowing the intake
+            // subsystem exists.
+            //
+            // NAMED `card_created`, not `created` -- the row itself already
+            // carries `created` (its own creation unix timestamp, from
+            // `detail_body`/`IssueRow::snapshot`), and a same-named boolean
+            // would silently overwrite it. Caught by create_list_detail_
+            // lifecycle's own assertion ("created must be unix INTEGER
+            // seconds") reddening under this exact mutation.
+            v["card_created"] = json!(!reused);
             v["intake"] = json!({"action":if reused {intake_response.decision.action.as_str()} else {"create"}, "comparison":intake_response});
             if !ignored.is_empty() {
                 v["ignored_fields"] = json!(ignored);
@@ -14654,6 +14672,84 @@ pub async fn delete_item(
         None => internal("delete produced no outcome"),
         Some(Out::NotFound) => not_found(&id),
         Some(Out::Deleted(mut body)) => {
+            body["global_rev"] = json!(reply.rev.0);
+            (StatusCode::OK, Json(body)).into_response()
+        }
+    }
+}
+
+/// POST /api/board/{id}/undelete (AF-922). The sanctioned inverse of DELETE.
+///
+/// Before this existed, a mistaken DELETE -- fat-fingered, or a create that
+/// silently folded into the wrong card and got cleaned up as if it were a
+/// disposable probe -- had exactly one recovery path: a raw SQL UPDATE
+/// against the live production database, clearing `issues.deleted` by hand.
+/// This mirrors `restore_item`'s shape for the SAME reason `unarchive` exists
+/// beside `archive`: every soft state this API can SET needs a way back that
+/// does not require leaving the API.
+async fn undelete_item(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let (_actor, actor_name) = actor_from_headers(&headers);
+    enum Out {
+        NotFound,
+        NotDeleted,
+        Undeleted(Value),
+    }
+    let slot: Arc<Mutex<Option<Out>>> = Arc::new(Mutex::new(None));
+    let slot_w = slot.clone();
+    let id_w = id.clone();
+    let who = actor_name.clone();
+    let write = state
+        .store
+        .write_async(move |conn| {
+            // `get_issue` filters `deleted IS NULL` (module invariant), so it
+            // cannot tell "never existed" from "exists but was deleted" --
+            // exactly the two cases this endpoint must answer differently.
+            if !bs::issue_exists_including_deleted(conn, &id_w)? {
+                return finish(&slot_w, Out::NotFound, no_write());
+            }
+            if !bs::undelete(conn, &id_w)? {
+                return finish(&slot_w, Out::NotDeleted, no_write());
+            }
+            let Some(mut row) = bs::get_issue(conn, &id_w)? else {
+                return finish(&slot_w, Out::NotFound, no_write());
+            };
+            row.log = Some(bs::append_log(
+                row.log.as_deref(),
+                &hhmm(),
+                &format!("{who}: undeleted"),
+            ));
+            row.rev += 1;
+            row.version += 1;
+            row.updated = now_secs();
+            bs::save_patched(conn, &mut row)?;
+            let event = ev_snap(&row, MutationKind::Updated);
+            finish(
+                &slot_w,
+                Out::Undeleted(detail_body(&row)),
+                WriteOutcome {
+                    applied: true,
+                    events: vec![event],
+                },
+            )
+        })
+        .await;
+    let reply = match write {
+        Ok(r) => r,
+        Err(e) => return internal(e),
+    };
+    let outcome = slot.lock().expect("outcome slot poisoned").take();
+    match outcome {
+        None => internal("undelete produced no outcome"),
+        Some(Out::NotFound) => not_found(&id),
+        Some(Out::NotDeleted) => err(
+            StatusCode::CONFLICT,
+            json!({"error": "task is not deleted", "code": "not_deleted", "id": id}),
+        ),
+        Some(Out::Undeleted(mut body)) => {
             body["global_rev"] = json!(reply.rev.0);
             (StatusCode::OK, Json(body)).into_response()
         }

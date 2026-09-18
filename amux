@@ -3460,6 +3460,22 @@ print(json.dumps(b))' \
       echo "$result" | _board_outcome "$id" "" "${subcmd}d"
       return $?
       ;;
+    undelete)
+      # AF-922. DELETE had no un-do anywhere -- the raw API endpoint
+      # (/{id}/undelete) exists so a mistaken delete does not need a hand-run
+      # SQL UPDATE against the live database to recover. Same shape as
+      # archive/unarchive above: an attributed setter for a state raw curl
+      # would otherwise touch unattributed.
+      local id="${1:-}"
+      [[ -n "$id" ]] || die "Usage: amux board undelete <ISSUE-ID>"
+      _board_id_guard "undelete" "$id"
+      local result
+      result=$(_curl -sk -X POST -H 'Content-Type: application/json' \
+        -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
+        "$AMUX_API/api/board/$id/undelete")
+      echo "$result" | _board_outcome "$id" "" "undeleted"
+      return $?
+      ;;
     reviewer)
       # review->done is gated on a NAMED reviewer's sign-off, and until now nothing
       # in the CLI could set that name — `amux board review <id> --reviewer X` died
@@ -4493,6 +4509,7 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
                                    that have opted in (AMUX_CONTINUATION_REQUIRED).
   amux board archive <ID>          Hide a card from every view AND every autonomy loop
   amux board unarchive <ID>        Bring an archived card back (the un-do, AMUX-2492)
+  amux board undelete <ID>         Bring a deleted card back (the un-do for DELETE, AF-922)
   amux board retitle <ID> <title>  Rewrite a title/desc so the card stands alone
                                    (--stdin/--file preferred; --desc-stdin for the body)
 

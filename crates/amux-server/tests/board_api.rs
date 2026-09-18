@@ -1402,6 +1402,114 @@ async fn archive_restore_round_trip_preserves_every_field() {
     assert!(log.contains("restored"), "log: {log}");
 }
 
+/// AF-922. A genuine create must say so unmistakably at the top level, not
+/// only via the status code (already 201 vs 200) or the `intake.action`
+/// field a caller has no reason to know exists -- the exact shape of the
+/// near-miss this card records, where a fold looked identical to a create.
+/// Named `card_created`, NOT `created` -- that key already belongs to the
+/// row's own creation timestamp (`detail_body`/`IssueRow::snapshot`), and a
+/// same-named boolean would silently clobber it.
+///
+/// The OTHER direction (`card_created: false` on a fold) is not exercisable
+/// from this test binary: `board_intake::MODEL` is a private OnceLock that
+/// only `board_intake::initialize()` populates, and that only runs from real
+/// server startup -- deliberately, so a router-only test can never launch a
+/// billable model provider by accident. Without it, `plan()` always takes
+/// the "semantic provider unavailable" branch and `reused` is always false.
+/// `card_created = !reused` is a one-line negation of an already-tested value
+/// (`board_intake`'s own unit tests cover `Plan.decision.action` under a
+/// mock model); this test covers the half actually reachable here.
+#[tokio::test]
+async fn create_response_names_itself_a_create_at_the_top_level() {
+    let (app, _dir) = app();
+    let (st, _, v) = send(
+        &app,
+        "POST",
+        "/api/board",
+        Some(json!({ "title": "plain create", "type": "chore" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{v}");
+    assert_eq!(v["card_created"], json!(true), "{v}");
+    assert_eq!(v["intake"]["action"], json!("create"), "{v}");
+    // The pre-existing `created` field (the row's own creation timestamp)
+    // must survive untouched -- this is the exact collision the rename
+    // above exists to avoid.
+    assert!(v["created"].is_i64(), "created must stay the row's timestamp: {v}");
+}
+
+/// AF-922. Before `undelete_item` existed, a soft-deleted card had no
+/// sanctioned recovery path at all -- `get_issue` filters `deleted IS NULL`
+/// everywhere, so once DELETE ran, the only way back was a raw SQL UPDATE
+/// against the live database (the exact incident this card records).
+#[tokio::test]
+async fn delete_undelete_round_trip_preserves_every_field_and_who_did_it() {
+    let (app, _dir) = app();
+    let card = create(
+        &app,
+        json!({
+            "title": "accidentally deleted", "status": "doing", "session": "my-project",
+            "desc": "still needed", "type": "research", "tags": ["q3"]
+        }),
+    )
+    .await;
+    let id = card["id"].as_str().unwrap().to_string();
+
+    // A live card cannot be undeleted -- there is nothing to reverse.
+    let (st, _, v0) = send(&app, "POST", &format!("/api/board/{id}/undelete"), None).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v0}");
+    assert_eq!(v0["code"], json!("not_deleted"), "{v0}");
+
+    // A card that never existed is not-found, not a `not_deleted` conflict --
+    // the two are different answers and issue_exists_including_deleted exists
+    // precisely to tell them apart.
+    let (st, _, _) = send(&app, "POST", "/api/board/NOPE-1/undelete", None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    let (st, _, _) = send_with(
+        &app,
+        "DELETE",
+        &format!("/api/board/{id}"),
+        None,
+        &[("X-Amux-Session", "orch")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Deleted: invisible to the normal read path, exactly like an archived
+    // card is invisible to a scoped list -- but unlike archive, nothing short
+    // of undelete can reach it again.
+    let (st, _, _) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    let (st, _, v) = send_with(
+        &app,
+        "POST",
+        &format!("/api/board/{id}/undelete"),
+        None,
+        &[("X-Amux-Session", "recover-lane")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["id"], json!(id));
+    assert_eq!(v["title"], json!("accidentally deleted"));
+    assert_eq!(v["desc"], json!("still needed"));
+    assert_eq!(v["session"], json!("my-project"));
+    assert_eq!(v["type"], json!("research"));
+    assert_eq!(v["tags"], json!(["q3"]));
+    assert_eq!(v["status"], json!("doing"), "undelete must not touch status");
+    let log = v["log"].as_str().unwrap();
+    assert!(log.contains("orch: deleted"), "who deleted it must survive: {log}");
+    assert!(log.contains("recover-lane: undeleted"), "who undeleted it: {log}");
+
+    // Fully live again: the normal read path sees it, and a second undelete
+    // now correctly refuses (nothing left to reverse).
+    let (st, _, _) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _, v2) = send(&app, "POST", &format!("/api/board/{id}/undelete"), None).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v2}");
+}
+
 // ---- circular depends_on -------------------------------------------------
 
 /// A refused cross-board create must stop before either the requested child or

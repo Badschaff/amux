@@ -3235,6 +3235,37 @@ pub fn soft_delete(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
     Ok(n > 0)
 }
 
+/// The inverse of `soft_delete` (AF-922). Before this existed, a mistaken
+/// DELETE on any card had no sanctioned recovery path at all -- `deleted` is
+/// the one column `save_patched` deliberately never touches (see its own
+/// note), and no other write in this module clears it, so the only way back
+/// was a raw SQL UPDATE against the live database. Same shape as
+/// `unarchive` clearing `archived`.
+///
+/// Returns false when the id does not resolve to a currently-deleted row
+/// (already live, or never existed -- the caller distinguishes those with
+/// [`issue_exists_including_deleted`] before calling this).
+pub fn undelete(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
+    let now = Utc::now().timestamp();
+    let n = conn.execute(
+        "UPDATE issues SET deleted = NULL, updated = ?2 WHERE id = ?1 AND deleted IS NOT NULL",
+        params![id, now],
+    )?;
+    Ok(n > 0)
+}
+
+/// Whether `id` exists at all, deleted or not. The ONE sanctioned exception
+/// to this module's own invariant ("`deleted IS NULL` is filtered in every
+/// query") -- undelete needs to tell "never existed" apart from "exists but
+/// was never deleted", which every other query in this file answers
+/// identically (not found) because they were never asked to distinguish them.
+pub fn issue_exists_including_deleted(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
+    Ok(conn
+        .query_row("SELECT 1 FROM issues WHERE id = ?1", params![id], |_| Ok(()))
+        .optional()?
+        .is_some())
+}
+
 /// Write back a patched row. Only columns this API models are touched —
 /// `creator`, `created`, `notified`, `gcal_event_id` and `deleted` are
 /// deliberately NOT in the SET list so a Rust write can never corrupt a

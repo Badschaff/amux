@@ -1303,6 +1303,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/board/{id}/artifacts/{aid}", methods: &["PATCH", "DELETE"] },
     RouteEntry { path: "/api/board/{id}/archive", methods: &["POST"] },
     RouteEntry { path: "/api/board/{id}/restore", methods: &["POST"] },
+    RouteEntry { path: "/api/board/{id}/undelete", methods: &["POST"] },
     // -- workers (+dead-letters merge)
     RouteEntry { path: "/api/workers", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/workers/{id}", methods: &["GET", "PATCH", "DELETE"] },
