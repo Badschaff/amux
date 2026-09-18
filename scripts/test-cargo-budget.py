@@ -99,12 +99,189 @@ class CargoBudgetTests(unittest.TestCase):
         self.assertEqual(rc, 124)
         self.assertIn('"reason": "target_size"', log)
 
-    def test_probe_failure_is_bounded_and_visible(self):
-        with patch.object(budget, 'group_rss', side_effect=ValueError('unreadable ps')):
-            rc, log = self.run_budget('import time; time.sleep(30)')
+    # ---- AMUX-4758: an unmeasurable budget is unenforced, not a refusal ----
+    #
+    # These replace `test_probe_failure_is_bounded_and_visible`, which asserted
+    # rc == 124 and `"reason": "probe_failed"` — it pinned the defect. Measured
+    # 2026-09-17 at load average 121: `du` timed out three times, this script
+    # killed a healthy `cargo check`, and the commit was refused while the same
+    # tree passed clippy clean minutes earlier and again on retry.
+
+    def test_a_broken_probe_does_not_kill_a_build_that_finishes(self):
+        """THE CARD. The command runs to completion and ITS exit code is returned."""
+        for expected in (0, 7):
+            with patch.object(budget, 'group_rss',
+                              side_effect=subprocess.TimeoutExpired(['ps'], 5)):
+                rc, log = self.run_budget(f'import sys; sys.exit({expected})')
+            self.assertEqual(rc, expected, log)
+            self.assertNotIn('probe_failed', log)
+            # SAID SO, not silently. A run with every probe broken and a run with
+            # every probe working must not print the same line.
+            self.assertIn('cargo_budget_unenforced', log)
+            self.assertIn('"still_enforced": ["timeout"]', log)
+
+    def test_the_wall_clock_timeout_still_holds_when_every_probe_is_broken(self):
+        """The residual guarantee, and the reason 'unenforced' is not 'unsupervised'.
+
+        A runaway build is still stopped with no working probe at all, because
+        the timeout reads a clock rather than shelling out. Without this cell
+        the fix above would be indistinguishable from removing the budget.
+        """
+        # max_seconds COMFORTABLY EXCEEDS three probe intervals. At .12s the
+        # timeout could fire before the third failure accumulated, so the
+        # `unenforced` assertion below passed or failed on scheduling: 2 of 6
+        # suite runs red, green every time in isolation. The timeout assertion
+        # was never the racy half; the state it is asserted ALONGSIDE was.
+        with patch.object(budget, 'group_rss',
+                          side_effect=subprocess.TimeoutExpired(['ps'], 5)):
+            rc, log = self.run_budget('import time; time.sleep(30)',
+                                      max_seconds=.5, interval=.02)
         self.assertEqual(rc, 124)
-        self.assertIn('"reason": "probe_failed"', log)
-        self.assertIn('"measured": false', log)
+        self.assertIn('"reason": "timeout"', log)
+        self.assertIn('"unenforced": ["disk_reserve", "memory", "target_size"]', log)
+
+    def test_a_preflight_probe_failure_still_runs_the_command(self):
+        """`du` timing out BEFORE the build must not stop the build starting."""
+        marker = self.base / 'ran'
+        with patch.object(budget, 'disk_usage',
+                          side_effect=subprocess.TimeoutExpired(['du'], 20)):
+            rc, log = self.run_budget(f'open({str(marker)!r},"w").close()')
+        self.assertEqual(rc, 0, log)
+        self.assertTrue(marker.exists(), 'the command never ran: ' + log)
+        self.assertIn('cargo_budget_unenforced', log)
+
+    def test_a_final_probe_failure_does_not_discard_a_successful_build(self):
+        """The worst arm: the build SUCCEEDED and its exit code was thrown away.
+
+        The pre-flight probe works, so the run starts normally; the `du` after
+        the command times out. That used to `return 75` over a green build.
+        """
+        real = budget.disk_usage
+        calls = []
+
+        def once_then_timeout(targets):
+            calls.append(1)
+            if len(calls) == 1:
+                return real(targets)
+            raise subprocess.TimeoutExpired(['du'], 20)
+
+        with patch.object(budget, 'disk_usage', side_effect=once_then_timeout):
+            rc, log = self.run_budget('import sys; sys.exit(0)', disk_interval=60)
+        self.assertGreaterEqual(len(calls), 2, 'the final probe never ran: ' + log)
+        self.assertEqual(rc, 0, log)
+        self.assertIn('cargo_budget_unenforced', log)
+
+    def test_enforced_means_measured_not_merely_unfailed(self):
+        """Absence of failure is not evidence of measurement.
+
+        A short command can finish with its ONLY `ps` sample having timed out.
+        That is one failure, below the three-strike lapse threshold, so the
+        limit is not `unenforced` — and it was still being reported under
+        `enforced` while nothing had ever read RSS. Found while verifying this
+        card, in the run that proves the fix.
+        """
+        # ONE PROBE ATTEMPT, DETERMINISTICALLY. A long `interval` means the loop
+        # samples once and then waits out the whole command, so `failures` lands
+        # at 1 — below the three-strike lapse — every run. Written first with the
+        # default interval, it passed or failed depending on how many times the
+        # loop spun during Python's own startup, which is a test whose result
+        # depends on scheduling and is worse than no test.
+        with patch.object(budget, 'group_rss',
+                          side_effect=subprocess.TimeoutExpired(['ps'], 5)):
+            rc, log = self.run_budget('import sys; sys.exit(0)', interval=5)
+        self.assertEqual(rc, 0, log)
+        finished = json.loads([l for l in log.splitlines()
+                               if 'cargo_budget_finished' in l][-1])
+        self.assertEqual(finished['probe_failures'], 0,
+                         'this cell needs the single sample to stay below the lapse '
+                         'threshold, or it is testing the other state: ' + str(finished))
+        self.assertNotIn('memory', finished['enforced'],
+                         'a limit nothing sampled must not read as enforced')
+        self.assertIn('timeout', finished['enforced'])
+        # THREE STATES, and they PARTITION the probed limits. "Never measured"
+        # is not the same as "measured and lapsed", and folding either into the
+        # other loses the distinction this cell exists for. Here only the memory
+        # probe is broken, so it is the only one that is not enforced.
+        self.assertEqual(finished['never_measured'], ['memory'])
+        self.assertEqual(finished['unenforced'], [])
+        buckets = (finished['enforced'] + finished['unenforced']
+                   + finished['never_measured'])
+        self.assertEqual(sorted(buckets), sorted(('timeout',) + budget.PROBED_LIMITS),
+                         'every limit must land in exactly one bucket: ' + str(finished))
+
+    def test_a_measured_violation_still_refuses(self):
+        """THE CONTROL. Only an UNMEASURABLE limit degrades.
+
+        Collapsing that distinction retires the budget instead of repairing it,
+        and AMUX-70 is real: an OOM-killed cargo in a shared pane scope takes
+        the whole session down. Every cell above passes on a script that simply
+        never enforces anything; this one does not.
+        """
+        (self.target / 'cache').write_bytes(b'x' * 8192)
+        marker = self.base / 'ran'
+        rc, log = self.run_budget(f'open({str(marker)!r},"w").close()', max_target=1)
+        self.assertEqual(rc, 75)
+        self.assertFalse(marker.exists())
+        self.assertIn('"measured": true', log)
+
+    def test_cleanup_failure_is_an_event_not_a_traceback(self):
+        """A stack out of a pre-commit gate reads as a broken toolchain.
+
+        The live one was PermissionError from `os.killpg` plus TimeoutExpired
+        from the `ps` that classifies the group, both raised out of the
+        `finally`, printed under a line about `cargo check`. Nothing in it named
+        this script.
+        """
+        with patch.object(budget, 'signal_group',
+                          side_effect=PermissionError(1, 'Operation not permitted')):
+            rc, log = self.run_budget('import sys; sys.exit(3)')
+        self.assertEqual(rc, 3, 'the run result must survive a cleanup failure: ' + log)
+        self.assertIn('cargo_budget_cleanup_failed', log)
+        self.assertNotIn('Traceback (most recent call last)', log)
+
+    def test_a_real_du_timeout_through_the_shipped_path_still_commits(self):
+        """END TO END, with a REAL timeout rather than a substituted exception.
+
+        `du` and `ps` are shimmed on PATH to outlive their own budgets, which are
+        named so this can be fast. This is the path the incident took: the
+        subprocess actually times out inside `disk_usage`/`group_rss`.
+        """
+        bindir = self.base / 'bin'
+        bindir.mkdir()
+        for name in ('du', 'ps'):
+            shim = bindir / name
+            shim.write_text('#!/bin/sh\nsleep 5\n')
+            shim.chmod(0o755)
+        marker = self.base / 'built'
+        env = os.environ | dict(
+            CARGO_TARGET_DIR=str(self.target),
+            AMUX_CARGO_DU_TIMEOUT_S='0.3', AMUX_CARGO_PS_TIMEOUT_S='0.3',
+            PATH=str(bindir) + os.pathsep + os.environ['PATH'])
+        result = subprocess.run(
+            [sys.executable, str(ROOT / 'cargo-budget.py'), '--',
+             sys.executable, '-c', f'open({str(marker)!r},"w").close()'],
+            env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(marker.exists(), 'the command never ran: ' + result.stderr)
+        self.assertIn('"event": "cargo_budget_unenforced"', result.stderr)
+        self.assertNotIn('Traceback (most recent call last)', result.stderr)
+
+    def test_a_supervisor_crash_names_itself_instead_of_printing_a_bare_stack(self):
+        """The backstop. If something here does raise, it must not look like Rust."""
+        env = os.environ | dict(CARGO_TARGET_DIR=str(self.target))
+        with patch.object(budget, 'supervise', side_effect=RuntimeError('probe exploded')), \
+                patch.dict(os.environ, env), \
+                patch.object(sys, 'argv', ['cargo-budget.py', '--', 'true']):
+            output = io.StringIO()
+            with contextlib.redirect_stderr(output):
+                rc = budget.main()
+        log = output.getvalue()
+        self.assertEqual(rc, 75)
+        self.assertIn('cargo_budget_crashed', log)
+        self.assertIn('scripts/cargo-budget.py', log)
+        # The stack is KEPT, inside the event, so a real supervisor defect is
+        # not traded away for a quieter failure.
+        self.assertIn('RuntimeError: probe exploded', log)
 
     def test_interrupt_forwards_to_owned_cargo_process(self):
         marker = self.base / 'pid'
