@@ -599,12 +599,57 @@ const MAX_CLAIM_WINDOW_S: i64 = 24 * 3600;
 /// of a claim for ledger rows older than the first attempt row. Its interval
 /// runs to the lane's next claim, capped the same way, so it cannot become an
 /// open window either.
-pub async fn attribute_tasks(store: &SharedStore) -> anyhow::Result<()> {
-    store
-        .write_async(move |conn| {
-            let now = chrono::Utc::now().timestamp();
-            let mut wins: Vec<(String, String, i64, i64)> = Vec::new();
+/// Claim windows, derived from a read-only snapshot (AMUX-4750).
+///
+/// PURE, AND OUTSIDE THE WRITER. This whole derivation used to run inside
+/// `write_async`, so the single writer was held for two full-table scans, a
+/// JSON parse per claim and an O(n^2) scan, every 120 seconds. Measured on the
+/// live DB: 9,294 claims, which is ~43M comparisons of pure CPU while every
+/// non-GET request in the fleet waits behind `record_receipt`.
+fn claim_windows(
+    attempts: Vec<(String, String, i64, i64)>,
+    claims: Vec<(String, String, i64)>,
+    now: i64,
+) -> Vec<(String, String, i64, i64)> {
+    let mut wins = attempts;
+    for (i, (session, data, ts)) in claims.iter().enumerate() {
+        let Some(card) = serde_json::from_str::<serde_json::Value>(data)
+            .ok()
+            .and_then(|v| v.get("issue").and_then(|c| c.as_str()).map(str::to_string))
+            .filter(|c| !c.is_empty())
+        else {
+            continue;
+        };
+        // The next claim BY THE SAME LANE ends this one. A later claim by
+        // another lane says nothing about when this one stopped.
+        //
+        // O(1), NOT A SCAN. The query orders by (session, ts), so a lane's
+        // claims are already contiguous and ascending: the next claim by this
+        // lane is the very next row, or there is none. The `.find()` this
+        // replaces walked the whole remaining tail per claim and looked
+        // perfectly correct doing it, which is why it survived.
+        let next = claims
+            .get(i + 1)
+            .filter(|(s, _, _)| s == session)
+            .map(|(_, _, t)| *t)
+            .unwrap_or(now);
+        wins.push((card, session.clone(), *ts, next.min(ts + MAX_CLAIM_WINDOW_S)));
+    }
+    // Oldest first, so the earliest claim covering a turn wins it; the UPDATE
+    // only touches rows still unattributed.
+    wins.sort_by_key(|(_, _, from, _)| *from);
+    wins
+}
 
+pub async fn attribute_tasks(store: &SharedStore) -> anyhow::Result<()> {
+    let now = chrono::Utc::now().timestamp();
+    // READ PHASE, off the writer. The snapshot can be a moment stale relative
+    // to the write below and it does not matter: a claim recorded in that gap
+    // is picked up on the next cycle, and the UPDATE only ever fills rows that
+    // are still unattributed, so nothing is overwritten by arriving late.
+    let (wins, bounds) = store
+        .read_async(move |conn| {
+            let mut attempts: Vec<(String, String, i64, i64)> = Vec::new();
             // The live source. `min(a, b)` is SQLite's two-argument scalar min.
             if let Ok(mut stmt) = conn.prepare(
                 "SELECT card, worker, started_at, \
@@ -616,7 +661,7 @@ pub async fn attribute_tasks(store: &SharedStore) -> anyhow::Result<()> {
                 if let Ok(rows) = stmt.query_map([now, MAX_CLAIM_WINDOW_S], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
                 }) {
-                    wins.extend(rows.flatten());
+                    attempts.extend(rows.flatten());
                 }
             }
 
@@ -637,37 +682,48 @@ pub async fn attribute_tasks(store: &SharedStore) -> anyhow::Result<()> {
                 })?;
                 rows.flatten().collect()
             };
-            for (i, (session, data, ts)) in claims.iter().enumerate() {
-                let Some(card) = serde_json::from_str::<serde_json::Value>(data)
-                    .ok()
-                    .and_then(|v| v.get("issue").and_then(|c| c.as_str()).map(str::to_string))
-                    .filter(|c| !c.is_empty())
-                else {
-                    continue;
-                };
-                // The next claim BY THE SAME LANE ends this one. A later claim
-                // by another lane says nothing about when this one stopped.
-                let next = claims[i + 1..]
-                    .iter()
-                    .find(|(s, _, _)| s == session)
-                    .map(|(_, _, t)| *t)
-                    .unwrap_or(now);
-                wins.push((card, session.clone(), *ts, next.min(ts + MAX_CLAIM_WINDOW_S)));
-            }
+            // The ts range that still has anything to attribute. A window
+            // outside it cannot match a row, so issuing its UPDATE is a
+            // guaranteed no-op — and in the steady state that is nearly all of
+            // them, because this job re-derives the whole of history every
+            // cycle and history was attributed on the first one.
+            let bounds: Option<(i64, i64)> = conn
+                .query_row(
+                    "SELECT MIN(ts), MAX(ts) FROM token_ledger WHERE task=''",
+                    [],
+                    |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?)),
+                )
+                .ok()
+                .and_then(|(lo, hi)| Some((lo?, hi?)));
+            Ok((claim_windows(attempts, claims, now), bounds))
+        })
+        .await?;
 
-            // Oldest first, so the earliest claim covering a turn wins it; the
-            // UPDATE only touches rows still unattributed.
-            wins.sort_by_key(|(_, _, from, _)| *from);
-            for (task, session, from, to) in wins {
-                if session.trim().is_empty() || task.trim().is_empty() || to < from {
-                    continue;
-                }
-                conn.execute(
-                    "UPDATE token_ledger SET task=?1 \
-                     WHERE task='' AND session=?2 AND COALESCE(session,'') <> '' \
-                       AND ts>=?3 AND ts<=?4",
-                    rusqlite::params![task, session, from, to],
-                )?;
+    let Some((lo, hi)) = bounds else {
+        // Nothing is unattributed. Taking the writer to prove that is the cost
+        // this whole job used to pay unconditionally.
+        return Ok(());
+    };
+    let pending: Vec<(String, String, i64, i64)> = wins
+        .into_iter()
+        .filter(|(task, session, from, to)| {
+            !session.trim().is_empty() && !task.trim().is_empty() && to >= from
+                // Overlaps the unattributed range, so the UPDATE can match.
+                && *from <= hi && *to >= lo
+        })
+        .collect();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    store
+        .write_async(move |conn| {
+            let mut stmt = conn.prepare_cached(
+                "UPDATE token_ledger SET task=?1 \
+                 WHERE task='' AND session=?2 AND COALESCE(session,'') <> '' \
+                   AND ts>=?3 AND ts<=?4",
+            )?;
+            for (task, session, from, to) in &pending {
+                stmt.execute(rusqlite::params![task, session, from, to])?;
             }
             Ok(WriteOutcome { applied: true, events: vec![] })
         })
@@ -732,6 +788,136 @@ mod tests {
 
     fn table() -> Vec<(String, [f64; 4])> {
         MODEL_PRICES_DEFAULT.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    // ---- claim windows (AMUX-4750) --------------------------------------
+
+    fn claim(session: &str, card: &str, ts: i64) -> (String, String, i64) {
+        (session.into(), format!(r#"{{"issue":"{card}"}}"#), ts)
+    }
+
+    /// The O(n^2) original, kept here as the ORACLE.
+    ///
+    /// The optimisation is a claim that two implementations agree, so the thing
+    /// to test is that claim directly. Asserting only the new function's output
+    /// against hand-written expectations would pass just as happily if the
+    /// rewrite had changed the semantics and I had written the expectations to
+    /// match it.
+    fn windows_by_scan(
+        attempts: Vec<(String, String, i64, i64)>,
+        claims: Vec<(String, String, i64)>,
+        now: i64,
+    ) -> Vec<(String, String, i64, i64)> {
+        let mut wins = attempts;
+        for (i, (session, data, ts)) in claims.iter().enumerate() {
+            let Some(card) = serde_json::from_str::<serde_json::Value>(data)
+                .ok()
+                .and_then(|v| v.get("issue").and_then(|c| c.as_str()).map(str::to_string))
+                .filter(|c| !c.is_empty())
+            else {
+                continue;
+            };
+            let next = claims[i + 1..]
+                .iter()
+                .find(|(s, _, _)| s == session)
+                .map(|(_, _, t)| *t)
+                .unwrap_or(now);
+            wins.push((card, session.clone(), *ts, next.min(ts + MAX_CLAIM_WINDOW_S)));
+        }
+        wins.sort_by_key(|(_, _, from, _)| *from);
+        wins
+    }
+
+    #[test]
+    fn a_lanes_window_ends_at_that_lanes_next_claim_and_never_a_peers() {
+        let now = 10_000;
+        // ORDERED BY (session, ts), which is what the query produces and what
+        // the O(1) lookup depends on. Two lanes, interleaved by time but
+        // contiguous by lane.
+        let claims = vec![
+            claim("alpha", "A-1", 100),
+            claim("alpha", "A-2", 300),
+            claim("beta", "B-1", 200),
+            claim("beta", "B-2", 400),
+        ];
+        let got = claim_windows(Vec::new(), claims.clone(), now);
+        let by_card = |c: &str| -> (i64, i64) {
+            let w = got.iter().find(|(card, _, _, _)| card == c).expect(c);
+            (w.2, w.3)
+        };
+        // alpha's first claim ends at ALPHA's next claim (300), not beta's 200.
+        assert_eq!(by_card("A-1"), (100, 300));
+        assert_eq!(by_card("B-1"), (200, 400));
+        // The last claim of each lane runs to `now`, capped by the window.
+        assert_eq!(by_card("A-2"), (300, now));
+        assert_eq!(by_card("B-2"), (400, now));
+    }
+
+    #[test]
+    fn the_window_is_capped_even_when_the_lane_never_claims_again() {
+        let now = 10 * MAX_CLAIM_WINDOW_S;
+        let got = claim_windows(Vec::new(), vec![claim("alpha", "A-1", 0)], now);
+        assert_eq!(got, vec![("A-1".into(), "alpha".into(), 0, MAX_CLAIM_WINDOW_S)]);
+    }
+
+    #[test]
+    fn a_claim_with_no_issue_in_its_payload_is_skipped() {
+        let claims = vec![
+            ("alpha".into(), "{}".into(), 100),
+            ("alpha".into(), r#"{"issue":""}"#.into(), 200),
+            ("alpha".into(), "not json at all".into(), 300),
+            claim("alpha", "A-1", 400),
+        ];
+        let got = claim_windows(Vec::new(), claims, 10_000);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].0, "A-1");
+    }
+
+    /// THE ONE THAT MATTERS. O(1) next-claim must agree with the O(n^2) scan on
+    /// every input the query can actually produce.
+    #[test]
+    fn the_indexed_lookup_agrees_with_the_scan_it_replaced() {
+        let now = 1_000_000;
+        // A corpus with the shapes that distinguish the two: lanes of length
+        // one, runs of several, adjacent lanes whose names sort next to each
+        // other, and a gap wider than the cap.
+        let mut claims: Vec<(String, String, i64)> = Vec::new();
+        for (lane, count) in [("a", 1), ("aa", 5), ("ab", 2), ("b", 7), ("c", 1), ("cc", 3)] {
+            for k in 0..count {
+                claims.push(claim(lane, &format!("{lane}-{k}"), 100 + (k as i64) * 250));
+            }
+        }
+        // One lane whose last two claims straddle the cap.
+        claims.push(claim("z", "z-0", 10));
+        claims.push(claim("z", "z-1", 10 + 3 * MAX_CLAIM_WINDOW_S));
+        let attempts = vec![("T-9".to_string(), "runner".to_string(), 5i64, 50i64)];
+
+        let fast = claim_windows(attempts.clone(), claims.clone(), now);
+        let slow = windows_by_scan(attempts, claims, now);
+        assert_eq!(fast, slow, "the rewrite changed a window");
+        assert!(!fast.is_empty());
+    }
+
+    /// The CONTROL for the cell above: the oracle and the subject must be able
+    /// to disagree, or their agreement proves nothing. Unordered input is
+    /// exactly where they part, and it is why the ordering is load-bearing
+    /// rather than incidental.
+    #[test]
+    fn the_two_implementations_part_company_on_input_the_query_never_emits() {
+        let now = 10_000;
+        // Same lane, NOT contiguous — a shape `ORDER BY session, ts` cannot
+        // produce. The scan finds alpha's later claim; the indexed lookup sees
+        // a different lane in the next row and runs to `now`.
+        let claims = vec![
+            claim("alpha", "A-1", 100),
+            claim("beta", "B-1", 200),
+            claim("alpha", "A-2", 300),
+        ];
+        assert_ne!(
+            claim_windows(Vec::new(), claims.clone(), now),
+            windows_by_scan(Vec::new(), claims, now),
+            "if these agree on unordered input the differential test above is vacuous"
+        );
     }
 
     #[test]
