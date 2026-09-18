@@ -569,14 +569,19 @@ pub async fn index_once_at(
 /// every later turn on that lane, which is not.
 const MAX_CLAIM_WINDOW_S: i64 = 24 * 3600;
 
-/// Claim windows applied per writer acquisition (AMUX-4750). See the loop that
-/// uses it for why the hold matters more than the total.
+/// How long one writer acquisition may spend applying claim windows (AMUX-4750).
 ///
-/// 150, not the 500 this shipped with. Sized from a live measurement rather
-/// than an estimate: at 500 the worst hold came back at 738ms, so an UPDATE is
-/// costing ~1.5ms here and not the ~0.4ms the arithmetic assumed. 150 x 1.5ms
-/// is ~225ms, inside the 250ms budget, at ~67 acquisitions per cycle.
-const UPDATES_PER_WRITE: usize = 150;
+/// A TIME BUDGET, after counting failed twice. The chunk was sized by dividing
+/// a total by an item count: 500 windows was "~200ms" at an implied 0.4ms per
+/// UPDATE, and measured 738ms. Resized to 150 on the corrected 1.5ms, it
+/// measured 696ms, implying ~4.6ms. The per-window cost is not a constant to
+/// divide by — most windows match nothing and return instantly while a few scan
+/// a real range — so no fixed count bounds the worst case. Elapsed time does,
+/// directly, and it is what the card actually asks about.
+///
+/// The hold is this budget plus at most one UPDATE, because the check happens
+/// after each one rather than before.
+const HOLD_BUDGET_MS: u128 = 200;
 
 /// Fill `token_ledger.task` for turns that fall inside a card's claim window on
 /// the SAME lane. Only touches unattributed rows.
@@ -730,21 +735,45 @@ pub async fn attribute_tasks(store: &SharedStore) -> anyhow::Result<()> {
     // Chunking does not make the job cheaper; it stops any one interactive write
     // being stuck behind all of it. 500 x ~0.4ms is ~200ms, inside the 250ms
     // this card asks for, and the loop yields the writer between chunks.
-    for chunk in pending.chunks(UPDATES_PER_WRITE) {
-        let chunk: Vec<(String, String, i64, i64)> = chunk.to_vec();
+    let pending = std::sync::Arc::new(pending);
+    let mut done = 0usize;
+    while done < pending.len() {
+        let consumed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (windows, counter, start_at) = (pending.clone(), consumed.clone(), done);
         store
             .write_async(move |conn| {
+                let started = std::time::Instant::now();
                 let mut stmt = conn.prepare_cached(
                     "UPDATE token_ledger SET task=?1 \
                      WHERE task='' AND session=?2 AND COALESCE(session,'') <> '' \
                        AND ts>=?3 AND ts<=?4",
                 )?;
-                for (task, session, from, to) in &chunk {
+                let mut n = 0usize;
+                for (task, session, from, to) in &windows[start_at..] {
                     stmt.execute(rusqlite::params![task, session, from, to])?;
+                    n += 1;
+                    if started.elapsed().as_millis() >= HOLD_BUDGET_MS {
+                        break;
+                    }
                 }
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                counter.store(n, std::sync::atomic::Ordering::Relaxed);
+                Ok(WriteOutcome { applied: n > 0, events: vec![] })
             })
             .await?;
+        let n = consumed.load(std::sync::atomic::Ordering::Relaxed);
+        // A zero would mean the closure applied nothing, which cannot happen
+        // while windows remain — but looping on it forever is the failure mode
+        // worth refusing outright rather than reasoning about.
+        if n == 0 {
+            tracing::warn!(
+                target: "amux::token_ledger",
+                verdict = "attribute_no_progress",
+                remaining = pending.len() - done,
+                "a writer acquisition applied no claim window; stopping rather than spinning"
+            );
+            break;
+        }
+        done += n;
     }
     Ok(())
 }
