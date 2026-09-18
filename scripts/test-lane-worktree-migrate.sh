@@ -173,5 +173,54 @@ else
   bad "D: mutation did not apply as expected — D proves nothing, fix the sed"
 fi
 
+# ── CASE E: --acknowledge-unclaimed, naming the unclaimed path EXACTLY, ─────
+# proceeds -- the honest escape hatch, not a silent one.
+lane_e="lane-e"
+shared_e="$TMP/shared-e"
+new_lane_fixture "$lane_e" "$shared_e"
+echo "mine" >> "$shared_e/pkg/main.rs"
+echo "a peer's WIP, acknowledged not mine" > "$shared_e/README.md"
+dest_e="$TMP/dest-e"
+if out_e="$(bash "$SCRIPT" "$lane_e" --claim "pkg/main.rs" --acknowledge-unclaimed "README.md" --dest "$dest_e" 2>&1)"; then
+  ok "E: migration with a matching --acknowledge-unclaimed succeeds"
+else
+  bad "E: migration refused despite an exact --acknowledge-unclaimed match"
+  printf '%s\n' "$out_e" | sed 's/^/       /' >&2
+fi
+e_dirty="$(git -C "$dest_e" status --porcelain --untracked-files=all 2>/dev/null | awk '{print $2}' | sort | tr '\n' ' ')"
+if [ "$e_dirty" = "pkg/main.rs " ]; then
+  ok "E: new worktree carries ONLY the claimed path, not the acknowledged one"
+else
+  bad "E: new worktree dirty set is '$e_dirty', expected only 'pkg/main.rs '"
+fi
+if [ -f "$shared_e/README.md" ] && grep -q "acknowledged not mine" "$shared_e/README.md"; then
+  ok "E: the acknowledged (not-mine) file is untouched in the original checkout"
+else
+  bad "E: the acknowledged file was modified or removed from the original checkout"
+fi
+
+# ── CASE F: --acknowledge-unclaimed naming the WRONG path still refuses -----
+# proves it is not a blanket "shut up and proceed" flag.
+lane_f="lane-f"
+shared_f="$TMP/shared-f"
+new_lane_fixture "$lane_f" "$shared_f"
+echo "mine" >> "$shared_f/pkg/main.rs"
+echo "a peer's WIP" > "$shared_f/README.md"
+dest_f="$TMP/dest-f"
+if out_f="$(bash "$SCRIPT" "$lane_f" --claim "pkg/main.rs" --acknowledge-unclaimed "some/other/path.txt" --dest "$dest_f" 2>&1)"; then
+  bad "F: migration succeeded despite --acknowledge-unclaimed naming the WRONG path"
+else
+  if printf '%s' "$out_f" | grep -q "REFUSED" && printf '%s' "$out_f" | grep -q "README.md"; then
+    ok "F: a mismatched --acknowledge-unclaimed still refuses and names the real unclaimed file"
+  else
+    bad "F: refused, but not with the expected REFUSED/README.md shape"
+  fi
+fi
+if [ -e "$dest_f" ]; then
+  bad "F: a destination worktree was created despite the refusal"
+else
+  ok "F: no destination worktree created"
+fi
+
 [ "$fail" -eq 0 ] && echo "lane-worktree-migrate suite: PASS" || echo "lane-worktree-migrate suite: FAIL" >&2
 exit "$fail"

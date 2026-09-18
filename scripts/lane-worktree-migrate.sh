@@ -32,6 +32,11 @@
 #                THIS lane's in-flight work. Omit entirely when the tree is
 #                already clean for this lane (the common case: run this
 #                between tasks, not mid-edit).
+#   --acknowledge-unclaimed  comma-separated paths that are dirty, are NOT
+#                this lane's, and are explicitly not being migrated. Must
+#                name every unclaimed path exactly, same as --claim -- this
+#                is the honest escape hatch past the refusal below, not a
+#                silent one.
 #   --dest       new worktree path. Default: ~/Dev/amux-lanes/<lane>.
 #   --dry-run    print every step without creating the worktree or writing
 #                anything outside a scratch temp dir.
@@ -50,12 +55,13 @@ set -euo pipefail
 
 lane=""
 claim_csv=""
+acknowledge_csv=""
 dest=""
 dry_run=0
 force=0
 
 usage() {
-  echo "usage: $0 <lane> [--claim p1,p2,...] [--dest DIR] [--dry-run] [--force]" >&2
+  echo "usage: $0 <lane> [--claim p1,p2,...] [--acknowledge-unclaimed p1,p2,...] [--dest DIR] [--dry-run] [--force]" >&2
   exit 2
 }
 
@@ -66,6 +72,7 @@ case "$lane" in --*) usage ;; esac
 while [ $# -gt 0 ]; do
   case "$1" in
     --claim) claim_csv="${2:-}"; shift 2 ;;
+    --acknowledge-unclaimed) acknowledge_csv="${2:-}"; shift 2 ;;
     --dest) dest="${2:-}"; shift 2 ;;
     --dry-run) dry_run=1; shift ;;
     --force) force=1; shift ;;
@@ -97,32 +104,47 @@ for p in "${claimed[@]:-}"; do
   [ -n "$p" ] && claimed_clean+=("$p")
 done
 
+IFS=',' read -r -a acked <<<"${acknowledge_csv:-}"
+acked_clean=()
+for p in "${acked[@]:-}"; do
+  [ -n "$p" ] && acked_clean+=("$p")
+done
+
 # ── refuse to guess whose dirt is whose ──────────────────────────────────────
+# --acknowledge-unclaimed is the one honest way past this: not a silent
+# bypass, a second explicit list. It must name EXACTLY the unclaimed paths --
+# same accounting principle as --claim itself -- so a caller cannot wave away
+# "whatever else happens to be dirty" today and have it quietly cover a
+# DIFFERENT file tomorrow. Anything acknowledged is not snapshotted and not
+# touched; it is left exactly where it is, same as everything else in the
+# original checkout.
 dirty_all="$(git -C "$cc_dir" status --porcelain --untracked-files=all)"
 unclaimed=""
 while IFS= read -r line; do
   [ -z "$line" ] && continue
   path="${line:3}"
   found=0
-  for c in "${claimed_clean[@]:-}"; do
+  for c in "${claimed_clean[@]:-}" "${acked_clean[@]:-}"; do
     [ "$c" = "$path" ] && found=1 && break
   done
   [ "$found" -eq 0 ] && unclaimed="$unclaimed  $line"$'\n'
 done <<<"$dirty_all"
 
 if [ -n "$unclaimed" ]; then
-  printf 'REFUSED: %s has dirty paths not named in --claim:\n%s' "$cc_dir" "$unclaimed" >&2
+  printf 'REFUSED: %s has dirty paths not named in --claim or --acknowledge-unclaimed:\n%s' "$cc_dir" "$unclaimed" >&2
   cat >&2 <<'EOF'
 These may belong to another lane working in the same shared checkout right
 now (this is the exact hazard AF-336 exists to end). Either:
   - re-run with --claim naming every path above that is genuinely yours, or
+  - re-run with --acknowledge-unclaimed naming every path above that is
+    genuinely NOT yours and you have verified is safe to leave untouched, or
   - coordinate with whoever owns the rest before migrating, or
   - wait until the tree is clean for you and run this with no --claim at all.
 Nothing was written.
 EOF
   exit 1
 fi
-note "every dirty path in $cc_dir accounted for (${#claimed_clean[@]} claimed)"
+note "every dirty path in $cc_dir accounted for (${#claimed_clean[@]} claimed, ${#acked_clean[@]} acknowledged unclaimed)"
 
 # ── snapshot the claimed paths ───────────────────────────────────────────────
 step "snapshotting claimed paths"
