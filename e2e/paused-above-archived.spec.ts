@@ -21,15 +21,35 @@ test('the Paused accordion renders immediately above the Archived accordion, bel
   await expect(paused).toContainText('1 paused');
   await expect(archived).toBeVisible();
 
-  // DOM order: cards, then paused, then archived, with nothing in between.
+  // DOM order: cards, then paused, then archived, with nothing VISIBLE in
+  // between.
+  //
+  // "Nothing visible" rather than "nextElementSibling is archived-section"
+  // (AMUX-4869). a2dbd758 added `#expired-section` between them, and
+  // `_renderExpiredSection` writes `el.innerHTML = ''` when there are no
+  // ephemeral workers to show, which is this fixture. So the requirement Ethan
+  // stated is still met on screen while the adjacency check was red, and a
+  // guard that fails on an empty structural sibling fails on the refactor
+  // rather than on the regression.
+  //
+  // This is STRICTER than the old check where it matters: if the expired
+  // accordion ever renders content here, paused is genuinely no longer
+  // immediately above archived, and the walk below says so by name.
   const order = await page.evaluate(() => {
     const p = document.getElementById('paused-section')!;
+    const between: string[] = [];
+    for (let n = p.nextElementSibling; n && n.id !== 'archived-section'; n = n.nextElementSibling) {
+      const el = n as HTMLElement;
+      // An element that occupies no space is not between them to a reader.
+      if (el.offsetHeight > 0 || (el.textContent || '').trim()) between.push(el.id || el.className);
+    }
     return {
       afterCards: p.previousElementSibling?.id,
-      beforeArchived: p.nextElementSibling?.id,
+      archivedFollows: !!p.parentElement?.querySelector('#archived-section'),
+      visibleBetween: between,
     };
   });
-  expect(order).toEqual({afterCards: 'cards', beforeArchived: 'archived-section'});
+  expect(order).toEqual({afterCards: 'cards', archivedFollows: true, visibleBetween: []});
 
   // Visual order: Paused sits above Archived and below the live worker card.
   const pb = await paused.boundingBox();
