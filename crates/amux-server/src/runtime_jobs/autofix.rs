@@ -2302,6 +2302,19 @@ fn detect_latency_with_scan_cap(
     let mut outliers_spanned = 0usize;
     let mut outliers_considered = 0usize;
     let mut outliers_failed = 0usize;
+    // THE SAME THREE COUNTS, PER TARGET (AMUX-4859). The three above are over
+    // EVERY route in the window, because the scan below has no path predicate.
+    // The card they are published on names ONE route and puts them beside `n`,
+    // which is per-route, so a reader subtracts two numbers from different
+    // populations and finds rows missing that were never on this route.
+    //
+    // Specimen: AMUX-4852 published "11 row(s) matched ... 0 dropped ... 0
+    // dropped" beside `n_over_floor: 1`. All four numbers were correct. 8 of
+    // the 11 were /api/email/inbox, which carries its own 30s budget and was
+    // never eligible to file. Keeping the fleet-wide figure is deliberate (it
+    // is what tells a reader another route is having a bad window), so the fix
+    // is to publish BOTH and label which is which.
+    let mut per_target: BTreeMap<(String, String), (usize, usize, usize)> = BTreeMap::new();
     if let Ok(mut stmt) = conn.prepare(
         "SELECT method, path, latency_ms, ts, status, boot_at, load1, client_ip FROM _amux_request_log \
          WHERE ts >= ?1 AND latency_ms >= ?2 \
@@ -2321,9 +2334,20 @@ fn detect_latency_with_scan_cap(
             ))
         }) {
             for (method, path, ms, ts, status, row_boot, row_load, row_ip) in rows.flatten() {
+                // Resolved HERE, above both exclusions, so the per-target tally
+                // can count the rows they drop (AMUX-4859). The grouping below
+                // reuses this exact value, so the two cannot disagree about
+                // which target a row belongs to. See the AMUX-3869 note at the
+                // `seen` entry for why this is the per-VERB target.
+                let row_target = rl::normalize_target_verb(&path);
+                let tally = per_target
+                    .entry((method.clone(), row_target.clone()))
+                    .or_insert((0usize, 0usize, 0usize));
+                tally.0 += 1;
                 outliers_considered += 1;
                 if spans_own_restart(ts, ms, row_boot, boot) {
                     outliers_spanned += 1;
+                    tally.1 += 1;
                     continue;
                 }
                 // A REQUEST THAT FAILED IS NOT A LATENCY MEASUREMENT (AMUX-3709).
@@ -2354,6 +2378,7 @@ fn detect_latency_with_scan_cap(
                 // breadth rule cannot see.
                 if status >= 500 {
                     outliers_failed += 1;
+                    tally.2 += 1;
                     continue;
                 }
                 // PER-VERB, not per-route-pattern (AMUX-3869). `normalize_target`
@@ -2378,7 +2403,10 @@ fn detect_latency_with_scan_cap(
                 // Only the LATENCY axis moves. The 5xx detector above keeps the
                 // coarse target deliberately: a 500 is a 500 whatever the verb,
                 // and its rollup wants the route shape.
-                let target = rl::normalize_target_verb(&path);
+                // Resolved at the top of the loop now (AMUX-4859), so the
+                // per-target tally and this grouping key are the SAME string by
+                // construction rather than by two calls agreeing.
+                let target = row_target;
                 // Computed BEFORE the entry call, which moves `target`.
                 let row_budget = design_budget_ms(&target);
                 let e = seen
@@ -2831,15 +2859,39 @@ fn detect_latency_with_scan_cap(
                 // Published unconditionally, including as zeros: "3 slow, 0
                 // excluded" and "3 slow, 1052 excluded" are different facts and
                 // must not render identically (ethos rule 4).
-                ("outliers_excluded".into(), format!(
-                    "{outliers_considered} row(s) matched the threshold in this window; \
-                     {outliers_spanned} dropped as spanning a server restart (AF-175: wall time \
-                     across a boot is not service time) and {outliers_failed} dropped as failed \
-                     requests (AMUX-3709: a timeout's duration is the timeout, not a \
-                     measurement). `n` and `worst_ms` above describe only what survived. If \
-                     `excluded` dwarfs the survivors, size the incident from the re-check query \
-                     below, not from this card."
-                )),
+                //
+                // SAY WHICH POPULATION EACH COUNT IS OVER (AMUX-4859). This
+                // line used to open with the FLEET-WIDE total and then refer to
+                // `n`, which is per-target, so on a card titled with one route
+                // the two read as one population and the difference looked like
+                // rows vanishing into an unnamed filter. AMUX-4852 published
+                // "11 matched; 0 dropped; 0 dropped" beside `n_over_floor: 1`,
+                // all four numbers correct, 8 of the 11 belonging to
+                // /api/email/inbox. This target's own figures come first now
+                // because they are the ones that reconcile with `n`, and the
+                // fleet-wide figures are kept and LABELLED because they are how
+                // a reader learns another route is having a bad window.
+                ("outliers_excluded".into(), {
+                    let (t_considered, t_spanned, t_failed) = per_target
+                        .get(&(method.clone(), target.clone()))
+                        .copied()
+                        .unwrap_or((0, 0, 0));
+                    format!(
+                        "ON THIS TARGET ({method} {target}): {t_considered} row(s) matched the \
+                         threshold in this window; {t_spanned} dropped as spanning a server \
+                         restart (AF-175: wall time across a boot is not service time) and \
+                         {t_failed} dropped as failed requests (AMUX-3709: a timeout's duration \
+                         is the timeout, not a measurement). `n` and `worst_ms` above describe \
+                         only what survived, so {t_considered} - {t_spanned} - {t_failed} = {n}. \
+                         If the dropped rows dwarf the survivors, size the incident from the \
+                         re-check query below, not from this card.\n  \
+                         ACROSS ALL TARGETS in the same window: {outliers_considered} matched, \
+                         {outliers_spanned} restart-spanning, {outliers_failed} failed. That is a \
+                         DIFFERENT population from `n` and from the per-target counts above, and \
+                         it is published so a quiet route can still show you that the window \
+                         itself was bad (AMUX-4859)."
+                    )
+                }),
                 // AMUX-3647. Until 2026-08-24 a row that arrived within
                 // `latency` seconds of a boot was DROPPED here, so this card
                 // did not exist for that request and nobody could weigh it.
@@ -14126,6 +14178,142 @@ mod tests {
         assert!(
             excluded.contains("0 dropped as failed"),
             "same for the failed-request filter: {excluded}"
+        );
+    }
+
+    /// AMUX-4859. The per-target counts and the window-wide counts are
+    /// different populations, and the card must say which is which.
+    ///
+    /// Specimen: AMUX-4852 published "11 row(s) matched ... 0 dropped ... 0
+    /// dropped" directly beside `n_over_floor: 1`, on a card whose title names
+    /// ONE route. All four numbers were correct. 8 of the 11 belonged to
+    /// /api/email/inbox, which carries its own 30s budget and could never have
+    /// filed. A reader subtracting the published numbers finds 10 rows removed
+    /// by a filter that does not exist, which is the opposite of the
+    /// mis-sizing AMUX-3907 added this field to prevent.
+    ///
+    /// The fixture reproduces that shape on purpose: the filing route
+    /// contributes ONE row, and a BUDGETED route contributes three more that
+    /// count toward the window while never filing. The two figures are 1 and 4
+    /// here, so a regression that fed either number into the other's slot
+    /// cannot keep both assertions green.
+    #[tokio::test]
+    async fn outliers_excluded_separates_this_target_from_the_whole_window() {
+        let (st, _d) = state();
+        let now = unix_now();
+        // The route under test: one slow row, no budget, so it files.
+        log_row(
+            &st,
+            Row {
+                ts: now - 50.0,
+                method: "GET",
+                path: "/api/board",
+                family: "/api/board",
+                status: 200,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 21_000.0,
+            },
+        );
+        // A DIFFERENT route, over the 10s floor but under its OWN 30s
+        // LONG_BY_DESIGN budget, so these three count toward the window and
+        // never produce a card. This is the /api/email/inbox role in the
+        // specimen.
+        for i in 0..3 {
+            log_row(
+                &st,
+                Row {
+                    ts: now - 40.0 + i as f64,
+                    method: "GET",
+                    path: "/api/sessions",
+                    family: "/api/sessions",
+                    status: 200,
+                    body: "",
+                    worker: "",
+                    ua: "curl/8",
+                    ms: 12_000.0,
+                },
+            );
+        }
+        // TWO ROWS THIS TARGET'S OWN `failed` FILTER DROPS. Without these the
+        // per-target failed counter is never exercised: a mutation deleting it
+        // stayed green, which is how this half got here (the tally counters
+        // were added with a fixture that had nothing for them to count).
+        for i in 0..2 {
+            log_row(
+                &st,
+                Row {
+                    ts: now - 30.0 + i as f64,
+                    method: "GET",
+                    path: "/api/board",
+                    family: "/api/board",
+                    status: 502,
+                    body: "",
+                    worker: "",
+                    ua: "curl/8",
+                    ms: 15_000.0,
+                },
+            );
+        }
+        // AND ONE THE restart-spanning FILTER DROPS. `spans_own_restart` takes
+        // `Some(boot) => ts < boot`, so a row stamped with a boot_at LATER than
+        // itself is one the process cannot have served end to end. log_row
+        // leaves boot_at NULL, so this goes in directly.
+        let spanned_ts = now - 20.0;
+        st.store
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO _amux_request_log (ts, method, path, family, status, latency_ms, \
+                     client_ip, user_agent, amux_session, worker, answered_by, boot_at) \
+                     VALUES (?1,'GET','/api/board','/api/board',200,18000.0, \
+                     '127.0.0.1','curl/8','','','native',?2)",
+                    rusqlite::params![spanned_ts, spanned_ts + 1.0],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+
+        let (f, _) = detect_latency(&st.store.read().unwrap(), now);
+        let hit = f
+            .iter()
+            .find(|x| x.signature.starts_with("latency|outlier|GET"))
+            .expect("the unbudgeted 21s row files on its own");
+        let ev: BTreeMap<_, _> = hit.evidence.iter().cloned().collect();
+        let excluded = ev
+            .get("outliers_excluded")
+            .expect("the card must say what its filters removed");
+
+        // THIS TARGET'S OWN FIGURES, the ones that reconcile with `n`:
+        // 4 matched here (1 survivor + 1 restart-spanning + 2 failed).
+        assert!(
+            excluded.contains("ON THIS TARGET (GET /api/board): 4 row(s) matched"),
+            "the per-target count must be this route's own, not the window's: {excluded}"
+        );
+        assert!(
+            excluded.contains("1 dropped as spanning a server restart"),
+            "the per-target restart-spanning count must be this route's own: {excluded}"
+        );
+        assert!(
+            excluded.contains("2 dropped as failed requests"),
+            "the per-target failed count must be this route's own: {excluded}"
+        );
+        // THE WINDOW'S FIGURE, kept and LABELLED as a different population:
+        // 7 = this target's 4 plus the budgeted route's 3.
+        assert!(
+            excluded.contains("ACROSS ALL TARGETS in the same window: 7 matched"),
+            "the window-wide count must be published and named as such: {excluded}"
+        );
+        // AND THE CARD SHOWS ITS OWN ARITHMETIC, so a reader can see the
+        // per-target numbers reconcile instead of taking it on faith.
+        assert!(
+            excluded.contains("4 - 1 - 2 = 1"),
+            "the per-target figures must visibly reconcile with n: {excluded}"
+        );
+        assert_eq!(
+            ev.get("n_over_floor").map(String::as_str),
+            Some("1"),
+            "and n itself is this target's survivor count"
         );
     }
 
