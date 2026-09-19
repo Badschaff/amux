@@ -3857,6 +3857,54 @@ fn steering_with_transport(conn: &rusqlite::Connection) -> rusqlite::Result<BTre
     Ok(steering)
 }
 
+/// The current branch, read from `.git/HEAD` instead of asking git.
+///
+/// AMUX-4778: the sessions build spent ~2.4s of every cold rebuild running
+/// `git rev-parse --abbrev-ref HEAD` once per distinct checkout, 12 at a time,
+/// across ~107 directories. `rev-parse` in the common case reads exactly this
+/// file, so the subprocess is the entire cost.
+///
+/// Measured against `git rev-parse --abbrev-ref HEAD` on all 100 real session
+/// directories on this box: AGREED 100 of 100, at 0.031 ms per directory
+/// against 37.4 ms for the subprocess (3.1 ms total against 3.74 s).
+///
+/// Handles the three shapes that made a naive `<dir>/.git/HEAD` read wrong when
+/// I first tried it (it agreed on only 21 of 100):
+///   - a SUBDIRECTORY of a checkout has no `.git`; git walks up, so this does;
+///   - a worktree or submodule has `.git` as a FILE holding `gitdir: <path>`,
+///     which may be relative;
+///   - a DETACHED head holds a raw sha, and `rev-parse --abbrev-ref` answers
+///     the literal "HEAD" for it, so that is what this returns.
+///
+/// Returns None when it cannot answer, and the caller then pays for git. A
+/// wrong branch is worse than a slow one.
+fn branch_from_head_file(dir: &str) -> Option<String> {
+    let mut cur = std::path::Path::new(dir).to_path_buf();
+    loop {
+        let dot = cur.join(".git");
+        if dot.exists() {
+            let gitdir = if dot.is_file() {
+                let txt = std::fs::read_to_string(&dot).ok()?;
+                let rest = txt.trim().strip_prefix("gitdir:")?.trim().to_string();
+                let p = std::path::PathBuf::from(&rest);
+                if p.is_absolute() { p } else { cur.join(p) }
+            } else {
+                dot
+            };
+            let head = std::fs::read_to_string(gitdir.join("HEAD")).ok()?;
+            let head = head.trim();
+            return Some(match head.strip_prefix("ref: refs/heads/") {
+                Some(b) => b.to_string(),
+                // Detached: `--abbrev-ref` prints HEAD, not the sha.
+                None => "HEAD".to_string(),
+            });
+        }
+        if !cur.pop() {
+            return None;
+        }
+    }
+}
+
 fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::Value>> {
     let mut signals = FleetSignals::load(conn);
     // Before any status is derived: the pane is the only signal that can
@@ -4413,7 +4461,20 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
                 .filter(|d| !d.is_empty())
                 .map(String::from)
                 .collect();
-            let dir_list: Vec<String> = dirs.into_iter().collect();
+            // FAST PATH FIRST (AMUX-4778): resolve what we can by reading
+            // `.git/HEAD`, and only spawn git for the directories that cannot
+            // be answered that way. On this box that is all of them, taking the
+            // projection from ~2.4s to ~3ms; the subprocess below stays for any
+            // shape the file read does not cover.
+            let mut dir_list: Vec<String> = Vec::new();
+            for d in dirs {
+                match branch_from_head_file(&d) {
+                    Some(b) => {
+                        branches.insert(d, b);
+                    }
+                    None => dir_list.push(d),
+                }
+            }
             for chunk in dir_list.chunks(12) {
                 let handles: Vec<_> = chunk
                     .iter()
@@ -6837,6 +6898,74 @@ Checked, nothing of mine was at risk, no action needed from you.
     /// The controls matter as much: prose that merely ENDS in something
     /// time-shaped, and a single-space gap, must pass through untouched — an
     /// over-eager strip would corrupt real preview text fleet-wide.
+    /// AMUX-4778: the branch must come from `.git/HEAD`, and agree with git.
+    ///
+    /// The sessions build spent ~2.4s of every cold rebuild on
+    /// `git rev-parse --abbrev-ref HEAD`, once per distinct checkout. The file
+    /// read that replaces it was verified against git on all 100 real session
+    /// directories on this box (100/100, 0.031ms vs 37.4ms each). A unit test
+    /// still has to build the shapes itself, because my FIRST attempt at this
+    /// read agreed on only 21 of those 100 and every miss was a different
+    /// shape.
+    #[test]
+    fn the_branch_read_matches_git_across_checkout_shapes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // 1. A repo ROOT on a branch.
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        assert_eq!(branch_from_head_file(repo.to_str().unwrap()).as_deref(), Some("main"));
+
+        // 2. A SUBDIRECTORY. This is what broke the naive version: 79 of the
+        // 100 real directories are nested, have no `.git` of their own, and git
+        // finds the root by walking up.
+        let nested = repo.join("a/b/c");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(
+            branch_from_head_file(nested.to_str().unwrap()).as_deref(),
+            Some("main"),
+            "a nested directory must resolve to its repo's branch, not None"
+        );
+
+        // 3. A WORKTREE: `.git` is a FILE holding `gitdir: <path>`.
+        let wt = root.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let wtgit = repo.join(".git/worktrees/wt");
+        std::fs::create_dir_all(&wtgit).unwrap();
+        std::fs::write(wtgit.join("HEAD"), "ref: refs/heads/feature/x\n").unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", wtgit.display())).unwrap();
+        assert_eq!(
+            branch_from_head_file(wt.to_str().unwrap()).as_deref(),
+            Some("feature/x"),
+            "a slash in the branch must survive: refs/heads/feature/x is ONE branch name"
+        );
+
+        // 4. DETACHED head. `rev-parse --abbrev-ref HEAD` prints the literal
+        // "HEAD", not the sha, so returning the sha would silently disagree
+        // with the command this replaces.
+        let det = root.join("det");
+        std::fs::create_dir_all(det.join(".git")).unwrap();
+        std::fs::write(det.join(".git/HEAD"), "9fceb02a1b0e4e1f0000000000000000deadbeef\n").unwrap();
+        assert_eq!(
+            branch_from_head_file(det.to_str().unwrap()).as_deref(),
+            Some("HEAD"),
+            "detached must report HEAD, matching --abbrev-ref, never the sha"
+        );
+
+        // 5. A `.git` FILE with junk in it must not be read as a branch: answer
+        // None so the caller pays for git rather than inventing one.
+        let junk = root.join("junk");
+        std::fs::create_dir_all(&junk).unwrap();
+        std::fs::write(junk.join(".git"), "this is not a gitdir pointer\n").unwrap();
+        assert_eq!(
+            branch_from_head_file(junk.to_str().unwrap()),
+            None,
+            "unparseable .git must fall back to git, not guess"
+        );
+    }
+
     #[test]
     fn elapsed_suffix_strips_the_ticker_and_only_the_ticker() {
         // The live specimens (column-padded status lines).
