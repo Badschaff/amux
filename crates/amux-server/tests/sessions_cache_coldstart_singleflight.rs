@@ -160,15 +160,76 @@ fn structural_changes_fail_closed_instead_of_returning_the_raced_snapshot() {
     assert!(writeback.contains("race_verdict("));
     assert!(writeback.contains("SESSIONS_EPOCH.load"));
     assert!(writeback.contains("registry_fingerprint()"));
-    assert!(writeback.contains("return Err(raced.into());"));
+    // THE PROPERTY IS "the Raced arm returns an error", NOT the spelling of the
+    // error (AMUX-4844). This asserted the literal `return Err(raced.into());`
+    // until AMUX-4838 replaced the bound `raced` with a typed `DiscoveryRaced`
+    // unit struct. The behaviour was identical and this cell still went red,
+    // and it stayed red on main for hours stacked behind an unrelated e2e
+    // failure. A golden string over code somebody is expected to refactor fails
+    // on the rename rather than on the regression.
+    //
+    // Scoped to the Raced ARM so it cannot be satisfied by an error return
+    // somewhere else in the write-back. The Unverifiable arm is asserted the
+    // opposite way on purpose: an unreadable registry must SERVE without
+    // caching (AMUX-4838), so an `Err` leaking into that arm is exactly the
+    // regression this file exists to catch, and a test that only looked for
+    // "some Err" in the write-back would pass through it.
+    let raced_arm = writeback
+        .split("RaceVerdict::Raced =>")
+        .nth(1)
+        .and_then(|tail| tail.split("RaceVerdict::").next())
+        .expect("the Raced arm moved or disappeared");
+    assert!(
+        raced_arm.contains("return Err("),
+        "a structural change during the build must fail closed, whatever the error type is \
+         called; the Raced arm now reads: {raced_arm}"
+    );
+    let unverifiable_arm = writeback
+        .split("RaceVerdict::Unverifiable =>")
+        .nth(1)
+        .unwrap_or("");
+    assert!(
+        !unverifiable_arm.contains("return Err("),
+        "an unreadable registry must SERVE without caching (AMUX-4838) rather than fail \
+         closed; the Unverifiable arm now reads: {unverifiable_arm}"
+    );
     let verdict = SRC
         .split("fn race_verdict(")
         .nth(1)
         .and_then(|tail| tail.split("\n}\n").next())
         .expect("race_verdict moved or disappeared");
-    assert!(verdict.contains("epoch_now == epoch_start"));
-    assert!(verdict.contains("registry_now == registry_start"));
-    assert!(verdict.contains("Err(DiscoveryRaced)"));
+    // WHAT SOURCE-GREP CAN UNIQUELY CHECK HERE, and nothing more (AMUX-4844).
+    //
+    // These three lines used to pin `epoch_now == epoch_start`,
+    // `registry_now == registry_start` and `Err(DiscoveryRaced)`. AMUX-4838
+    // rewrote the comparison as an early `epoch_now != epoch_start` guard plus
+    // a `(Some(a), Some(b)) if a == b` match returning a RaceVerdict enum. The
+    // behaviour was preserved and all three still went red, which is a guard
+    // failing on the refactor it was supposed to survive.
+    //
+    // The OUTCOMES are already covered properly, by behavioural unit tests next
+    // to the function (`assert_eq!(race_verdict(1, 1, Some(7), Some(7)),
+    // RaceVerdict::Fresh)` and friends) that call it with real arguments. So
+    // asserting the spelling here bought nothing and cost a red main.
+    //
+    // What a source check CAN add is that the function cannot quietly stop
+    // consulting one of its inputs: a behavioural test only catches that if
+    // somebody wrote the case that distinguishes them. So require all four
+    // parameters to be read, and all three verdicts to be reachable.
+    for needle in ["epoch_start", "epoch_now", "registry_start", "registry_now"] {
+        assert!(
+            verdict.contains(needle),
+            "race_verdict must still consult `{needle}`; a verdict that ignores one of its \
+             inputs cannot tell a race from a fresh build"
+        );
+    }
+    for variant in ["Raced", "Fresh", "Unverifiable"] {
+        assert!(
+            verdict.contains(variant),
+            "race_verdict must still be able to answer `{variant}`; collapsing a verdict is \
+             how an unreadable registry starts reading as a race again (AMUX-4838)"
+        );
+    }
     assert!(
         !writeback.contains("caller still gets"),
         "a response that raced an isolation/delete/config change must not be returned"
