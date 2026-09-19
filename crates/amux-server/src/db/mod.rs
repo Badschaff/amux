@@ -119,6 +119,17 @@ pub struct Store {
     /// only testable by holding every connection, and the paths that must hold
     /// it (`api::policy::enforce`) live in other modules.
     pub(crate) read_pool: ReadPool,
+    /// AF-937: held only for its lifetime -- an RAII guard, not state. An
+    /// flock on a sidecar file next to `db_path`, acquired in
+    /// [`claim_sole_writer`] at open time. The OS releases it automatically
+    /// when every clone of this `Arc` (and so the underlying `File`) drops,
+    /// including on a crash or SIGKILL, so a stale lock cannot outlive the
+    /// process that took it. `None` means either another live process
+    /// already held it (a WARN was logged) or the probe itself could not run
+    /// (never treated as contention). Read only by the `#[cfg(test)]`
+    /// accessor below; production code never inspects it, only outlives it.
+    #[allow(dead_code, reason = "RAII guard: outlived, not read, outside tests")]
+    pub(crate) writer_lock: Option<Arc<std::fs::File>>,
     db_path: Arc<std::path::PathBuf>,
     pub(crate) health_probe: Arc<tokio::sync::Semaphore>,
     pub(crate) health_probe_started: Arc<std::sync::atomic::AtomicU64>,
@@ -173,6 +184,99 @@ pub(crate) fn record_blocking_dispatch(
     }
 }
 
+/// Sidecar to `db_path` recording which live process holds it open for
+/// writing. A `.holder-lock` suffix, distinct from SQLite's own `-wal`,
+/// `-shm` and `-journal` files, so nothing that globs those is affected.
+fn holder_lock_path(db_path: &Path) -> std::path::PathBuf {
+    let mut s = db_path.as_os_str().to_owned();
+    s.push(".holder-lock");
+    std::path::PathBuf::from(s)
+}
+
+/// What a contended lock probe learned about the process that beat us to it.
+/// `pid`/`port` are `None` only when the lock file's content could not be
+/// parsed (an old-format or corrupt write) -- never a stand-in for "nobody
+/// holds it", which is the `Ok` case in [`claim_sole_writer`]'s caller.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ExistingWriter {
+    pub pid: Option<u32>,
+    pub port: Option<u16>,
+}
+
+pub(crate) enum WriterLockOutcome {
+    /// We hold the lock. Keep the `File` alive for the store's lifetime, or
+    /// the OS releases it immediately.
+    Acquired(std::fs::File),
+    /// Another live OS process already holds it.
+    HeldByOther(Option<ExistingWriter>),
+    /// The recorded holder IS this process (a same-process reopen of the
+    /// same `db_path` while the first handle is still alive -- e.g. a test
+    /// simulating a restart without an actual exec). flock() is scoped to
+    /// the open file description, not the process, so a second open()
+    /// within the same process still contends; that is not a second OS
+    /// process and must not be reported as one.
+    HeldBySelf,
+}
+
+/// Claim sole-writer status on `db_path` via an advisory `flock` on a sidecar
+/// file, or report who already holds it.
+///
+/// AF-937 / AEAB-11 recurrence: a manual `amux-server-rs` run with no
+/// `AMUX_RS_PORT` falls onto `DEFAULT_PORT` and the default `AMUX_HOME`,
+/// landing on the exact `db_path` the real server already has open -- and
+/// nothing said so for 13 hours (both processes reported healthy the whole
+/// time; SQLite's own WAL locking serializes the writes correctly, so this
+/// was never about corruption, only a silent second writer). This makes that
+/// coexistence loud. It never blocks or fails startup: a probe that cannot
+/// even open the sidecar file degrades to `HeldByOther(None)` treated as
+/// "unknown", not a reason to refuse.
+fn claim_sole_writer(db_path: &Path) -> WriterLockOutcome {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::io::AsRawFd;
+
+    let lock_path = holder_lock_path(db_path);
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        // Explicit: opening must NOT clear a prior holder's content -- the
+        // contended branch below reads it before this fn's caller ever
+        // decides whether to overwrite it (only the lock-winning branch
+        // truncates, deliberately, via `set_len(0)`).
+        .truncate(false)
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        Err(_) => return WriterLockOutcome::HeldByOther(None),
+    };
+
+    // SAFETY: `file` is a valid, open fd for the lifetime of this call.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        let mut f = &file;
+        let _ = f.set_len(0);
+        let _ = f.seek(SeekFrom::Start(0));
+        let payload =
+            serde_json::json!({"pid": std::process::id(), "port": crate::config::canonical_port()});
+        let _ = write!(f, "{payload}");
+        let _ = f.flush();
+        return WriterLockOutcome::Acquired(file);
+    }
+
+    let mut buf = String::new();
+    let mut f = &file;
+    let _ = f.read_to_string(&mut buf);
+    let existing = serde_json::from_str::<serde_json::Value>(&buf).ok().map(|v| ExistingWriter {
+        pid: v.get("pid").and_then(serde_json::Value::as_u64).map(|x| x as u32),
+        port: v.get("port").and_then(serde_json::Value::as_u64).map(|x| x as u16),
+    });
+    if existing.as_ref().and_then(|e| e.pid) == Some(std::process::id()) {
+        WriterLockOutcome::HeldBySelf
+    } else {
+        WriterLockOutcome::HeldByOther(existing)
+    }
+}
+
 impl Store {
     /// Open the store: apply migrations, start the writer thread, build the
     /// read pool.
@@ -180,6 +284,28 @@ impl Store {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // AF-937: probe BEFORE opening anything else, so a warning is the
+        // first thing this open logs if it fires, and so the probe never
+        // depends on migrations or the writer thread having succeeded.
+        let writer_lock = match claim_sole_writer(db_path) {
+            WriterLockOutcome::Acquired(f) => Some(Arc::new(f)),
+            WriterLockOutcome::HeldBySelf => None,
+            WriterLockOutcome::HeldByOther(existing) => {
+                tracing::warn!(
+                    target: "store",
+                    verdict = "concurrent_writer_detected",
+                    db = %db_path.display(),
+                    other_pid = existing.as_ref().and_then(|e| e.pid),
+                    other_port = existing.as_ref().and_then(|e| e.port),
+                    measured = true,
+                    "another live process already has this database open for writing -- \
+                     AEAB-11/AF-937: a manual amux-server-rs run with no AMUX_RS_PORT set \
+                     falls onto the compiled-in default port and can silently collide with \
+                     the real server on this exact db_path"
+                );
+                None
+            }
+        };
         // Migrations run on a dedicated connection before anything else may
         // touch the DB. Health returns 503 until `open` completes.
         let mut conn = Connection::open(db_path)?;
@@ -257,6 +383,7 @@ impl Store {
         Ok(Store {
             write_tx,
             read_pool,
+            writer_lock,
             db_path: Arc::new(db_path.to_path_buf()),
             health_probe: Arc::new(tokio::sync::Semaphore::new(1)),
             health_probe_started: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -266,6 +393,16 @@ impl Store {
             blocking_dispatch_max_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             events_tx,
         })
+    }
+
+    /// AF-937: whether this instance won the sidecar `flock` at open time.
+    /// `false` covers both "another live process already held it" (a WARN
+    /// was logged) and "this process already held it" (a same-process
+    /// reopen, silently benign) -- callers that need to tell those apart
+    /// read the log, not this method.
+    #[cfg(test)]
+    pub(crate) fn holds_writer_lock(&self) -> bool {
+        self.writer_lock.is_some()
     }
 
     /// Run a mutation on the writer thread and wait for commit. Returns the
@@ -1228,5 +1365,142 @@ mod af640_read_pool_tests {
         // CONTROL: after releasing, a read must succeed again. Without this the
         // assertions above are satisfied by a pool that is simply broken.
         assert!(store.read().is_ok(), "the pool must recover once connections are returned");
+    }
+}
+
+/// AF-937 / AEAB-11 recurrence: a second `amux-server-rs` opened the same
+/// production db_path as the real server for ~13h with nothing anywhere
+/// warning that two writers existed. `claim_sole_writer` closes that gap.
+#[cfg(test)]
+mod af937_writer_lock_tests {
+    use super::*;
+
+    #[derive(Clone)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    struct CapturedLogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriter(self.0.clone())
+        }
+    }
+
+    impl std::io::Write for CapturedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn with_captured_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(CapturedLogs(buf.clone()))
+            .finish();
+        let _scope = tracing::subscriber::set_default(subscriber);
+        let result = f();
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        (result, logs)
+    }
+
+    /// A fabricated holder-lock, as a genuinely different OS process would
+    /// leave one: a real flock held (so a real probe really contends), with a
+    /// pid that is NOT this test's own. Kept alive by returning the `File` --
+    /// dropping it releases the lock, same as the codebase's own real usage.
+    fn plant_foreign_holder(db_path: &Path, fake_pid: u32, fake_port: u16) -> std::fs::File {
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+        let lock_path = holder_lock_path(db_path);
+        let file =
+            std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&lock_path)
+                .unwrap();
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "test setup must win an uncontended lock");
+        let mut f = &file;
+        write!(f, r#"{{"pid":{fake_pid},"port":{fake_port}}}"#).unwrap();
+        f.flush().unwrap();
+        file
+    }
+
+    /// The plain case first: nothing else has this db_path open. Opening must
+    /// both succeed AND leave no trace of the warning this whole card is
+    /// about -- the single-writer path must be silent, not merely non-fatal.
+    #[test]
+    fn a_lone_opener_holds_the_lock_and_logs_no_contention_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.db");
+        let (store, logs) = with_captured_logs(|| Store::open(&db_path).unwrap());
+        assert!(store.holds_writer_lock(), "the only opener must win the lock");
+        assert!(
+            !logs.contains("concurrent_writer_detected"),
+            "a lone opener must not warn about contention: {logs}"
+        );
+    }
+
+    /// The defect this card fixes: a second process (simulated here by a
+    /// planted foreign lock, not this test's own pid) already has db_path
+    /// open. Opening must still SUCCEED (never refuse to start) and must log
+    /// a WARN naming the other pid/port.
+    #[test]
+    fn a_foreign_holder_produces_a_named_warn_and_does_not_block_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.db");
+        let fake_pid = std::process::id().wrapping_add(9973); // never our own pid
+        let _foreign = plant_foreign_holder(&db_path, fake_pid, 8823);
+
+        let (opened, logs) = with_captured_logs(|| Store::open(&db_path));
+        let store = opened.expect("a contended writer-lock must not fail startup");
+        assert!(
+            !store.holds_writer_lock(),
+            "the loser of the flock must not report holding it"
+        );
+        assert!(
+            logs.contains("concurrent_writer_detected"),
+            "must warn under the greppable verdict: {logs}"
+        );
+        assert!(
+            logs.contains(&fake_pid.to_string()),
+            "the warning must name the OTHER process's pid, not just that one exists: {logs}"
+        );
+        assert!(logs.contains("8823"), "the warning must carry the other process's port too: {logs}");
+    }
+
+    /// The false-positive this design specifically avoids: the SAME process
+    /// reopening db_path while its first handle is still alive (exactly what
+    /// board_drive.rs's crash-recovery tests do to simulate a restart without
+    /// an actual exec). flock() is scoped to the open file description, so
+    /// the second open() genuinely contends -- but it must read as "this is
+    /// me", not get reported as a second OS process.
+    #[test]
+    fn a_same_process_reopen_is_not_reported_as_a_foreign_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.db");
+        let first = Store::open(&db_path).unwrap();
+        assert!(first.holds_writer_lock());
+
+        let (second, logs) = with_captured_logs(|| Store::open(&db_path));
+        let second = second.expect("a same-process reopen must not fail startup");
+        assert!(
+            !second.holds_writer_lock(),
+            "the second handle cannot ALSO hold an exclusive flock the first still has"
+        );
+        assert!(
+            !logs.contains("concurrent_writer_detected"),
+            "a same-process reopen is not a second OS process and must not warn: {logs}"
+        );
+        drop(first);
     }
 }
