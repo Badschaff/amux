@@ -6320,6 +6320,22 @@ async fn send_dedup_forget(state: &AppState, name: &str, msg_id: &str) {
 /// `None` = could not determine (tmux/pgrep unavailable or errored). This is
 /// the process-level discriminator the scrape detectors cannot fake: a pane
 /// whose shell has a child is hosting SOMETHING, however the frame reads.
+/// Is any of `ps -o stat=`'s output a state other than zombie?
+///
+/// AMUX-4826. A SIGKILLed process stays in the table as a ZOMBIE until its
+/// parent reaps it, and on Linux `pgrep -P` lists zombies, so "the pane shell
+/// has a child" was true for a child that had already been killed. Measured in
+/// a Debian 12 container against the shipped terminate path: the zombie was
+/// still there at t=10s across every trial, so it is not a race that a longer
+/// wait would settle. macOS never shows it, which is why this passed here and
+/// failed in CI on the same commit.
+///
+/// Split out so the RULE is pinned by a test rather than only the probe that
+/// calls it, the same reason `race_verdict` is its own function.
+fn any_non_zombie(stat_output: &str) -> bool {
+    stat_output.split_whitespace().any(|s| !s.starts_with('Z'))
+}
+
 async fn pane_has_live_child(name: &str) -> Option<bool> {
     let stq = st(name);
     let out = tmux(&["list-panes", "-t", &stq, "-F", "#{pane_pid}"]).await?;
@@ -6331,7 +6347,20 @@ async fn pane_has_live_child(name: &str) -> Option<bool> {
         return None;
     }
     let ch = run_cmd("pgrep", &["-P", &pid], OP_TIMEOUT).await?;
-    Some(!ch.stdout.iter().all(|b| b.is_ascii_whitespace()))
+    let listed = String::from_utf8_lossy(&ch.stdout).to_string();
+    let kids: Vec<&str> = listed.split_whitespace().collect();
+    if kids.is_empty() {
+        return Some(false);
+    }
+    // `pgrep` reports the pid, never the state, so ask `ps` what these are.
+    // `-p <csv>` and `-o stat=` are the spelling both procps and BSD ps accept.
+    let Some(stats) = run_cmd("ps", &["-p", &kids.join(","), "-o", "stat="], OP_TIMEOUT).await
+    else {
+        // A missing or timed-out `ps` is not evidence that the child is dead.
+        // Fall back to the pre-AMUX-4826 answer rather than inventing one.
+        return Some(true);
+    };
+    Some(any_non_zombie(&String::from_utf8_lossy(&stats.stdout)))
 }
 
 pub(crate) async fn is_running(name: &str) -> bool {
@@ -27912,6 +27941,47 @@ CLAUDE-POSTFIX-COMPLETE
         assert!(pane.try_wait().unwrap().is_none(), "pane shell must survive");
         assert!(peer.try_wait().unwrap().is_none(), "unrelated worker must survive");
         pane.kill().await.unwrap(); peer.kill().await.unwrap();
+    }
+
+    /// AMUX-4826: a killed child is a ZOMBIE, and a zombie is not a live child.
+    ///
+    /// `stop_route_interrupts_busy_tools_...` below passed on macOS and failed
+    /// on CI's Linux runner on the same commit. Reproduced in a Debian 12
+    /// container against the shipped terminate path (SIGSTOP the descendants,
+    /// SIGKILL leaves-first, the same sleep_ms(100)):
+    ///
+    ///   macOS   post-stop `pgrep -P <pane>` -> ""        -> Some(false), passes
+    ///   Linux   post-stop `pgrep -P <pane>` -> "221"     -> Some(true),  fails
+    ///           `ps -p 221 -o stat=`        -> "Z"
+    ///
+    /// I had guessed on the card that bounding the assertion with a deadline
+    /// would fix it. IT WOULD NOT: polling showed the zombie still present at
+    /// t=10s on every trial, so a retry loop would only have failed slower
+    /// while hiding that the discriminator itself was wrong.
+    ///
+    /// The strings below are real `ps -o stat=` output from both platforms.
+    #[test]
+    fn a_zombie_child_is_not_a_live_child() {
+        // The FIXTURE shape, both platforms: a running shell. Must stay live,
+        // or the fix would trade one wrong answer for another.
+        assert!(any_non_zombie("S+"), "a running child is live");
+        assert!(any_non_zombie("S+\nS\n"), "several running children are live");
+
+        // The POST-STOP shape on Linux: the exact byte that broke CI.
+        assert!(!any_non_zombie("Z"), "a zombie is NOT a live child");
+        assert!(!any_non_zombie("Z\nZ\n"), "all-zombie is not live");
+        assert!(!any_non_zombie("Z+"), "zombie with a flag suffix is still a zombie");
+
+        // MIXED is the case that decides the predicate's shape: one real child
+        // beside a zombie sibling still means the pane is hosting something.
+        // `all(is_zombie)` and `any(!is_zombie)` differ only here.
+        assert!(any_non_zombie("Z\nS+\n"), "a live sibling still counts");
+        assert!(any_non_zombie("S+\nZ\n"), "order must not matter");
+
+        // The POST-STOP shape on macOS: ps printed nothing because no pid
+        // matched. Empty means no live child, not "cannot tell".
+        assert!(!any_non_zombie(""), "no rows is not a live child");
+        assert!(!any_non_zombie("   \n  \n"), "whitespace is not a live child");
     }
 
     #[tokio::test]
