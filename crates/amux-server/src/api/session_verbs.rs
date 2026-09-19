@@ -9592,17 +9592,34 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
             .map(|(_, value)| value.clone())
     };
     let mut env_args: Vec<String> = Vec::new();
+    // SECRET VALUES NEVER GO IN ARGV (AMUX-4803). Process arguments are
+    // world-readable on macOS, and a tmux SERVER keeps the argv of the
+    // new-session that created it for its whole lifetime — measured at 3d22h,
+    // with `ps -axo command` showing `-e OPENAI_API_KEY=<full key>` to every
+    // lane, script and diagnostic on the box. From there it reaches transcripts
+    // and logs, which has already happened at least once.
+    //
+    // These are deferred to `tmux set-environment` after the session exists,
+    // then imported into the pane's shell. That is not a new mechanism: the
+    // auto-wake path ~70 lines below already does exactly this, and its comment
+    // says why it works ("the typed command contains no values, so provider
+    // keys cannot land in terminal history or pane logs").
+    //
+    // set-environment still passes the value as an argv element, but to a
+    // SHORT-LIVED tmux client that exits immediately, not to the server process
+    // that outlives it by days. That is the difference this fixes.
+    let mut deferred_secrets: Vec<(String, String)> = Vec::new();
     if has_oauth {
+        // Empty, so not a secret: it must stay in argv because it is what
+        // SUPPRESSES an inherited key for an OAuth worker.
         env_args.push("-e".into());
         env_args.push("ANTHROPIC_API_KEY=".into());
     } else if let Some(v) = provider_value("ANTHROPIC_API_KEY") {
-        env_args.push("-e".into());
-        env_args.push(format!("ANTHROPIC_API_KEY={v}"));
+        deferred_secrets.push(("ANTHROPIC_API_KEY".into(), v));
     }
     for k in ["OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"] {
         if let Some(v) = provider_value(k) {
-            env_args.push("-e".into());
-            env_args.push(format!("{k}={v}"));
+            deferred_secrets.push((k.to_string(), v));
         }
     }
     for k in [
@@ -9810,6 +9827,22 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
         let _ = tmux(&["set-option", "-t", &stq, "allow-rename", "off"]).await;
         let _ = tmux(&["set-window-option", "-t", &stq, "automatic-rename", "off"]).await;
         let _ = tmux(&["rename-window", "-t", &stq, name]).await;
+        // The secrets kept out of argv above, handed over the tmux control
+        // socket and then imported by the shell (AMUX-4803). Order matters:
+        // set-environment changes what the SESSION carries, and this shell is
+        // already running, so the import below is what actually gives the
+        // provider its key. Same two steps, same order, as the auto-wake path.
+        for (key, value) in &deferred_secrets {
+            let _ = tmux(&["set-environment", "-t", &stq, key, value]).await;
+        }
+        if !deferred_secrets.is_empty() {
+            type_line(
+                name,
+                &format!("eval \"$(tmux show-environment -s -t {})\"", sh_quote(&stq)),
+            )
+            .await;
+            poll_shell_prompt(name, 3000).await;
+        }
         type_line(name, &shell_rc).await;
         poll_shell_prompt(name, 3000).await;
     }
@@ -34461,5 +34494,94 @@ mod schedule_target_refusal_tests {
         ];
         let slugs: std::collections::HashSet<&str> = all.iter().map(|r| r.cause()).collect();
         assert_eq!(slugs.len(), all.len(), "two causes share a slug, so grouping would merge them");
+    }
+}
+
+/// AMUX-4803: the worker-spawn path must not put provider keys in tmux argv.
+#[cfg(test)]
+mod spawn_argv_secret_tests {
+    /// A SOURCE GUARD, because nothing observable distinguishes the two.
+    ///
+    /// Both spellings compile, both spawn a working worker, and both look
+    /// entirely ordinary in review. The only difference is whether the value
+    /// lands in a process argument list that every lane on the box can read for
+    /// as long as the tmux server lives — which is invisible from inside the
+    /// program and was found by reading `ps`, not by a failing test.
+    ///
+    /// Scoped to the env_args block rather than the file: `format!("{k}={v}")`
+    /// is an ordinary thing to write elsewhere, and a file-wide search would
+    /// fail on innocent code while missing a rename here.
+    #[test]
+    fn provider_keys_are_deferred_off_argv_at_spawn() {
+        let src = include_str!("session_verbs.rs");
+        let at = src
+            .find("let mut env_args: Vec<String> = Vec::new();")
+            .expect("the spawn env_args block exists");
+        let end = src[at..]
+            .find("args.extend(env_args")
+            .map(|i| at + i)
+            .unwrap_or_else(|| (at + 4000).min(src.len()));
+        let block = &src[at..end];
+
+        // SCOPE TO THE SECRET LOOP, because the two loops are indistinguishable
+        // by what they push.
+        //
+        // The block also configures ANTHROPIC_API_BASE, GOOGLE_CLOUD_PROJECT and
+        // friends with the SAME `format!("{k}={v}")` expression, and those are
+        // not secrets and must keep travelling in argv. So the discriminator is
+        // which KEY LIST a loop iterates, not the shape of its push.
+        //
+        // The first version of this checked `!block.contains("OPENAI_API_KEY={v}")`
+        // and was VACUOUS: the source never held that literal, because the loop
+        // formats over a key list. Re-introducing the leak left it green, which
+        // a mutation proved.
+        let loop_at = block
+            .find("for k in [\"OPENAI_API_KEY\"")
+            .expect("the provider-key loop exists; if it was renamed, re-point this guard");
+        let loop_end = block[loop_at..]
+            .find("\n    }")
+            .map(|i| loop_at + i)
+            .unwrap_or(block.len());
+        let secret_loop = &block[loop_at..loop_end];
+        assert!(
+            !secret_loop.contains("env_args.push"),
+            "the provider-key loop pushes into tmux argv again. Process arguments are \
+             world-readable and a tmux server keeps its creating argv for its whole lifetime \
+             (measured 3d22h with a live OPENAI_API_KEY in it). Loop body was: {secret_loop}"
+        );
+        assert!(
+            secret_loop.contains("deferred_secrets.push"),
+            "the provider-key loop must defer to set-environment: {secret_loop}"
+        );
+        assert!(
+            block.contains("deferred_secrets.push"),
+            "the deferral is gone; secrets would travel in argv again"
+        );
+        // The EMPTY suppression value must survive: it is how an OAuth worker
+        // runs without an inherited key, and it carries no secret.
+        assert!(
+            block.contains("\"ANTHROPIC_API_KEY=\""),
+            "the empty ANTHROPIC_API_KEY suppression must stay in argv"
+        );
+    }
+
+    /// Deferring is only half of it: a set-environment nobody imports leaves the
+    /// provider with no key at all, which is a broken worker rather than a leak.
+    #[test]
+    fn the_deferred_secrets_are_handed_over_and_imported() {
+        let src = include_str!("session_verbs.rs");
+        let at = src
+            .find("for (key, value) in &deferred_secrets {")
+            .expect("the hand-over loop exists");
+        let block = &src[at..(at + 700).min(src.len())];
+        assert!(
+            block.contains("\"set-environment\""),
+            "secrets must reach the session over the control socket"
+        );
+        assert!(
+            block.contains("show-environment"),
+            "the pane's shell already exists when set-environment runs, so without the \
+             import the provider never sees the key"
+        );
     }
 }

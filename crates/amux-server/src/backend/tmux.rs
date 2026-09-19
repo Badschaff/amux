@@ -67,6 +67,26 @@ pub struct TmuxBackend {
     bin: String,
 }
 
+/// May this `KEY=VALUE` pair travel as a process argument? (AMUX-4803)
+///
+/// Empty values are always safe: `ANTHROPIC_API_KEY=` carries no secret and is
+/// exactly how an OAuth worker SUPPRESSES an inherited key, so a blanket ban on
+/// the name would break that.
+///
+/// Name-shaped rather than value-shaped on purpose. Guessing "does this look
+/// like a credential" from the VALUE is how a guard both misses a short key and
+/// blocks an innocent path; the names are a closed, boring set that the people
+/// adding new ones already follow.
+pub(crate) fn env_pair_is_argv_safe(key: &str, value: &str) -> bool {
+    if value.is_empty() {
+        return true;
+    }
+    let k = key.to_ascii_uppercase();
+    !["KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "PASSWD"]
+        .iter()
+        .any(|needle| k.contains(needle))
+}
+
 impl TmuxBackend {
     pub fn new() -> Self {
         Self { bin: "tmux".into() }
@@ -291,6 +311,29 @@ impl SessionBackend for TmuxBackend {
             args.insert(0, "-N".into());
         }
         for (k, v) in &spec.env {
+            // NEVER A SECRET VALUE IN ARGV (AMUX-4803). Process arguments are
+            // world-readable on macOS and a tmux SERVER keeps the argv of the
+            // new-session that created it for its whole lifetime, so a key put
+            // here is readable by every process on the box for days.
+            //
+            // No caller currently routes a credential through `spec.env`, which
+            // is why this is a guard rather than a repair: the live leak was the
+            // worker-spawn path in api/session_verbs.rs, and it now defers
+            // secrets to `tmux set-environment` after the session exists. This
+            // stops the same mistake arriving here later, and it is LOUD rather
+            // than silent because a dropped variable that nobody notices is its
+            // own outage.
+            if !env_pair_is_argv_safe(k, v) {
+                tracing::error!(
+                    target: "amux::backend",
+                    verdict = "secret_refused_in_argv", key = %k, session = %ref_,
+                    measured = true, n_considered = 1,
+                    "refusing to put a secret-shaped value in tmux argv; pass it with \
+                     `tmux set-environment` after the session exists and import it in the \
+                     pane, the way api/session_verbs.rs does"
+                );
+                continue;
+            }
             args.push("-e".into());
             args.push(format!("{k}={v}"));
         }
@@ -734,5 +777,54 @@ mod tests {
         assert_eq!(sh_quote("$(reboot)"), "'$(reboot)'");
         assert_eq!(sh_quote("it's"), r"'it'\''s'");
         assert_eq!(sh_quote(""), "''");
+    }
+}
+
+/// AMUX-4803: secrets must not reach a process argument list.
+#[cfg(test)]
+mod argv_secret_tests {
+    use super::*;
+
+    /// The keys actually observed in the leak, plus the shapes around them.
+    /// `ps -axo command` showed `-e OPENAI_API_KEY=<full key>` on a tmux server
+    /// that had been up 3d22h.
+    #[test]
+    fn credential_shaped_names_are_refused_from_argv() {
+        for key in [
+            "OPENAI_API_KEY", "GOOGLE_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY",
+            "GITHUB_TOKEN", "SLACK_CLIENT_SECRET", "MATTERMOST_PASSWORD",
+        ] {
+            assert!(
+                !env_pair_is_argv_safe(key, "sk-live-value"),
+                "{key} carries a credential and must not go in argv"
+            );
+        }
+        // Case is not a defence: argv does not care how the caller spelled it.
+        assert!(!env_pair_is_argv_safe("openai_api_key", "v"));
+        assert!(!env_pair_is_argv_safe("MyApiKeyThing", "v"));
+    }
+
+    /// The ordinary configuration that SHOULD keep travelling in argv. A guard
+    /// that blocks these breaks worker spawn, which is worse than the leak it
+    /// was meant to stop.
+    #[test]
+    fn ordinary_configuration_still_travels() {
+        for key in [
+            "TMUX_SESSION_NAME", "AMUX_SESSION", "AMUX_WORKER", "AMUX_URL",
+            "ANTHROPIC_API_BASE", "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION",
+            "TERM", "GOOGLE_GENAI_USE_VERTEXAI",
+        ] {
+            assert!(env_pair_is_argv_safe(key, "some-value"), "{key} is not a secret");
+        }
+    }
+
+    /// AN EMPTY VALUE IS ALWAYS SAFE, and this is load-bearing rather than a
+    /// nicety: `ANTHROPIC_API_KEY=` is how an OAuth worker SUPPRESSES an
+    /// inherited key. Banning the name outright would delete that mechanism and
+    /// silently hand OAuth workers a key they are supposed to run without.
+    #[test]
+    fn an_empty_value_is_not_a_secret() {
+        assert!(env_pair_is_argv_safe("ANTHROPIC_API_KEY", ""));
+        assert!(env_pair_is_argv_safe("OPENAI_API_KEY", ""));
     }
 }
