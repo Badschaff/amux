@@ -244,6 +244,20 @@ jobs:
       # replaced by something equally green. Its cells prove the detector
       # catches a 100KB/min leak, does not call a warm-up plateau a leak, and
       # refuses a verdict on a run too short to have reached steady state.
+      # AF-928 / AF-927 via AMUX-4823. Two harnesses a peer landed unwired while
+      # this card was being worked, which is the treadmill the card is about —
+      # my own new pre-push check caught them before I could push into a red
+      # main. Both are CI-safe (zero AMUX_URL/curl refs; they exercise the CLI's
+      # own behaviour). Exercised from a detached worktree at origin/main before
+      # wiring: exit 0 each, both "suite: PASS".
+      - name: the CLI is sourceable without side effects (AF-928)
+        run: |
+          set -uo pipefail
+          ./scripts/test-cli-sourceable.sh
+      - name: worktree cleanup warns before discarding a dirty tree (AF-927)
+        run: |
+          set -uo pipefail
+          ./scripts/test-cli-worktree-dirty-warn.sh
       # AMUX-4823. The pre-push refusal for an unwired harness. Its first cell
       # is the control that makes the other five mean anything: the fixture's
       # own wired-check always exits non-zero, so an ALLOWED push can only mean
