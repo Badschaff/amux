@@ -1290,8 +1290,10 @@ fn last_advance(conn: &Connection, session: &str) -> Option<(f64, Option<String>
 /// it re-walked every claim-type event for EVERY candidate row, and board-drive
 /// runs this per lane. Measured on the live board (117 candidate rows):
 ///
-///     correlated LIKE      116 rows   3073 ms
-///     this form            116 rows    227 ms   (218 ms of which is transport)
+/// ```text
+/// correlated LIKE      116 rows   3073 ms
+/// this form            116 rows    227 ms   (218 ms of which is transport)
+/// ```
 ///
 /// so the query itself went from ~2.9s to ~9ms. Equivalence was checked ROW BY
 /// ROW, not by comparing counts: a query selecting the two predicates
