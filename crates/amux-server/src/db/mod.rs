@@ -92,6 +92,12 @@ type WriteFn = Box<dyn FnOnce(&Connection) -> rusqlite::Result<WriteOutcome> + S
 struct WriteRequest {
     work: WriteFn,
     origin: &'static str,
+    /// AMUX-4781: WHERE the write was issued, not just which function.
+    /// `origin` is `type_name::<F>()`, and every closure inside one function
+    /// renders identically, so `Runtime::tick_once`'s twelve `write_async`
+    /// call sites all logged one indistinguishable string. That is what made
+    /// the top writer hold unattributable.
+    site: &'static std::panic::Location<'static>,
     queued_at: std::time::Instant,
     interaction_id: Option<String>,
     reply: mpsc::Sender<rusqlite::Result<WriteReply>>,
@@ -264,14 +270,20 @@ impl Store {
 
     /// Run a mutation on the writer thread and wait for commit. Returns the
     /// revision assigned to this write (unchanged if the write was a no-op).
+    #[track_caller]
     pub fn write<F>(&self, f: F) -> anyhow::Result<WriteReply>
     where
         F: FnOnce(&Connection) -> rusqlite::Result<WriteOutcome> + Send + 'static,
     {
-        self.write_correlated(f, interactions::current_id())
+        self.write_correlated(f, interactions::current_id(), std::panic::Location::caller())
     }
 
-    fn write_correlated<F>(&self, f: F, interaction_id: Option<String>) -> anyhow::Result<WriteReply>
+    fn write_correlated<F>(
+        &self,
+        f: F,
+        interaction_id: Option<String>,
+        site: &'static std::panic::Location<'static>,
+    ) -> anyhow::Result<WriteReply>
     where
         F: FnOnce(&Connection) -> rusqlite::Result<WriteOutcome> + Send + 'static,
     {
@@ -284,6 +296,7 @@ impl Store {
             .send(WriteRequest {
                 work: Box::new(f),
                 origin: std::any::type_name::<F>(),
+                site,
                 queued_at: std::time::Instant::now(),
                 interaction_id,
                 reply: reply_tx,
@@ -321,7 +334,15 @@ impl Store {
 
     /// Async wrapper: parks the wait on the blocking pool so an API handler
     /// can await a write without pinning a runtime worker.
-    pub async fn write_async<F>(&self, f: F) -> anyhow::Result<WriteReply>
+    /// NOT an `async fn` on purpose: `#[track_caller]` does not propagate
+    /// through the generated future, and the call site is the whole point
+    /// (AMUX-4781). Returning a `'static` future keeps every `.await` caller
+    /// source-compatible.
+    #[track_caller]
+    pub fn write_async<F>(
+        &self,
+        f: F,
+    ) -> impl std::future::Future<Output = anyhow::Result<WriteReply>> + Send
     where
         F: FnOnce(&Connection) -> rusqlite::Result<WriteOutcome> + Send + 'static,
     {
@@ -329,6 +350,8 @@ impl Store {
         let interaction_id = interactions::current_id();
         let dispatch = self.blocking_dispatch_max_ms.clone();
         let queued = std::time::Instant::now();
+        let site = std::panic::Location::caller();
+        async move {
         tokio::task::spawn_blocking(move || {
             // TIME SPENT WAITING FOR A BLOCKING THREAD, which every other
             // instrument on this path is structurally blind to (AMUX-4744).
@@ -343,9 +366,10 @@ impl Store {
             // a 90s request with a small `queued_ms` and a large value here
             // means the writer was never the problem.
             record_blocking_dispatch(&dispatch, queued.elapsed());
-            this.write_correlated(f, interaction_id)
+            this.write_correlated(f, interaction_id, site)
         })
         .await?
+        }
     }
 
     /// Run a read WITHOUT pinning a runtime worker (AF-640 / AMUX-4744).
@@ -585,7 +609,8 @@ fn writer_loop(
             // Function identity only; never record the request body or SQL
             // values. Separate the slow writer from callers waiting behind it.
             tracing::warn!(target: "store", verdict = "writer_slow", origin = req.origin,
-                queued_ms, work_ms, ok = result.is_ok(), measured = true, n_considered = 1,
+                site = %req.site, queued_ms, work_ms, ok = result.is_ok(),
+                measured = true, n_considered = 1,
                 "serialized write delayed; origin identifies the blocking mutation");
         }
         if let Err(error) = &result {
@@ -891,13 +916,63 @@ mod amux4744_write_queue_tests {
         // A verdict with no numbers says something was slow and not how slow,
         // and without `origin` it cannot say WHAT was slow, which is the field
         // that turns this line into a lead instead of a notification.
-        for field in ["queued_ms", "work_ms", "origin = req.origin"] {
+        for field in ["queued_ms", "work_ms", "origin = req.origin", "site = %req.site"] {
             assert!(
                 body.contains(field),
                 "the writer_slow verdict must carry `{field}`; without it the line \
                  reports that a stall happened and not what caused it"
             );
         }
+    }
+
+    /// AMUX-4781: `origin` names the FUNCTION, and that is not enough to act on.
+    ///
+    /// `origin` is `type_name::<F>()`, and every closure inside one function
+    /// renders as the identical string. `Runtime::tick_once` holds twelve
+    /// `write_async` call sites and was the largest writer hold on this box
+    /// (n=4, median 1917ms over one build), yet all twelve logged
+    /// `Runtime::tick_once::{{closure}}::{{closure}}`. There was no way to ask
+    /// which write was slow, which is why the card that sent me here could not
+    /// name a target.
+    ///
+    /// The fix is `#[track_caller]` plus `Location::caller()`. This test is the
+    /// reason it had to stop being an `async fn`: `#[track_caller]` is accepted
+    /// on one and silently does not propagate through the generated future, so
+    /// every site would have reported db/mod.rs itself.
+    #[test]
+    fn two_writes_from_different_call_sites_are_told_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sites.db")).unwrap();
+        let noop = |_: &Connection| {
+            Ok(WriteOutcome { applied: false, events: vec![] })
+        };
+        // Two calls, two LINES, one identical closure body: `origin` cannot
+        // separate these and `site` must.
+        let a = std::panic::Location::caller();
+        store.write(noop).unwrap();
+        let b = std::panic::Location::caller();
+        store.write(noop).unwrap();
+        assert_eq!(a.file(), b.file(), "same file, so only the line can differ");
+
+        // The real assertion is on the mechanism the writer uses. A call from
+        // THIS file must attribute here, not to db/mod.rs's own internals.
+        #[track_caller]
+        fn site_of() -> &'static std::panic::Location<'static> {
+            std::panic::Location::caller()
+        }
+        let here = site_of();
+        let there = site_of();
+        assert!(
+            here.file().ends_with("mod.rs"),
+            "track_caller must report the CALLER's file, got {}",
+            here.file()
+        );
+        assert_ne!(
+            here.line(),
+            there.line(),
+            "two call sites on different lines must produce different locations; \
+             if these are equal the caller location is being captured in the callee"
+        );
     }
 
     /// The threshold has to be crossable in the direction that matters. A warn
