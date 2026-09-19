@@ -7780,23 +7780,36 @@ pub(crate) async fn deliver_automated(
         AutoDelivery { message: msg, submitted, submission, queue_id: None, refused: !ok }
     };
 
-    if name.trim().is_empty() {
-        return refuse("schedule has no target session".into());
-    }
-    if !env_path(name).exists() {
-        return refuse(format!("target '{name}' is not a registered session"));
-    }
+    // SAME PREDICATE AS THE INVARIANT (AMUX-4784). The conditions and their
+    // order are unchanged; what changed is that `schedule_target_refusal` is now
+    // the single place they are written, so `schedule.target_can_receive` cannot
+    // drift from what actually refuses.
+    //
     // A schedule must never be a wake path for an ARCHIVED lane (Ethan,
     // 2026-08-02). The send path would refuse anyway, but refusing here keeps
     // the reason in the run row instead of surfacing as a nightly `error`
-    // forever. Unarchiving is a human's call (ethos rule 8).
-    if parse_env(name).get("CC_ARCHIVED") == Some("1") {
-        return refuse(format!("target '{name}' is archived — not delivered, not woken"));
-    }
-    // AMUX-4574: a paused lane is not a wake target for a schedule either; say so
-    // in the run row instead of letting auto-wake fail with a 500.
-    if parse_env(name).get("CC_PAUSED") == Some("1") {
-        return refuse(format!("target '{name}' is paused — not delivered, not woken; resume it to receive schedules"));
+    // forever. Unarchiving is a human's call (ethos rule 8). AMUX-4574 added
+    // the paused arm for the same reason: say it in the run row rather than
+    // letting auto-wake fail with a 500.
+    match schedule_target_refusal(name) {
+        Some(TargetRefusal::NoTarget) => return refuse("schedule has no target session".into()),
+        Some(TargetRefusal::Unregistered) => {
+            return refuse(format!("target '{name}' is not a registered session"))
+        }
+        Some(TargetRefusal::Archived) => {
+            return refuse(format!("target '{name}' is archived — not delivered, not woken"))
+        }
+        Some(TargetRefusal::Paused) => {
+            return refuse(format!(
+                "target '{name}' is paused — not delivered, not woken; resume it to receive schedules"
+            ))
+        }
+        // ISOLATION IS NOT HOISTED HERE, deliberately. It is refused further
+        // down, by `isolation_refusal` on the send path, and moving it would
+        // change both the message and the refusal point for a case this card
+        // only needed to REPORT on. The invariant still names it, through the
+        // same function.
+        Some(TargetRefusal::Isolated) | None => {}
     }
     // A blocked session is on a permission/approval dialog. Delivering input
     // could accidentally answer that dialog. The message stays queued (via the
@@ -17296,6 +17309,110 @@ pub(crate) fn env_flag_on(v: Option<&str>) -> bool {
 /// exemptions as much as to features.
 pub(crate) fn session_is_isolated(name: &str) -> bool {
     env_flag_on(parse_env(name).get("CC_ISOLATED"))
+}
+
+/// Why an automated schedule delivery can never reach this lane, or `None`.
+///
+/// PERMANENT conditions only. `blocked` (on a permission dialog) and `stopped`
+/// are deliberately absent: both deliver later, the first when the dialog
+/// clears and the second through `send_text`'s auto-wake, so reporting them
+/// would be crying wolf over a schedule that is working.
+///
+/// ONE DEFINITION, TWO READERS (AMUX-4784). [`deliver_automated`] refuses on
+/// these, and the `schedule.target_can_receive` invariant reports them. The
+/// card that asked for the invariant named the hazard precisely: a check that
+/// re-derives deliverability from its own copy of the rules will disagree with
+/// the deliverer eventually, and a check that disagrees with the mechanism it
+/// describes is the same class of defect one layer up. So both call this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TargetRefusal {
+    /// The schedule names no target at all.
+    NoTarget,
+    /// No `.env` for that name: nothing registers the lane.
+    Unregistered,
+    Archived,
+    Paused,
+    Isolated,
+}
+
+impl TargetRefusal {
+    /// A stable slug for grouping, distinct from the human sentence.
+    pub(crate) fn cause(self) -> &'static str {
+        match self {
+            TargetRefusal::NoTarget => "no_target",
+            TargetRefusal::Unregistered => "unregistered",
+            TargetRefusal::Archived => "archived",
+            TargetRefusal::Paused => "paused",
+            TargetRefusal::Isolated => "isolated",
+        }
+    }
+
+    /// Whether the lane could ever start receiving again without someone
+    /// changing the SCHEDULE. Archived is the one state with no such future,
+    /// which is why it is the subset that can be acted on without guessing at
+    /// intent; paused and isolated are ordinary temporary states and their
+    /// schedules are right to keep their cadence.
+    pub(crate) fn is_terminal(self) -> bool {
+        matches!(self, TargetRefusal::Archived | TargetRefusal::Unregistered | TargetRefusal::NoTarget)
+    }
+}
+
+pub(crate) fn schedule_target_refusal(name: &str) -> Option<TargetRefusal> {
+    // Each lookup is the one the deliverer already used; the ORDER and the
+    // decision live in `target_refusal_from_state` so they can be tested
+    // without AMUX_HOME. `session_is_isolated` is delegated to rather than
+    // re-reading CC_ISOLATED, so that arm shares its predicate with
+    // `isolation_refusal` the way the others share theirs.
+    if name.trim().is_empty() {
+        return Some(TargetRefusal::NoTarget);
+    }
+    if !env_path(name).exists() {
+        return Some(TargetRefusal::Unregistered);
+    }
+    let env = parse_env(name);
+    target_refusal_from_state(
+        name,
+        true,
+        env.get("CC_ARCHIVED") == Some("1"),
+        env.get("CC_PAUSED") == Some("1"),
+        session_is_isolated(name),
+    )
+}
+
+/// The decision itself, with every lookup already done.
+///
+/// Split out so the precedence can be pinned by a test that touches no files
+/// and no process-global home. That matters here beyond convenience: swapping
+/// `AMUX_HOME` under parallel tests is a known source of interleaved reads in
+/// this crate (AMUX-4838), so a test that set it to prove a point about
+/// reading it would be racing a bug rather than describing one.
+pub(crate) fn target_refusal_from_state(
+    name: &str,
+    registered: bool,
+    archived: bool,
+    paused: bool,
+    isolated: bool,
+) -> Option<TargetRefusal> {
+    if name.trim().is_empty() {
+        return Some(TargetRefusal::NoTarget);
+    }
+    if !registered {
+        return Some(TargetRefusal::Unregistered);
+    }
+    // ARCHIVED BEFORE PAUSED, and both before ISOLATED, because a lane can be
+    // more than one at once and the report should name the most permanent
+    // cause. An archived lane that is also paused is not going to be resumed
+    // into service by un-pausing it.
+    if archived {
+        return Some(TargetRefusal::Archived);
+    }
+    if paused {
+        return Some(TargetRefusal::Paused);
+    }
+    if isolated {
+        return Some(TargetRefusal::Isolated);
+    }
+    None
 }
 
 /// Why a lane cannot receive a ROUTED board request, or `None` when it can
@@ -34260,5 +34377,89 @@ mod amux4770_worktree_isolation_tests {
             "success must require the directory to exist, not just a zero exit; the incident \
              behind this card had git reporting success with no directory"
         );
+    }
+}
+
+/// AMUX-4784: the precedence `deliver_automated` refuses by, and the invariant
+/// reports by, pinned in one place so the two cannot drift.
+#[cfg(test)]
+mod schedule_target_refusal_tests {
+    use super::*;
+
+    #[test]
+    fn a_healthy_target_has_no_refusal() {
+        assert_eq!(target_refusal_from_state("amux", true, false, false, false), None);
+    }
+
+    /// Each condition on its own, so a mutation that drops one arm cannot hide
+    /// behind another arm catching the same row.
+    #[test]
+    fn each_condition_is_named_on_its_own() {
+        assert_eq!(
+            target_refusal_from_state("", true, false, false, false),
+            Some(TargetRefusal::NoTarget)
+        );
+        assert_eq!(
+            target_refusal_from_state("   ", true, false, false, false),
+            Some(TargetRefusal::NoTarget),
+            "a whitespace-only target is no target"
+        );
+        assert_eq!(
+            target_refusal_from_state("ghost", false, false, false, false),
+            Some(TargetRefusal::Unregistered)
+        );
+        assert_eq!(
+            target_refusal_from_state("amux-cloud", true, true, false, false),
+            Some(TargetRefusal::Archived)
+        );
+        assert_eq!(
+            target_refusal_from_state("ts-gke", true, false, true, false),
+            Some(TargetRefusal::Paused)
+        );
+        assert_eq!(
+            target_refusal_from_state("self", true, false, false, true),
+            Some(TargetRefusal::Isolated)
+        );
+    }
+
+    /// A lane can be several of these at once, and the report should name the
+    /// most PERMANENT cause. Un-pausing an archived lane does not put it back
+    /// into service, so "paused" would send someone at the wrong remedy.
+    #[test]
+    fn the_most_permanent_cause_wins_when_several_apply() {
+        assert_eq!(
+            target_refusal_from_state("x", true, true, true, true),
+            Some(TargetRefusal::Archived)
+        );
+        assert_eq!(
+            target_refusal_from_state("x", true, false, true, true),
+            Some(TargetRefusal::Paused)
+        );
+    }
+
+    /// `is_terminal` is what splits "a decision someone can make now" from
+    /// "this lane comes back on its own". Getting it backwards would push a
+    /// reader toward disabling a schedule whose target resumes tomorrow.
+    #[test]
+    fn only_states_with_no_future_delivery_are_terminal() {
+        assert!(TargetRefusal::Archived.is_terminal());
+        assert!(TargetRefusal::Unregistered.is_terminal());
+        assert!(TargetRefusal::NoTarget.is_terminal());
+        assert!(!TargetRefusal::Paused.is_terminal(), "a paused lane resumes");
+        assert!(!TargetRefusal::Isolated.is_terminal(), "isolation is toggled off, not permanent");
+    }
+
+    /// The slugs are grouped on and appear in evidence, so they are contract.
+    #[test]
+    fn every_cause_has_a_distinct_stable_slug() {
+        let all = [
+            TargetRefusal::NoTarget,
+            TargetRefusal::Unregistered,
+            TargetRefusal::Archived,
+            TargetRefusal::Paused,
+            TargetRefusal::Isolated,
+        ];
+        let slugs: std::collections::HashSet<&str> = all.iter().map(|r| r.cause()).collect();
+        assert_eq!(slugs.len(), all.len(), "two causes share a slug, so grouping would merge them");
     }
 }

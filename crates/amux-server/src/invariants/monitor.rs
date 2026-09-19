@@ -450,6 +450,7 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // fact with nothing between them.
     out.extend(frustration_ledger_check(state));
     out.extend(schedule_kind_check(state));
+    out.extend(schedule_target_check(state));
     // AF-582: the announcement for an interrupted schedule fire already
     // existed (scheduler.rs's own AF-515 warn on startup) and reached
     // nobody — it fired 20 times through gtm-ticker's incident window and
@@ -747,6 +748,66 @@ fn alert_channel_check(state: &AppState) -> Vec<InvariantResult> {
 /// `deleted` and `enabled` are filtered HERE rather than in the check, because a
 /// disabled or deleted schedule costs nothing per fire — it does not fire. The
 /// claim under test is about what a LIVE schedule spends.
+/// AMUX-4784: enabled schedules pointed at a lane that refuses them.
+///
+/// The deliverability question is NOT answered here. It delegates to
+/// `session_verbs::schedule_target_refusal`, which is the same function
+/// `deliver_automated` refuses with, so this check cannot drift from the
+/// mechanism it describes. Re-deriving the rules locally is exactly the defect
+/// one layer up: a view that does not share the predicate of the thing it
+/// reports on.
+fn schedule_target_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "schedule.target_can_receive";
+    let Ok(conn) = state.store.read() else {
+        // Cannot read: Unknown, never Pass.
+        return vec![InvariantResult::new(ID, Status::Unknown)];
+    };
+    // `consecutive_refusals` counts back only to the last run that was NOT
+    // refused, so a schedule that recovered does not carry its old refusals
+    // forever. It is evidence of how long this has been going on; it is not
+    // part of the predicate, which is purely the target's state right now.
+    let rows: Vec<(String, String, String, String, i64)> = conn
+        .prepare(
+            "SELECT s.id, COALESCE(s.title,''), COALESCE(s.session,''), COALESCE(s.kind,'tmux'), \
+                    (SELECT COUNT(*) FROM schedule_runs r \
+                       WHERE r.schedule_id = s.id \
+                         AND COALESCE(r.delivery,'') = 'refused' \
+                         AND r.ran_at > COALESCE((SELECT MAX(r2.ran_at) FROM schedule_runs r2 \
+                                                    WHERE r2.schedule_id = s.id \
+                                                      AND COALESCE(r2.delivery,'') <> 'refused'), 0)) \
+             FROM schedules s WHERE s.enabled=1 AND COALESCE(s.deleted,0)=0",
+        )
+        .and_then(|mut st| {
+            st.query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .map(|it| it.flatten().collect::<Vec<_>>())
+        })
+        .unwrap_or_default();
+
+    let mut total_enabled = 0i64;
+    let mut bad = Vec::new();
+    for (id, title, target, kind, refusals) in rows {
+        // `shell` runs a command with no lane to deliver into, so it has no
+        // target that could refuse. Named in the evidence, not silently dropped.
+        if kind == "shell" {
+            continue;
+        }
+        total_enabled += 1;
+        if let Some(refusal) = crate::api::session_verbs::schedule_target_refusal(&target) {
+            bad.push(checks::UndeliverableSchedule {
+                schedule_id: id,
+                title,
+                target,
+                cause: refusal.cause().to_string(),
+                refusals,
+                terminal: refusal.is_terminal(),
+            });
+        }
+    }
+    checks::schedule_targets_can_receive(&bad, total_enabled)
+}
+
 fn schedule_kind_check(state: &AppState) -> Vec<InvariantResult> {
     let Ok(conn) = state.store.read() else {
         // Cannot read: Unknown, never Pass. A store we could not open is not a

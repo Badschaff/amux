@@ -2344,6 +2344,106 @@ pub fn todo_is_reachable_by_dispatch(
     }))]
 }
 
+/// One enabled schedule whose target cannot receive it (AMUX-4784).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndeliverableSchedule {
+    pub schedule_id: String,
+    pub title: String,
+    pub target: String,
+    /// Slug from `TargetRefusal::cause()`, so the check groups on the same
+    /// vocabulary the deliverer refuses with.
+    pub cause: String,
+    /// Consecutive refusals already recorded for this schedule. Evidence of
+    /// how long it has been firing into nothing, not part of the predicate.
+    pub refusals: i64,
+    /// Whether the target has any future in which it receives without someone
+    /// editing the SCHEDULE. Archived has none; paused and isolated do.
+    pub terminal: bool,
+}
+
+/// An enabled schedule claims it will fire. One pointed at a lane that cannot
+/// receive it makes a claim nothing can honour.
+///
+/// THE PRECEDENT IS `board.todo_is_reachable_by_dispatch`, directly above, and
+/// the reasoning transfers exactly: "`todo` is the dispatch queue — a card here
+/// claims to be next" and nothing will ever offer it. This is the same shape
+/// for schedules, and it existed for cards while 37 of 76 enabled schedules
+/// refused on every tick, some for seven weeks, with no check reading
+/// `last_delivery` or `last_refusal_reason` at all.
+///
+/// SHELL SCHEDULES ARE EXEMPT, and the exemption is named rather than silent
+/// (ethos rule 1): `kind='shell'` runs a command with no lane to deliver into
+/// (scheduler.rs `run_shell`), so it has no target that could be archived.
+///
+/// TERMINAL AND TEMPORARY ARE REPORTED SEPARATELY because they are different
+/// decisions. An ARCHIVED target has no state in which it ever delivers, so its
+/// schedules can be disabled or repointed without guessing at intent. PAUSED and
+/// ISOLATED are ordinary temporary states, and those schedules are RIGHT to keep
+/// their cadence; folding them together would push someone toward disabling a
+/// schedule whose lane resumes tomorrow.
+pub fn schedule_targets_can_receive(rows: &[UndeliverableSchedule], total_enabled: i64) -> Vec<InvariantResult> {
+    const ID: &str = "schedule.target_can_receive";
+    if rows.is_empty() {
+        return vec![InvariantResult::pass(ID).evidence(json!({
+            "undeliverable": 0,
+            "total_enabled": total_enabled,
+        }))];
+    }
+    let mut sorted: Vec<&UndeliverableSchedule> = rows.iter().collect();
+    // Worst first, and "worst" is how long it has been firing into nothing.
+    sorted.sort_by(|a, b| {
+        b.terminal
+            .cmp(&a.terminal)
+            .then_with(|| b.refusals.cmp(&a.refusals))
+            .then_with(|| a.schedule_id.cmp(&b.schedule_id))
+    });
+    let terminal: Vec<&&UndeliverableSchedule> = sorted.iter().filter(|r| r.terminal).collect();
+    let temporary: Vec<&&UndeliverableSchedule> = sorted.iter().filter(|r| !r.terminal).collect();
+    let pct = if total_enabled > 0 { rows.len() as i64 * 100 / total_enabled } else { 0 };
+    let name = |r: &&&UndeliverableSchedule| {
+        format!("{} -> '{}' is {} ({} refusal(s))", r.schedule_id, r.target, r.cause, r.refusals)
+    };
+    let row = |r: &&&UndeliverableSchedule| {
+        json!({
+            "schedule_id": r.schedule_id,
+            "title": r.title,
+            "target": r.target,
+            "cause": r.cause,
+            "refusals": r.refusals,
+            "terminal": r.terminal,
+        })
+    };
+    vec![InvariantResult::fail(
+        ID,
+        "every enabled schedule targets a lane that can actually receive it".to_string(),
+        format!(
+            "{} of {total_enabled} enabled schedule(s) ({pct}%) fire into a lane that refuses \
+             them. {} have a target that can NEVER receive (archived, unregistered or unset), \
+             so those are a decision someone can make now: {}. The other {} are targets that \
+             are only temporarily unavailable (paused or isolated), and those schedules are \
+             right to keep their cadence: {}. An enabled schedule claims it will fire; these \
+             claims nothing can honour, and until this check existed nothing read \
+             `last_delivery` or `last_refusal_reason`, so they went unseen for weeks.",
+            rows.len(),
+            terminal.len(),
+            if terminal.is_empty() { "none".to_string() } else { terminal.iter().map(name).collect::<Vec<_>>().join("; ") },
+            temporary.len(),
+            if temporary.is_empty() { "none".to_string() } else { temporary.iter().map(name).collect::<Vec<_>>().join("; ") },
+        ),
+    )
+    .evidence(json!({
+        "undeliverable": rows.len(),
+        "total_enabled": total_enabled,
+        "pct_of_enabled": pct,
+        "terminal_count": terminal.len(),
+        "temporary_count": temporary.len(),
+        "terminal": terminal.iter().map(row).collect::<Vec<_>>(),
+        "temporary": temporary.iter().map(row).collect::<Vec<_>>(),
+        "shell_exempt_note": "kind='shell' schedules are not counted: they run a command with \
+                              no lane to deliver into, so they have no target to refuse.",
+    }))]
+}
+
 /// One (lane, card) pair that crossed the repeat threshold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepeatOfferPair {
@@ -7854,6 +7954,93 @@ mod todo_reachable_tests {
         assert!(d.contains("209"), "a pass must say how big the population was: {d}");
     }
 }
+
+#[cfg(test)]
+mod schedule_target_tests {
+    use super::*;
+
+    fn sched(id: &str, target: &str, cause: &str, refusals: i64, terminal: bool) -> UndeliverableSchedule {
+        UndeliverableSchedule {
+            schedule_id: id.into(),
+            title: format!("{id} tick"),
+            target: target.into(),
+            cause: cause.into(),
+            refusals,
+            terminal,
+        }
+    }
+
+    /// Nothing refusing is a pass, and the pass still publishes the population
+    /// it looked at. A bare pass cannot be told from a probe that found no
+    /// schedules at all.
+    #[test]
+    fn no_undeliverable_schedules_passes_and_says_what_it_counted() {
+        let out = schedule_targets_can_receive(&[], 71);
+        assert_eq!(out[0].status, Status::Pass);
+        assert_eq!(out[0].evidence["undeliverable"], 0);
+        assert_eq!(out[0].evidence["total_enabled"], 71);
+    }
+
+    /// The live shape this was built from: SCHED-424 firing into an ARCHIVED
+    /// amux-cloud 479 times, beside schedules whose targets are merely paused.
+    /// Both are reported, and they are reported SEPARATELY, because disabling a
+    /// schedule whose lane resumes tomorrow is the wrong move.
+    #[test]
+    fn terminal_and_temporary_targets_are_counted_and_named_apart() {
+        let rows = vec![
+            sched("SCHED-424", "amux-cloud", "archived", 479, true),
+            sched("SCHED-402", "mixpeek-frustrations", "paused", 471, false),
+            sched("SCHED-419", "ts-gke", "paused", 195, false),
+        ];
+        let out = schedule_targets_can_receive(&rows, 71);
+        assert_eq!(out[0].status, Status::Fail);
+        assert_eq!(out[0].evidence["terminal_count"], 1);
+        assert_eq!(out[0].evidence["temporary_count"], 2);
+        assert_eq!(out[0].evidence["undeliverable"], 3);
+        // The archived one is the actionable subset and must be named as such.
+        assert_eq!(out[0].evidence["terminal"][0]["schedule_id"], "SCHED-424");
+        for needle in ["SCHED-424", "amux-cloud", "archived", "SCHED-402", "ts-gke"] {
+            assert!(out[0].observed.contains(needle), "observed must name {needle}: {}", out[0].observed);
+        }
+    }
+
+    /// A paused-only window must NOT read as "nothing can ever receive these".
+    /// The counts are the discriminator a reader acts on, so they have to be
+    /// right when one bucket is empty.
+    #[test]
+    fn only_temporary_targets_reports_zero_terminal_rather_than_folding_them_in() {
+        let rows = vec![sched("SCHED-402", "mixpeek-frustrations", "paused", 471, false)];
+        let out = schedule_targets_can_receive(&rows, 71);
+        assert_eq!(out[0].status, Status::Fail);
+        assert_eq!(out[0].evidence["terminal_count"], 0);
+        assert_eq!(out[0].evidence["temporary_count"], 1);
+        assert!(
+            out[0].observed.contains("0 have a target that can NEVER receive"),
+            "a temporary-only window must say zero terminal: {}",
+            out[0].observed
+        );
+    }
+
+    /// Worst first, and worst means the terminal ones: a target that can never
+    /// receive outranks a longer-running paused one, because only the first is
+    /// a decision someone can make today.
+    #[test]
+    fn a_terminal_target_leads_even_when_a_temporary_one_has_more_refusals() {
+        let rows = vec![
+            sched("SCHED-PAUSED", "ts-gke", "paused", 9999, false),
+            sched("SCHED-ARCH", "amux-cloud", "archived", 12, true),
+        ];
+        let out = schedule_targets_can_receive(&rows, 71);
+        let pos_arch = out[0].observed.find("SCHED-ARCH").expect("archived present");
+        let pos_paused = out[0].observed.find("SCHED-PAUSED").expect("paused present");
+        assert!(
+            pos_arch < pos_paused,
+            "the archived target leads; refusal count is the tiebreak, not the key: {}",
+            out[0].observed
+        );
+    }
+}
+
 
 #[cfg(test)]
 mod repeat_offer_tests {
