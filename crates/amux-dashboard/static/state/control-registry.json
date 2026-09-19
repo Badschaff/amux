@@ -1,6 +1,6 @@
 {
   "measured": true,
-  "n_considered": 2050,
+  "n_considered": 2052,
   "command_handlers": {
     "_applyEmbedView": {
       "kind": "command._applyEmbedView",
@@ -1898,12 +1898,6 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "_peekPollNow": {
-      "kind": "command._peekPollNow",
-      "feedback_required": true,
-      "target": "control-or-request",
-      "queue_policy": "transport-declared"
-    },
     "_peekPollStop": {
       "kind": "command._peekPollStop",
       "feedback_required": true,
@@ -1912,12 +1906,6 @@
     },
     "_peekReclassifyPrompts": {
       "kind": "command._peekReclassifyPrompts",
-      "feedback_required": true,
-      "target": "control-or-request",
-      "queue_policy": "transport-declared"
-    },
-    "_peekResumeAfterSelection": {
-      "kind": "command._peekResumeAfterSelection",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1942,12 +1930,6 @@
     },
     "_peekShowSelPopover": {
       "kind": "command._peekShowSelPopover",
-      "feedback_required": true,
-      "target": "control-or-request",
-      "queue_policy": "transport-declared"
-    },
-    "_peekStaleFrame": {
-      "kind": "command._peekStaleFrame",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
