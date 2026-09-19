@@ -161,6 +161,12 @@ pub async fn ensure(home: &Path, name: &str, configured_repo: &str) -> Result<Wo
         base,
     };
     save(home, name, &workspace)?;
+    if integration_status(home, name)["status"] == "workspace_requires_recovery" {
+        write_integration_status(home, name, &serde_json::json!({
+            "status":"workspace_ready","detail":"Workspace recovered; continuing its owned board",
+            "at":crate::config::now_f64(),"worktree":workspace.path,"branch":workspace.branch
+        }));
+    }
     tracing::info!(session=name,worktree=%workspace.path,branch=%workspace.branch,reused=existing,
         verdict="fanout_workspace_ready","durable fan-out workspace ready");
     Ok(workspace)
@@ -532,7 +538,8 @@ pub async fn adopt_at_boundary(state: &crate::api::AppState, name: &str) {
         || env.get("CC_PAUSED") == Some("1")
         || env.get("CC_ARCHIVED") == Some("1")
         || env.get("CC_ISOLATED") == Some("1")
-        || load(&home, name).is_some()
+        || (load(&home, name).is_some()
+            && integration_status(&home, name)["status"] != "workspace_requires_recovery")
     {
         return;
     }
@@ -600,8 +607,10 @@ mod tests {
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
         let head = git(&w.path, &["rev-parse", "HEAD"]).await.unwrap();
         let index = git(&w.path, &["ls-files", "--stage"]).await.unwrap();
+        write_integration_status(&d.path().join("home"), "child-a", &serde_json::json!({"status":"workspace_requires_recovery"}));
         let adopted = ensure(&d.path().join("home"), "child-a", &w.repo).await.unwrap();
         assert!(adopted.base.is_empty());
+        assert_eq!(integration_status(&d.path().join("home"), "child-a")["status"], "workspace_ready");
         assert_eq!(git(&w.path, &["rev-parse", "HEAD"]).await.unwrap(), head);
         assert_eq!(git(&w.path, &["ls-files", "--stage"]).await.unwrap(), index);
         assert_eq!(git(&w.path, &["branch", "--show-current"]).await.unwrap(), w.branch);
