@@ -23,6 +23,18 @@ pub fn initialize() {
 
 pub(crate) fn model_client() -> Option<Arc<dyn ModelClient>> { MODEL.get().cloned() }
 
+/// How long a create will wait for the semantic comparison before giving up on
+/// it and filing the card anyway (AMUX-4836). Override with
+/// `AMUX_INTAKE_MODEL_TIMEOUT_MS`; the floor keeps a misconfiguration from
+/// turning the comparison off entirely by setting it to something unreachable.
+fn intake_model_timeout_ms() -> u64 {
+    std::env::var("AMUX_INTAKE_MODEL_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(20_000)
+        .max(1_000)
+}
+
 pub async fn lock(session: &str, owner: &str) -> tokio::sync::OwnedMutexGuard<()> {
     let lane = {
         let mut locks = LOCKS.get_or_init(Mutex::default).lock().expect("intake locks");
@@ -174,6 +186,54 @@ fn classify(client: &dyn ModelClient, model: &str, title: &str, description: &st
     Ok(decision)
 }
 
+/// `classify` with a deadline, as `plan` calls it (AMUX-4836).
+///
+/// A NAMED FUNCTION BECAUSE THE TEST HAS TO DRIVE THE SHIPPED PATH. The first
+/// version of this test rebuilt the `timeout(...)` expression inside the test
+/// body, which is a paraphrase: mutating the real deadline away left it green.
+/// Found by doing exactly that and watching nothing redden.
+///
+/// WHY A DEADLINE AT ALL. `plan` is awaited by `board::create_item` before it
+/// answers, so this sits on the POST /api/board request path and a slow model
+/// call is latency the caller sits through. Measured over 921 intakes: p50
+/// 3145ms, p90 4660ms, p99 10345ms, max 184264ms. Three minutes on a
+/// user-facing create, reachable because nothing here stopped waiting.
+///
+/// THE BOUND IS DERIVED, NOT PICKED: ~2x the measured p99, which would have cut
+/// 1 of those 921 calls (0.11%), the 184s one. A tighter 10s bound cuts 13
+/// (1.41%), and each of those is a create that silently loses its duplicate
+/// check. A missed dedup is how the same finding gets filed twice, so cutting
+/// more is not a free win.
+///
+/// IT BOUNDS THE WAIT, NOT THE WORK: `spawn_blocking` cannot be cancelled, so
+/// on elapse the model call keeps running and its answer is discarded. That is
+/// still strictly better than the caller waiting for it.
+async fn classify_within_deadline(
+    client: Arc<dyn ModelClient>,
+    model: String,
+    title: String,
+    description: String,
+    candidates: Vec<Candidate>,
+) -> Result<Result<Decision, String>, tokio::task::JoinError> {
+    let deadline = intake_model_timeout_ms();
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(deadline),
+        tokio::task::spawn_blocking(move || {
+            classify(client.as_ref(), &model, &title, &description, &candidates)
+        }),
+    )
+    .await
+    {
+        Ok(joined) => joined,
+        // The SAME arm a model error already takes: the honest outcome of "no
+        // comparison" is identical whether the model failed or never answered,
+        // and that path is already tested.
+        Err(_elapsed) => Ok(Err(format!(
+            "semantic intake exceeded its {deadline}ms deadline; creating without a duplicate check"
+        ))),
+    }
+}
+
 pub async fn plan(store: &Store, session: &str, owner: &str, title: &str, description: &str) -> Plan {
     let loaded = (|| -> anyhow::Result<(Vec<Candidate>, usize)> {
         let conn = store.read()?;
@@ -191,9 +251,9 @@ pub async fn plan(store: &Store, session: &str, owner: &str, title: &str, descri
     if candidates.is_empty() { return Plan::create("no open work in this ownership scope", candidates,available,true); }
     let Some(client) = MODEL.get().cloned() else { return Plan::create("semantic provider unavailable or explicitly disabled; request preserved",candidates,available,false) };
     let model = super::mdai::resolve_model(None);
-    let (t,d,rows,m) = (title.to_string(), description.to_string(), candidates.clone(), model.clone());
+    let (t,d,rows) = (title.to_string(), description.to_string(), candidates.clone());
     let started = std::time::Instant::now();
-    let result = tokio::task::spawn_blocking(move || classify(client.as_ref(), &m, &t, &d, &rows)).await;
+    let result = classify_within_deadline(client, model.clone(), t, d, rows).await;
     let model_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let mut plan = match result {
         Ok(Ok(decision)) => Plan {decision, measured:true, n_considered:candidates.len(), n_available:available, model:Some(model), model_ms:Some(model_ms), candidates},
@@ -463,4 +523,79 @@ mod tests {
         }).unwrap();
     }
 
+}
+
+/// AMUX-4836: the create must not wait forever on the classifier.
+#[cfg(test)]
+mod intake_deadline_tests {
+    use super::*;
+
+    /// The knob is bounded below, so a misconfiguration cannot disable the
+    /// comparison by making the deadline unreachably small.
+    #[test]
+    fn the_deadline_has_a_floor_and_a_measured_default() {
+        std::env::remove_var("AMUX_INTAKE_MODEL_TIMEOUT_MS");
+        assert_eq!(
+            intake_model_timeout_ms(),
+            20_000,
+            "the default is derived: ~2x the measured p99 of 10345ms, which cuts 1 of 921 \
+             observed intakes rather than the 13 a 10s bound would cut"
+        );
+        std::env::set_var("AMUX_INTAKE_MODEL_TIMEOUT_MS", "5");
+        assert_eq!(intake_model_timeout_ms(), 1_000, "a too-small value is floored, not honoured");
+        std::env::set_var("AMUX_INTAKE_MODEL_TIMEOUT_MS", "not a number");
+        assert_eq!(intake_model_timeout_ms(), 20_000, "garbage falls back to the default");
+        std::env::remove_var("AMUX_INTAKE_MODEL_TIMEOUT_MS");
+    }
+
+    /// The behaviour that matters: a classifier that never answers must not
+    /// hold the create open. The caller gets a card, without a dedup check.
+    ///
+    /// This drives the REAL deadline path (`tokio::time::timeout` around the
+    /// `spawn_blocking`), not a paraphrase of it, by blocking the classifier
+    /// far longer than the deadline and asserting the wait ends anyway.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_classifier_that_never_answers_does_not_hold_the_create_open() {
+        struct Hangs;
+        impl ModelClient for Hangs {
+            fn complete(&self, _: &str, _: &str) -> Result<String, String> {
+                // 2s, not 30: the deadline below is 1s, so this still proves
+                // the wait ends early, and the SUITE pays only 2s. A
+                // spawn_blocking thread cannot be cancelled, so the runtime
+                // joins it at shutdown and a long sleep here is time added to
+                // every test run — the first version of this slept 30s and the
+                // cell took 30.14s.
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                Ok(r#"{"action":"append","task_id":"A-1","reason":"late","confidence":1}"#.into())
+            }
+        }
+        std::env::set_var("AMUX_INTAKE_MODEL_TIMEOUT_MS", "1000");
+        let started = std::time::Instant::now();
+        // The SHIPPED function, not a rebuilt timeout expression. `plan` calls
+        // exactly this, so mutating the deadline away reddens here.
+        let out = classify_within_deadline(
+            Arc::new(Hangs),
+            "test".into(),
+            "t".into(),
+            "d".into(),
+            vec![Candidate { id: "A-1".into(), title: "x".into(), description: "y".into(), rev: 1 }],
+        )
+        .await;
+        let waited = started.elapsed();
+        std::env::remove_var("AMUX_INTAKE_MODEL_TIMEOUT_MS");
+
+        let inner = out.expect("the join itself must not fail");
+        let err = inner.expect_err("a classifier that never answers yields no decision");
+        assert!(
+            err.contains("deadline"),
+            "the give-up reason must say it was a deadline, so the card's log line explains \
+             the missing dedup: {err}"
+        );
+        assert!(
+            waited < std::time::Duration::from_millis(1800),
+            "the create waited {waited:?} on a classifier that sleeps 2s; the deadline did not \
+             bound it"
+        );
+        // that nobody is waiting on it.
+    }
 }
