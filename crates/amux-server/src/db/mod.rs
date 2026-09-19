@@ -594,6 +594,9 @@ fn writer_loop(
     while let Ok(req) = rx.recv() {
         let queued_ms = req.queued_at.elapsed().as_millis() as u64;
         let started = std::time::Instant::now();
+        // Reset first: a mutation that fails before committing must not report
+        // the PREVIOUS write's commit time as its own.
+        LAST_COMMIT_MS.store(0, std::sync::atomic::Ordering::Relaxed);
         // A panicking caller must not kill the sole writer and strand every
         // later mutation. The transaction guard rolls back during unwinding.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -605,11 +608,17 @@ fn writer_loop(
                 std::io::Error::other("writer mutation panicked; transaction rolled back"))))
         });
         let work_ms = started.elapsed().as_millis() as u64;
+        // SPLIT THE HOLD (AMUX-4830). `work_ms` alone cannot say whether a slow
+        // write is slow WORK or a slow COMMIT, and on this box it is the
+        // commit: `stmt_ms` near zero with `commit_ms` near `work_ms` means
+        // per-site optimisation will not move the number.
+        let commit_ms = LAST_COMMIT_MS.load(std::sync::atomic::Ordering::Relaxed);
+        let stmt_ms = work_ms.saturating_sub(commit_ms);
         if work_ms >= 250 || queued_ms >= 1000 {
             // Function identity only; never record the request body or SQL
             // values. Separate the slow writer from callers waiting behind it.
             tracing::warn!(target: "store", verdict = "writer_slow", origin = req.origin,
-                site = %req.site, queued_ms, work_ms, ok = result.is_ok(),
+                site = %req.site, queued_ms, work_ms, commit_ms, stmt_ms, ok = result.is_ok(),
                 measured = true, n_considered = 1,
                 "serialized write delayed; origin identifies the blocking mutation");
         }
@@ -624,6 +633,22 @@ fn writer_loop(
     // Channel closed = Store dropped = shutdown. Nothing to clean up: WAL
     // checkpoints on connection close.
 }
+
+/// How long the LAST `apply_write` spent inside `transaction.commit()`.
+///
+/// AMUX-4830: `work_ms` spans statements AND the commit, and on this box the
+/// commit dominates. Thirteen writer sites doing completely different work
+/// clustered between 589ms and 2189ms (coefficient of variation 0.32) — a
+/// single small insert at `api/interactions.rs:101` cost 589ms, which cannot be
+/// statement time. That floor was only visible by comparing sites against each
+/// other; splitting it out makes it readable in one line.
+///
+/// A static counter rather than a thread-local: the writer is a single thread
+/// (`writer_loop` owns the connection) so both are exact, but a thread-local is
+/// invisible to a test, which reads its OWN thread's copy and sees 0 forever.
+/// My first version of this was a thread-local and both of its mutations passed
+/// green, which is how I found out.
+static LAST_COMMIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn apply_write(
     conn: &Connection,
@@ -697,7 +722,9 @@ fn apply_write(
         let rev: u64 = conn.query_row("SELECT rev FROM _amux_rev WHERE id = 1", [], |r| r.get(0))?;
         StateRevision(rev)
     };
+    let commit_started = std::time::Instant::now();
     transaction.commit()?;
+    LAST_COMMIT_MS.store(commit_started.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
     // Publish only after commit: a subscriber must never see an event whose
     // transaction later rolled back.
     for ev in &committed_events {
@@ -916,13 +943,81 @@ mod amux4744_write_queue_tests {
         // A verdict with no numbers says something was slow and not how slow,
         // and without `origin` it cannot say WHAT was slow, which is the field
         // that turns this line into a lead instead of a notification.
-        for field in ["queued_ms", "work_ms", "origin = req.origin", "site = %req.site"] {
+        // BOUND TO THE WARN, not the function. `commit_ms` also appears in the
+        // `stmt_ms` arithmetic above the macro, so a version of this that
+        // scanned the whole body stayed GREEN when the field was deleted from
+        // the warn itself. Measured: that mutation passed.
+        let warn_at = body.find("writer_slow").expect("the verdict is in this function");
+        let warn = &body[warn_at..body[warn_at..].find(");").map(|i| warn_at + i).unwrap_or(body.len())];
+        for field in [
+            "queued_ms",
+            "work_ms",
+            "origin = req.origin",
+            "site = %req.site",
+            "commit_ms",
+            "stmt_ms",
+        ] {
             assert!(
-                body.contains(field),
+                warn.contains(field),
                 "the writer_slow verdict must carry `{field}`; without it the line \
                  reports that a stall happened and not what caused it"
             );
         }
+    }
+
+    /// AMUX-4830: a slow write must say whether it was slow WORK or a slow COMMIT.
+    ///
+    /// `work_ms` spans both, and conflating them sent this card at the wrong
+    /// target. Thirteen writer sites doing completely different work clustered
+    /// between 589ms and 2189ms (CV 0.32) on the live box: a single small insert
+    /// at `api/interactions.rs:101` cost 589ms, which cannot be statement time.
+    /// Per-site optimisation cannot move a shared commit floor, and without this
+    /// split the only way to see that was to compare sites against each other.
+    #[test]
+    fn a_slow_write_separates_its_commit_from_its_statements() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("split.db")).unwrap();
+        // A real write, so a real commit happens and the thread-local is set by
+        // the shipped path rather than by the test.
+        store
+            .write(|conn| {
+                conn.execute("CREATE TABLE IF NOT EXISTS t_split (k INTEGER)", [])?;
+                conn.execute("INSERT INTO t_split (k) VALUES (1)", [])?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+
+        // The arithmetic the warn publishes must hold: stmt + commit == work,
+        // and neither half may exceed the whole. `saturating_sub` makes the
+        // second one silent if the reset is ever dropped, which is why it is
+        // asserted rather than assumed.
+        let commit = LAST_COMMIT_MS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            commit < 60_000,
+            "a commit time of {commit}ms is not a measurement, it is a stuck clock"
+        );
+
+        // THE RESET IS LOAD-BEARING. Without it a write that fails BEFORE
+        // committing reports the previous write's commit time as its own, which
+        // is a wrong number that looks entirely plausible.
+        // SEED a non-zero value first. Without this the assertion below passes
+        // whether or not the reset exists, because a fast commit leaves 0
+        // behind anyway — the exact way my first version of this test was
+        // vacuous, confirmed by a mutation that dropped the reset and stayed
+        // green.
+        LAST_COMMIT_MS.store(4242, std::sync::atomic::Ordering::Relaxed);
+        let failed = store.write(|_conn| {
+            Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other("deliberate failure before commit"),
+            )))
+        });
+        assert!(failed.is_err(), "the fixture must actually fail");
+        assert_eq!(
+            LAST_COMMIT_MS.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a write that never committed must report commit_ms 0, not the last \
+             successful write's commit time"
+        );
     }
 
     /// AMUX-4781: `origin` names the FUNCTION, and that is not enough to act on.
