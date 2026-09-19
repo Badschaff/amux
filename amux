@@ -5603,21 +5603,29 @@ cmd_grid() {
 # This lets the test suite source the script to access helper functions
 # without triggering CLI side effects.
 #
-# AF-927 FOUND, NOT FIXED HERE: that last sentence is currently false. This
-# guard does skip the dispatch `case` as documented, but `exit "$?"` sits
-# AFTER this `fi`, unconditionally — so sourcing still hits that exit and
-# terminates the sourcing shell, same as a real invocation would. No existing
-# test actually exercises `source amux` (grepped for it: zero hits), which is
-# how this went unnoticed — the comment describes a capability nothing has
-# tried to use. The obvious fix (move `exit "$?"` inside the `then` block)
-# breaks test-cli-offset-safe.sh's own invariant on purpose: that test
-# requires the file's literal last two non-blank lines to be `exit "$?"` then
-# `}`, at column 0, so bash always parses to the closing brace before running
-# anything (AMUX-3891 — a live-edited, constantly-invoked symlinked CLI can
-# otherwise resume at a shifted byte offset mid-read). Fixing sourcing
-# without reopening that hazard needs restructuring past a `git board add`-
-# sized fix, not a two-line move; filed as its own card rather than forced
-# into this one.
+# AF-928. That last sentence used to be false: this guard correctly skipped
+# the dispatch `case`, but the file's tail (further down, unconditional
+# `exit "$?"` right before the closing `}`) still ran either way, and `exit`
+# terminates the CURRENT SHELL regardless of how execution got there — there
+# is no bash mechanism that makes it behave like `return` just because the
+# file was sourced. So `source amux` killed the sourcing shell before any
+# code after the `source` line ever ran. No existing test exercised the
+# pattern (grepped for `source amux`: zero hits), which is how a comment can
+# describe a capability nothing had tried to use.
+#
+# THE FIX IS AN EARLY, INVERTED CHECK — placed further down, right before
+# dispatch begins, AFTER every function in this file (including
+# _warn_stale_amux_url below) is defined — not a change to the tail. Moving
+# the tail's `exit "$?"` inside the `then` block was the obvious first
+# attempt and it reddens test-cli-offset-safe.sh: that test requires the
+# file's literal last two non-blank lines to be `exit "$?"` then `}`, at
+# column 0, so bash always parses to the closing `}` before running anything
+# (AMUX-3891 — a live-edited, constantly-invoked symlinked CLI can otherwise
+# resume a read at a shifted byte offset). That invariant is real and left
+# untouched. Instead: when sourced, `return` before dispatch OR the tail's
+# `exit` are ever reached — `return` at the top level of a sourced file is
+# exactly what bash provides for this, and it is unreachable dead code (never
+# evaluated) on the direct-invocation path, where that condition is false.
 # One-time-per-session warning when $AMUX_URL points at a DEAD port (mvs-infra,
 # AMUX-2944). A session started before the 8822 compat bind was removed carries
 # the retired value for its whole life — env can't be re-read live — and a raw
@@ -5643,6 +5651,18 @@ _warn_stale_amux_url() {
   return 0
 }
 
+# AF-928's actual check: everything below this point (dispatch, and the
+# tail's unconditional `exit "$?"`) must never run when sourced. Placed here,
+# not near the top comment, because every function above — including
+# _warn_stale_amux_url just defined — must already exist for a sourced test
+# to use it.
+if [[ "${BASH_SOURCE[0]:-$0}" != "${0}" ]]; then
+  return 0
+fi
+
+# Always true from here on (the sourced case already returned above) --
+# kept as an `if` rather than de-indenting this whole block, to keep this
+# fix a minimal, reviewable diff rather than a full-file reformat.
 if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
   ensure_dirs
   # Every verb must resolve the same installation as `amux url`; most legacy
