@@ -5947,12 +5947,31 @@ pub fn ci_findings(runs: &[CiRun], now: f64) -> (Vec<Finding>, Vec<Suppressed>) 
     for ((repo, workflow), all) in groups {
         // --- eligibility, with the exclusions PUBLISHED -----------------
         let mut n_pr = 0usize;
+        let mut n_dispatch = 0usize;
         let mut n_branch = 0usize;
         let mut n_running = 0usize;
         let mut eligible: Vec<&CiRun> = Vec::new();
         for r in &all {
             if r.event == "pull_request" || r.event == "pull_request_target" {
                 n_pr += 1;
+                continue;
+            }
+            // AMUX-4812: a HAND-DISPATCHED run is somebody's experiment, and a
+            // failing experiment is often the point of running it.
+            //
+            // This detector's own verdict says why it exists: "a red CI is
+            // invisible unless a human happens to look". A `workflow_dispatch`
+            // run is the one case where a human IS looking, because they
+            // pressed the button. Its result is theirs to read.
+            //
+            // THE SPECIMEN. `rust-soak` is weekly and its scheduled runs passed
+            // five weeks running (08-16 through 09-13). Every failure on this
+            // card was a dispatch fired the same afternoon to A/B
+            // MALLOC_ARENA_MAX against a suspected glibc arena leak. A soak
+            // exists to fail when it finds growth, so those runs failing was
+            // the experiment working, reported as production breakage.
+            if r.event == "workflow_dispatch" {
+                n_dispatch += 1;
                 continue;
             }
             if !r.on_default_branch {
@@ -5965,14 +5984,15 @@ pub fn ci_findings(runs: &[CiRun], now: f64) -> (Vec<Finding>, Vec<Suppressed>) 
             }
             eligible.push(r);
         }
-        if n_pr + n_branch + n_running > 0 {
+        if n_pr + n_dispatch + n_branch + n_running > 0 {
             suppressed.push(sup(
                 DetectorKind::CiFailure,
                 &format!("ci|{repo}|{workflow}"),
                 &format!(
-                    "excluded {n_pr} pull-request/fork run(s), {n_branch} non-default-branch \
-                     run(s), {n_running} still-running run(s) — only completed default-branch \
-                     runs are evidence about main"
+                    "excluded {n_pr} pull-request/fork run(s), {n_dispatch} hand-dispatched \
+                     run(s), {n_branch} non-default-branch run(s), {n_running} still-running \
+                     run(s) — only completed default-branch runs that nobody was already \
+                     watching are evidence about main"
                 ),
             ));
         }
@@ -14526,6 +14546,57 @@ mod tests {
         assert!(
             s.iter().any(|x| x.reason.contains("pull-request")),
             "the exclusion must be visible, not silent: {s:?}"
+        );
+
+        // AMUX-4812: a HAND-DISPATCHED red is somebody's experiment, not a gate.
+        //
+        // THE SPECIMEN. `rust-soak` is weekly; its scheduled runs passed five
+        // weeks running, and three dispatches fired the same afternoon to A/B
+        // MALLOC_ARENA_MAX all failed. A soak exists to fail when it finds
+        // growth, so the experiment working filed as production breakage.
+        //
+        // The green scheduled run is in this fixture ON PURPOSE. Without it the
+        // test would pass merely because nothing was left to file, which is a
+        // different reason and would not catch a change that drops dispatches
+        // from the WINDOW instead of from the STREAK.
+        let mut d1 = ci_run("rust-soak", 70, "failure", 10.0);
+        d1.event = "workflow_dispatch".into();
+        let mut d2 = ci_run("rust-soak", 71, "failure", 20.0);
+        d2.event = "workflow_dispatch".into();
+        let mut d3 = ci_run("rust-soak", 72, "failure", 30.0);
+        d3.event = "workflow_dispatch".into();
+        let sched = {
+            let mut r = ci_run("rust-soak", 69, "success", 9000.0);
+            r.event = "schedule".into();
+            r
+        };
+        let (f, s) = ci_findings(&[d1.clone(), d2.clone(), d3.clone(), sched.clone()], now);
+        assert!(
+            f.is_empty(),
+            "three failed dispatches over a passing weekly gate must not file: {f:?}"
+        );
+        assert!(
+            s.iter().any(|x| x.reason.contains("hand-dispatched")),
+            "the exclusion must be PUBLISHED, not silent: {s:?}"
+        );
+
+        // THE CONTROL, and the load-bearing half: the same three failures on
+        // the SCHEDULE still file. Without this, deleting the streak entirely
+        // would also make the assertion above pass.
+        let sched_fail: Vec<CiRun> = [70i64, 71, 72]
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let mut r = ci_run("rust-soak", *id, "failure", 10.0 + i as f64 * 10.0);
+                r.event = "schedule".into();
+                r
+            })
+            .collect();
+        let (f, _) = ci_findings(&sched_fail, now);
+        assert_eq!(
+            f.len(),
+            1,
+            "a genuinely red WEEKLY GATE must still file; only dispatches are excluded: {f:?}"
         );
 
         // One red run is below the threshold — and says so, rather than
