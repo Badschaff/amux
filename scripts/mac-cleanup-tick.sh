@@ -5,7 +5,10 @@
 #   1. `purge`, when the kernel says the machine is under memory pressure or
 #      free memory is under a floor. On 2026-09-15 at 10:00 one purge took free
 #      memory from 3.6 GB to 14.0 GB. It drops caches; it cannot lose work.
-#   2. A launchd agent named in AMUX_CLEANUP_AGENTS whose footprint has grown
+#   2. Claude Code shell-snapshot bash processes older than 6 hours. These are
+#      background watchers (build polls, dev servers, CI loops) that outlive
+#      their session. One held a busy-loop at 100% CPU for 21 hours.
+#   3. A launchd agent named in AMUX_CLEANUP_AGENTS whose footprint has grown
 #      past AMUX_CLEANUP_AGENT_LEAK_GB. The prompting case is
 #      com.procwarden.menubar, which leaked to 27 GB over 15 days and again to
 #      1.3 GB within 13 hours of a restart. KeepAlive brings it straight back,
@@ -73,6 +76,11 @@ FAMILY_AGE_H=${AMUX_CLEANUP_FAMILY_AGE_H:-12}
 PURGE_CMD=${AMUX_CLEANUP_PURGE_CMD:-sudo -n /usr/sbin/purge}
 THIN_CMD=${AMUX_CLEANUP_THIN_CMD:-tmutil thinlocalsnapshots / BYTES URGENCY}
 RESTART_CMD=${AMUX_CLEANUP_RESTART_CMD:-launchctl kickstart -k gui/UID/LABEL}
+# Claude Code shell-snapshots older than this many hours are killed. These are
+# background bash processes that Claude Code leaves behind: `until` loops
+# waiting for builds, dev servers, CI watchers. One of them held a tight
+# busy-loop (`until [ -s /dev/null ]`) at 100% CPU for 21 hours (2026-09-19).
+STALE_SHELL_SNAPSHOT_H=${AMUX_CLEANUP_STALE_SHELL_SNAPSHOT_H:-6}
 
 # ── pure decisions (no side effects, so the tests can exercise them) ──────────
 
@@ -251,6 +259,45 @@ for label in $AGENTS; do
   fi
 done
 
+# ── act: kill stale Claude Code shell-snapshot processes ──────────────────────
+# Claude Code spawns bash processes for background commands (build watchers, dev
+# servers, CI polls). They persist after the session that created them ends, and
+# occasionally hold busy-loops that burn a full core. Safe to kill: they are
+# abandoned scaffolding, not user work.
+stale_killed=0; stale_found=0
+stale_cutoff_s=$((STALE_SHELL_SNAPSHOT_H * 3600))
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  pid=$(printf '%s' "$line" | awk '{print $1}')
+  elapsed_raw=$(printf '%s' "$line" | awk '{print $2}')
+  # Parse elapsed (DD-HH:MM:SS or HH:MM:SS or MM:SS)
+  elapsed_s=0
+  case "$elapsed_raw" in
+    *-*)
+      days=${elapsed_raw%%-*}; rest=${elapsed_raw#*-}
+      elapsed_s=$((days * 86400))
+      ;;
+    *) rest=$elapsed_raw ;;
+  esac
+  IFS=: read -r f1 f2 f3 <<< "$rest"
+  case "$rest" in
+    *:*:*) elapsed_s=$((elapsed_s + f1*3600 + f2*60 + f3)) ;;
+    *:*)   elapsed_s=$((elapsed_s + f1*60 + f2)) ;;
+  esac
+  [ "$elapsed_s" -ge "$stale_cutoff_s" ] || continue
+  stale_found=$((stale_found+1))
+  cpu=$(ps -o pcpu= -p "$pid" 2>/dev/null | tr -d ' ')
+  if [ "$DRY" = "1" ]; then
+    echo "mac-cleanup: stale shell-snapshot pid=$pid age=${elapsed_raw} cpu=${cpu}% would be killed (dry run)"
+  else
+    kill "$pid" 2>/dev/null && stale_killed=$((stale_killed+1))
+    echo "mac-cleanup: killed stale shell-snapshot pid=$pid age=${elapsed_raw} cpu=${cpu}%"
+  fi
+done <<EOF
+$(ps -eo pid=,etime=,args= 2>/dev/null | grep 'shell-snapshots/snapshot-bash' | grep -v grep)
+EOF
+echo "mac-cleanup: shell-snapshots found=${stale_found} killed=${stale_killed} (floor ${STALE_SHELL_SNAPSHOT_H}h)"
+
 # ── report: the consumers this script must not touch ─────────────────────────
 # Named with an owner, because the useful half of a hog report is who can act.
 echo "mac-cleanup: consumers above ${REPORT_GB}G (reported, never killed):"
@@ -323,5 +370,5 @@ if [ -n "$fse_pid" ]; then
   fi
 fi
 
-echo "mac-cleanup: done purge=${purged%% *} agents_restarted=${agents_restarted}/${agents_checked} reported=${reported}"
+echo "mac-cleanup: done purge=${purged%% *} agents_restarted=${agents_restarted}/${agents_checked} stale_shells=${stale_killed} reported=${reported}"
 exit 0
