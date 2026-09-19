@@ -6,16 +6,62 @@ const source=fs.readFileSync(process.env.AMUX_OUTBOX_SOURCE || 'crates/amux-dash
 function section(start,end){const a=source.indexOf(start),b=source.indexOf(end,a);assert(a>=0 && b>a, start);return source.slice(a,b);}
 const run=section('async function _runSyncBanner(', 'async function _syncOneDraft(');
 const helpers=source.includes('function _outboxMessageId(') ? section('function _outboxMessageId(', '// Queue modal') : '';
+// AMUX-4844. THE SANDBOX IS HAND-MAINTAINED, SO MAKE ITS GAPS SAY SO.
+//
+// This file does not load app.js. It slices it by text markers and evaluates
+// the slice in a vm whose globals are the object literal in harness(). Every
+// app.js internal the slice CALLS but does not DEFINE has to be provided there.
+//
+// When one is missing, v8 throws `ReferenceError: <name> is not defined` from
+// `evalmachine.<anonymous>`. That message is actively misleading, because the
+// name is usually defined perfectly well in app.js, just OUTSIDE the slice. It
+// cost this repo eight consecutive red `rust` runs on main: `_syncBannerBeacon`
+// is defined at app.js:1017 and called from inside the sliced region (:3003,
+// :3135), so the sandbox never saw it. Nothing pointed at this file, and the
+// red gate also silently stopped every cloud deploy, because
+// deploy-cloud.yml only runs when `rust` concludes success.
+//
+// NINE MORE NAMES ARE MISSING THE SAME WAY right now (_syncOneDraft,
+// _validateBoardAcknowledgement, _peekMessagesRender and friends). They are
+// invisible only because no test reaches those branches, so each one is the
+// next incident waiting for someone to touch the right line.
+//
+// NOT FIXED BY STUBBING THEM ALL AS NO-OPS. A silent no-op on a branch a future
+// test does depend on would pass while doing nothing, which is worse than the
+// red. So every missing name gets a stub that THROWS, naming itself and this
+// file. The branch still fails if it is reached; it just stops lying about why.
+// A name that needs real behaviour gets a real stub in the context literal,
+// which takes precedence over this because it is already `in ctx`.
+//
+// Scoped to the `_` prefix app.js uses for its internals, so a genuine global
+// like Date or JSON is never matched.
+function installMissingStubs(src,ctx){
+ const defined=new Set([...src.matchAll(/(?:function|const|let|var)\s+(_[A-Za-z0-9_$]*)/g)].map(m=>m[1]));
+ const called=new Set([...src.matchAll(/\b(_[A-Za-z0-9_$]*)\s*\(/g)].map(m=>m[1]));
+ const missing=[...called].filter(n=>!defined.has(n)&&!(n in ctx)).sort();
+ for(const name of missing){
+  ctx[name]=(...args)=>{
+   throw new Error(
+    `${name}() was called by the sliced app.js, but e2e/outbox-acceptance-recovery.test.mjs `+
+    `does not provide it. It is defined in app.js OUTSIDE the evaluated slice, so the vm `+
+    `cannot see it. Add a stub for ${name} to the vm context in THIS file (${args.length} `+
+    `arg(s) were passed); do not go looking for a missing definition in app.js.`);
+  };
+ }
+ return missing;
+}
 function harness(queue,replies){
- const requests=[],patches=[],signals=[],timers=[];
+ const requests=[],patches=[],signals=[],timers=[],beacons=[];
  const element={classList:{add(){},remove(){},contains(){return false;}},textContent:'',innerHTML:''};
- const ctx=vm.createContext({Date,Set,console,Response,JSON,navigator:{onLine:true},_upqList:async()=>[],_uploadSyncPending:false,_syncChecklist:[],_clearSyncTransientToast(){},encodeURIComponent,decodeURIComponent,document:{getElementById:()=>element},drafts:[],offlineQueue:queue,_outboxActive:new Set(),describeOp:()=> 'test send',esc:s=>s,
+ const ctx=vm.createContext({Date,Set,console,Response,JSON,navigator:{onLine:true},_upqList:async()=>[],_uploadSyncPending:false,_syncChecklist:[],_clearSyncTransientToast(){},_syncBannerBeacon:(phase,items)=>beacons.push({phase,n:(items||[]).length}),encodeURIComponent,decodeURIComponent,document:{getElementById:()=>element},drafts:[],offlineQueue:queue,_outboxActive:new Set(),describeOp:()=> 'test send',esc:s=>s,
   _outboxLock:async(_,f)=>f(),_readQueue:()=>queue,_interactionReplay:()=>({id:'int-test'}),_outboxQueueable:()=>true,_mutateQueue:async f=>f(queue),_authHeaders:h=>h,
   _boundedMutationFetch:async(url,opts)=>{requests.push({url,opts});const r=replies.shift();assert(r,'unexpected request');if(r instanceof Error)throw r;return new Response(JSON.stringify(r.body),{status:r.status});},
   _apiErrText:async r=>(await r.json()).error,_interactionSet:(_,v)=>patches.push(v),_interactionAcknowledge:async()=>{},_validateMessageAcknowledgement:r=>assert.equal(r.deduped,true),
   _outboxDiagnostic:(kind,data)=>signals.push({kind,...data}),amuxTrack(){},updateConnectionStatus(){},fetchSessions(){},fetchBoard(){},showToast(){},setTimeout:(f,ms)=>timers.push(ms),clearTimeout(){},_writeError:'',_syncRetryTimer:null,_syncBackoffMs:0,_SYNC_MIN_MS:2000,_SYNC_MAX_MS:60000});
- vm.runInContext(helpers+run+section('function _scheduleSyncRetry()', 'function runSyncBanner('),ctx);
- return {queue,requests,patches,signals,timers,banner:element,drain:()=>vm.runInContext('_runSyncBanner(true)',ctx),schedule:()=>vm.runInContext('_scheduleSyncRetry()',ctx)};
+ const evaluated=helpers+run+section('function _scheduleSyncRetry()', 'function runSyncBanner(');
+ installMissingStubs(evaluated,ctx);
+ vm.runInContext(evaluated,ctx);
+ return {queue,requests,patches,signals,timers,beacons,banner:element,drain:()=>vm.runInContext('_runSyncBanner(true)',ctx),schedule:()=>vm.runInContext('_scheduleSyncRetry()',ctx)};
 }
 function pending(extra={}) {return {id:'q1',url:'/api/sessions/test-worker/send',options:{method:'POST',headers:{},body:JSON.stringify({text:'continue',msg_id:'same-identity'})},timestamp:Date.now(),...extra};}
 const waiting={status:202,body:{accepted:false,msg_id:'same-identity'}};
