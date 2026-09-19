@@ -781,7 +781,7 @@ test('settings_cloud_only_sections_stay_hidden', async ({ page }, testInfo) => {
 //
 // Provider probes are deliberately host-conditional: CI may have none of the
 // three subscription credentials. The invariant is wider than any one host:
-// all four shipped providers have a compact row, and every number/reset the
+// every shipped provider has a compact row, and every number/reset the
 // API measured is reachable by expanding that row. Degradation belongs to one
 // provider and must never hide the others.
 test('settings_usage_meter', async ({ page, request }) => {
@@ -798,8 +798,17 @@ test('settings_usage_meter', async ({ page, request }) => {
   expect(typeof wire.cache_ttl_s).toBe('number');
   expect(Array.isArray(wire.providers), 'usage response must enumerate providers').toBe(true);
   expect(wire.provider_count).toBe(wire.providers.length);
+  // EXACT, not a subset, on purpose: a provider appearing or disappearing from
+  // the meter is a thing to notice, not to tolerate. The cost is that shipping
+  // one makes this cell red, which is how it got here — dd13d663 added the Muse
+  // Code provider (and its own spec) without this list, and settings_usage_meter
+  // failed on all three browser projects for it (AMUX-4865).
+  //
+  // So if you are here because you shipped a provider: add it, that is the
+  // intended maintenance. The comment above says "all shipped providers have a
+  // compact row", and this list is what makes that claim checkable.
   expect(wire.providers.map((provider: any) => provider.id).sort()).toEqual([
-    'claude', 'codex', 'gemini', 'ollama',
+    'claude', 'codex', 'gemini', 'muse', 'ollama',
   ]);
 
   await openSettings(page);
