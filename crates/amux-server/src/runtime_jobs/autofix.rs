@@ -559,6 +559,54 @@ fn ci_min_failures() -> i64 {
 /// streak reported "AT LEAST 21, last success unknown" when the truth was 31
 /// with a known green run. 200 recovers both. When the success still falls out,
 /// the finding says so rather than reporting a floor as a count.
+/// How many low-frequency workflows may be backfilled in ONE tick (AMUX-4831).
+///
+/// Each costs one `gh run list`. AF-396: a burst of requests trips a
+/// per-ACCOUNT secondary limit that 403s every other lane on every endpoint,
+/// so this is capped rather than scaling with however many workflows are red.
+/// Workflows whose `last_success` cannot be answered from the repo-wide window
+/// (AMUX-4831): the newest decisive run on the default branch is a FAILURE and
+/// no success appears at all.
+///
+/// Pure and separate so the predicate is pinned by a test rather than only by
+/// the fetch that consults it, the same reason `ci_findings` is pure.
+///
+/// The `any_success` half is what keeps this cheap: a workflow that is merely
+/// red, with a green visible behind it, needs nothing. Only a workflow whose
+/// whole visible history is red is one whose window might be too short — and
+/// that is exactly the low-frequency case, since a busy workflow accumulates a
+/// green inside 200 repo-wide runs.
+fn workflows_needing_backfill(runs: &[CiRun]) -> Vec<(String, String)> {
+    let mut by_wf: BTreeMap<(String, String), Vec<&CiRun>> = BTreeMap::new();
+    for r in runs {
+        if !r.on_default_branch || r.status != "completed" || ci_is_inconclusive(&r.conclusion) {
+            continue;
+        }
+        by_wf
+            .entry((r.repo.clone(), r.workflow.clone()))
+            .or_default()
+            .push(r);
+    }
+    let mut out = Vec::new();
+    for ((repo, wf), group) in by_wf {
+        // ONE CONDITION, not two. This read `newest_is_red && !any_success`
+        // until a mutation showed the first half is dead: `by_wf` holds only
+        // non-empty groups, so if NO run succeeded then every run failed and
+        // the newest is a failure by definition. Dropping `newest_is_red`
+        // changed no behaviour and no test could tell, which is the signature
+        // of redundancy rather than of coverage — so the redundant half is
+        // gone instead of being given a contrived test.
+        if group.iter().all(|r| ci_is_failure(&r.conclusion)) {
+            out.push((repo, wf));
+        }
+    }
+    out
+}
+
+fn ci_backfill_max() -> usize {
+    env_i64("AMUX_CI_BACKFILL_MAX", 3).clamp(0, 10) as usize
+}
+
 fn ci_run_limit() -> i64 {
     env_i64("AMUX_CI_RUN_LIMIT", 200).clamp(10, 600)
 }
@@ -6271,6 +6319,8 @@ async fn fetch_ci_runs(now: f64) -> (Vec<CiRun>, Vec<Suppressed>) {
     }
 
     let mut runs: Vec<CiRun> = Vec::new();
+
+    let mut default_branches: BTreeMap<String, String> = BTreeMap::new();
     let mut suppressed: Vec<Suppressed> = Vec::new();
     let timeout_s = ci_cmd_timeout_s();
 
@@ -6325,6 +6375,9 @@ async fn fetch_ci_runs(now: f64) -> (Vec<CiRun>, Vec<Suppressed>) {
                 continue;
             }
         };
+        // AMUX-4831: the backfill below runs after this loop and needs each
+        // repo's default branch to classify the runs it fetches.
+        default_branches.insert(repo.clone(), default_branch.clone());
         let parsed: Vec<Value> = serde_json::from_str(&list).unwrap_or_default();
         if parsed.is_empty() {
             suppressed.push(sup(
@@ -6355,6 +6408,95 @@ async fn fetch_ci_runs(now: f64) -> (Vec<CiRun>, Vec<Suppressed>) {
                 failing_step: None,
             });
         }
+    }
+
+    // BACKFILL A LOW-FREQUENCY WORKFLOW'S LAST SUCCESS (AMUX-4831).
+    //
+    // The fetch above is bounded by a run COUNT and is REPO-WIDE. Measured on
+    // mixpeek/amux: 200 runs span 18.8 hours, because checks/rust/deploy push
+    // ~65 runs each in that time. `rust-soak` fires WEEKLY, so it had 3 runs in
+    // the window and ZERO successes — its last green (5 consecutive weekly
+    // passes) sat days outside it. `last_success` then reads NONE for a gate
+    // that has never failed, and the signature falls back to
+    // `since-beyond-window`, giving low-frequency workflows a different dedupe
+    // identity from busy ones.
+    //
+    // Widening the repo-wide window is the wrong fix: a range big enough for a
+    // weekly workflow pulls thousands of runs for the daily ones. Instead ask
+    // per workflow, and ONLY for the ones where the answer is currently wrong —
+    // newest decisive run is a failure and no success is visible. Normally that
+    // set is empty and this costs nothing; it is the same bounded cost model as
+    // the step resolution below, which already spends one call per workflow.
+    let mut needs_backfill = workflows_needing_backfill(&runs);
+    // Bound the extra calls. AF-396: a burst of `gh` requests trips a per-ACCOUNT
+    // secondary limit that 403s every other lane, so this is capped rather than
+    // left to scale with however many workflows happen to be red at once.
+    needs_backfill.truncate(ci_backfill_max());
+    for (repo, wf) in needs_backfill {
+        let Ok(list) = gh(
+            &[
+                "run".into(),
+                "list".into(),
+                "--repo".into(),
+                repo.clone(),
+                "--workflow".into(),
+                wf.clone(),
+                "--limit".into(),
+                ci_run_limit().to_string(),
+                "--json".into(),
+                "databaseId,conclusion,createdAt,event,headBranch,url,workflowName,status".into(),
+            ],
+            timeout_s,
+        )
+        .await
+        else {
+            suppressed.push(sup(
+                DetectorKind::CiFailure,
+                &format!("ci|{repo}|{wf}"),
+                "could not backfill this workflow's history; last_success may read NONE because \
+                 the repo-wide window is too short, not because the gate never passed",
+            ));
+            continue;
+        };
+        let parsed: Vec<Value> = serde_json::from_str(&list).unwrap_or_default();
+        let known: std::collections::BTreeSet<i64> = runs.iter().map(|r| r.run_id).collect();
+        let mut added = 0usize;
+        for v in parsed {
+            let s = |k: &str| {
+                v.get(k)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let id = v.get("databaseId").and_then(Value::as_i64).unwrap_or(0);
+            if known.contains(&id) {
+                continue;
+            }
+            let branch = s("headBranch");
+            runs.push(CiRun {
+                repo: repo.clone(),
+                workflow: s("workflowName"),
+                run_id: id,
+                status: s("status"),
+                conclusion: s("conclusion"),
+                event: s("event"),
+                on_default_branch: default_branches.get(&repo).is_some_and(|d| *d == branch),
+                branch,
+                created_at: ci_parse_ts(&s("createdAt")),
+                url: s("url"),
+                failing_step: None,
+            });
+            added += 1;
+        }
+        suppressed.push(sup(
+            DetectorKind::CiFailure,
+            &format!("ci|{repo}|{wf}|backfill"),
+            &format!(
+                "{wf} had no visible success in the repo-wide window, so its own history was \
+                 fetched: {added} additional run(s). A weekly workflow cannot show its last \
+                 green in a count-bounded repo window"
+            ),
+        ));
     }
 
     // Resolve the failing STEP, but only for the newest failing run of each
@@ -12600,6 +12742,78 @@ mod tests {
 
         // Degenerate input must not panic or divide by zero.
         assert!(p95_position(0, 0.0).contains("sample 1 of 1"));
+    }
+
+    /// AMUX-4831: a WEEKLY workflow cannot show its last success in a window
+    /// bounded by a repo-wide run COUNT.
+    ///
+    /// Measured on mixpeek/amux: a 200-run fetch spans 18.8 hours, because
+    /// checks/rust/deploy push ~65 runs each in that time. rust-soak fires
+    /// weekly, so it had 3 runs in that window and ZERO successes, while its
+    /// real history was five consecutive weekly passes. `last_success` then
+    /// reads NONE for a gate that has never failed.
+    ///
+    /// This pins WHICH workflows get the extra fetch. The cheap half is
+    /// `any_success`: a merely-red workflow with a green behind it needs
+    /// nothing, and that is every busy workflow.
+    #[test]
+    fn only_a_workflow_with_no_visible_green_is_backfilled() {
+        let now = unix_now();
+        let mk = |wf: &str, id: i64, concl: &str, mins: f64| {
+            let mut r = ci_run(wf, id, concl, mins);
+            r.on_default_branch = true;
+            r
+        };
+
+        // WEEKLY, all red in the window: its green is outside. Needs backfill.
+        let weekly = vec![
+            mk("rust-soak", 1, "failure", 10.0),
+            mk("rust-soak", 2, "failure", 2000.0),
+        ];
+        assert_eq!(
+            workflows_needing_backfill(&weekly),
+            vec![("mixpeek/amux".to_string(), "rust-soak".to_string())],
+            "a workflow whose whole visible history is red must be backfilled"
+        );
+
+        // A GREEN IS VISIBLE behind the red: the window already answers it, so
+        // no call. This is the assertion that keeps the fix cheap, and without
+        // it the predicate would fire for every red workflow on the board.
+        let mut busy = vec![mk("rust", 10, "failure", 5.0)];
+        busy.push(mk("rust", 11, "success", 60.0));
+        assert!(
+            workflows_needing_backfill(&busy).is_empty(),
+            "a red workflow with a visible green needs no extra fetch"
+        );
+
+        // NEWEST IS GREEN: not failing, nothing to explain.
+        let green = vec![mk("checks", 20, "success", 5.0), mk("checks", 21, "failure", 60.0)];
+        assert!(
+            workflows_needing_backfill(&green).is_empty(),
+            "a workflow that is currently passing must not be backfilled"
+        );
+
+        // NON-DEFAULT-BRANCH and STILL-RUNNING rows are not evidence about the
+        // gate and must not by themselves trigger a fetch.
+        let mut pr = mk("rust-soak", 30, "failure", 5.0);
+        pr.on_default_branch = false;
+        let mut running = mk("rust-soak", 31, "", 6.0);
+        running.status = "in_progress".into();
+        assert!(
+            workflows_needing_backfill(&[pr, running]).is_empty(),
+            "PR runs and in-flight runs must not trigger a backfill on their own"
+        );
+
+        // CANCELLED runs are inconclusive: they neither prove a green nor make
+        // one invisible, so a workflow with only cancellations is not a
+        // backfill candidate either.
+        let mut cancelled = mk("rust-soak", 40, "cancelled", 5.0);
+        cancelled.on_default_branch = true;
+        assert!(
+            workflows_needing_backfill(&[cancelled]).is_empty(),
+            "an all-cancelled workflow is not a red gate"
+        );
+        let _ = now;
     }
 
     /// AMUX-3646: three families regressing at once is ONE event, not three
