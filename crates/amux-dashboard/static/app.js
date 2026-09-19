@@ -4254,6 +4254,119 @@ document.addEventListener('click', (e) => {
   }
 });
 
+// ── Needs You digest (AF-510) ──
+// Read-only, dashboard-only by design: NOT wired through _notifPush, on
+// purpose, so it never fires a native/lock-screen notification regardless of
+// this browser's own notification-permission state. The channel decision on
+// AF-510 was specifically "dashboard-only, not push" — routing through the
+// existing native-capable notification pipe would quietly reintroduce the
+// push channel that was ruled out. This is its own small header indicator
+// (button/badge/panel), visually consistent with the notif panel (same CSS
+// classes) but functionally independent of it.
+let _needsYouPanelOpen = false;
+let _needsYouData = null;
+
+function toggleNeedsYouPanel() {
+  _needsYouPanelOpen = !_needsYouPanelOpen;
+  const panel = document.getElementById('needsyou-panel');
+  if (!panel) return;
+  panel.classList.toggle('active', _needsYouPanelOpen);
+  document.getElementById('needsyou-btn')?.setAttribute('aria-expanded', String(_needsYouPanelOpen));
+  if (_needsYouPanelOpen) {
+    panel.scrollTop = 0;
+    _positionNeedsYouPanel();
+    _needsYouFetch();
+  }
+}
+
+function _positionNeedsYouPanel() {
+  const panel = document.getElementById('needsyou-panel');
+  const button = document.getElementById('needsyou-btn');
+  if (!panel || !button || !_needsYouPanelOpen) return;
+  const anchor = button.getBoundingClientRect();
+  const width = panel.getBoundingClientRect().width;
+  const top = Math.min(anchor.bottom + 8, Math.max(12, innerHeight - 120));
+  panel.style.left = Math.max(12, Math.min(anchor.left, innerWidth - width - 12)) + 'px';
+  panel.style.top = top + 'px';
+  panel.style.maxHeight = Math.max(80, Math.min(520, innerHeight - top - 12)) + 'px';
+}
+window.addEventListener('resize', _positionNeedsYouPanel);
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && _needsYouPanelOpen) {
+    toggleNeedsYouPanel();
+    document.getElementById('needsyou-btn')?.focus();
+  }
+});
+document.addEventListener('click', (e) => {
+  if (_needsYouPanelOpen && !e.target.closest('#needsyou-panel') && !e.target.closest('#needsyou-btn')) {
+    toggleNeedsYouPanel();
+  }
+});
+
+async function _needsYouFetch(forceRender) {
+  try {
+    const r = await fetch(API + '/api/debug/needsyou-digest', { headers: _authHeaders() });
+    if (!r.ok) return;
+    const d = await r.json();
+    if (!d || d.measured !== true) return;  // an unmeasured probe is not a zero (ethos rule 4)
+    _needsYouData = d;
+    _needsYouUpdateBadge();
+    if (_needsYouPanelOpen || forceRender) _needsYouRenderPanel();
+  } catch (e) { /* offline or the endpoint is unreachable — leave the last-known badge as is */ }
+}
+
+function _needsYouUpdateBadge() {
+  const badge = document.getElementById('needsyou-badge');
+  if (!badge || !_needsYouData) return;
+  // The TRUE fleet-wide count, not the capped list length — a capped badge
+  // would silently read as "that's everything" (ethos rule 4).
+  const n = _needsYouData.n_considered || 0;
+  badge.textContent = n > 99 ? '99+' : String(n);
+  badge.style.display = n > 0 ? 'flex' : 'none';
+}
+
+function _needsYouRenderPanel() {
+  const list = document.getElementById('needsyou-panel-list');
+  if (!list) return;
+  const d = _needsYouData;
+  if (!d || !d.n_considered) {
+    list.innerHTML = '<div class="notif-panel-empty">Nothing waiting on you</div>';
+    return;
+  }
+  // Render exactly the order the API already gives (oldest-first, fleet-wide)
+  // -- re-sorting client-side would drift from the one thing this list is
+  // for (age is the ordering signal AF-510 was built around).
+  let html = (d.by_lane || []).map(lane => {
+    const items = (lane.cards || []).map(c => {
+      const age = c.age_days >= 1 ? Math.round(c.age_days) + 'd' : Math.round(c.age_days * 24) + 'h';
+      const sub = c.ask_question || c.title || '';
+      return '<div class="notif-panel-item" onclick="toggleNeedsYouPanel();switchView(\'board\');setTimeout(function(){openBoardDetail(\'' + escJs(c.id) + '\')},250)">'
+        + '<span class="npi-icon">\u{1F64B}</span>'
+        + '<div class="npi-body"><div class="npi-title">' + esc(c.id) + ' — ' + esc((c.title || '').slice(0, 60)) + '</div>'
+        + '<div class="npi-text">' + esc(sub.slice(0, 90)) + '</div></div>'
+        + '<span class="npi-time">' + age + '</span></div>';
+    }).join('');
+    return '<div class="needsyou-panel-lane">' + esc(lane.session) + '</div>' + items;
+  }).join('');
+  if (d.truncated) {
+    html += '<div class="needsyou-panel-note">Showing oldest ' + d.shown + ' of ' + d.n_considered + ' fleet-wide</div>';
+  }
+  list.innerHTML = html;
+}
+
+// Boot: one fetch on load for the badge count (matches this file's own
+// DOMContentLoaded-guard convention — app.js loads at the end of body, so
+// document.body already exists by the time this line runs in the common case).
+(function () {
+  const boot = () => _needsYouFetch();
+  if (document.body) boot(); else document.addEventListener('DOMContentLoaded', boot);
+  // Coarse periodic refresh so the badge count does not go stale across a
+  // long-open tab. Not wired to SSE (.claude/rules/sse-realtime.md would
+  // require adding it to the polling fallback too) -- a scoped choice for
+  // this dashboard-only rollout, not a limitation of the endpoint itself.
+  setInterval(_needsYouFetch, 5 * 60 * 1000);
+})();
+
 function _fireSessionNotif(name, title, body) {
   let icon = '\U0001f535';
   if (title.includes('needs input')) icon = '⚠️';
@@ -11377,7 +11490,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.988';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.989';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
