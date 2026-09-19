@@ -675,6 +675,20 @@ pub(crate) fn dominated_by_external(total_ms: u128, external_ms: u128) -> bool {
 /// carries the measured external time rather than a bare label. An exclusion
 /// that cannot say what it excluded on is the ethos-4 shape this whole
 /// mechanism exists to avoid.
+/// Bound a caller-supplied verb before it becomes a response header (AMUX-4779).
+///
+/// The value comes straight from the request body, so it is capped and stripped
+/// to a safe charset. A header value cannot carry a newline, and an unbounded
+/// one would let a caller widen every request-log row it touches. Anything that
+/// is not `[A-Za-z0-9_-]` is dropped rather than escaped: the point is to group
+/// rows by verb, and a verb that needs escaping is not one of the seven.
+pub(crate) fn truncate_verb(v: &str) -> String {
+    v.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(32)
+        .collect()
+}
+
 pub(crate) fn slow_ok(mut r: axum::response::Response, why: &str) -> axum::response::Response {
     if let Ok(hv) = axum::http::HeaderValue::from_str(why) {
         r.headers_mut().insert("x-amux-slow-ok", hv);

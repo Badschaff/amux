@@ -477,6 +477,18 @@ pub async fn middleware(State(logger): State<RequestLogger>, req: Request, next:
     if let Some(v) = res.headers().get("x-amux-slow-ok").and_then(|v| v.to_str().ok()) {
         meta.insert("slow_ok".into(), json!(truncate_chars(v, 40)));
     }
+    // AMUX-4779: which VERB a multi-verb route ran. `POST /api/browser/action`
+    // is one path over seven actions whose costs differ by three orders of
+    // magnitude (p50 9ms, p99 12698ms over 7 days), so the path alone is a
+    // grouping key coarser than the population it groups, and a latency card
+    // quoting a slow `wait` beside a `click`'s baseline points at the wrong
+    // verb. Recorded the same way `command_kind` and `slow_ok` already are:
+    // the handler sets a header, this lifts it.
+    if let Some(v) = res.headers().get("x-amux-action").and_then(|v| v.to_str().ok()) {
+        if !v.is_empty() {
+            meta.insert("action".into(), json!(truncate_chars(v, 40)));
+        }
+    }
     let req_meta = if meta.is_empty() {
         None
     } else {
