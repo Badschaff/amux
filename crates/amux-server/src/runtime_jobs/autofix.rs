@@ -432,6 +432,174 @@ const LONG_BY_DESIGN: &[(&str, f64)] = &[
     ("/api/sessions", 30_000.0),
 ];
 
+/// WARN/ERROR lines the server logged INSIDE one request's own window.
+///
+/// AMUX-4839, from AMUX-4780. That card reported a 59621ms `/api/email/inbox`
+/// request and already published `host_load_at_worst` and
+/// `arrived_into_process_life`, so it carried "is the box busy" and "is this a
+/// restart". It did NOT carry the one fact that explained the breach: a single
+/// WARN sitting 31 seconds inside the request's own window, saying the gmail
+/// batch endpoint had failed and it was falling back to 100 single fetches.
+/// Finding that by hand took a log-coverage check, a timestamp-semantics read
+/// and a correlation script.
+///
+/// THE WINDOW IS EXACT, not inferred. `_amux_request_log.ts` is stamped BEFORE
+/// the handler runs (`api/request_log.rs`, `let ts = unix_now();` above
+/// `let started = Instant::now();`) and `latency_ms` comes from
+/// `started.elapsed()` after it, so `[ts, ts + latency_ms]` is the interval the
+/// request actually occupied. Getting this backwards is easy and quiet: the
+/// AMUX-4780 warn is stamped 31s AFTER the row's `ts` and reads like it
+/// happened after the request unless you know which end is stamped.
+#[derive(Debug, Clone, PartialEq)]
+struct WindowScan {
+    /// Matching lines, capped and truncated.
+    hits: Vec<String>,
+    /// Whether a log generation actually spans the window. FALSE means the
+    /// probe could not look, which is a different answer from "nothing fired".
+    covered: bool,
+    /// How many matches were dropped by the cap.
+    dropped: u64,
+}
+
+/// At most this many lines reach a card, and at most this many bytes each.
+/// A breach that logged 400 warns is a different story, and `dropped` carries
+/// it without pasting the log into the board.
+const WINDOW_SCAN_CAP: usize = 8;
+const WINDOW_SCAN_LINE_BYTES: usize = 240;
+
+/// Parse the leading `2026-09-19T09:04:54.415883Z` of a log line to unix
+/// seconds. `None` for any line that does not start with one, which is most
+/// continuation lines in a multi-line warn.
+fn log_line_ts(line: &[u8]) -> Option<f64> {
+    // 20 bytes is the shortest RFC3339 this writer emits; bail before the
+    // allocation on anything shorter.
+    if line.len() < 20 || line[4] != b'-' || line[10] != b'T' {
+        return None;
+    }
+    let end = line.iter().position(|b| *b == b' ')?;
+    let s = std::str::from_utf8(&line[..end]).ok()?;
+    chrono::DateTime::parse_from_rfc3339(s).ok().map(|t| t.timestamp() as f64 + f64::from(t.timestamp_subsec_millis()) / 1000.0)
+}
+
+/// Is this a line a reader would act on? WARN and ERROR only: INFO during a
+/// slow request is the normal chatter of the request itself.
+fn is_actionable_log_line(line: &[u8]) -> bool {
+    let s = String::from_utf8_lossy(line);
+    s.contains(" WARN ") || s.contains(" ERROR ")
+}
+
+/// The scan itself, over an already-opened sequence of lines.
+///
+/// Split from the file reading so the window arithmetic and the COVERAGE rule
+/// are testable without a log on disk.
+///
+/// COVERAGE IS DECIDED WITHOUT A SECOND PASS. A generation spans the window if
+/// this scan saw a timestamp at or before `start` AND one at or after `end`.
+/// The second half is what an early exit would otherwise destroy, and it is
+/// also the honest answer when a request is still running: the log simply has
+/// not reached `end` yet, so the window is not covered and the card must not
+/// claim it looked.
+fn scan_lines_for_window<I, B>(lines: I, start: f64, end: f64) -> WindowScan
+where
+    I: IntoIterator<Item = B>,
+    B: AsRef<[u8]>,
+{
+    let mut hits = Vec::new();
+    let mut dropped = 0u64;
+    let mut saw_at_or_before_start = false;
+    let mut saw_at_or_after_end = false;
+    for line in lines {
+        let line = line.as_ref();
+        let Some(ts) = log_line_ts(line) else { continue };
+        if ts <= start {
+            saw_at_or_before_start = true;
+        }
+        if ts >= end {
+            saw_at_or_after_end = true;
+        }
+        if ts >= start && ts <= end && is_actionable_log_line(line) {
+            if hits.len() < WINDOW_SCAN_CAP {
+                let s = String::from_utf8_lossy(line);
+                let cut = s.char_indices().nth(WINDOW_SCAN_LINE_BYTES).map(|(i, _)| i).unwrap_or(s.len());
+                hits.push(s[..cut].trim_end().to_string());
+            } else {
+                dropped += 1;
+            }
+        }
+    }
+    WindowScan { hits, covered: saw_at_or_before_start && saw_at_or_after_end, dropped }
+}
+
+/// Read the server log generations and scan them for `[start, end]`.
+///
+/// READS BYTES, NOT `grep`. The shell recipe for this needs `-a`, because one
+/// NUL byte anywhere makes grep treat the file as binary and SUPPRESS match
+/// output while `-c` keeps counting (CLAUDE.md, AF-481). Reading the file
+/// ourselves and converting lossily sidesteps that class entirely; the note is
+/// here so nobody "simplifies" this into a `grep` call later.
+///
+/// Both generations are read because rotation is copy-truncate with one kept
+/// generation (`runtime_jobs::storage`), and the AMUX-4780 breach lived only in
+/// `server-rs.log.1`.
+fn warns_during_request(start: f64, end: f64) -> WindowScan {
+    use std::io::BufRead;
+    let dir = crate::config::amux_home().join("logs");
+    let mut out = WindowScan { hits: Vec::new(), covered: false, dropped: 0 };
+    for name in ["server-rs.log.1", "server-rs.log"] {
+        let Ok(f) = std::fs::File::open(dir.join(name)) else { continue };
+        let lines = std::io::BufReader::new(f).split(b'\n').filter_map(Result::ok);
+        let scan = scan_lines_for_window(lines, start, end);
+        out.covered |= scan.covered;
+        out.dropped += scan.dropped;
+        for h in scan.hits {
+            if out.hits.len() < WINDOW_SCAN_CAP {
+                out.hits.push(h);
+            } else {
+                out.dropped += 1;
+            }
+        }
+    }
+    out
+}
+
+/// The card field. Says what it measured in every branch, including the two
+/// that have nothing to show (ethos rule 4: an output that can read empty must
+/// publish whether the measurement ran, in the same payload).
+fn logged_during_worst_request(scan: &WindowScan, start: f64, end: f64) -> String {
+    let window = format!(
+        "{} .. {} ({:.1}s)",
+        rl::local_when(start),
+        rl::local_when(end),
+        (end - start).max(0.0)
+    );
+    if !scan.covered {
+        return format!(
+            "NOT MEASURED for {window}: no retained log generation spans this window, so \
+             nothing can be said about what the server logged during it. The log rotates \
+             copy-truncate with one generation kept, so a breach older than the current \
+             pair is simply gone. This is an absence of coverage, not an absence of warnings."
+        );
+    }
+    if scan.hits.is_empty() {
+        return format!(
+            "none. The log covers {window} and carried no WARN or ERROR inside it, so \
+             whatever made this request slow did not announce itself in the log."
+        );
+    }
+    let more = if scan.dropped > 0 {
+        format!(" (+{} more, capped)", scan.dropped)
+    } else {
+        String::new()
+    };
+    format!(
+        "{} line(s) logged DURING this request{more}, window {window}. This is \
+         correlation, not cause: these lines were emitted while the request was open, \
+         which is evidence a reader can act on and not a verdict.\n{}",
+        scan.hits.len(),
+        scan.hits.iter().map(|h| format!("  {h}")).collect::<Vec<_>>().join("\n")
+    )
+}
+
 fn design_budget_ms(target: &str) -> f64 {
     LONG_BY_DESIGN
         .iter()
@@ -1984,6 +2152,13 @@ fn detect_latency_with_scan_cap(
         /// route has no budget, so the untouched case stays untouched.
         n_over_budget: u64,
         worst_ms: f64,
+        /// Unix seconds at which the WORST row STARTED (AMUX-4839).
+        ///
+        /// Not `last_ts`, which is the newest offending row and is usually a
+        /// different request. The window a reader wants is the worst one's,
+        /// and it is `[worst_ts, worst_ts + worst_ms]` because the request log
+        /// stamps `ts` before the handler runs.
+        worst_ts: f64,
         last_ts: f64,
         sample: String,
         /// AMUX-3647: seconds between the WORST row's arrival and the boot of
@@ -2166,6 +2341,10 @@ fn detect_latency_with_scan_cap(
                         n: 0,
                         n_over_budget: 0,
                         worst_ms: 0.0,
+                        // Seeded to this row's own ts, so a group whose every
+                        // row somehow failed the `ms > worst_ms` test still
+                        // names a real instant rather than the epoch.
+                        worst_ts: ts,
                         last_ts: ts,
                         sample: format!("{method} {path} → {status}"),
                         worst_since_boot: None,
@@ -2219,6 +2398,10 @@ fn detect_latency_with_scan_cap(
                     e.sample = format!("{method} {path} → {status}");
                     e.worst_since_boot = row_boot.map(|b| ts - b);
                     e.worst_load1 = row_load;
+                    // Same assignment as every other worst-row property, for
+                    // the reason the comment above gives: one block carries
+                    // them together or they drift onto different requests.
+                    e.worst_ts = ts;
                 }
                 e.last_ts = e.last_ts.max(ts);
             }
@@ -2458,6 +2641,7 @@ fn detect_latency_with_scan_cap(
             n,
             n_over_budget,
             worst_ms: worst,
+            worst_ts,
             last_ts,
             sample,
             worst_since_boot,
@@ -2653,6 +2837,15 @@ fn detect_latency_with_scan_cap(
                     ),
                     (Some(l), None) => format!("1-minute load {l:.1}; core count unavailable"),
                     (None, _) => "not recorded — this row predates migration 0034 (load1)".into(),
+                }),
+                // AMUX-4839. Sits beside the other two context fields on
+                // purpose: `host_load_at_worst` answers "was the box busy",
+                // `arrived_into_process_life` answers "was this a restart",
+                // and neither could answer the AMUX-4780 breach, which was
+                // explained by one WARN inside the request's own window.
+                ("logged_during_worst_request".into(), {
+                    let end = worst_ts + worst / 1000.0;
+                    logged_during_worst_request(&warns_during_request(worst_ts, end), worst_ts, end)
                 }),
             ],
             recheck: format!(
@@ -15805,5 +15998,182 @@ mod tests {
             (open as u64) < limit,
             "a healthy test process is under its own limit ({open}/{limit})"
         );
+    }
+}
+
+/// AMUX-4839: the window arithmetic, and the coverage rule that keeps an empty
+/// result from reading as a measured absence.
+#[cfg(test)]
+mod window_scan_tests {
+    use super::*;
+
+    /// Lines shaped like the real log, with the timestamps AMUX-4780 produced.
+    /// The breach ran 04:37:33 -> 04:38:33 and the warn sits 31s inside it.
+    fn breach_log() -> Vec<Vec<u8>> {
+        [
+            "2026-09-18T04:36:51.131048Z  WARN amux_server::runtime_jobs::autofix: connector_auth: needs re-authorization",
+            "2026-09-18T04:37:33.000000Z  INFO amux_server::api: GET /api/email/inbox",
+            "2026-09-18T04:38:04.881382Z  WARN amux_server::integrations::email: gmail batch transport error — falling back to single fetches for 100 ids",
+            "2026-09-18T04:38:52.464986Z  WARN amux_server::runtime_jobs::autofix: connector_auth: needs re-authorization",
+        ]
+        .iter()
+        .map(|s| s.as_bytes().to_vec())
+        .collect()
+    }
+
+    fn at(s: &str) -> f64 {
+        chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp() as f64
+    }
+
+    /// The whole point: the warn INSIDE the window is found, and the two warns
+    /// outside it are not. Both neighbours are real lines from that log, and
+    /// both are the kind a looser window would sweep in.
+    #[test]
+    fn only_lines_inside_the_request_window_are_reported() {
+        let scan = scan_lines_for_window(
+            breach_log(),
+            at("2026-09-18T04:37:33Z"),
+            at("2026-09-18T04:38:33Z"),
+        );
+        assert!(scan.covered, "the fixture spans the window");
+        assert_eq!(scan.hits.len(), 1, "got {:?}", scan.hits);
+        assert!(scan.hits[0].contains("gmail batch transport error"), "{:?}", scan.hits);
+        assert!(
+            !scan.hits.iter().any(|h| h.contains("connector_auth")),
+            "warns outside the window must not be reported: {:?}",
+            scan.hits
+        );
+    }
+
+    /// A log that stops before the window ends has NOT measured it. This is the
+    /// case that would otherwise print an empty list and read as "nothing
+    /// fired", which is a negative the probe never established (ethos rule 4).
+    #[test]
+    fn a_log_that_does_not_reach_the_end_is_not_covered() {
+        let short: Vec<Vec<u8>> = breach_log().into_iter().take(2).collect();
+        let scan = scan_lines_for_window(
+            short,
+            at("2026-09-18T04:37:33Z"),
+            at("2026-09-18T04:38:33Z"),
+        );
+        assert!(!scan.covered, "nothing at or after the window end was seen");
+        assert!(scan.hits.is_empty());
+    }
+
+    /// And a log that starts after the window began is equally unmeasured. This
+    /// is the rotation case: AMUX-4780's breach lived only in server-rs.log.1,
+    /// and scanning the current generation alone would have found nothing.
+    #[test]
+    fn a_log_that_starts_after_the_window_is_not_covered() {
+        let late: Vec<Vec<u8>> = breach_log().into_iter().skip(2).collect();
+        let scan = scan_lines_for_window(
+            late,
+            at("2026-09-18T04:37:33Z"),
+            at("2026-09-18T04:38:33Z"),
+        );
+        assert!(!scan.covered, "nothing at or before the window start was seen");
+    }
+
+    /// Covered with no hits is a REAL answer and must read differently from
+    /// "could not look". These two branches are the whole contract.
+    #[test]
+    fn covered_and_empty_reads_differently_from_uncovered() {
+        let start = at("2026-09-18T04:37:33Z");
+        let end = at("2026-09-18T04:38:33Z");
+        let quiet = WindowScan { hits: vec![], covered: true, dropped: 0 };
+        let blind = WindowScan { hits: vec![], covered: false, dropped: 0 };
+        let quiet_s = logged_during_worst_request(&quiet, start, end);
+        let blind_s = logged_during_worst_request(&blind, start, end);
+        assert!(quiet_s.starts_with("none."), "{quiet_s}");
+        assert!(blind_s.starts_with("NOT MEASURED"), "{blind_s}");
+        assert_ne!(quiet_s, blind_s, "an absence of warnings is not an absence of coverage");
+        assert!(
+            blind_s.contains("not an absence of warnings"),
+            "the uncovered branch must say what it could not do: {blind_s}"
+        );
+    }
+
+    /// The report hedges on purpose. The correlation is evidence, and a card
+    /// that reads as a verdict sends the next actor at a conclusion the data
+    /// does not carry.
+    #[test]
+    fn a_hit_is_presented_as_correlation_not_cause() {
+        let start = at("2026-09-18T04:37:33Z");
+        let end = at("2026-09-18T04:38:33Z");
+        let scan = scan_lines_for_window(breach_log(), start, end);
+        let s = logged_during_worst_request(&scan, start, end);
+        assert!(s.contains("correlation, not cause"), "{s}");
+        assert!(s.contains("gmail batch transport error"), "{s}");
+    }
+
+    /// INFO during a slow request is the request's own chatter. Reporting it
+    /// would bury the one line that matters under the ones that always appear.
+    #[test]
+    fn info_lines_are_not_actionable() {
+        assert!(is_actionable_log_line(b"2026-01-01T00:00:00Z  WARN x: y"));
+        assert!(is_actionable_log_line(b"2026-01-01T00:00:00Z  ERROR x: y"));
+        assert!(!is_actionable_log_line(b"2026-01-01T00:00:00Z  INFO x: y"));
+    }
+
+    /// Continuation lines of a multi-line warn carry no timestamp, and a line
+    /// with no timestamp cannot be placed in or out of the window.
+    #[test]
+    fn a_line_without_a_timestamp_is_skipped_rather_than_guessed() {
+        assert_eq!(log_line_ts(b"    at some::frame (src/lib.rs:1)"), None);
+        assert_eq!(log_line_ts(b""), None);
+        assert!(log_line_ts(b"2026-09-18T04:38:04.881382Z  WARN x: y").is_some());
+    }
+
+    /// THE WINDOW MUST COME FROM THE WORST ROW, not the newest one.
+    ///
+    /// `last_ts` and `worst_ts` are both `f64` unix seconds in the same scope,
+    /// so swapping them compiles, runs, and produces a card that looks entirely
+    /// normal while scanning a DIFFERENT request's minute. No runtime assertion
+    /// can catch that: both are real instants and both find plausible warns.
+    /// This is the same reason `every_blocking_subprocess_here_goes_through_a_bounded_helper`
+    /// below reads the source rather than observing behaviour.
+    #[test]
+    fn the_scanned_window_is_built_from_the_worst_row_not_the_newest() {
+        let src = include_str!("autofix.rs");
+        let prod = src.split("\n#[cfg(test)]").next().unwrap_or(src);
+        let at = prod
+            .find("(\"logged_during_worst_request\".into()")
+            .expect("the evidence field exists");
+        // Bound to the field's own block, not the file: a version of this that
+        // searched the whole source stayed green with the wrong variable,
+        // because `worst_ts` appears elsewhere.
+        let block = &prod[at..at + 400.min(prod.len() - at)];
+        assert!(
+            block.contains("worst_ts + worst / 1000.0"),
+            "the window must be [worst_ts, worst_ts + worst_ms]: {block}"
+        );
+        assert!(
+            !block.contains("last_ts"),
+            "last_ts is the NEWEST offending row, usually a different request: {block}"
+        );
+    }
+
+    /// The cap bounds what reaches the board, and `dropped` carries the rest
+    /// rather than silently truncating.
+    #[test]
+    fn the_cap_reports_what_it_dropped() {
+        let many: Vec<Vec<u8>> = (0..20)
+            .map(|i| format!("2026-09-18T04:38:{:02}.000000Z  WARN x: line {i}", i % 60).into_bytes())
+            .chain(std::iter::once(
+                "2026-09-18T04:37:33.000000Z  INFO start".as_bytes().to_vec(),
+            ))
+            .chain(std::iter::once(
+                "2026-09-18T04:38:33.000000Z  INFO end".as_bytes().to_vec(),
+            ))
+            .collect();
+        let scan = scan_lines_for_window(
+            many,
+            at("2026-09-18T04:37:33Z"),
+            at("2026-09-18T04:38:33Z"),
+        );
+        assert_eq!(scan.hits.len(), WINDOW_SCAN_CAP);
+        assert!(scan.dropped > 0, "the overflow must be counted, not dropped silently");
+        let s = logged_during_worst_request(&scan, at("2026-09-18T04:37:33Z"), at("2026-09-18T04:38:33Z"));
+        assert!(s.contains("more, capped"), "{s}");
     }
 }
