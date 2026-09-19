@@ -1282,14 +1282,53 @@ fn last_advance(conn: &Connection, session: &str) -> Option<(f64, Option<String>
 /// below; a container is never dispatchable, drainable, or a WIP slot.
 ///
 /// Params: ?1 = session, ?2 = fresh_cut (epoch s), ?3 = reclaim_cut (epoch s).
-const DISPATCHABLE_WHERE: &str = "i.session=?1 AND i.status='todo' \
-     AND i.owner_type='agent' AND i.deleted IS NULL AND COALESCE(i.archived,0)=0 \
-     AND COALESCE(i.type,'') NOT IN ('tripwire','watch','epic') \
-     AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=i.id \
-                     AND lower(t.tag) LIKE 'needs:you%') \
-     AND i.updated >= ?2 \
-     AND NOT EXISTS (SELECT 1 FROM session_events e WHERE e.type IN ('task.claimed','pickup.reclaimed_stale') \
-                     AND e.ts > ?3 AND e.data LIKE '%\"' || i.id || '\"%')";
+/// Issue ids claimed (or stale-reclaimed) since a cutoff, as a NON-CORRELATED
+/// subquery. `?N` is the cutoff timestamp.
+///
+/// AMUX-4782: this replaced `e.data LIKE '%"' || i.id || '"%'`, which is a
+/// CORRELATED leading-wildcard LIKE. SQLite cannot index a leading wildcard, so
+/// it re-walked every claim-type event for EVERY candidate row, and board-drive
+/// runs this per lane. Measured on the live board (117 candidate rows):
+///
+///     correlated LIKE      116 rows   3073 ms
+///     this form            116 rows    227 ms   (218 ms of which is transport)
+///
+/// so the query itself went from ~2.9s to ~9ms. Equivalence was checked ROW BY
+/// ROW, not by comparing counts: a query selecting the two predicates
+/// side-by-side and keeping only the rows where they disagree returned ZERO.
+///
+/// BOTH GUARDS ARE LOAD-BEARING, and the second one I only found by testing.
+///
+/// `x NOT IN (set)` is NULL, not TRUE, when the set contains a NULL, so one
+/// claim event whose data lacked `.issue` would make this predicate reject
+/// EVERY card on EVERY lane and board-drive would go quietly idle on a full
+/// queue. `IS NOT NULL` removes those from the set.
+///
+/// `json_valid` is the one that is easy to miss: `json_extract` on malformed
+/// data RAISES rather than returning NULL, and the caller's `unwrap_or(0)` then
+/// turns that error into a count of zero, which is the same silent stall by a
+/// different route. A test inserting `'not json at all'` caught it; the
+/// NULL-only version passed the first two cells and failed the third.
+fn claimed_since_sql(param: u8) -> String {
+    format!(
+        "SELECT json_extract(e.data,'$.issue') FROM session_events e \
+         WHERE e.type IN ('task.claimed','pickup.reclaimed_stale') AND e.ts > ?{param} \
+         AND json_valid(e.data) AND json_extract(e.data,'$.issue') IS NOT NULL"
+    )
+}
+
+fn dispatchable_where() -> String {
+    format!(
+        "i.session=?1 AND i.status='todo' \
+         AND i.owner_type='agent' AND i.deleted IS NULL AND COALESCE(i.archived,0)=0 \
+         AND COALESCE(i.type,'') NOT IN ('tripwire','watch','epic') \
+         AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=i.id \
+                         AND lower(t.tag) LIKE 'needs:you%') \
+         AND i.updated >= ?2 \
+         AND i.id NOT IN ({claimed})",
+        claimed = claimed_since_sql(3)
+    )
+}
 
 /// py:14403 — the count over EXACTLY the rows pickup selects from, via
 /// [`DISPATCHABLE_WHERE`]. Per-card refusals (junk shells, structured deps) still
@@ -1299,7 +1338,7 @@ fn eligible_todo_count(conn: &Connection, session: &str, now: f64) -> i64 {
     let fresh_cut = pickup_fresh_cut(now);
     let reclaim_cut = now - reclaim_cooldown_s();
     conn.query_row(
-        &format!("SELECT COUNT(*) FROM issues i WHERE {DISPATCHABLE_WHERE}"),
+        &format!("SELECT COUNT(*) FROM issues i WHERE {dw}", dw = dispatchable_where()),
         rusqlite::params![session, fresh_cut, reclaim_cut],
         |r| r.get(0),
     )
@@ -1651,13 +1690,13 @@ fn drainable_backlog_rows(conn: &Connection, session: &str, now: f64) -> rusqlit
                            AND lower(t.tag) LIKE 'needs:you%') \
            AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=i.id \
                            AND lower(t.tag) = 'defer:focused') \
-           AND NOT EXISTS (SELECT 1 FROM session_events e WHERE e.type='task.claimed' \
-                           AND e.ts > ?2 AND e.data LIKE '%\"' || i.id || '\"%') \
+           AND i.id NOT IN ({CLAIMED}) \
            AND NOT (COALESCE(i.source_ref,'') <> '' AND COALESCE(i.last_verified_at,0) > ?3) \
            AND COALESCE(i.blocked_on,'') = '' \
            AND NOT (COALESCE(i.source,'')='capture' AND COALESCE(i.source_ref,'') <> '') \
          ORDER BY COALESCE(i.pinned,0) DESC, COALESCE(i.created,0) ASC, i.id ASC",
-                CAPTURE = bs::capture_shell_sql()),
+                CAPTURE = bs::capture_shell_sql(),
+                CLAIMED = claimed_since_sql(2)),
         )
         .and_then(|mut st| {
             st.query_map(rusqlite::params![session, reclaim_cut, verified_cut], |r| {
@@ -1799,7 +1838,8 @@ fn promote_blocked_self_owned_deps(conn: &Connection, session: &str, now: f64) -
     let reclaim_cut = now - reclaim_cooldown_s();
     let ids: Vec<String> = conn
         .prepare(&format!(
-            "SELECT i.id FROM issues i WHERE {DISPATCHABLE_WHERE} ORDER BY COALESCE(i.pinned,0) DESC, COALESCE(i.created,0) ASC"
+            "SELECT i.id FROM issues i WHERE {dw} ORDER BY COALESCE(i.pinned,0) DESC, COALESCE(i.created,0) ASC",
+            dw = dispatchable_where()
         ))
         .and_then(|mut st| {
             st.query_map(rusqlite::params![session, fresh_cut, reclaim_cut], |r| {
@@ -3381,8 +3421,9 @@ pub fn select_pickup_with(
                 // the 256-card scoring window before its pin boost applies; then
                 // oldest-first so a deep queue never drops the oldest before it
                 // can score.
-                "SELECT i.id FROM issues i WHERE {DISPATCHABLE_WHERE} \
-                 ORDER BY COALESCE(i.pinned,0) DESC, i.created ASC LIMIT 256"
+                "SELECT i.id FROM issues i WHERE {dw} \
+                 ORDER BY COALESCE(i.pinned,0) DESC, i.created ASC LIMIT 256",
+                dw = dispatchable_where()
             ))
             .and_then(|mut st| {
                 st.query_map(rusqlite::params![session, fresh_cut, reclaim_cut], |r| {
@@ -3423,8 +3464,9 @@ pub fn select_pickup_with(
         scored.into_iter().map(|(_, _, id)| id).collect()
     } else {
         conn.prepare(&format!(
-            "SELECT i.id FROM issues i WHERE {DISPATCHABLE_WHERE} \
-             ORDER BY COALESCE(i.pinned,0) DESC, COALESCE(i.pos, 0) ASC, i.created ASC LIMIT 16"
+            "SELECT i.id FROM issues i WHERE {dw} \
+             ORDER BY COALESCE(i.pinned,0) DESC, COALESCE(i.pos, 0) ASC, i.created ASC LIMIT 16",
+            dw = dispatchable_where()
         ))
         .and_then(|mut st| {
             st.query_map(rusqlite::params![session, fresh_cut, reclaim_cut], |r| {
@@ -10713,6 +10755,79 @@ mod tests {
             drainable_backlog_ids(&conn, "studio", now),
             vec!["MS-1".to_string(), "MS-2".to_string()],
             "a tag that merely starts with defer:focused must not match the exact exclusion"
+        );
+    }
+
+    /// AMUX-4782: a claim event with no `.issue` must not stop the fleet.
+    ///
+    /// The dispatch predicate used to be a CORRELATED leading-wildcard LIKE over
+    /// `session_events.data`, re-walked for every candidate row, per lane. On
+    /// the live board that cost 3073ms for 117 candidates; the non-correlated
+    /// `id NOT IN (SELECT json_extract(...))` form returned the identical rows
+    /// in 227ms, of which 218ms was transport.
+    ///
+    /// The rewrite carries one hazard the LIKE did not have, and it is the
+    /// reason this test exists rather than a benchmark. `x NOT IN (set)` is
+    /// NULL, not TRUE, when the set contains a NULL. So a SINGLE malformed
+    /// claim event whose data has no `.issue` would make the predicate reject
+    /// EVERY card on EVERY lane, and board-drive would go quietly idle with a
+    /// full queue. `json_extract(...) IS NOT NULL` inside the subquery is what
+    /// makes that impossible, and deleting it must fail here.
+    #[test]
+    fn a_claim_event_without_an_issue_id_cannot_empty_the_dispatch_queue() {
+        let conn = board_db();
+        let now = now_f64();
+        add_card(&conn, "GOOD-1", "lane", "todo", "dispatchable", "SCOPE: x");
+        add_card(&conn, "GOOD-2", "lane", "todo", "dispatchable", "SCOPE: x");
+
+        // Baseline: both cards are dispatchable with no claim events at all.
+        assert_eq!(
+            eligible_todo_count(&conn, "lane", now),
+            2,
+            "premise: both cards dispatchable before any event exists"
+        );
+
+        // A REAL claim removes exactly its own card, which pins that the
+        // rewrite still does the job the LIKE was there to do.
+        conn.execute(
+            "INSERT INTO session_events (ts,session,type,data,source) \
+             VALUES (?1,'lane','task.claimed','{\"issue\":\"GOOD-1\"}','test')",
+            [now],
+        )
+        .unwrap();
+        assert_eq!(
+            eligible_todo_count(&conn, "lane", now),
+            1,
+            "a genuine claim must still exclude its own card"
+        );
+
+        // THE TRAP: an event of a matching type whose payload has no `issue`.
+        // Under `NOT IN` with an unguarded subquery this yields NULL for every
+        // row and the count collapses to 0.
+        conn.execute(
+            "INSERT INTO session_events (ts,session,type,data,source) \
+             VALUES (?1,'lane','task.claimed','{\"note\":\"no issue field\"}','test')",
+            [now],
+        )
+        .unwrap();
+        assert_eq!(
+            eligible_todo_count(&conn, "lane", now),
+            1,
+            "a malformed claim event must not reject every card; if this reads 0 the \
+             `json_extract(...) IS NOT NULL` guard is gone and the fleet stops dispatching"
+        );
+
+        // Non-JSON data is the same hazard by a different route.
+        conn.execute(
+            "INSERT INTO session_events (ts,session,type,data,source) \
+             VALUES (?1,'lane','task.claimed','not json at all','test')",
+            [now],
+        )
+        .unwrap();
+        assert_eq!(
+            eligible_todo_count(&conn, "lane", now),
+            1,
+            "unparseable event data must not reject every card either"
         );
     }
 
