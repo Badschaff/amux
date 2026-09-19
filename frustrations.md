@@ -3292,44 +3292,36 @@ FIX: Assert the SHAPE either way, and admit exactly one host excuse. The
   tick — so the test was not merely flaky, it was the only thing reporting a
   production job that has silently not run.
 
-  ## A create can silently fold into an active card, with no visible signal, and a routine cleanup then lands on the wrong card
-  AREA: board
-  SEVERITY: blocks
-  STATUS: open
-  DATE: 2026-09-18
-  SESSION: amux-frustrations
-  CARD: AF-922
-  SYMPTOM: sent a plain `POST /api/board` to create a throwaway verification card
-   (title "af460 verify probe") while my own AF-460 was `doing`. The response was an
-   ordinary-looking 2xx with an `id` field — no error, nothing that read as a
-   refusal — except the `id` it returned was `AF-460` itself: a model-judged
-   "semantic intake" classifier (92% confidence, ~4.7s) had decided the new title
-   was "the same work" and folded it (`intake.action: "append"`) instead of
-   creating anything new. The fold signal was real and present in the response
-   body (`intake.comparison.decision.reason`), just buried where nobody creating
-   a routine test card would think to check it. Treating the returned id as a
-   disposable probe, I archived it, force-PATCHed its status (correctly refused,
-   `archived_task_immutable`), restored it, then DELETEd it — every one of those
-   calls actually landed on my real, in-progress AF-460 work card. Caught only
-   because the DELETE produced a 404 on a card I knew should still exist.
-  COST: a live work card carrying ~50 log lines of investigation, decisions and a
-   shipped fix came within one missed double-check of being permanently gone from
-   every normal read path. Recovery required leaving the sanctioned API entirely —
-   a direct `sqlite3` UPDATE clearing `issues.deleted` on the live production DB —
-   because no undelete endpoint or CLI verb exists for a soft-deleted card
-   (confirmed: `board.rs::delete_item` calls `bs::soft_delete`, which only sets a
-   timestamp; nothing clears it back). Ten minutes, plus the risk of a manual raw
-   SQL write against the fleet's shared database, for what should have been a
-   disposable throwaway create.
-  FIX: not chosen. Two independent fixes, and they are not the same one: (1) a
-   fold this consequential should not resolve to a bare 2xx — the response should
-   make it unmistakable that no new resource was created (a distinct status code,
-   or `applied: false`-shaped body, the way other non-mutations in this API
-   already signal a no-op rather than dressing it as success). (2) `soft_delete`
-   has no inverse anywhere in the API or CLI — a mistaken delete on ANY card, fold
-   or not, currently has no sanctioned recovery path at all; a plain `amux board
-   undelete <ID>` (clearing `deleted` the same way `unarchive` clears `archived`)
-   would have made this a 5-second fix instead of a raw DB write. Neither is mine
-   to ship unilaterally — (1) changes the create contract every caller reads, (2)
-   is a new recovery primitive — but leaving (2) missing means the NEXT accidental
-   delete on this fleet has the same only-option: raw SQL against production.
+## `waiting_on` PATCHed with its own documented JSON-object shape silently cleared it instead
+AREA: board
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-18
+SESSION: amux-frustrations
+CARD: AF-930
+SYMPTOM: PATCHed `waiting_on` on a real needsyou card (AF-546) with the exact
+ object shape migrations/0048 documents ({"actor":...,"type":...,"question":...,
+ "unblocks":...}) and the shape `advance()`'s own Gap-4 logic writes on NeedsYou
+ entry. Response was 200, `applied: true`, `waiting_on` echoed back correctly in
+ that one response -- but a subsequent GET, and the card's own `log`, showed
+ `waiting_on: null`, with the log line reading plainly "amux-frustrations:
+ waiting_on" as if the write had landed. `set_opt`'s `body_opt_str` treats any
+ non-string JSON value the same as an explicit null: `Some(v) =>
+ Some(v.as_str().map(str::to_string))` returns `Some(None)` for an object,
+ which is indistinguishable from a caller clearing the field on purpose. Same
+ defect shape AF-711 already fixed for `acceptance_criteria` four lines above
+ the unfixed `waiting_on` call site in the same file.
+COST: two extra round-trips fixing the same card's `waiting_on` field before
+ realizing the object shape itself was the problem, one of which briefly left
+ AF-546 -- a card actually waiting on Ethan -- carrying a stale, wrong question
+ because the correction attempt used the same broken shape.
+FIX: 831cc0cb + a35d850f. Added `encode_waiting_on` mirroring
+ `encode_acceptance_criteria`: object or non-empty string -> JSON-encoded and
+ stored; null/empty -> clears; any other shape -> rejected with a 400 instead
+ of silently coerced into a clear. Also fixed a second, related read-side gap:
+ `snapshot_fields` decoded `waiting_on` via `serde_json::from_str(s).ok()`,
+ which reports the same null for "empty" and "holds real content that failed
+ to parse" -- switched to the existing `parse_json_or_raw_string` helper
+ (already used for `acceptance_criteria`), so legacy non-JSON content also
+ stops rendering as null. 6 new tests, mutation-verified: reverting the object
+ arm to `Ok(None)` reddened exactly the 2 tests exercising that shape.
