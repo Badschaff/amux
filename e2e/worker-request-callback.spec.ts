@@ -1,6 +1,6 @@
 // Worker board ownership is an authorization boundary. Peer collaboration is
-// represented by reviewer/shepherd/task-dependency links, never by placing a
-// newly created card directly on another worker's board.
+// represented by reviewer/shepherd and evidence references. Another worker's
+// board cannot become an execution prerequisite or receive this worker's tasks.
 import { test, expect } from './fixtures';
 
 test('a worker creates only on its own board and links peers explicitly', async ({ page, request }, testInfo) => {
@@ -25,7 +25,7 @@ test('a worker creates only on its own board and links peers explicitly', async 
     }
 
     // Administrative setup creates a real task on the reviewer's board. The
-    // worker may depend on it, but may not create another card in that lane.
+    // worker may reference it, but cannot depend on it or create cards there.
     const dependencyMade = await request.post('/api/board', {
       headers: auth,
       data: {
@@ -46,17 +46,30 @@ test('a worker creates only on its own board and links peers explicitly', async 
       code: 'cross_board_create_forbidden', caller: owner, requested_owner: reviewer,
     });
 
+    const foreignDependency = await request.post('/api/board', {
+      headers: { ...auth, 'X-Amux-Worker': owner },
+      data: {
+        title: 'Foreign dependency must fail', status: 'backlog', session: owner,
+        type: 'chore', depends_on: [dependency],
+      },
+    });
+    expect(foreignDependency.status()).toBe(409);
+    expect(await foreignDependency.json()).toMatchObject({
+      code: 'cross_board_dependency_forbidden',
+      dependencies: [{ id: dependency, session: reviewer }],
+    });
+
     const made = await request.post('/api/board', {
       headers: { ...auth, 'X-Amux-Worker': owner },
       data: {
         title: 'Owner-controlled work with peer links',
-        desc: 'Ownership stays local while peer review and dependency edges remain explicit.',
+        desc: `Ownership stays local. Reference peer artifact ${dependency}; own any missing implementation.`,
         status: 'backlog',
         session: owner,
         type: 'chore',
         reviewer,
         shepherd,
-        depends_on: [dependency],
+        depends_on: [],
       },
     });
     expect(made.status()).toBe(201);
@@ -66,7 +79,7 @@ test('a worker creates only on its own board and links peers explicitly', async 
       session: owner,
       reviewer,
       shepherd,
-      depends_on: [dependency],
+      depends_on: [],
     });
 
     const reassignRefused = await request.patch(`/api/board/${encodeURIComponent(owned)}`, {

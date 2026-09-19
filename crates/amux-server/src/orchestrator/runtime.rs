@@ -2826,14 +2826,16 @@ mod adherence_tests {
         );
     }
 
-    /// M5 guards: steering words mint nothing, but every durable command cards
-    /// even while other work is open. Command/message idempotency owns transport
-    /// retries; text equality is not enough to erase an intentional repeat.
+    /// Commands remain deliverable even when their board receipt is reused.
+    /// Distinct work gets its own receipt; identical open work must not inflate
+    /// the backlog or replace the current execution claim.
     #[tokio::test]
-    async fn steering_skips_but_open_work_and_repeated_commands_still_card() {
+    async fn steering_skips_and_repeated_commands_reuse_open_board_receipts() {
         let store = store();
         let w = seed_worker(&store, 4, "alpha");
-        let rt = runtime(store.clone(), None, false);
+        let protocol = Arc::new(MockProtocol::new());
+        protocol.register(w.clone(), AgentState::Idle);
+        let rt = runtime(store.clone(), Some(protocol.clone()), false);
 
         // Control word: retained as a message by the caller, but not a task.
         let now = Utc::now();
@@ -2855,21 +2857,34 @@ mod adherence_tests {
             "an open card must not absorb a different command before the model can classify it"
         );
 
-        // A second durable message with identical text may be intentional. The
-        // transport layer dedupes retries by message id, so capture must not add
-        // a second, capability-reducing text heuristic.
-        rt.capture_prompt_card(
-            &w,
-            "also handle the retry path in the same module please",
-            now + chrono::Duration::seconds(1),
-        )
-        .await
-        .unwrap();
+        // Two intentional repeats still reach the model and remain durable
+        // messages. Only the redundant board receipts are consolidated.
+        for key in ["repeat-one", "repeat-two"] {
+            let message = MessageId::from_ulid(ulid::Ulid::new());
+            seed_message(&store, &message, "also handle the retry path in the same module please");
+            enqueue_deliver(&store, &w, &message, key);
+            rt.pump_commands(Utc::now(), &BTreeMap::new()).await.unwrap();
+            // The mock does not emit provider acknowledgements. Confirm this
+            // delivery through the command state machine before the next one.
+            store.write(move |conn| {
+                let id: String = conn.query_row(
+                    "SELECT id FROM _amux_commands WHERE idempotency_key=?1", [key], |r| r.get(0),
+                )?;
+                crate::db::commands::transition(conn, &CommandId::parse(&id).unwrap(),
+                    amux_core::protocol::CommandTransition::Confirm, 3)?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            }).unwrap();
+        }
+        assert_eq!(protocol.calls().iter().filter(|call|
+            matches!(call, RecordedCall::DeliverMessage { .. })).count(), 2);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM _amux_messages"), 2);
         assert_eq!(
             count(&store, "SELECT COUNT(*) FROM issues"),
-            3,
-            "a separate durable command must remain visible to the model"
+            2,
+            "repeated delivery must not duplicate the same unfinished board outcome"
         );
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM issues WHERE status='doing'"), 1);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM issues WHERE status='backlog'"), 1);
     }
 
     fn seed_message(store: &SharedStore, id: &MessageId, body: &str) {
