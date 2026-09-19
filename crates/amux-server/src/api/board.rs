@@ -6466,6 +6466,26 @@ async fn provision_ephemeral(
     if !session_verbs::valid_session_name(name) { return Err("invalid ephemeral worker name".into()); }
     static PROVISIONING: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
     let provisioning = PROVISIONING.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+    let parent = session_verbs::parse_env(config.parent);
+    if parent.get("CC_PAUSED") == Some("1") || parent.get("CC_ARCHIVED") == Some("1") {
+        return Err("parent worker is paused or archived".into());
+    }
+    // Provisioning follows the writer transaction. Recheck the assignment after
+    // that boundary so a closed, moved or held task cannot start from a stale row.
+    {
+        let conn = state.store.read().map_err(|e| e.to_string())?;
+        let current = bs::get_issue(&conn, &child.id).map_err(|e| e.to_string())?
+            .ok_or_else(|| "assignment no longer exists".to_string())?;
+        if current.session.as_deref() != Some(name) || current.archived != 0
+            || bs::execution_is_terminal(&current.status, &current.item_type)
+            || !matches!(current.status.as_str(), "todo" | "doing" | "done")
+            || current.blocked_on.as_deref().is_some_and(|v| !v.trim().is_empty())
+            || current.depends_on.iter().any(|id| !bs::dependency_resolved(&conn, id).unwrap_or(false)) {
+            tracing::info!(card = %child.id, session = name, verdict = "ephemeral_assignment_changed",
+                "ephemeral start refused after assignment changed or lost readiness");
+            return Err("assignment changed or is no longer ready; worker not started".into());
+        }
+    }
     let path = env_path(name);
     let mut env = EnvFile::load(&path);
     if path.exists() {
@@ -6482,10 +6502,6 @@ async fn provision_ephemeral(
             return Ok(());
         }
     } else {
-        let parent = session_verbs::parse_env(config.parent);
-        if parent.get("CC_PAUSED") == Some("1") || parent.get("CC_ARCHIVED") == Some("1") {
-            return Err("parent worker is paused or archived".into());
-        }
         env.set("CC_DIR", parent.get_or("CC_DIR", ""));
         env.set("CC_WORKTREE", "1");
         env.set("CC_EPHEMERAL", "1");

@@ -781,3 +781,23 @@ async fn fan_out_consumes_completed_inputs_without_cross_worker_execution_depend
     assert_eq!(after["depends_on"],json!([]));
     assert!(after["log"].as_str().unwrap().contains(input_id), "completed input remains auditable");
 }
+
+#[tokio::test]
+async fn retry_does_not_restart_existing_children_of_a_paused_parent() {
+    let r=rig();
+    write_parent_env(&r.home,"paused-parent");
+    let request=json!({"parent_session":"paused-parent","priorities":["Verify the parser"],"model":"haiku"});
+    let (status,_,first)=send(&r.app,"POST","/api/board/launch",Some(request.clone()),&[("x-amux-session","paused-parent")]).await;
+    assert_eq!(status,StatusCode::CREATED,"{first}");
+    let child=first["children"][0]["worker"].as_str().unwrap();
+    let child_path=r.home.join("sessions").join(format!("{child}.env"));
+    let child_before=std::fs::read_to_string(&child_path).unwrap();
+    let parent_path=r.home.join("sessions/paused-parent.env");
+    let parent_before=std::fs::read_to_string(&parent_path).unwrap();
+    std::fs::write(parent_path,format!("{parent_before}\nCC_PAUSED=1\n")).unwrap();
+    let (status,_,retry)=send(&r.app,"POST","/api/board/launch",Some(request),&[("x-amux-session","paused-parent")]).await;
+    assert_eq!(status,StatusCode::CREATED,"{retry}");
+    assert_eq!(retry["epic"],first["epic"]);
+    assert!(retry["failed"][0]["error"].as_str().unwrap().contains("parent worker is paused"));
+    assert_eq!(std::fs::read_to_string(child_path).unwrap(),child_before);
+}
