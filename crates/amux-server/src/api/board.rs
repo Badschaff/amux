@@ -5384,6 +5384,38 @@ pub async fn create_item(
             // seconds") reddening under this exact mutation.
             v["card_created"] = json!(!reused);
             v["intake"] = json!({"action":if reused {intake_response.decision.action.as_str()} else {"create"}, "comparison":intake_response});
+            // AMUX-4846. A create that waited on the classifier should say what
+            // would have skipped it.
+            //
+            // `model_ms` already tells the caller the call happened and how long
+            // it took (AMUX-4655). What it cannot say is that the wait was
+            // AVOIDABLE. plan_create skips the comparison entirely when the
+            // create carries its own structure, and 963 of 1185 intake decisions
+            // in one 28h window took that path; the 222 that did not have a p50
+            // of 3322ms.
+            //
+            // Worth saying on this path specifically because the two sets
+            // coincide: a card filed with no `next_action` is also the card the
+            // continuation gate refuses to dispatch, so the creates paying three
+            // seconds here are largely the ones that cannot be picked up
+            // afterwards. Naming the keys turns a cost the caller cannot see
+            // into one they can remove, which is cheaper than moving the call
+            // off the request and does not touch the 201-vs-200 contract every
+            // worker's create recipe reads.
+            //
+            // Built from board_intake::STRUCTURED_KEYS rather than a written-out
+            // list, so the advice cannot drift from the gate that enforces it.
+            if intake_response.model_ms.is_some() {
+                v["intake_wait_avoidable"] = json!({
+                    "why": "this create waited on the semantic classifier because it carried no \
+                            structure of its own; a create carrying any of these keys skips the \
+                            comparison and returns without a model call",
+                    "keys": super::board_intake::STRUCTURED_KEYS,
+                    "note": "`next_action` is usually the one worth adding: the continuation gate \
+                             already refuses to dispatch a card without it, so supplying it here \
+                             removes this wait and makes the card claimable.",
+                });
+            }
             // AMUX-4860. The status the caller asked for is not the status it
             // got, so SAY SO in the reply. A create that silently becomes
             // something else is the AMUX-4776 trap: there, intake folded a

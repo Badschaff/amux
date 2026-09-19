@@ -89,6 +89,24 @@ impl Plan {
     }
 }
 
+/// The keys whose presence proves a create already carries its own structure,
+/// so the semantic comparison is skipped and no model call is made.
+///
+/// AMUX-4846: NAMED ONCE so the create response can tell a caller which keys
+/// would have skipped the call it just waited on. The hint and the gate must
+/// read the same list, or the advice drifts from the behaviour and sends people
+/// to fields that no longer help.
+///
+/// Measured 2026-09-19 over one 28h window: 963 of 1185 intake decisions took
+/// this path and made no model call; the 222 that did have a p50 of 3322ms.
+/// So this list is what separates a create that returns immediately from one
+/// that waits about three seconds.
+pub(crate) const STRUCTURED_KEYS: [&str; 15] = [
+    "depends_on", "gate", "callback", "due", "due_time", "reviewer", "shepherd",
+    "ask_actor", "ask_type", "ask_question", "ask_unblocks", "tags", "request_to",
+    "next_action", "acceptance_criteria",
+];
+
 /// Explicit graph/gate metadata already determines that a new record is needed.
 /// Keep the comparison lazy: invoking and then discarding a model result holds
 /// the lane lock and bills a call that cannot change the outcome.
@@ -109,8 +127,7 @@ where
     // AF-616's auto-fold hazard with a requester attached: there, a capture was
     // folded into an unrelated finding carded in the same minute, and the trail
     // from the report to its fix ran through a card about something else.
-    let structured = ["depends_on", "gate", "callback", "due", "due_time", "reviewer", "shepherd",
-        "ask_actor", "ask_type", "ask_question", "ask_unblocks", "tags", "request_to", "next_action", "acceptance_criteria"].iter()
+    let structured = STRUCTURED_KEYS.iter()
         .any(|key| map.get(*key).is_some_and(|v| !v.is_null() && v != "" && v != &serde_json::json!([])))
         || matches!(item_type, "epic" | "watch" | "tripwire");
     if structured {
@@ -526,6 +543,110 @@ mod tests {
 }
 
 /// AMUX-4836: the create must not wait forever on the classifier.
+#[cfg(test)]
+mod structured_skip_tests {
+    use super::*;
+    use serde_json::json;
+    use std::cell::Cell;
+
+    /// AMUX-4846. Every key the create response advertises as avoiding the
+    /// classifier must actually avoid it.
+    ///
+    /// The response now tells a caller which keys would have skipped the ~3.3s
+    /// wait it just paid, and that advice is only worth anything if the gate
+    /// honours the same list. Both read `STRUCTURED_KEYS`, so this pins that
+    /// the list MEANS what the hint claims: each key on it, alone, prevents the
+    /// comparison from being invoked at all.
+    ///
+    /// THE CONTROL ARM IS THE POINT. Asserting that a structured create skips
+    /// the call passes just as well against a plan_create that never calls the
+    /// model for anything, which would silently disable semantic intake
+    /// entirely. The bare create below is what catches that.
+    #[tokio::test]
+    async fn every_advertised_key_skips_the_model_and_a_bare_create_does_not() {
+        // THE LOOP BELOW CANNOT CHECK THE KEY NAMES, so these do it first.
+        //
+        // Iterating STRUCTURED_KEYS and setting whatever it contains is
+        // self-consistent by construction: rename a key and the test renames
+        // with it, so the gate still honours what the test sends. Caught by
+        // mutating `"next_action"` to `"next_action_NOT_HONOURED"` and watching
+        // the suite stay green.
+        //
+        // These names are the CONTRACT, because the create response prints them
+        // as advice a caller will type, so a rename has to redden something.
+        // Asserted as literals, independent of the const.
+        for required in ["next_action", "acceptance_criteria", "depends_on", "request_to"] {
+            assert!(
+                STRUCTURED_KEYS.contains(&required),
+                "`{required}` is advertised to callers and must stay on the list the gate reads"
+            );
+            let called = Cell::new(false);
+            let mut m = serde_json::Map::new();
+            m.insert(required.to_string(), json!("x"));
+            let _ = plan_create(&m, "code", || async {
+                called.set(true);
+                Plan::create("compared", vec![], 0, true)
+            })
+            .await;
+            assert!(
+                !called.get(),
+                "a create carrying the literal key `{required}` must skip the comparison"
+            );
+        }
+
+        for key in STRUCTURED_KEYS {
+            let called = Cell::new(false);
+            let mut map = serde_json::Map::new();
+            map.insert(key.to_string(), json!("x"));
+            let plan = plan_create(&map, "code", || async {
+                called.set(true);
+                Plan::create("compared", vec![], 0, true)
+            })
+            .await;
+            assert!(
+                !called.get(),
+                "a create carrying `{key}` must skip the comparison, or the response's own \
+                 advice to add it is false"
+            );
+            assert!(
+                plan.model_ms.is_none(),
+                "and it must report no model call for `{key}`"
+            );
+        }
+
+        // CONTROL: nothing structured, so the comparison DOES run. Without this
+        // the loop above is satisfied by a gate that skips everything.
+        let called = Cell::new(false);
+        let mut bare = serde_json::Map::new();
+        bare.insert("title".into(), json!("a bare card"));
+        let _ = plan_create(&bare, "code", || async {
+            called.set(true);
+            Plan::create("compared", vec![], 0, true)
+        })
+        .await;
+        assert!(
+            called.get(),
+            "a create with no structure must still be compared, or semantic intake is off"
+        );
+
+        // AND AN EMPTY VALUE IS NOT STRUCTURE. `{\"next_action\": \"\"}` must
+        // not buy a skip, or a caller sending the key with nothing in it gets
+        // the fast path and an undispatchable card.
+        let called = Cell::new(false);
+        let mut empty = serde_json::Map::new();
+        empty.insert("next_action".into(), json!(""));
+        let _ = plan_create(&empty, "code", || async {
+            called.set(true);
+            Plan::create("compared", vec![], 0, true)
+        })
+        .await;
+        assert!(
+            called.get(),
+            "an empty structured value must not count as structure"
+        );
+    }
+}
+
 #[cfg(test)]
 mod intake_deadline_tests {
     use super::*;
