@@ -78,9 +78,15 @@ real current task).
 
 ### P8 — Nothing user-authored is destroyed
 Clearing/typing into the input box must never eat queued or user-composed
-text: `C-u` only fires on amux's own delivery path, ghost-rescue only submits
-text carrying amux's `[H:MM AM]` prefix, and switching agent views round-trips
-without touching pending input.
+text: `C-u` only fires on amux's own delivery path, and switching agent views
+round-trips without touching pending input.
+
+Ghost-rescue (the `[H:MM AM]`-stamped auto-submit for a stuck composer) was
+removed in the 2026-09-17 KISS audit — nothing automated touches the composer
+on a stuck send anymore, which trivially satisfies this criterion by having
+no actor to violate it. A message that never gets submitted now surfaces
+manually instead: the message list's `submit_verdict` renders a red "NOT
+SENT" chip (`_msgSubmitChip`, AMUX-2643) rather than being auto-recovered.
 
 ## Automated checks
 
