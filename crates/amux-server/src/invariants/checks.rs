@@ -7126,12 +7126,12 @@ pub fn unrecorded_schedule_outcomes_are_visible(
         .collect();
     let mut out = InvariantResult::new(ID, Status::Fail);
     out.expected = format!(
-        "every delivery='unknown' run in the last {window_h}h is followed by a success within \
-         the schedule's own cadence"
+        "every delivery='unknown' run in the last {window_h}h is followed by a RECORDED outcome \
+         (success, delivery or a stated refusal) within the schedule's own cadence"
     );
     out.observed = format!(
         "{} schedule(s) of the {total} unrecorded fire(s) in the last {window_h}h are PAST their \
-         own next fire and still have not succeeded: {}. The server restarted mid-fire (AF-515); \
+         own next fire and have still recorded no outcome: {}. The server restarted mid-fire (AF-515); \
          status='error' on these rows is not a job failure, it is an unrecorded outcome, and for \
          these the work may simply not have happened. A further {} schedule(s) were interrupted \
          and have already caught up on their own next tick, and {} more are still inside their \

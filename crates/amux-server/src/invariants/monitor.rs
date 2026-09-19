@@ -849,6 +849,17 @@ fn unrecorded_schedule_outcomes_check(state: &AppState) -> Vec<InvariantResult> 
     // only shell recoveries and reports every healthy tmux schedule as never
     // having recovered — it invented a stalled SCHED-455 while that schedule
     // was firing every 20 minutes exactly as configured.
+    //
+    // AND A REFUSAL COUNTS, because what this invariant measures is whether an
+    // outcome got RECORDED, not whether the work succeeded (AMUX-4805). A
+    // 'refused' row says the scheduler fired, reached a decision and wrote it
+    // down, with `last_refusal_reason` naming the cause; nothing about that tick
+    // is in doubt. Leaving it out meant a schedule whose TARGET is paused could
+    // never clear, because a paused target yields refusals forever and never a
+    // success: SCHED-183 read as 11.7 days outstanding while firing daily on
+    // time, and the actionable fact ("gtm-engine is paused") was already on
+    // every one of those rows. Measured over the full history, including it
+    // drops the fires from 15 to 11 and every one it removes is that shape.
     let rows: Vec<checks::UnrecordedScheduleOutcome> = conn
         .prepare(
             "SELECT r.schedule_id, COUNT(*), COALESCE(s.title,''), COALESCE(s.session,''), \
@@ -856,7 +867,7 @@ fn unrecorded_schedule_outcomes_check(state: &AppState) -> Vec<InvariantResult> 
                     (SELECT MIN(n.ran_at) FROM schedule_runs n \
                        WHERE n.schedule_id = r.schedule_id \
                          AND n.ran_at > MAX(r.ran_at) \
-                         AND n.status IN ('ok','delivered','queued')) AS recovered_at, \
+                         AND n.status IN ('ok','delivered','queued','refused')) AS recovered_at, \
                     s.schedule_expr, \
                     (s.id IS NOT NULL AND COALESCE(s.enabled,0)=1 AND s.deleted IS NULL) AS can_fire \
              FROM schedule_runs r LEFT JOIN schedules s ON s.id = r.schedule_id \
