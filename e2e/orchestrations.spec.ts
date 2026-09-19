@@ -161,7 +161,7 @@ test.describe('orchestrations tab', () => {
     });
     await linkChild(request, auth, activeChild.id, activeEpic.id);
 
-    // Create a paused orchestration (status: todo)
+    // A queued epic is active work, not a paused worker.
     const pausedTitle = `e2e-paused-${Date.now()}`;
     const pausedEpic = await createCard(request, auth, {
       title: pausedTitle,
@@ -186,13 +186,85 @@ test.describe('orchestrations tab', () => {
     await page.click('.orch-filter-pill[data-filter="active"]');
     await expect(page.locator('#orch-list')).toContainText(activeTitle, { timeout: 5_000 });
 
-    // Click the "Paused" filter pill
+    await expect(page.locator('#orch-list')).toContainText(pausedTitle);
+    // No worker was paused; an epic's To Do status must not imply a pause.
     await page.click('.orch-filter-pill[data-filter="paused"]');
-    await expect(page.locator('#orch-list')).toContainText(pausedTitle, { timeout: 5_000 });
+    await expect(page.locator('#orch-list')).not.toContainText(pausedTitle);
 
     // Click "All" to restore
     await page.click('.orch-filter-pill[data-filter="all"]');
     await expect(page.locator('#orch-list')).toContainText(activeTitle, { timeout: 5_000 });
     await expect(page.locator('#orch-list')).toContainText(pausedTitle, { timeout: 5_000 });
   });
+});
+
+
+test('whole child boards, orphan fan-outs, real pauses and worktree state are visible', async ({ page }) => {
+  const cards = [
+    { id:'E', title:'Customer reliability epic', type:'epic', status:'doing', session:'parent', execution_terminal:false },
+    { id:'A', title:'Assignment implementation', type:'code', status:'done', session:'child', epic:'E', execution_terminal:false },
+    { id:'B', title:'Follow-up without an epic link', type:'code', status:'doing', session:'child', execution_terminal:false },
+    { id:'C', title:'Orphan board work', type:'code', status:'backlog', session:'orphan', execution_terminal:false },
+    { id:'P', title:'Preserved paused work', type:'code', status:'verified', session:'paused-child', execution_terminal:true },
+    { id:'R', title:'Retired worker outcome', type:'code', status:'verified', session:'retired', execution_terminal:true },
+  ];
+  await page.route('**/api/board/orchestrations', r => r.fulfill({json:{measured:true,n_considered:20000,cards,ephemeral_workers:['retired'],workers:[{name:'retired',ephemeral:true,lifecycle:'expired',running:false}]}}));
+  await page.route('**/api/sessions', r => r.fulfill({json:[
+    {name:'child',ephemeral:true,lifecycle:'active',running:true,status:'active',task_board_id:'B',worktree_active:true,branch:'amux/fanout/child',worktree_integration:{status:'requires_work',detail:'Validation failed: fix on this worker'}},
+    {name:'orphan',ephemeral:true,lifecycle:'active',running:false,status:'idle'},
+    {name:'paused-child',ephemeral:true,lifecycle:'paused',running:false,status:'paused'},
+  ]}));
+  const fullHistory: string[]=[];
+  page.on('request',r=>{if(r.url().includes('/api/board?all=1&slim=0')) fullHistory.push(r.url());});
+  await page.goto('/');
+  await page.locator('#tab-orchestrations').click();
+  const root=page.locator('[data-orch-id="E"]');
+  await expect(root).toContainText('0/2'); // Code Done still needs its terminal gate.
+  await root.locator('.orch-node-header').click();
+  await expect(root).toContainText('Follow-up without an epic link');
+  await expect(root.locator('.working-now')).toContainText('Working now');
+  await expect(root).toContainText('amux/fanout/child');
+  await expect(root).toContainText('requires work');
+  await expect(page.locator('[data-orch-id="worker:orphan"]')).toBeVisible();
+  await page.click('.orch-filter-pill[data-filter="paused"]');
+  await expect(page.locator('#orch-list')).toContainText('paused-child');
+  await expect(page.locator('#orch-list')).not.toContainText('Customer reliability epic');
+  expect(fullHistory).toEqual([]);
+  await page.click('.orch-filter-pill[data-filter="expired"]');
+  await expect(page.locator('#orch-list')).toContainText('retired');
+  await expect(page.locator('#orch-list')).not.toContainText('paused-child');
+  await page.click('.orch-filter-pill[data-filter="all"]');
+  const width=await page.evaluate(()=>({w:innerWidth,body:document.documentElement.scrollWidth}));
+  expect(width.body).toBeLessThanOrEqual(width.w+1);
+  await page.screenshot({path:test.info().outputPath('orchestrations.png'),fullPage:true});
+});
+
+test('loading and failed measurement are explicit and retry recovers', async ({ page }) => {
+  let attempts=0;
+  await page.route('**/api/board/orchestrations', async r => {
+    attempts++;
+    if(attempts===1) { await new Promise(resolve=>setTimeout(resolve,600)); await r.fulfill({status:503,json:{measured:false,error:'fixture failure'}}); }
+    else await r.fulfill({json:{measured:true,n_considered:0,cards:[]}});
+  });
+  await page.route('**/api/sessions', r => r.fulfill({json:[]}));
+  await page.goto('/');
+  await page.locator('#tab-orchestrations').click();
+  await expect(page.locator('#orch-list')).toContainText('Loading orchestration boards');
+  await expect(page.locator('#orch-list [role="alert"]')).toContainText('Could not load');
+  await page.locator('#orch-list').getByRole('button',{name:'Retry'}).click();
+  await expect(page.locator('#orch-list')).toContainText('No orchestrations yet');
+  expect(attempts).toBe(2);
+});
+
+
+test('board content is visible while live worker status is still pending', async ({ page }) => {
+  let release!:()=>void;
+  const gate=new Promise<void>(resolve=>{release=resolve;});
+  await page.route('**/api/sessions',async r=>{await gate;await r.fulfill({json:[]});});
+  await page.route('**/api/board/orchestrations',r=>r.fulfill({json:{measured:true,n_considered:1,cards:[{id:'PENDING',title:'Visible without runtime probes',type:'epic',status:'todo',execution_terminal:false}],workers:[]}}));
+  try {
+    await page.goto('/');
+    await page.locator('#tab-orchestrations').click();
+    await expect(page.locator('#orch-list')).toContainText('Visible without runtime probes',{timeout:2000});
+  } finally { release(); }
 });

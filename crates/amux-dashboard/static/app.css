@@ -6865,3 +6865,15 @@ select.input { height:var(--control-height); }
   .msg-ctx-close { min-height:44px; }
   .msg-ctx-k { flex-basis:38%; }
 }
+
+/* Whole fan-out boards keep integration state readable on narrow screens. */
+.orch-integration,.orch-worktree { font-size:.68rem; color:var(--dim); max-width:180px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.orch-child.working-now > .orch-child-row { background:color-mix(in srgb,var(--accent) 9%,var(--surface)); border-left:3px solid var(--accent); }
+@media (max-width:600px) {
+  .orch-node-header { flex-wrap:wrap; }
+  .orch-node-title { flex-basis:calc(100% - 40px); white-space:normal; overflow-wrap:anywhere; }
+  .orch-child-row { flex-wrap:wrap; }
+  .orch-child-title { flex-basis:60%; white-space:normal; overflow-wrap:anywhere; }
+  .orch-worktree { max-width:100%; }
+  .orch-node-worker { max-width:85px; }
+}

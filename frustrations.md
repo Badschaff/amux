@@ -3378,3 +3378,26 @@ CARD: CLA-1
 SYMPTOM: Launch-created workers had three identical priority cards and AMUX_DISPATCH_BACKLOG_WHEN_IDLE=0; fan-out enabled the flag. Repeating either endpoint rewrote child env files, and title-derived identities could collide or change on retitle.
 COST: Three workers each held three copies of the same priority, while the harness could not drain their backlogs after completing the current task.
 FIX: Share ephemeral provisioning, reuse an identical open launch graph, retain assigned identity across retries, preserve pause/configuration, and fan out only ready independent tasks. Originator acceptance remains pending.
+
+
+## Orchestrations stays blank while full board history loads and misses child follow-ups
+AREA: board
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-19
+SESSION: codex-lifecycle-adherence
+CARD: CLA-2
+SYMPTOM: The Orchestrations view fetched all 20,888 issues with full descriptions before rendering; existing fan-out follow-ups without epic links were absent, and To Do epics were labelled paused regardless of worker lifecycle.
+COST: The owner could not see running fan-outs or assess their complete queues from Orchestrations.
+FIX: Compact measured projection of existing boards, whole child queues and orphan fan-outs, actual worker pause state, explicit loading/error/retry, shared terminal predicate and current-task highlighting. Pending originating-user validation.
+
+## Fan-out restart can discard the workspace and has no durable main integration stage
+AREA: scheduler
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-19
+SESSION: codex-lifecycle-adherence
+CARD: CLA-2
+SYMPTOM: Ephemeral starts recreated detached worktrees; stop forcibly disposed worktrees. Existing fan-outs had no recorded creation base or automatic checked integration. Two legacy worktrees had empty indexes over populated commits, and two running children had no worktree directory.
+COST: Completed child work had no deterministic route to main; stopping or restarting could lose uncommitted work, and malformed workspaces obstructed the board drain.
+FIX: Durable per-child branches, preserve workspaces on stop/restart, whole-board integration admission, separately tested merge candidate and ordinary push, pause cancellation, explicit preserved legacy recovery. Pending originating-user validation.

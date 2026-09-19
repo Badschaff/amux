@@ -697,7 +697,7 @@ fn pt(name: &str) -> String {
     pane_target(&tmux_name(name))
 }
 
-async fn run_cmd(bin: &str, args: &[&str], timeout: Duration) -> Option<std::process::Output> {
+pub(crate) async fn run_cmd(bin: &str, args: &[&str], timeout: Duration) -> Option<std::process::Output> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args(args)
         .stdin(std::process::Stdio::null())
@@ -9301,7 +9301,7 @@ fn build_claude_cmd(cfg: &EnvFile, flags: &str, default_flags: &str, session_fla
 /// experienced as "the fresh claude exited immediately". Each start/stop now
 /// owns the pane exclusively; a queued second start finds claude running and
 /// returns "already running" instead of typing over a healthy boot.
-fn session_op_lock(name: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+pub(crate) fn session_op_lock(name: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     static LOCKS: std::sync::Mutex<Option<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>> =
         std::sync::Mutex::new(None);
     let mut g = LOCKS.lock().unwrap();
@@ -9589,8 +9589,17 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
     };
 
     // --- Worktree isolation (opt-in via CC_WORKTREE=1) ---
-    let worktree_enabled = cfg.get_or("CC_WORKTREE", "") == "1";
-    if worktree_enabled {
+    let fanout = cfg.get("CC_EPHEMERAL") == Some("1");
+    let worktree_enabled = fanout || cfg.get_or("CC_WORKTREE", "") == "1";
+    if fanout {
+        match crate::fanout_workspace::ensure(&home(), name, &work_dir).await {
+            Ok(workspace) => work_dir = workspace.path,
+            Err(error) => {
+                tracing::warn!(session=name,%error,verdict="fanout_workspace_required", "fan-out start refused; workspace preserved");
+                return (false,error);
+            }
+        }
+    } else if worktree_enabled {
         let wt_dir = home().join("worktrees").join(name);
         let wt_path = wt_dir.to_string_lossy().into_owned();
         // Clean up stale worktree from a previous run.
@@ -10875,7 +10884,8 @@ async fn stop_session(state: &AppState, name: &str) -> (bool, String) {
             return (false, format!("worker stopped but status reset failed: {error}"));
         }
     }
-    cleanup_worktree(name).await;
+    // A stop/pause is a process lifecycle event, never workspace disposal.
+    tracing::info!(session=name,verdict="workspace_preserved_on_stop", "stopped worker retains its workspace and uncommitted files");
     result
 }
 
@@ -10992,37 +11002,6 @@ async fn stop_session_process(name: &str) -> (bool, String) {
         return (false, "could not confirm the worker process stopped".into());
     }
     (true, "stopped (hard-kill)".into())
-}
-
-/// Remove the per-worker worktree if one exists. Resolves the parent repo from
-/// the worktree's `.git` file so `git worktree remove` prunes the lock.
-async fn cleanup_worktree(name: &str) {
-    let wt_dir = home().join("worktrees").join(name);
-    if !wt_dir.exists() {
-        return;
-    }
-    let wt_path = wt_dir.to_string_lossy().into_owned();
-    // The worktree's .git is a file containing "gitdir: <repo>/.git/worktrees/<name>"
-    let repo_dir = match tokio::fs::read_to_string(wt_dir.join(".git")).await {
-        Ok(content) => {
-            content.strip_prefix("gitdir: ")
-                .and_then(|s| s.split("/.git/worktrees/").next())
-                .map(|s| s.trim().to_string())
-        }
-        Err(_) => None,
-    };
-    let removed = if let Some(ref repo) = repo_dir {
-        matches!(
-            run_cmd("git", &["-C", repo, "worktree", "remove", "--force", &wt_path], OP_TIMEOUT).await,
-            Some(o) if o.status.success()
-        )
-    } else {
-        false
-    };
-    if !removed && wt_dir.exists() {
-        let _ = tokio::fs::remove_dir_all(&wt_dir).await;
-    }
-    tracing::info!(session = name, worktree = %wt_path, "worktree cleaned up on stop");
 }
 
 async fn kill_tmux_session(name: &str) {
@@ -22259,6 +22238,37 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
     }
     let f = env_path(name);
     let mut cfg = parse_env(name);
+
+    // Fan-out integration configuration is durable and takes effect at the
+    // next boundary; changing it never restarts a worker or weakens its gates.
+    if let Some(value) = body.get("worktree_verify") {
+        let Some(command) = value.as_str().filter(|s| !s.trim().is_empty() && s.len() <= 8192) else {
+            return jresp(StatusCode::BAD_REQUEST, json!({"error":"worktree_verify must be a nonempty command (maximum 8192 bytes)"}));
+        };
+        cfg.set("CC_WORKTREE_VERIFY", command);
+        return match cfg.write(&f) {
+            Ok(()) => j200(json!({"ok":true,"worktree_verify":command})),
+            Err(e) => jresp(StatusCode::INTERNAL_SERVER_ERROR,json!({"error":env_write_error(&f,&e)})),
+        };
+    }
+    if let Some(value) = body.get("worktree_base") {
+        let Some(base) = value.as_str().filter(|s| s.len()==40 && s.bytes().all(|b|b.is_ascii_hexdigit())) else {
+            return jresp(StatusCode::BAD_REQUEST,json!({"error":"worktree_base must be an exact reviewed 40-character commit SHA"}));
+        };
+        let Some(mut workspace)=crate::fanout_workspace::load(&home(),name) else {
+            return jresp(StatusCode::CONFLICT,json!({"error":"No durable fan-out workspace is registered"}));
+        };
+        for tip in ["HEAD","origin/main"] {
+            if crate::fanout_workspace::git(&workspace.path,&["merge-base","--is-ancestor",base,tip]).await.is_err() {
+                return jresp(StatusCode::CONFLICT,json!({"error":format!("Reviewed base is not an ancestor of {tip}")}));
+            }
+        }
+        workspace.base=base.to_string();
+        return match crate::fanout_workspace::save(&home(),name,&workspace) {
+            Ok(()) => j200(json!({"ok":true,"worktree_base":base})),
+            Err(e) => jresp(StatusCode::INTERNAL_SERVER_ERROR,json!({"error":e})),
+        };
+    }
 
     // Rename — convergent cascade with journaling (owner addendum on
     // AMUX-2598: "if we change a name of a worker nothing happens — we

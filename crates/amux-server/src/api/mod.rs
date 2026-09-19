@@ -82,6 +82,7 @@ pub mod telegram;
 pub mod board_themes;
 pub mod lookup;
 pub mod orchestrate;
+pub mod orchestrations;
 pub mod simple;
 pub mod config_iac;
 pub mod skin;

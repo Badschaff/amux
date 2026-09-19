@@ -21,9 +21,14 @@ struct Rig {
     app: axum::Router,
     _dir: tempfile::TempDir,
     home: std::path::PathBuf,
+    _env: tokio::sync::MutexGuard<'static, ()>,
 }
 
-fn rig() -> Rig {
+async fn rig() -> Rig {
+    // AMUX_HOME is process-global. Hold one async lock for the entire fixture,
+    // including requests and assertions, so no test borrows a peer's home.
+    static ENV:tokio::sync::Mutex<()>=tokio::sync::Mutex::const_new(());
+    let guard=ENV.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("amux-home");
     std::fs::create_dir_all(home.join("sessions")).unwrap();
@@ -44,6 +49,7 @@ fn rig() -> Rig {
         app: router(state),
         _dir: dir,
         home,
+        _env:guard,
     }
 }
 
@@ -120,7 +126,7 @@ fn read_env_file(home: &std::path::Path, name: &str) -> std::collections::HashMa
 
 #[tokio::test]
 async fn fan_out_requires_session_attribution() {
-    let r = rig();
+    let r = rig().await;
     let epic = create(&r.app, json!({"title": "test epic", "type": "epic"})).await;
     let id = epic["id"].as_str().unwrap();
 
@@ -138,7 +144,7 @@ async fn fan_out_requires_session_attribution() {
 
 #[tokio::test]
 async fn fan_out_rejects_missing_card() {
-    let r = rig();
+    let r = rig().await;
     let (st, _, _) = send(
         &r.app,
         "POST",
@@ -152,7 +158,7 @@ async fn fan_out_rejects_missing_card() {
 
 #[tokio::test]
 async fn fan_out_rejects_non_epic_card() {
-    let r = rig();
+    let r = rig().await;
     let card = create(
         &r.app,
         json!({"title": "plain card", "type": "code", "session": "orch"}),
@@ -174,7 +180,7 @@ async fn fan_out_rejects_non_epic_card() {
 
 #[tokio::test]
 async fn fan_out_rejects_epic_with_no_children() {
-    let r = rig();
+    let r = rig().await;
     let epic = create(
         &r.app,
         json!({"title": "lonely epic", "type": "epic", "session": "orch"}),
@@ -196,7 +202,7 @@ async fn fan_out_rejects_epic_with_no_children() {
 
 #[tokio::test]
 async fn fan_out_rejects_epic_owned_by_another_worker() {
-    let r = rig();
+    let r = rig().await;
     let epic = create(
         &r.app,
         json!({"title": "owned epic", "type": "epic", "session": "alice"}),
@@ -234,7 +240,7 @@ async fn fan_out_rejects_epic_owned_by_another_worker() {
 
 #[tokio::test]
 async fn fan_out_skips_terminal_children() {
-    let r = rig();
+    let r = rig().await;
     let epic = create(
         &r.app,
         json!({"title": "mixed epic", "type": "epic", "session": "orch"}),
@@ -286,7 +292,7 @@ async fn fan_out_skips_terminal_children() {
 
 #[tokio::test]
 async fn fan_out_reassigns_children_and_writes_env_files() {
-    let r = rig();
+    let r = rig().await;
     let epic = create(
         &r.app,
         json!({"title": "deploy pipeline", "type": "epic", "session": "orch"}),
@@ -408,7 +414,7 @@ async fn fan_out_reassigns_children_and_writes_env_files() {
 
 #[tokio::test]
 async fn launch_creates_epic_children_and_env_files() {
-    let r = rig();
+    let r = rig().await;
     write_parent_env(&r.home, "dashboard");
 
     let (st, _, v) = send(
@@ -474,7 +480,7 @@ async fn launch_creates_epic_children_and_env_files() {
 
 #[tokio::test]
 async fn launch_rejects_empty_priorities() {
-    let r = rig();
+    let r = rig().await;
     write_parent_env(&r.home, "dashboard");
 
     let (st, _, v) = send(
@@ -494,7 +500,7 @@ async fn launch_rejects_empty_priorities() {
 
 #[tokio::test]
 async fn launch_rejects_missing_parent_session_env() {
-    let r = rig();
+    let r = rig().await;
     // No env file written for "ghost"
 
     let (st, _, v) = send(
@@ -516,7 +522,7 @@ async fn launch_rejects_missing_parent_session_env() {
 
 #[tokio::test]
 async fn launch_response_carries_all_fields_the_ui_needs() {
-    let r = rig();
+    let r = rig().await;
     write_parent_env(&r.home, "ui-test");
 
     let (st, _, v) = send(
@@ -566,7 +572,7 @@ async fn launch_response_carries_all_fields_the_ui_needs() {
 
 #[tokio::test]
 async fn launch_requires_session_attribution() {
-    let r = rig();
+    let r = rig().await;
     write_parent_env(&r.home, "dashboard");
 
     let (st, _, v) = send(
@@ -586,13 +592,11 @@ async fn launch_requires_session_attribution() {
 
 // ---- env file contract (single test, deterministic AMUX_HOME) ---------------
 //
-// The tests above tolerate missing env files because AMUX_HOME races across
-// parallel tests in the same binary. This test runs last and verifies the
-// full env file contract by constructing the state in one shot.
+// Every fixture holds the environment lock; missing files now fail honestly.
 
 #[tokio::test]
 async fn env_files_carry_the_full_ephemeral_contract() {
-    let r = rig();
+    let r = rig().await;
     write_parent_env(&r.home, "env-test-parent");
 
     let (st, _, v) = send(
@@ -609,16 +613,6 @@ async fn env_files_carry_the_full_ephemeral_contract() {
         &[("x-amux-session", "env-test-parent")],
     )
     .await;
-    if st == StatusCode::BAD_REQUEST
-        && v["error"]
-            .as_str()
-            .is_some_and(|e| e.contains("env file"))
-    {
-        // AMUX_HOME was overwritten by another parallel test in this binary,
-        // so the parent env file landed in a different tempdir than the
-        // handler is reading from. Not a fan-out defect.
-        return;
-    }
     assert_eq!(st, StatusCode::CREATED, "launch: {v}");
 
     let children = v["children"].as_array().unwrap();
@@ -626,13 +620,9 @@ async fn env_files_carry_the_full_ephemeral_contract() {
     let worker = children[0]["worker"].as_str().unwrap();
 
     let env = read_env_file(&r.home, worker);
-    if env.is_empty() {
-        // AMUX_HOME was overwritten by another test; not a fan-out defect.
-        return;
-    }
-
     let required = [
         ("CC_WORKTREE", "1"),
+        ("CC_WORKTREE_AUTO_MERGE", "1"),
         ("CC_EPHEMERAL", "1"),
         ("CC_PARENT", "env-test-parent"),
         ("CC_PROVIDER", "claude"),
@@ -668,7 +658,7 @@ async fn env_files_carry_the_full_ephemeral_contract() {
 
 #[tokio::test]
 async fn launch_deduplicates_worker_names() {
-    let r = rig();
+    let r = rig().await;
     write_parent_env(&r.home, "dashboard");
 
     let (st, _, v) = send(
@@ -691,7 +681,7 @@ async fn launch_deduplicates_worker_names() {
 
 #[tokio::test]
 async fn launch_retry_reuses_graph_and_preserves_paused_child_configuration() {
-    let r = rig();
+    let r = rig().await;
     write_parent_env(&r.home, "retry-parent");
     let request = json!({"title":"Retry receipt", "priorities":["Verify parser regression"],
         "parent_session":"retry-parent", "model":"haiku"});
@@ -718,7 +708,7 @@ async fn launch_retry_reuses_graph_and_preserves_paused_child_configuration() {
 
 #[tokio::test]
 async fn fan_out_retry_keeps_assignment_after_retitle_and_does_not_start_dependents() {
-    let r = rig();
+    let r = rig().await;
     write_parent_env(&r.home,"retry-fanout");
     let epic = create(&r.app,json!({"title":"Parser rollout", "type":"epic", "session":"retry-fanout"})).await;
     let eid = epic["id"].as_str().unwrap();
@@ -753,7 +743,7 @@ async fn fan_out_retry_keeps_assignment_after_retitle_and_does_not_start_depende
 
 #[tokio::test]
 async fn launch_cannot_put_work_on_another_workers_board() {
-    let r = rig();
+    let r = rig().await;
     write_parent_env(&r.home, "unrelated-owner");
     let (status,_,result) = send(&r.app,"POST","/api/board/launch",Some(json!({
         "parent_session":"unrelated-owner", "priorities":["Fix parser"]
@@ -764,7 +754,7 @@ async fn launch_cannot_put_work_on_another_workers_board() {
 
 #[tokio::test]
 async fn fan_out_consumes_completed_inputs_without_cross_worker_execution_dependencies() {
-    let r=rig();
+    let r=rig().await;
     write_parent_env(&r.home,"ready-parent");
     let epic=create(&r.app,json!({"title":"Independent rollout","type":"epic","session":"ready-parent"})).await;
     let eid=epic["id"].as_str().unwrap();
@@ -784,7 +774,7 @@ async fn fan_out_consumes_completed_inputs_without_cross_worker_execution_depend
 
 #[tokio::test]
 async fn retry_does_not_restart_existing_children_of_a_paused_parent() {
-    let r=rig();
+    let r=rig().await;
     write_parent_env(&r.home,"paused-parent");
     let request=json!({"parent_session":"paused-parent","priorities":["Verify the parser"],"model":"haiku"});
     let (status,_,first)=send(&r.app,"POST","/api/board/launch",Some(request.clone()),&[("x-amux-session","paused-parent")]).await;
@@ -800,4 +790,28 @@ async fn retry_does_not_restart_existing_children_of_a_paused_parent() {
     assert_eq!(retry["epic"],first["epic"]);
     assert!(retry["failed"][0]["error"].as_str().unwrap().contains("parent worker is paused"));
     assert_eq!(std::fs::read_to_string(child_path).unwrap(),child_before);
+}
+
+#[tokio::test]
+async fn orchestration_projection_and_integration_configuration_use_public_routes() {
+    let r=rig().await;
+    write_parent_env(&r.home,"child");
+    std::fs::write(r.home.join("sessions/child.env"),"CC_DIR=/tmp\nCC_EPHEMERAL=1\n").unwrap();
+    let epic=create(&r.app,json!({"title":"Integration epic","type":"epic","session":"parent"})).await;
+    let assignment=create(&r.app,json!({"title":"Assigned outcome","session":"child","epic":epic["id"]})).await;
+    let followup=create(&r.app,json!({"title":"Whole-board follow-up","session":"child","desc":"long private history"})).await;
+    let (st,_,v)=send(&r.app,"GET","/api/board/orchestrations",None,&[]).await;
+    assert_eq!(st,StatusCode::OK,"{v}");
+    assert_eq!(v["measured"],true);
+    let cards=v["cards"].as_array().unwrap();
+    assert!(cards.iter().any(|c|c["id"]==assignment["id"]));
+    assert!(cards.iter().any(|c|c["id"]==followup["id"]));
+    assert!(!v.to_string().contains("long private history"));
+    let (st,_,v)=send(&r.app,"PATCH","/api/sessions/child/config",Some(json!({"worktree_verify":"npm test"})),&[]).await;
+    assert_eq!(st,StatusCode::OK,"{v}");
+    assert_eq!(amux_server::config::parse_env_file(&r.home.join("sessions/child.env")).get("CC_WORKTREE_VERIFY").map(String::as_str),Some("npm test"));
+    let (st,_,_)=send(&r.app,"PATCH","/api/sessions/child/config",Some(json!({"worktree_verify":""})),&[]).await;
+    assert_eq!(st,StatusCode::BAD_REQUEST);
+    let (st,_,_)=send(&r.app,"PATCH","/api/sessions/child/config",Some(json!({"worktree_base":"HEAD"})),&[]).await;
+    assert_eq!(st,StatusCode::BAD_REQUEST,"legacy adoption requires an exact reviewed commit");
 }

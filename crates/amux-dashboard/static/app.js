@@ -11526,7 +11526,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.994';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.995';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -32457,6 +32457,7 @@ function _bdRenderFanoutChildren(item) {
 let _orchTimer = null;
 let _orchFilter = 'all';
 let _orchData = null;
+let _orchLoading = false;
 
 function _orchSetFilter(f) {
   _orchFilter = f;
@@ -32476,26 +32477,46 @@ function _orchSetFilter(f) {
 // file left to start from, e.g. a reaped ephemeral worker) fails honestly
 // instead of the button looking broken.
 function _fanoutStartBtn(name, running) {
-  if (running) return '';
+  if (running !== false) return '';
   return '<button class="bd-fanout-start-btn" onclick="event.stopPropagation();doStart(\'' + escJs(name) + '\');" title="Start ' + esc(name) + '">&#x25B6; Start</button>';
 }
 
 async function _orchLoad() {
   const el = document.getElementById('orch-list');
-  if (!el) return;
-
+  if (!el || _orchLoading) return;
+  _orchLoading = true;
+  if (!_orchData) el.innerHTML = '<div role="status" style="padding:12px">Loading orchestration boards…</div>';
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(), 15000);
+  // Share the normal inventory request. Its cold runtime probes must never
+  // hold up the board, or create another full-fleet request from this view.
+  const activity = fetchSessions();
   try {
-    const [boardR, sessR] = await Promise.all([
-      fetch(API + '/api/board?all=1&slim=0'),
-      fetch(API + '/api/sessions')
-    ]);
-    if (!boardR.ok || !sessR.ok) { el.innerHTML = '<div style="color:var(--dim);padding:8px;">Failed to load.</div>'; return; }
+    const boardR = await fetch(API + '/api/board/orchestrations', {signal:controller.signal});
+    if (!boardR.ok) throw new Error('Board request failed');
     const allCards = await boardR.json();
-    const allSess = await sessR.json();
-    const sessMap = {};
-    (Array.isArray(allSess) ? allSess : []).forEach(s => { sessMap[s.name] = s; });
+    _orchBuild(allCards, sessions);
+    activity.then(() => {
+      if (activeView === 'orchestrations' && _orchData?.source === allCards) _orchBuild(allCards, sessions);
+    }).catch(e => console.warn('orchestration_activity_refresh_failed', e));
+  } catch (e) {
+    console.warn('orchestration_load_failed', e);
+    el.innerHTML = '<div role="alert" style="color:var(--error);padding:8px;">Could not load orchestrations: ' + esc(e.name === 'AbortError' ? 'request timed out' : e.message) + ' <button onclick="_orchLoad()">Retry</button></div>';
+  } finally { clearTimeout(deadline); _orchLoading = false; }
+  clearTimeout(_orchTimer);
+  if (activeView === 'orchestrations') _orchTimer = setTimeout(_orchLoad, 10000);
+}
 
-    const cards = Array.isArray(allCards) ? allCards : [];
+function _orchBuild(allCards, allSess) {
+    const sessMap = {};
+    (allCards.workers || []).forEach(s => { sessMap[s.name] = s; });
+    (Array.isArray(allSess) ? allSess : []).forEach(s => { sessMap[s.name] = {...sessMap[s.name],...s}; });
+
+    if (!allCards.measured || !Array.isArray(allCards.cards)) throw new Error('Orchestration boards were not measured');
+    (allCards.ephemeral_workers || []).forEach(name => {
+      if (!sessMap[name]) sessMap[name] = {name,ephemeral:true,running:null,lifecycle:'unknown'};
+    });
+    const cards = allCards.cards;
     const childByEpic = {};
     const parentIds = new Set();
     cards.forEach(c => {
@@ -32510,7 +32531,7 @@ async function _orchLoad() {
     const orchEpics = [];
     const addEpic = c => { if (!seen.has(c.id)) { seen.add(c.id); orchEpics.push(c); } };
     cards.forEach(c => {
-      if (!parentIds.has(c.id)) return;
+      if (!parentIds.has(c.id)) { if (c.type === 'epic' && !c.epic) addEpic(c); return; }
       const children = childByEpic[c.id] || [];
       const hasEph = children.some(ch => {
         const s = sessMap[ch.session || ''];
@@ -32522,30 +32543,38 @@ async function _orchLoad() {
       if ((c.title || '').startsWith('[EPIC]')) addEpic(c);
     });
 
-    const TERMINAL = _CLOSED_STATUSES;
+    const groupedWorkers = new Set();
     orchEpics.forEach(epic => {
       const children = childByEpic[epic.id] || [];
-      const allDone = children.length > 0 && children.every(c => TERMINAL.has(c.status));
+      const workers = new Set(children.map(c => c.session).filter(n => (sessMap[n] || {}).ephemeral));
+      workers.forEach(n => groupedWorkers.add(n));
+      const ids = new Set(children.map(c => c.id));
+      cards.forEach(c => { if (workers.has(c.session) && c.id !== epic.id && !ids.has(c.id)) { children.push(c); ids.add(c.id); } });
+      childByEpic[epic.id] = children;
+    });
+    Object.values(sessMap).filter(s => s.ephemeral && !groupedWorkers.has(s.name)).forEach(s => {
+      const id = 'worker:' + s.name;
+      const children = cards.filter(c => c.session === s.name);
+      childByEpic[id] = children;
+      addEpic({id, title:'Fan-out: ' + s.name, session:s.name, status:children.some(c => !c.execution_terminal) ? 'doing' : 'done', _workerOnly:true});
+    });
+    orchEpics.forEach(epic => {
+      const children = childByEpic[epic.id] || [];
+      const allDone = children.length > 0 && children.every(c => c.execution_terminal === true);
       const hasEph = children.some(ch => (ch.session || '').includes('-eph-') || (sessMap[ch.session || ''] || {}).ephemeral);
-      const hasLive = children.some(ch => { const s = sessMap[ch.session || '']; return s && (s.status === 'busy' || s.status === 'idle'); });
+      const owners = [...new Set(children.map(c => c.session).filter(Boolean))].map(n => sessMap[n]).filter(Boolean);
+      const paused = owners.length > 0 && owners.every(s => s.lifecycle === 'paused' || s.lifecycle === 'archived' || s.archived);
+      const hasLive = owners.some(s => s.running);
       const st = epic.status || 'todo';
-      if (allDone && !hasLive && hasEph) epic._orchGroup = 'expired';
-      else if (st === 'archived' || st === 'discarded') epic._orchGroup = 'archived';
-      else if (st === 'todo' || st === 'backlog') epic._orchGroup = 'paused';
+      if (epic.archived || st === 'archived' || st === 'discarded') epic._orchGroup = 'archived';
+      else if (paused) epic._orchGroup = 'paused';
+      else if (allDone && !hasLive && hasEph && owners.length > 0 && owners.every(s => s.running === false)) epic._orchGroup = 'expired';
       else epic._orchGroup = 'active';
     });
 
-    _orchData = { orchEpics, childByEpic, sessMap, TERMINAL };
+    _orchData = { orchEpics, childByEpic, sessMap, source:allCards };
     _orchRenderFilters(orchEpics);
     _orchRender(_orchData);
-  } catch (e) {
-    el.innerHTML = '<div style="color:var(--error);padding:8px;">Error: ' + esc(e.message) + '</div>';
-  }
-
-  clearTimeout(_orchTimer);
-  if (activeView === 'orchestrations') {
-    _orchTimer = setTimeout(_orchLoad, 10000);
-  }
 }
 
 function _orchRenderFilters(epics) {
@@ -32575,7 +32604,7 @@ function _orchToggle(id) {
 function _orchRender(data) {
   const el = document.getElementById('orch-list');
   if (!el || !data) return;
-  const { orchEpics, childByEpic, sessMap, TERMINAL } = data;
+  const { orchEpics, childByEpic, sessMap } = data;
 
   const filtered = _orchFilter === 'all' ? orchEpics : orchEpics.filter(e => e._orchGroup === _orchFilter);
   if (!filtered.length) {
@@ -32605,14 +32634,14 @@ function _orchRender(data) {
   let html = '<div class="orch-tree">';
   filtered.forEach(epic => {
     const children = childByEpic[epic.id] || [];
-    const doneCt = children.filter(c => TERMINAL.has(c.status)).length;
+    const doneCt = children.filter(c => c.execution_terminal === true).length;
     const total = children.length;
     const pct = total > 0 ? Math.round((doneCt / total) * 100) : 0;
     const grp = epic._orchGroup || 'active';
     const expanded = _orchExpanded.has(epic.id);
     const chevron = expanded ? '&#x25BE;' : '&#x25B8;';
 
-    html += '<div class="orch-node ' + grp + '">';
+    html += '<div class="orch-node ' + grp + '" data-orch-id="' + esc(epic.id) + '">';
     html += '<div class="orch-node-header" onclick="_orchToggle(\'' + escJs(epic.id) + '\')">';
     html += '<span class="orch-node-chevron">' + chevron + '</span>';
     html += '<span class="orch-node-dot" style="background:' + (STATUS_CLR[epic.status] || 'var(--dim)') + ';"></span>';
@@ -32625,7 +32654,7 @@ function _orchRender(data) {
     if (epic.session) {
       const epicSess = sessMap[epic.session];
       html += '<span class="orch-node-worker" onclick="event.stopPropagation();openPeek(\'' + escJs(epic.session) + '\')">' + esc(epic.session) + '</span>';
-      html += _fanoutStartBtn(epic.session, !!(epicSess && epicSess.running));
+      html += _fanoutStartBtn(epic.session, epicSess?.running);
     }
     html += '</div>';
 
@@ -32636,12 +32665,13 @@ function _orchRender(data) {
         const dot = STATUS_CLR[st] || 'var(--dim)';
         const sess = sessMap[child.session || ''];
         const isEph = (sess && sess.ephemeral) || (child.session || '').includes('-eph-');
-        const workerStatus = sess ? (sess.status || 'stopped') : 'stopped';
+        const workerStatus = sess?.status || (sess?.running === false ? 'stopped' : 'status pending');
         const grandchildren = childByEpic[child.id] || [];
         const hasGrand = grandchildren.length > 0;
         const childExpanded = hasGrand && _orchExpanded.has(child.id);
 
-        html += '<div class="orch-child">';
+        const isActiveCard = sess && sess.task_board_id === child.id;
+        html += '<div class="orch-child' + (isActiveCard ? ' working-now' : '') + '">';
         html += '<div class="orch-child-row" onclick="event.stopPropagation();' + (hasGrand ? '_orchToggle(\'' + escJs(child.id) + '\')' : 'switchView(\'board\');setTimeout(function(){openBoardDetail(\'' + escJs(child.id) + '\')},300)') + '">';
         if (hasGrand) {
           html += '<span class="orch-node-chevron" style="font-size:.7rem;">' + (childExpanded ? '&#x25BE;' : '&#x25B8;') + '</span>';
@@ -32650,13 +32680,16 @@ function _orchRender(data) {
         }
         html += '<span class="orch-node-dot" style="background:' + dot + ';width:7px;height:7px;"></span>';
         html += '<span class="orch-child-title">' + esc(child.title) + '</span>';
+        if (isActiveCard) html += '<span class="orch-integration">Working now</span>';
         html += '<span class="status-badge ' + st + '" style="font-size:.58rem;">' + esc(st) + '</span>';
         if (isEph && workerStatus !== 'stopped') {
           html += '<span class="bd-fanout-status ' + (workerStatus === 'busy' ? 'running' : 'idle') + '" style="font-size:.58rem;">' + esc(workerStatus) + '</span>';
         }
         if (child.session) {
           html += '<span class="orch-node-worker" onclick="event.stopPropagation();openPeek(\'' + escJs(child.session) + '\')">' + esc(child.session) + '</span>';
-          html += _fanoutStartBtn(child.session, !!(sess && sess.running));
+          html += _fanoutStartBtn(child.session, sess?.running);
+          if (sess && sess.worktree_integration && sess.worktree_integration.status) html += '<span class="orch-integration" title="' + esc(sess.worktree_integration.detail || '') + '">' + esc(sess.worktree_integration.status.replace(/_/g, ' ')) + '</span>';
+          if (sess && sess.worktree_active) html += '<span class="orch-worktree">' + esc(sess.branch || 'Detached worktree') + '</span>';
         }
         html += '</div>';
 

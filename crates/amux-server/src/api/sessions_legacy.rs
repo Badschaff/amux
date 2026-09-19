@@ -3808,7 +3808,9 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             "external_email_allowed_own": env.contains_key("AMUX_EMAIL_EXTERNAL_ALLOW"),
             "worktree": env.get("CC_WORKTREE").cloned().unwrap_or_default(),
             "worktree_repo": env.get("CC_WORKTREE_REPO").cloned().unwrap_or_default(),
-            "worktree_active": home.join("worktrees").join(&name).exists(),
+            "worktree_active": home.join("worktrees").join(&name).join(".git").exists(),
+            "worktree_path": home.join("worktrees").join(&name).to_string_lossy(),
+            "worktree_integration": crate::fanout_workspace::integration_status(&home, &name),
             "ephemeral": env.get("CC_EPHEMERAL").map(|v| v == "1").unwrap_or(false),
             "ephemeral_parent": env.get("CC_PARENT").cloned().unwrap_or_default(),
             "mcp": env.get("CC_MCP").cloned().unwrap_or_default(),
@@ -4609,7 +4611,9 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
         }
         for v in out.iter_mut() {
             let b = v["dir"].as_str().and_then(|d| branches.get(d)).cloned().unwrap_or_default();
-            v["branch"] = json!(b);
+            v["branch"] = if v["worktree_active"] == true {
+                json!(v["worktree_path"].as_str().and_then(branch_from_head_file).unwrap_or_default())
+            } else { json!(b) };
         }
     }
 

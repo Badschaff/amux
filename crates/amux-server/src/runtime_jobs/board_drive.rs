@@ -2452,12 +2452,9 @@ mod epic_completion_unit_tests {
 
 // ── Ephemeral worker reaper ──────────────────────────────────────────────
 //
-// Ephemeral workers (CC_EPHEMERAL=1) exist for exactly one fan-out card.
-// Once the work is done or parked, the worker has no purpose. This reaper
-// runs every drive_tick and handles two cases:
-//
-// 1. ALL cards terminal -> stop worker, archive env file, clean worktree
-// Queued work retains its worker and owner; only completed assignments retire.
+// Ephemeral workers retain their entire assigned board. Retirement requires
+// every type-specific terminal gate, a recorded integration of the unchanged
+// clean head, and a stopped provider. Workspaces survive retirement.
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct EphemeralReaperReport {
@@ -2525,6 +2522,15 @@ pub(crate) async fn reap_ephemeral_workers(state: &AppState) -> EphemeralReaperR
         // An idle worker with queued work still owns that work. Reaping it and
         // returning cards to the parent made an ordinary pause look like a handoff.
         if !card_list.iter().all(|(_, status, kind)| bs::execution_is_terminal(status, kind)) { continue; }
+        // Completion cannot retire a branch before its integration is recorded.
+        if crate::fanout_workspace::integration_status(&home, name)["status"] != "integrated" {
+            crate::fanout_workspace::queue_integration(state, name).await;
+            continue;
+        }
+        let Some(workspace)=crate::fanout_workspace::load(&home,name) else { continue; };
+        let integration=crate::fanout_workspace::integration_status(&home,name);
+        if crate::fanout_workspace::git(&workspace.path,&["rev-parse","HEAD"]).await.ok().as_deref()!=integration["head"].as_str()
+            || crate::fanout_workspace::git(&workspace.path,&["status","--porcelain"]).await.map(|s|!s.is_empty()).unwrap_or(true) { continue; }
         let action = "done";
 
         let is_idle = !crate::api::session_verbs::is_running(name).await;
@@ -4478,8 +4484,8 @@ fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String
          Reuse existing artifacts and tasks; implement missing ordinary prerequisites yourself, \
          using an isolated checkout when necessary. Peer review may run in parallel. \
          Only an actually unavailable required artifact justifies a depends_on edge; \
-         if only a peer can produce it, use `amux board request <lane> <title>` with an exact \
-         deliverable and callback, and continue independent work. Do not invent peer signoff gates. \
+         own the missing deliverable on this same board and continue independent work. \
+         Do not create cross-worker dependencies or invent peer signoff gates. \
          Preserve explicit owner holds and access restrictions. \
          Needs You must satisfy the scoped approval policy below. \
          Do NOT move unfinished work to review to park it.{}\n{}{}",
@@ -4496,6 +4502,9 @@ fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String
         row.id, row.id
     ));
     prompt.push_str(&format!("\n\n[approval policy] Allowed Needs You categories: {}. Make ordinary implementation choices. Resolve operational prerequisites yourself within existing authority.", bs::approval_types(Some(session)).join(", ")));
+    if crate::api::session_verbs::parse_env(session).get("CC_EPHEMERAL") == Some("1") {
+        prompt.push_str("\n\n[fan-out workspace] Own the entire board in your dedicated amux/fanout branch. Preserve the worktree across pauses. Resolve implementation dependencies locally and never create a task on another worker board. Commit your changes and record test evidence; configure CC_WORKTREE_VERIFY with the appropriate repository verification command. When the complete board is implemented (Review/Done with evidence), the harness merges an isolated candidate, runs those checks, and pushes main without changing the shared checkout. Resolve returned conflicts/check failures yourself; keep driving to the resolved terminal gates. Only actual spend/customer-outbound authorization remains an approval.");
+    }
     if let Some(next) = row.next_action.as_deref().filter(|v| !v.is_empty()) {
         prompt.push_str(&format!("\nNext action: {}", quoted_card_text(next, &row.id)));
     }
@@ -6338,6 +6347,10 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
     // mutation. An exact surviving claim comes first: resuming its own Doing
     // work is not a second WIP claim and must not be hidden by the WIP cap.
     let woke_for_dispatch = if !fleet.is_running(lane).await {
+        crate::fanout_workspace::adopt_at_boundary(state,lane).await;
+        if crate::fanout_workspace::queue_integration(state,lane).await {
+            return LaneTrace::skip(lane,"integrating","validating completed worker changes before resuming terminal gates").with_counts(eligible,open);
+        }
         let should_wake = match state.store.read() {
             Ok(conn) => match select_resume(&conn, lane, now_f64(), true) {
                 Resume::Claim { .. } => true,
@@ -6354,7 +6367,7 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
             Err(_) => return LaneTrace::skip(lane, "store-unavailable", "could not preflight stopped worker")
                 .with_counts(eligible, open),
         };
-        if !should_wake {
+        if !should_wake && !crate::fanout_workspace::integration_followup_needed(state,lane) {
             return LaneTrace::skip(
                 lane,
                 "not-running-no-dispatchable-work",
@@ -6442,6 +6455,10 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
         return LaneTrace::skip(lane, "mid-turn", detail).with_counts(eligible, open);
     }
 
+    crate::fanout_workspace::adopt_at_boundary(state, lane).await;
+    if crate::fanout_workspace::queue_integration(state, lane).await {
+        return LaneTrace::skip(lane, "integrating", "repository validation and main integration are running").with_counts(eligible, open);
+    }
     let now = now_f64();
     let tags = fleet.tags(lane);
     let Ok(conn) = state.store.read() else {

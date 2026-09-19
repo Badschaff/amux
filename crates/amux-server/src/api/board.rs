@@ -40,6 +40,7 @@ pub fn routes() -> Router<AppState> {
         .route("/", get(list_board).post(create_item))
         // Static /export outranks /{id}, same as /statuses below.
         .route("/export", get(export_board))
+        .route("/orchestrations", get(super::orchestrations::list))
         // Static segment outranks /{id} in axum: /statuses never collides.
         .route("/statuses", get(list_statuses).post(create_status))
         // Static /reorder outranks /{sid}; both outrank /api/board/{id}.
@@ -6504,6 +6505,8 @@ async fn provision_ephemeral(
     } else {
         env.set("CC_DIR", parent.get_or("CC_DIR", ""));
         env.set("CC_WORKTREE", "1");
+        env.set("CC_WORKTREE_AUTO_MERGE", "1");
+        if let Some(command) = parent.get("CC_WORKTREE_VERIFY") { env.set("CC_WORKTREE_VERIFY", command); }
         env.set("CC_EPHEMERAL", "1");
         env.set("CC_PARENT", config.parent);
         env.set("CC_BOARD_CARD", &child.id);

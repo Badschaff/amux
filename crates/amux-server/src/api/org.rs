@@ -290,6 +290,7 @@ pub(crate) fn authorize_local_member_request(
         "/api/board/statuses"
             | "/api/board/session-gates"
             | "/api/board/contract"
+            | "/api/board/orchestrations"
             | "/api/board/themes"
     ) && *method == Method::GET
     {
