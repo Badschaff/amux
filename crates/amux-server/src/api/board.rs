@@ -4140,6 +4140,18 @@ fn encode_waiting_on(v: &Value) -> Result<Option<String>, String> {
     match v {
         Value::Null => Ok(None),
         Value::String(s) if s.trim().is_empty() => Ok(None),
+        // AF-935: a caller who pre-serializes the object to a JSON string
+        // (instead of sending the object itself) used to get it silently
+        // double-encoded here -- `serde_json::to_string` on a `Value::String`
+        // re-quotes the already-JSON text, and the read side's single
+        // `serde_json::from_str` pass only strips that outer layer, leaving a
+        // raw string where an object was intended. Reject it with an
+        // actionable message instead of storing corrupted data.
+        Value::String(s) if matches!(serde_json::from_str::<Value>(s), Ok(Value::Object(_))) => {
+            Err("waiting_on was sent as a string containing an already-JSON-encoded object; \
+                 send the object itself as the field's value, not a pre-serialized string of it"
+                .to_string())
+        }
         Value::String(_) => Ok(Some(serde_json::to_string(v).expect("a JSON string always encodes"))),
         Value::Object(map) if map.is_empty() => Ok(None),
         Value::Object(_) => Ok(Some(serde_json::to_string(v).expect("a JSON object always encodes"))),
@@ -14592,6 +14604,38 @@ mod af930_waiting_on_tests {
             json!("a plain string stored before this fix, not JSON-encoded"),
             "legacy non-JSON content must not read back as null"
         );
+    }
+
+    /// AF-935: a caller sending the object pre-serialized to a string (instead
+    /// of the object itself) must be rejected, not silently double-encoded
+    /// into a value that reads back as a raw string on the next GET.
+    #[tokio::test]
+    async fn a_pre_encoded_object_string_is_rejected_not_double_encoded() {
+        let (state, store) = fixture();
+        let id = seed(&store, None);
+        let ask = json!({"actor": "Ethan", "type": "decision", "question": "q", "unblocks": "u"});
+        let pre_encoded = serde_json::to_string(&ask).unwrap();
+        let (status, body) = patch_as(&state, &id, json!({"waiting_on": pre_encoded})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let row = current(&store, &id);
+        assert_eq!(
+            row.waiting_on, None,
+            "a rejected write must not leave a double-encoded value behind: {:?}",
+            row.waiting_on
+        );
+    }
+
+    /// The existing plain-text contract (identical round trip) must survive
+    /// unaffected by the AF-935 check above -- only strings whose content
+    /// parses as a JSON *object* are rejected.
+    #[tokio::test]
+    async fn plain_text_that_is_not_json_still_round_trips() {
+        let (state, store) = fixture();
+        let id = seed(&store, None);
+        let (status, body) =
+            patch_as(&state, &id, json!({"waiting_on": "waiting on infra to add a label"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["waiting_on"], json!("waiting on infra to add a label"));
     }
 }
 
