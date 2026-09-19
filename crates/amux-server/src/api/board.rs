@@ -4611,6 +4611,35 @@ pub(crate) async fn append_session_task_activity(
     receipt
 }
 
+/// AMUX-4860. Whether a requested `todo` has to be stored as `backlog`
+/// because the lane it names is isolated.
+///
+/// `todo` is the dispatch queue and a card there claims to be next.
+/// `board_drive` skips isolated lanes before any claim, so such a card is
+/// never offered to anyone, which is what `board.todo_is_reachable_by_dispatch`
+/// reports. It failed 18863 times over 13 days on one card, because nothing
+/// stopped the filing.
+///
+/// PARAMETERISED ON THE PREDICATE, for the reason `scope_env_layers` and
+/// `stranded_lanes` already are: `session_is_isolated` reads a file under
+/// `AMUX_HOME`, `AMUX_HOME` is process-global, and cargo runs a binary's tests
+/// in PARALLEL. A test that set it to fake an isolated lane would race its
+/// siblings over one file, and serialising with `--test-threads=1` would make
+/// it green while making it order-dependent. Both handlers pass the real
+/// `session_is_isolated`, so this is the shipped decision rather than a
+/// paraphrase of it.
+///
+/// The empty-lane arm is not a formality: a detector card carries no session,
+/// and an empty name would otherwise be handed to a predicate that reads a
+/// path built from it.
+pub(crate) fn todo_unreachable_on_isolated_lane(
+    requested_todo: bool,
+    lane: &str,
+    is_isolated: &dyn Fn(&str) -> bool,
+) -> bool {
+    requested_todo && !lane.is_empty() && is_isolated(lane)
+}
+
 pub async fn create_item(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -5065,6 +5094,46 @@ pub async fn create_item(
     // queue-disposition job is exempt BY NAME: it is the one card whose whole
     // purpose is to arrive when the queue is too long, so refusing it for queue
     // depth would be the mechanism suppressing its own alarm.
+    // AMUX-4860: A `todo` FOR AN ISOLATED LANE IS A CLAIM NOTHING CAN HONOUR.
+    //
+    // `todo` is the dispatch queue and a card there claims to be next.
+    // board_drive skips isolated lanes before any claim (board_drive.rs,
+    // verdict "isolated_not_claimed"), so such a card is never offered to
+    // anyone. That is what board.todo_is_reachable_by_dispatch reports, and it
+    // failed 18863 times over 13 days on ONE card (DESKT-44 on `desktop`)
+    // because nothing stopped the filing in the first place.
+    //
+    // DEFAULTED, NOT REFUSED, which is the opposite of the WIP cap below and
+    // deliberately so. The cap refuses something the FILER can resolve by
+    // finishing work. Isolation is a property of the LANE that the filer
+    // usually neither knows nor controls, so a 409 would fail a legitimate
+    // filing for an unactionable reason, and the obvious escape from it is to
+    // clear CC_ISOLATED, which is the one remedy AMUX-4850 ruled out.
+    //
+    // ADJUSTED BEFORE the cap, on purpose: the card is no longer entering
+    // `todo`, so it must not consume a todo WIP slot.
+    //
+    // `session_is_isolated` is called rather than re-reading CC_ISOLATED,
+    // because it is the same predicate board_drive and the invariant consult.
+    // checks.rs's own doc comment warns that a second definition is how this
+    // check goes quietly wrong.
+    let mut status_adjusted_from: Option<&'static str> = None;
+    let mut status_raw = status_raw;
+    if todo_unreachable_on_isolated_lane(status_raw == "todo", &session, &|l| {
+        crate::api::session_verbs::session_is_isolated(l)
+    }) {
+        tracing::info!(
+            target: "amux::board",
+            marker = "todo_defaulted_to_backlog",
+            verdict = "isolated_lane_cannot_be_dispatched",
+            session = %session,
+            measured = true,
+            n_considered = 1,
+            "board create: todo filed for an isolated lane, stored as backlog"
+        );
+        status_adjusted_from = Some("todo");
+        status_raw = "backlog".to_string();
+    }
     if !intake_matches && status_raw == "todo" && owner_type == "agent" && !session.is_empty() && creator != WIP_EXEMPT_CREATOR {
         let limit = bs::todo_wip_limit(Some(&session));
         if limit > 0 {
@@ -5293,6 +5362,21 @@ pub async fn create_item(
             // seconds") reddening under this exact mutation.
             v["card_created"] = json!(!reused);
             v["intake"] = json!({"action":if reused {intake_response.decision.action.as_str()} else {"create"}, "comparison":intake_response});
+            // AMUX-4860. The status the caller asked for is not the status it
+            // got, so SAY SO in the reply. A create that silently becomes
+            // something else is the AMUX-4776 trap: there, intake folded a
+            // create into another card and the response still carried an `id`,
+            // so a caller reading only `id` could not tell. The code stays 201
+            // because a card really was created; this field is how the caller
+            // learns the queue it named was not the queue it got.
+            if let Some(from) = status_adjusted_from {
+                v["status_adjusted_from"] = json!(from);
+                v["status_adjusted_reason"] = json!(format!(
+                    "lane '{session}' is isolated, so board_drive never offers its todo cards; \
+                     filed as backlog, which is unbounded and claims nothing. Clear CC_ISOLATED \
+                     on the lane to take board automation, or send as the owner."
+                ));
+            }
             if !ignored.is_empty() {
                 v["ignored_fields"] = json!(ignored);
             }
@@ -10907,6 +10991,10 @@ pub async fn patch_item(
 
             // ---- status transition through the core state machine --------
             let mut status_event: Option<(String, String)> = None;
+            // Declared out here beside `status_event`, for the same reason: it
+            // is SET inside the status branch and READ at the response, which
+            // are different scopes (AMUX-4860).
+            let mut target_adjusted_from: Option<&'static str> = None;
 
             // ---- user-created columns (AMUX-2609) ------------------------
             //
@@ -11121,6 +11209,38 @@ pub async fn patch_item(
                         no_write(),
                     );
                 };
+                // AMUX-4860, the patch half of the create guard. Same reason:
+                // board_drive skips isolated lanes, so moving a card INTO
+                // `todo` on one makes a claim no tick can honour, and
+                // board.todo_is_reachable_by_dispatch is what reports it.
+                //
+                // Adjusted HERE, immediately after the parse, because
+                // `target_raw` is derived from `target` further down and the
+                // gate trail, the WIP cap and the write all read it. Adjusting
+                // later would leave those disagreeing about the target status.
+                //
+                // Defaulted rather than refused, and via the shared
+                // `session_is_isolated` predicate, for the reasons recorded on
+                // the create side.
+                let mut target = target;
+                if todo_unreachable_on_isolated_lane(
+                    target == TaskStatus::Todo,
+                    next.session.as_deref().unwrap_or(""),
+                    &|l| crate::api::session_verbs::session_is_isolated(l),
+                ) {
+                    tracing::info!(
+                        target: "amux::board",
+                        marker = "todo_defaulted_to_backlog",
+                        verdict = "isolated_lane_cannot_be_dispatched",
+                        card = %next.id,
+                        session = %next.session.as_deref().unwrap_or("(none)"),
+                        measured = true,
+                        n_considered = 1,
+                        "board patch: todo requested for an isolated lane, stored as backlog"
+                    );
+                    target_adjusted_from = Some("todo");
+                    target = TaskStatus::Backlog;
+                }
                 let from = bs::parse_status(&next.status);
                 // MOVING ANOTHER LANE'S CARD OUT OF `needsyou` IS A CROSS-LANE
                 // HIDE, and requires the same `authorized_by` the archive guard
@@ -13294,6 +13414,20 @@ pub async fn patch_item(
                     caller = %caller_lane,
                     "board note appended to an ARCHIVED card — write succeeded, nobody will see it"
                 );
+            }
+            // AMUX-4860. The status the caller asked for is not the status it
+            // got, so the reply says so. Same disclosure as the create path,
+            // and for the same reason: a write that silently becomes something
+            // else is the AMUX-4776 trap, and a caller reading only the status
+            // code cannot tell. The code stays 200 because the patch applied.
+            if let Some(from) = target_adjusted_from {
+                body["status_adjusted_from"] = json!(from);
+                body["status_adjusted_reason"] = json!(format!(
+                    "lane '{}' is isolated, so board_drive never offers its todo cards; \
+                     stored as backlog, which is unbounded and claims nothing. Clear \
+                     CC_ISOLATED on the lane to take board automation, or send as the owner.",
+                    next.session.as_deref().unwrap_or("")
+                ));
             }
             finish(
                 &slot_w,
@@ -16060,6 +16194,61 @@ mod param_tests {
 mod isolation_designation_tests {
     use super::*;
 
+    /// AMUX-4860. A `todo` for an isolated lane is stored as `backlog`, and a
+    /// `todo` for an ordinary lane is left alone.
+    ///
+    /// BOTH ARMS IN ONE CELL ON PURPOSE. The obvious test files into an
+    /// isolated lane and asserts the result is backlog, and that test passes
+    /// just as well against an implementation that defaults EVERYTHING to
+    /// backlog, which would silently empty every lane's dispatch queue. The
+    /// negative arm is the one that can catch that, so it is asserted beside
+    /// the positive rather than in a cell someone could delete on its own.
+    #[test]
+    fn a_todo_is_rerouted_only_when_its_lane_is_actually_isolated() {
+        let isolated = |l: &str| l == "desktop";
+
+        // The specimen: DESKT-44 on `desktop`, the card that failed
+        // board.todo_is_reachable_by_dispatch 18863 times.
+        assert!(
+            todo_unreachable_on_isolated_lane(true, "desktop", &isolated),
+            "a todo for an isolated lane cannot be dispatched and must be rerouted"
+        );
+
+        // THE ARM THAT CATCHES AN OVER-EAGER FIX.
+        assert!(
+            !todo_unreachable_on_isolated_lane(true, "amux", &isolated),
+            "an ordinary lane's todo must stay todo, or the dispatch queue is emptied"
+        );
+
+        // Only `todo` claims to be next, so nothing else is touched. Without
+        // this, moving a card to `doing` or `done` on an isolated lane would
+        // be rewritten to backlog, which would make the lane unable to record
+        // its own work.
+        assert!(
+            !todo_unreachable_on_isolated_lane(false, "desktop", &isolated),
+            "a non-todo status on an isolated lane must pass through untouched"
+        );
+
+        // A detector card carries no session. The predicate must not be asked
+        // about an empty lane name.
+        // RefCell because the parameter is `&dyn Fn`, and a closure that
+        // pushes to a Vec it captured is `FnMut`.
+        let asked: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        let recording = |l: &str| {
+            asked.borrow_mut().push(l.to_string());
+            true
+        };
+        assert!(
+            !todo_unreachable_on_isolated_lane(true, "", &recording),
+            "a card with no lane has no lane to be isolated"
+        );
+        assert!(
+            asked.borrow().is_empty(),
+            "the empty lane must short-circuit before the predicate is consulted, got {:?}",
+            asked.borrow()
+        );
+    }
+
     /// AMUX-3713: a card whose owning lane is ISOLATED says so, and an ordinary
     /// one does not.
     ///
@@ -16945,5 +17134,4 @@ mod bulk_migrate_tests {
         // Nothing considered is nothing to report.
         assert_eq!(unanimous_gate(0, 0, &[]), None, "an empty column is not a gate refusal");
     }
-
 }
