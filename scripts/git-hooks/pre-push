@@ -192,6 +192,73 @@ def main():
                 return r.returncode
     except Exception:
         pass  # fail open — the guard must never brick a push on its own bug
+
+    # UNWIRED HARNESS (AMUX-4823). A scripts/test-*.sh that no workflow invokes
+    # and no baseline records reds `checks` on AF-346 — after the push, for
+    # everyone, and the job aborts on its first failing step so the verdict can
+    # sit invisible behind older breakage for days. It did: main was red
+    # 09-17 to 09-18 with five independent failures stacked up, two of them
+    # exactly this. Measured over that same 24h, 2 of the 3 harnesses that
+    # reached main were unwired.
+    #
+    # BEFORE THE SESSION EARLY-RETURNS BELOW, and for the same reason the
+    # append-only guard is: this breaks main regardless of who pushes, so a
+    # human push or AMUX_ALLOW_FOREIGN must not skip it.
+    #
+    # SELECTED FROM THE PUSHED RANGE, not run unconditionally. The check costs
+    # ~4.4s, which is not worth paying on every push when it can only change
+    # its answer if the push touches a harness, the workflow that wires them,
+    # or the baseline that records them.
+    try:
+        _touch = []
+        for _line in stdin_text.splitlines():
+            _p = _line.split()
+            if len(_p) < 4:
+                continue
+            _local, _remote = _p[1], _p[3]
+            if _local.strip("0") == "":
+                continue
+            _rng = [_local, "--not", "--remotes=origin"]
+            if _remote != ZERO:
+                _rng.append(_remote)
+            _r = subprocess.run(["git", "log", "--name-only", "--format="] + _rng,
+                                capture_output=True, text=True, timeout=30)
+            _touch.extend(x for x in _r.stdout.splitlines() if x.strip())
+        _relevant = [
+            x for x in _touch
+            if (x.startswith("scripts/test-") and x.endswith(".sh"))
+            or x == ".github/workflows/checks.yml"
+            or x == "scripts/fixtures/harness-wired-baseline.txt"
+        ]
+        if _relevant:
+            _root = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                                   capture_output=True, text=True, timeout=10).stdout.strip()
+            _chk = os.path.join(_root, "scripts", "test-harness-wired.sh")
+            if os.path.exists(_chk):
+                _w = subprocess.run(["bash", _chk], capture_output=True, text=True, timeout=120)
+                if _w.returncode != 0:
+                    sys.stderr.write(
+                        "\nBLOCKED: a test harness in this push is wired to nothing "
+                        "(AF-346).\n\n")
+                    sys.stderr.write(_w.stdout)
+                    sys.stderr.write(_w.stderr)
+                    sys.stderr.write(
+                        "\nThis is the check `checks` runs. It is refusing HERE so you do not\n"
+                        "find out from a red main that everyone else is also pushing into.\n"
+                        "Two remedies, and baselining is the right one for a harness that\n"
+                        "needs a live server or a real device:\n"
+                        "  * wire it into .github/workflows/checks.yml, or\n"
+                        "  * add it to scripts/fixtures/harness-wired-baseline.txt with a\n"
+                        "    verifiability tag and a one-line reason.\n"
+                        "Override for this push, if you are deliberately landing it red:\n"
+                        "  AMUX_SKIP_HARNESS_WIRED=1 git push ...\n")
+                    if os.environ.get("AMUX_SKIP_HARNESS_WIRED", "").strip().lower() not in (
+                            "1", "true", "yes", "on"):
+                        return 1
+                    sys.stderr.write("AMUX_SKIP_HARNESS_WIRED set — landing it anyway.\n")
+    except Exception:
+        pass  # fail open, same rule as the guard above
+
     sess = os.environ.get("AMUX_SESSION", "")
     if not sess or os.environ.get("AMUX_ALLOW_FOREIGN"):
         return 0

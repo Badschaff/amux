@@ -244,6 +244,15 @@ jobs:
       # replaced by something equally green. Its cells prove the detector
       # catches a 100KB/min leak, does not call a warm-up plateau a leak, and
       # refuses a verdict on a run too short to have reached steady state.
+      # AMUX-4823. The pre-push refusal for an unwired harness. Its first cell
+      # is the control that makes the other five mean anything: the fixture's
+      # own wired-check always exits non-zero, so an ALLOWED push can only mean
+      # the range selection skipped it. Without that, "refused" would also be
+      # true of a gate that blocks every push.
+      - name: the pre-push unwired-harness refusal fires, and only when it should (AMUX-4823)
+        run: |
+          set -uo pipefail
+          python3 scripts/git-hooks/test_pre_push_harness_wired.py
       # AF-926 via AMUX-4759, same reasoning as the step below: CI-safe by
       # construction (synthetic fixture in a temp dir, zero network refs, and
       # its own header says it deliberately avoids the real frustrations.md).
