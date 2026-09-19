@@ -3,16 +3,17 @@
 # this repo's own Dockerfile.rust-base.
 #
 # OWNERSHIP: amux, not infra (Ivo's call, 2026-09-05) — infra provisioned
-# the 3 build hosts themselves (build-02.baar, build.home, build.virt04)
-# and their Woodpecker server/agents, and still owns THAT layer, but the
-# actual amux-rust-base image (its Dockerfile lives here, its rebuild
-# cadence is driven by amux's own Cargo.lock) is this repo's job now.
-# Before this, infra ran the build via three Tofu `docker_image` resources
-# (one per host) as an incidental part of standing up each build host —
-# see infra's own tofu/docker-build-{02-baar,home,northstage}/
-# amux-rust-base.tf for that prior mechanism, kept in place only until
-# this script has been verified working at least once against all three
-# hosts (avoids a gap where nobody rebuilds the image).
+# the 3 build hosts themselves (see CLAUDE.local.md for their real names
+# -- this repo is public and hostnames don't belong in it) and their
+# Woodpecker server/agents, and still owns THAT layer, but the actual
+# amux-rust-base image (its Dockerfile lives here, its rebuild cadence is
+# driven by amux's own Cargo.lock) is this repo's job now. Before this,
+# infra ran the build via three Tofu `docker_image` resources (one per
+# host) as an incidental part of standing up each build host — see
+# infra's own per-host Tofu docker-image modules (CLAUDE.local.md has the
+# exact paths) for that prior mechanism, kept in place only until this
+# script has been verified working at least once against all three hosts
+# (avoids a gap where nobody rebuilds the image).
 #
 # WHY A SCRIPT, NOT A THIRD TOFU MODULE HERE: this repo has no IaC of its
 # own and no reason to grow one for a single docker_image resource --
@@ -26,7 +27,7 @@
 # already set up (see infra's tofu/docker-mtls/ -- TCP + mutual TLS,
 # tlsverify, never plain SSH, never 0.0.0.0):
 #   - a `docker context` already created for it, e.g.:
-#       docker context create build-02-baar \
+#       docker context create my-build-host \
 #         --docker "host=tcp://<host-ip>:2376,ca=<ca.pem>,cert=<cert.pem>,key=<key.pem>"
 #   - listed (space-separated context names) in AMUX_RUST_BASE_CONTEXTS,
 #     e.g. in this box's own ~/.amux/server.env (private, gitignored --
@@ -38,9 +39,10 @@
 # this box's own local Docker CLI config, not repo content.
 #
 # Each host is built independently and a slow/failed host does not block
-# the others -- build-02.baar in particular is documented (infra's own
-# CLAUDE.md) to have a flaky/slow uplink; this must not turn a fleet-wide
-# rebuild into an all-or-nothing operation blocked on that one host.
+# the others -- one of them in particular is documented (infra's own
+# CLAUDE.md; see this repo's CLAUDE.local.md for which) to have a
+# flaky/slow uplink; this must not turn a fleet-wide rebuild into an
+# all-or-nothing operation blocked on that one host.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
