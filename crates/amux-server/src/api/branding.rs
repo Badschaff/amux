@@ -68,10 +68,70 @@ async fn brand_prefs(state: &AppState) -> Result<Vec<(String, String)>, String> 
     .map_err(|e| e.to_string())
 }
 
+/// `brand_%` prefs rows, and the `(<asset>_url, path)` pairs for assets that
+/// exist on disk. Named because clippy's `type_complexity` refuses the tuple
+/// inline, and the pair really is one return value with two halves.
+type BrandPrefsAndAssets = (Vec<(String, String)>, Vec<(String, String)>);
+
+/// The prefs read AND the on-disk asset probe, in ONE blocking hop.
+///
+/// AMUX-4768: the prefs query was already on `spawn_blocking`, but the asset
+/// probe that follows it ran on the async runtime. It is up to
+/// `ASSETS x EXTS` = 10 `stat(2)` calls, and it breaks early only on a HIT, so
+/// an empty branding directory (this box's state, and the default) pays all ten
+/// every request while holding a runtime thread.
+///
+/// That is what made the endpoint track host load. Measured over 48h against
+/// `/api/health` as a control, from `_amux_request_log`:
+///
+/// | load1  | /api/branding    | /api/health   |
+/// |--------|------------------|---------------|
+/// | <10    | 1ms (n=5)        | 24ms          |
+/// | 10-30  | 5ms (n=324)      | 10ms          |
+/// | 30-60  | 22ms (n=135)     | 20ms          |
+/// | 60+    | 92ms (n=14)      | 37ms          |
+///
+/// branding rises monotonically 1 -> 92ms; the control is flat and
+/// non-monotonic (24, 10, 20, 37), so this is the endpoint tracking contention
+/// rather than the box slowing everything equally.
+///
+/// Same defect and same fix as `/api/grants` (AMUX-4756, ccc096de).
+/// `manifest` deliberately keeps calling [`brand_prefs`]: it has no use for the
+/// asset URLs and should not pay for ten stats to render a PWA manifest.
+async fn brand_prefs_and_assets(state: &AppState) -> Result<BrandPrefsAndAssets, String> {
+    let store = state.store.clone();
+    tokio::task::spawn_blocking(
+        move || -> anyhow::Result<BrandPrefsAndAssets> {
+            let conn = store.read()?;
+            let mut stmt = conn.prepare("SELECT key, value FROM prefs WHERE key LIKE 'brand_%'")?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            let dir = branding_dir();
+            let mut assets = Vec::new();
+            for asset in ASSETS {
+                for ext in EXTS {
+                    if dir.join(format!("{asset}{ext}")).exists() {
+                        assets.push((
+                            format!("{asset}_url"),
+                            format!("/api/branding/{asset}{ext}"),
+                        ));
+                        break;
+                    }
+                }
+            }
+            Ok((rows, assets))
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
+}
+
 // ---- GET /api/branding ------------------------------------------------------
 
 pub async fn get_branding(State(state): State<AppState>) -> Response {
-    let rows = match brand_prefs(&state).await {
+    let (rows, assets) = match brand_prefs_and_assets(&state).await {
         Ok(r) => r,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
     };
@@ -80,14 +140,8 @@ pub async fn get_branding(State(state): State<AppState>) -> Response {
         let key = k.strip_prefix("brand_").unwrap_or(&k).to_string();
         result.insert(key, Value::String(v));
     }
-    let dir = branding_dir();
-    for asset in ASSETS {
-        for ext in EXTS {
-            if dir.join(format!("{asset}{ext}")).exists() {
-                result.insert(format!("{asset}_url"), json!(format!("/api/branding/{asset}{ext}")));
-                break;
-            }
-        }
+    for (key, url) in assets {
+        result.insert(key, json!(url));
     }
     Json(Value::Object(result)).into_response()
 }
@@ -350,6 +404,60 @@ mod tests {
             "data:image/png;base64,{}",
             base64::engine::general_purpose::STANDARD.encode(&bytes)
         )
+    }
+
+    /// AMUX-4768: the asset probe must run on a blocking thread, not the async
+    /// runtime. An empty branding directory costs all ten `stat(2)` calls, and
+    /// paying them on a runtime thread is what made this endpoint's latency
+    /// track host load (1ms at load<10, 92ms at load 60+, against a flat
+    /// control).
+    ///
+    /// Asserting `get_branding` CONTAINS "spawn_blocking" would not test this:
+    /// the prefs read was already on a blocking thread before the fix, so that
+    /// assertion was green while the bug was live. The rule is that the
+    /// filesystem probe is ABSENT from the handler body and present in the
+    /// blocking helper, so this checks both halves.
+    #[test]
+    fn the_asset_probe_runs_off_the_async_runtime() {
+        let src = include_str!("branding.rs");
+        let strip = |s: &str| -> String {
+            s.lines()
+                .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("///"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let body_of = |sig: &str| -> String {
+            let start = src.find(sig).unwrap_or_else(|| panic!("{sig} not found"));
+            let rest = &src[start..];
+            let end = rest.find("\n}\n").map(|i| i + 2).unwrap_or(rest.len());
+            strip(&rest[..end])
+        };
+
+        let handler = body_of("pub async fn get_branding");
+        assert!(
+            !handler.contains(".exists()"),
+            "get_branding must not stat the branding dir on the async runtime; \
+             move the probe into brand_prefs_and_assets"
+        );
+
+        let helper = body_of("async fn brand_prefs_and_assets");
+        assert!(
+            helper.contains("spawn_blocking"),
+            "brand_prefs_and_assets must do its work on a blocking thread"
+        );
+        assert!(
+            helper.contains(".exists()"),
+            "the asset probe must live INSIDE the blocking helper; if it moved \
+             somewhere else, this guard is pinning the wrong layer"
+        );
+
+        // The manifest path stays on the prefs-only read on purpose: it has no
+        // use for asset URLs and should not pay ten stats to render a manifest.
+        let manifest = body_of("pub async fn manifest");
+        assert!(
+            manifest.contains("brand_prefs(") && !manifest.contains("brand_prefs_and_assets"),
+            "manifest should keep the cheaper prefs-only read"
+        );
     }
 
     #[tokio::test]
