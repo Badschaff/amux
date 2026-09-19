@@ -1766,152 +1766,40 @@ impl Runtime {
         body: &str,
         now: DateTime<Utc>,
     ) -> anyhow::Result<()> {
-        // Redact secret shapes before the prompt reaches the fleet-readable board
-        // — title AND desc both derive from `body` (AMUX-3384). Same helper the
-        // send-path capture uses, so the two sites cannot drift on what leaks.
-        let redacted = crate::api::session_verbs::redact_prompt_secrets(body);
-        let body = redacted.as_str();
-        let Some(title) = amux_core::board::title_from_prompt(body) else {
-            return Ok(()); // steering, not a task
-        };
-        if amux_core::board::is_informational_query(body) {
-            tracing::info!(
-                worker = %worker,
-                "ledger: informational prompt not carded by orchestrator (message retained)"
-            );
-            return Ok(());
-        }
-        // AMUX-2604: a prompt is spoken INTO a context capture cannot see, so
-        // "This should be one row" mints a card no one can dispatch later. The
-        // check is COMPUTED here (never a model call — ethos rule 2) and the
-        // REWRITE is asked of the worker at its next turn boundary, because
-        // the worker is the only party that ever held the missing referent.
-        let needs_self_desc = amux_core::board::title_needs_self_description(&title);
+        // All transports use the same receipt policy: redact, classify, deduplicate,
+        // and retain the current work claim when a distinct follow-up arrives.
         let wid = worker.to_string();
         let body = body.to_string();
-        let captured_desc = crate::api::session_verbs::format_captured_desc(&body);
-        // Carries (card id, session name) out of the writer so the nudge can
-        // be addressed AFTER the card exists — the consequence hangs off the
-        // write that already happens, with a named consumer and a durable
-        // dedupe key, rather than a new bus (CLAUDE.md's recorded decision).
-        let minted: std::sync::Arc<std::sync::Mutex<Option<(String, String)>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let minted = std::sync::Arc::new(std::sync::Mutex::new(None));
         let minted_w = minted.clone();
-        self.store
-            .write_async(move |conn| {
-                let Some(wrow) = crate::db::queries::get_worker(conn, &wid)? else {
-                    // A card must be attributable; a worker the store cannot
-                    // name gets no invented attribution (Invariant 20).
-                    tracing::warn!(worker = %wid,
-                        "prompt delivered to a worker with no store row; no ledger card minted");
-                    return Ok(WriteOutcome { applied: false, events: vec![] });
-                };
-                let name = wrow.display_name;
-                if name.trim().is_empty() {
-                    tracing::warn!(worker = %wid,
-                        "worker has no display name; no ledger card minted");
-                    return Ok(WriteOutcome { applied: false, events: vec![] });
-                }
-                let mut row = crate::db::board_store::create_issue(
-                    conn,
-                    &crate::db::board_store::NewIssue {
-                        acceptance_criteria: None,
-                        next_action: None,
-                        title,
-                        desc: captured_desc,
-                        // In flight, not queued: see the doc comment — a
-                        // `todo` mint was re-dispatched by the planner,
-                        // double-running every direct prompt.
-                        status: "doing".into(),
-                        session: Some(name.clone()),
-                        // AF-699: a peer-relay REPLY carrying no ask is not
-                        // code work and cannot close on "implemented and
-                        // merged" -- reported by mixpeek-orchestrator, 11
-                        // accumulated un-closeable on one lane's board alone.
-                        item_type: amux_core::board::item_type_for_capture(&body).into(),
-                        creator: "amux".into(),
-                        owner_type: "agent".into(),
-                        due: None,
-                        due_time: None,
-                        reviewer: None,
-                        shepherd: None,
-                        gate: vec![],
-                        depends_on: vec![],
-                        // The tag is the durable half of the flag: the steer
-                        // below is delivered once and consumed, but a card
-                        // whose title was never repaired stays findable by
-                        // anyone querying the board (`needs-self-description`)
-                        // — a nudge with no residue is a nudge that silently
-                        // did not happen (ethos rule 4).
-                        tags: if needs_self_desc.is_some() {
-                            vec!["needs-self-description".to_string()]
-                        } else {
-                            vec![]
-                        },
-                        // Not an ask: this producer files ordinary cards, and a card
-                        // filed into needsyou without one is what AMUX-3929 is about.
-                        ask_type: None,
-                        ask_question: None,
-                        ask_unblocks: None,
-                        ask_actor: None,
-                        // AF-367: minted by the orchestrator runtime.
-                        source: Some("orchestrator".into()),
-                        requested_by: None,
-                        callback_session: None,
-                        callback_prompt: None,
-                    },
-                    now.timestamp(),
-                )?;
-                let stamp = chrono::Local::now().format("%H:%M").to_string();
-                row.log = Some(crate::db::board_store::append_log(
-                    row.log.as_deref(),
-                    &stamp,
-                    "capture: session prompt",
-                ));
-                if let Some(reason) = needs_self_desc {
-                    row.log = Some(crate::db::board_store::append_log(
-                        row.log.as_deref(),
-                        &stamp,
-                        &format!("capture: title needs self-description — {reason}"),
-                    ));
-                    *minted_w.lock().unwrap() = Some((row.id.clone(), name));
-                }
-                crate::db::board_store::save_patched(conn, &mut row)?;
-                // notified is deliberately outside save_patched's SET list
-                // (a Python-owned column); set it here so the assignment
-                // notifier never re-announces a prompt the worker already
-                // has in hand.
-                conn.execute(
-                    "UPDATE issues SET notified = 1 WHERE id = ?1",
-                    params![row.id],
-                )?;
-                Ok(WriteOutcome {
-                    applied: true,
-                    events: vec![PendingEvent {
-                        entity_type: EntityType::Task,
-                        entity_id: row.id.clone(),
-                        mutation: MutationKind::Created,
-                        payload: Some(row.snapshot()),
-                    }],
-                })
+        self.store.write_async(move |conn| {
+            let Some(worker) = crate::db::queries::get_worker(conn, &wid)? else {
+                tracing::warn!(worker = %wid, "capture: worker missing; receipt not minted");
+                return Ok(WriteOutcome { applied: false, events: vec![] });
+            };
+            let name = worker.display_name;
+            let Some(row) = crate::api::session_verbs::mint_capture_card(
+                conn, &name, &body, now.timestamp_millis(), false,
+            )? else {
+                return Ok(WriteOutcome { applied: false, events: vec![] });
+            };
+            if let Some(reason) = amux_core::board::title_needs_self_description(&row.title) {
+                *minted_w.lock().unwrap() = Some((row.id.clone(), name, reason));
+            }
+            tracing::info!(card = %row.id, verdict = "canonical_capture", "orchestrator used shared prompt capture");
+            Ok(WriteOutcome {
+                applied: true,
+                events: vec![PendingEvent {
+                    entity_type: EntityType::Task,
+                    entity_id: row.id.clone(),
+                    mutation: MutationKind::Created,
+                    payload: Some(row.snapshot()),
+                }],
             })
-            .await?;
+        }).await?;
 
-        // The consequence, hung off the write that already happened and
-        // addressed to a NAMED consumer: the worker that received the prompt.
-        //
-        // Delivery is `steer_enqueue`, the existing path, never a direct send
-        // — the steering loop applies the turn-boundary gate, so this cannot
-        // land mid-turn, and it arrives exactly when the worker has finished
-        // the prompt and therefore HOLDS the context the capture lacked.
-        //
-        // Asked once, not every turn: the enqueue is fired from the MINT, which
-        // happens once per card, and the guard key is the card id — so even a
-        // duplicate mint replaces the queued row instead of stacking a second
-        // copy (steer_enqueue dedupes on `guard`).
         let minted = minted.lock().unwrap().take();
-        if let Some((card_id, session)) = minted {
-            let reason = needs_self_desc.unwrap_or("it has no referent outside this conversation");
+        if let Some((card_id, session, reason)) = minted {
             let msg = format!(
                 "Board card {card_id} was captured from your last prompt, and its title \
                  cannot be dispatched by anyone who was not in this conversation: {reason}.\n\n\
@@ -2732,6 +2620,26 @@ mod adherence_tests {
         assert!(log.contains("capture: session prompt"), "durable marker: {log}");
         assert_eq!(notified, 1, "the worker already received this prompt; not news");
         assert!(!sem.is_empty());
+    }
+
+    #[tokio::test]
+    async fn every_transport_reuses_capture_and_preserves_active_work() {
+        let store = store();
+        let worker = seed_worker(&store, 34, "capture-retry");
+        let rt = runtime(store.clone(), None, false);
+        let now = Utc::now();
+        let body = "1. Fix the flaky parser\n2. Verify the regression";
+        rt.capture_prompt_card(&worker, body, now).await.unwrap();
+        rt.capture_prompt_card(&worker, body, now + chrono::Duration::minutes(20)).await.unwrap();
+        rt.capture_prompt_card(&worker, "Add a route for the archive endpoint", now).await.unwrap();
+        rt.capture_prompt_card(&worker, "Thanks, looks good", now).await.unwrap();
+        let conn = store.read().unwrap();
+        assert_eq!(conn.query_row("SELECT count(*) FROM issues", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+        let rows = conn.prepare("SELECT title,status,source FROM issues ORDER BY created,id").unwrap()
+            .query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,String>(2)?))).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert!(rows.contains(&("Fix the flaky parser".into(), "doing".into(), "capture".into())));
+        assert!(rows.contains(&("Add a route for the archive endpoint".into(), "backlog".into(), "capture".into())));
     }
 
     #[tokio::test]

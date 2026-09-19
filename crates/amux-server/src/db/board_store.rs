@@ -3492,6 +3492,13 @@ pub fn dependency_is_resolved(status: &str, item_type: &str) -> bool {
             && !amux_core::board::verified_is_meaningful(core_item_type(item_type)))
 }
 
+/// Whether an execution lane can retire this assignment. Failed terminal
+/// outcomes stop execution but must never satisfy a dependent task's gate.
+pub fn execution_is_terminal(status: &str, item_type: &str) -> bool {
+    parse_status(status).is_some_and(|s| s.is_terminal())
+        || dependency_is_resolved(status, item_type)
+}
+
 pub fn dependency_resolved(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
     let state = conn.query_row(
         "SELECT status, type FROM issues WHERE id=?1 AND deleted IS NULL",
@@ -3589,6 +3596,27 @@ pub fn is_capture_shell(row: &IssueRow) -> bool {
     row.creator == "amux"
         && row.desc.trim_start().starts_with("**Prompt:**")
         && !capture_is_delegated_ask(&row.desc)
+        && !has_execution_details(row)
+}
+
+/// Raw provenance can remain in the description after intake. Execution is
+/// structured when both the next action and at least one textual gate exist.
+pub fn has_execution_details(row: &IssueRow) -> bool {
+    row.next_action.as_deref().is_some_and(|s| !s.trim().is_empty())
+        && row.acceptance_criteria.as_deref()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .and_then(|v| v.as_array().cloned())
+            .is_some_and(|items| items.iter().any(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())))
+}
+
+fn execution_details_sql() -> String {
+    // CASE prevents json_each from evaluating corrupt legacy JSON.
+    let whitespace = "char(9)||char(10)||char(11)||char(12)||char(13)||' '||char(133)||char(160)||char(5760)||char(8192)||char(8193)||char(8194)||char(8195)||char(8196)||char(8197)||char(8198)||char(8199)||char(8200)||char(8201)||char(8202)||char(8232)||char(8233)||char(8239)||char(8287)||char(12288)";
+    format!("(length(trim(COALESCE(i.next_action,''), {whitespace})) > 0 AND \
+        CASE WHEN json_valid(i.acceptance_criteria) THEN \
+          json_type(i.acceptance_criteria)='array' AND EXISTS(\
+            SELECT 1 FROM json_each(i.acceptance_criteria) c WHERE c.type='text' \
+            AND length(trim(c.value, {whitespace})) > 0) ELSE 0 END)")
 }
 
 /// A captured message whose FIRST LINE opens with `ASK` and names a board id is
@@ -3664,7 +3692,7 @@ fn capture_prompt_first_line(desc: &str) -> Option<&str> {
 /// would match "ask me later" and part company with `strip_prefix("ASK")` on the
 /// very first message anyone writes in lower case.
 pub fn capture_shell_sql() -> String {
-    format!("({} AND NOT {})", capture_envelope_sql(), capture_delegation_sql())
+    format!("({} AND NOT {} AND NOT {})", capture_envelope_sql(), capture_delegation_sql(), execution_details_sql())
 }
 
 /// `creator='amux'` plus the `**Prompt:**` marker: amux minted this row from an
@@ -3972,6 +4000,15 @@ fn entered_state_at_for_write(conn: &Connection, row: &IssueRow) -> Option<i64> 
 }
 
 pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<usize> {
+    // This marker records delivery, not an outside dependency. Once the owner
+    // structures the captured request it must become eligible without a second
+    // manual PATCH deleting harness-generated text. Preserve all real holds.
+    if row.source_ref.as_deref() == Some("Already delivered owner follow-up; claim explicitly when switching work")
+        && row.creator == "amux" && has_execution_details(row) {
+        row.source_ref = None;
+        tracing::info!(card = %row.id, verdict = "capture_intake_completed",
+            "structured captured request released its delivery-only hold");
+    }
     let dep_json = if row.depends_on.is_empty() {
         None
     } else {
@@ -6812,6 +6849,54 @@ everything to a clean machine.";
     /// Runs BOTH over the same fixtures rather than asserting each separately,
     /// which is the only arrangement that can catch a drift: two independent
     /// assertions both stay green while the predicates diverge.
+    #[test]
+    fn execution_retirement_keeps_runtime_verification_and_dependency_failure_distinct() {
+        assert!(!execution_is_terminal("done", "code"));
+        assert!(execution_is_terminal("done", "chore"));
+        assert!(execution_is_terminal("verified", "code"));
+        for status in ["discarded", "quarantined"] {
+            assert!(execution_is_terminal(status, "code"));
+            assert!(!dependency_is_resolved(status, "code"));
+        }
+        for status in ["backlog", "todo", "review", "doing", "unknown"] {
+            assert!(!execution_is_terminal(status,"code"));
+        }
+    }
+
+    #[test]
+    fn structured_capture_releases_only_the_delivery_marker() {
+        let conn = crate::db::migrate::test_memdb();
+        for (i, hold) in ["Already delivered owner follow-up; claim explicitly when switching work", "budget approval pending"].into_iter().enumerate() {
+            let id = format!("HOLD-{i}");
+            conn.execute("INSERT INTO issues(id,title,desc,status,creator,created,updated,next_action,acceptance_criteria,source_ref) VALUES (?1,'Reproduce bug','**Prompt:** fix this','backlog','amux',1,1,'Run regression','[\"Regression passes\"]',?2)", rusqlite::params![id, hold]).unwrap();
+            let mut row = get_issue(&conn,&id).unwrap().unwrap();
+            save_patched(&conn,&mut row).unwrap();
+            assert_eq!(row.source_ref.as_deref(), if i==0 {None} else {Some(hold)});
+            assert_eq!(get_issue(&conn,&id).unwrap().unwrap().source_ref, row.source_ref);
+        }
+    }
+
+    #[test]
+    fn retained_prompt_provenance_does_not_make_structured_work_a_shell() {
+        let conn = crate::db::migrate::test_memdb();
+        for (i, (action, criteria, expected)) in [
+            ("Run the reproduction", r#"["Regression no longer reproduces"]"#, false),
+            ("", r#"["Regression no longer reproduces"]"#, true),
+            ("Run the reproduction", "[]", true),
+            ("Run the reproduction", r#"[" ", null, 1]"#, true),
+            ("Run the reproduction", "broken json", true),
+            ("Run the reproduction", r#"{"gate":"done"}"#, true),
+            ("\u{2003}", r#"["done"]"#, true),
+        ].into_iter().enumerate() {
+            let id = format!("INTAKE-{i}");
+            conn.execute("INSERT INTO issues(id,title,desc,status,creator,created,updated,next_action,acceptance_criteria) VALUES (?1,'Reproduce bug','**Prompt:** fix this','backlog','amux',1,1,?2,?3)", rusqlite::params![id, action, criteria]).unwrap();
+            let row = get_issue(&conn, &id).unwrap().unwrap();
+            let sql: bool = conn.query_row(&format!("SELECT {} FROM issues i WHERE id=?1", capture_shell_sql()), [&id], |r| r.get(0)).unwrap();
+            assert_eq!(is_capture_shell(&row), expected, "Rust: {id}");
+            assert_eq!(sql, expected, "SQL: {id}");
+        }
+    }
+
     #[test]
     fn the_sql_predicate_and_the_rust_one_select_the_same_rows() {
         // The REAL schema via the migration chain, not a hand-rolled four-column

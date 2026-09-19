@@ -2457,8 +2457,7 @@ mod epic_completion_unit_tests {
 // runs every drive_tick and handles two cases:
 //
 // 1. ALL cards terminal -> stop worker, archive env file, clean worktree
-// 2. Worker idle, only card in backlog/todo, no doing cards -> stop worker
-//    (the card stays on the board for the parent to handle)
+// Queued work retains its worker and owner; only completed assignments retire.
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct EphemeralReaperReport {
@@ -2479,9 +2478,6 @@ pub(crate) async fn reap_ephemeral_workers(state: &AppState) -> EphemeralReaperR
         Err(_) => return report,
     };
 
-    let terminal: std::collections::HashSet<&str> =
-        ["done", "verified", "discarded", "cancelled"].iter().copied().collect();
-
     let mut ephemeral_sessions: Vec<(String, String)> = Vec::new(); // (name, parent)
     for entry in entries.flatten() {
         let fname = entry.file_name();
@@ -2489,7 +2485,9 @@ pub(crate) async fn reap_ephemeral_workers(state: &AppState) -> EphemeralReaperR
         if !fname_s.ends_with(".env") { continue; }
         let name = fname_s.trim_end_matches(".env").to_string();
         let env = crate::config::parse_env_file(&entry.path());
-        if env.get("CC_EPHEMERAL").map(|v| v == "1").unwrap_or(false) {
+        if env.get("CC_EPHEMERAL").map(|v| v == "1").unwrap_or(false)
+            && env.get("CC_PAUSED").is_none_or(|v| v != "1")
+            && env.get("CC_ARCHIVED").is_none_or(|v| v != "1") {
             let parent = env.get("CC_PARENT").cloned().unwrap_or_default();
             ephemeral_sessions.push((name, parent));
         }
@@ -2498,20 +2496,18 @@ pub(crate) async fn reap_ephemeral_workers(state: &AppState) -> EphemeralReaperR
     report.n_considered = ephemeral_sessions.len();
     if ephemeral_sessions.is_empty() { return report; }
 
-    let cards_by_session: HashMap<String, Vec<(String, String)>> = match state.store.read() {
+    let cards_by_session: HashMap<String, Vec<(String, String, String)>> = match state.store.read() {
         Ok(conn) => {
-            let mut map: HashMap<String, Vec<(String, String)>> = HashMap::new();
-            if let Ok(mut stmt) = conn.prepare(
-                "SELECT id, session, status FROM issues WHERE session IN \
-                 (SELECT DISTINCT session FROM issues WHERE session LIKE '%-eph-%')"
-            ) {
-                let rows = stmt.query_map([], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
-                });
-                if let Ok(rows) = rows {
-                    for row in rows.flatten() {
-                        map.entry(row.1).or_default().push((row.0, row.2));
-                    }
+            let mut map = HashMap::new();
+            let Ok(mut stmt) = conn.prepare("SELECT id,status,COALESCE(type,'code') FROM issues WHERE session=?1 AND deleted IS NULL AND COALESCE(archived,0)=0") else {
+                report.errors += 1;
+                return report;
+            };
+            for (name, _) in &ephemeral_sessions {
+                match stmt.query_map([name], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+                    .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>()) {
+                    Ok(rows) => { map.insert(name.clone(), rows); }
+                    Err(_) => { report.errors += 1; }
                 }
             }
             map
@@ -2526,17 +2522,10 @@ pub(crate) async fn reap_ephemeral_workers(state: &AppState) -> EphemeralReaperR
             _ => continue,
         };
 
-        let all_terminal = card_list.iter().all(|(_, st)| terminal.contains(st.as_str()));
-        let has_doing = card_list.iter().any(|(_, st)| st == "doing");
-        let all_parked = card_list.iter().all(|(_, st)| st == "backlog" || st == "todo");
-
-        let action = if all_terminal {
-            "done"
-        } else if !has_doing && all_parked {
-            "parked"
-        } else {
-            continue;
-        };
+        // An idle worker with queued work still owns that work. Reaping it and
+        // returning cards to the parent made an ordinary pause look like a handoff.
+        if !card_list.iter().all(|(_, status, kind)| bs::execution_is_terminal(status, kind)) { continue; }
+        let action = "done";
 
         let is_idle = !crate::api::session_verbs::is_running(name).await;
         if !is_idle {
@@ -2545,9 +2534,8 @@ pub(crate) async fn reap_ephemeral_workers(state: &AppState) -> EphemeralReaperR
             continue;
         }
 
-        let card_ids: Vec<String> = card_list.iter().map(|(id, _)| id.clone()).collect();
         let card_summary = card_list.iter()
-            .map(|(id, st)| format!("{id}={st}"))
+            .map(|(id, st, _)| format!("{id}={st}"))
             .collect::<Vec<_>>().join(", ");
 
         tracing::info!(
@@ -2581,41 +2569,9 @@ pub(crate) async fn reap_ephemeral_workers(state: &AppState) -> EphemeralReaperR
             report.errors += 1;
         }
 
-        // Clean up worktree if present
-        let wt_path = home.join("worktrees").join(name);
-        if wt_path.exists() {
-            let _ = tokio::process::Command::new("git")
-                .args(["worktree", "remove", "--force"])
-                .arg(&wt_path)
-                .output()
-                .await;
-        }
-
-        // Log the card back to the parent if parked
-        if action == "parked" && !parent.is_empty() {
-            let stamp = chrono::Local::now().format("%H:%M").to_string();
-            for card_id in &card_ids {
-                let cid = card_id.clone();
-                let par = parent.clone();
-                let stamp_w = stamp.clone();
-                let _ = state.store.write_async(move |conn| {
-                    if let Some(mut card) = bs::get_issue(conn, &cid)? {
-                        card.session = Some(par);
-                        card.log = Some(bs::append_log(
-                            card.log.as_deref(), &stamp_w,
-                            "ephemeral worker reaped (card parked); returned to parent session",
-                        ));
-                        card.updated = chrono::Utc::now().timestamp();
-                        card.rev += 1;
-                        bs::save_patched(conn, &mut card)?;
-                    }
-                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
-                }).await;
-            }
-            report.reaped_parked += 1;
-        } else {
-            report.reaped_done += 1;
-        }
+        // Worktree disposal is owned by the worktree lifecycle. A terminal card
+        // is not proof that every untracked file is disposable.
+        report.reaped_done += 1;
     }
 
     report
@@ -4664,28 +4620,23 @@ fn capture_cleanup_reason(row: &bs::IssueRow) -> String {
 /// Select the owning model's once-per-card disposition request. Neither a
 /// progress append nor generic advance nudges can spend this distinct action.
 fn unnudged_capture_cleanup(conn: &Connection, session: &str) -> Option<String> {
-    let candidates: Vec<String> = conn
-        .prepare(
-            "SELECT id FROM issues \
-             WHERE session=?1 AND status='doing' AND source='capture' \
-             AND deleted IS NULL AND COALESCE(archived,0)=0 AND owner_type='agent' AND COALESCE(type,'') != 'epic' \
-             ORDER BY updated DESC LIMIT 40",
-        )
-        .and_then(|mut st| {
-            st.query_map([session], |r| r.get(0))
-                .map(|rows| rows.flatten().collect())
-        })
-        .unwrap_or_default();
-
-    candidates.into_iter().find_map(|id| {
-        let row = bs::get_issue(conn, &id).ok().flatten()?;
-        if capture_cleanup_reason(&row).is_empty() { return None; }
-        let idem = format!("decompose:{id}");
-        let already = conn
-            .query_row("SELECT 1 FROM session_events WHERE idem=?1 LIMIT 1", [idem], |_| Ok(()))
-            .optional().ok().flatten().is_some();
-        (!already).then_some(id)
-    })
+    // Filter disposed/structured receipts before LIMIT. Looking at only the
+    // newest 40 first let already-asked receipts hide all older pending intake.
+    let sql = format!(
+        "SELECT i.id FROM issues i WHERE i.session=?1 \
+         AND i.status IN ('doing','todo','backlog') AND i.source IN ('capture','orchestrator') \
+         AND i.deleted IS NULL AND COALESCE(i.archived,0)=0 AND i.owner_type='agent' \
+         AND COALESCE(i.type,'') != 'epic' AND {} \
+         AND NOT EXISTS (SELECT 1 FROM session_events e WHERE e.idem='decompose:'||i.id) \
+         ORDER BY i.created,i.id LIMIT 1", bs::capture_shell_sql());
+    match conn.query_row(&sql, [session], |r| r.get(0)).optional() {
+        Ok(card) => card,
+        Err(error) => {
+            tracing::warn!(session, %error, verdict = "capture_intake_selection_failed",
+                "could not inspect pending command intake");
+            None
+        }
+    }
 }
 
 /// [`select_advance`] over an INJECTED "is this name a registered worker"
@@ -4865,6 +4816,11 @@ pub fn select_advance_with(
         })
         .unwrap_or_default();
     if let Some(capture_id) = capture_cleanup.as_deref() {
+        if !cands.iter().any(|(id, _)| id == capture_id) {
+            if let Ok(Some(row)) = bs::get_issue(conn, capture_id) {
+                cands.insert(0, (row.id, row.status));
+            }
+        }
         cands.sort_by_key(|(id, _)| if id == capture_id { 0 } else { 1 });
     }
     if cands.is_empty() {
@@ -4966,7 +4922,7 @@ pub fn select_advance_with(
         let text = format!(
             "[amux] {card_id} is a capture shell ({why}). Not blocking pickup.\n\n\
              Not work? `amux board discard {card_id} --outcome-stdin`\n\
-             One task? `amux board retitle {card_id} \"<title>\" --desc-stdin`\n\
+             One task? Add next_action and acceptance_criteria, then `amux board retitle {card_id} \"<title>\" --desc-stdin`\n\
              Existing tasks? `amux board type {card_id} epic`, then \
              `amux board epic <child-id> {card_id}`. Reuse canonical tasks; do not duplicate them.\n\
              New tasks? `amux board decompose {card_id} --stdin` with descriptions, dependencies, \
@@ -6671,93 +6627,96 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
             .with_counts(eligible, open);
     };
     let advance = select_advance(&conn, lane, &tags, now);
-    let pickup = match &advance {
-        Advance::Nudge { .. } => None,
-        Advance::None { .. } => Some(select_pickup(&conn, lane, now)),
-    };
+    let pickup = select_pickup(&conn, lane, now);
     drop(conn);
-
-    if let Advance::Nudge { target, card, status, text, kind } = advance {
-        // A NUDGE IS ABOUT A CARD, so it carries that card's revision and the
-        // delivery loop drops it if the card moves first (AMUX-3659). Read
-        // here, at compute time, because that is the state the text describes.
-        // A card whose rev cannot be read delivers unconditionally — the same
-        // behaviour as before, since refusing to nudge because a read failed
-        // would be a worse trade than an occasionally-stale nudge.
-        let rev: Option<i64> = state
-            .store
-            .read()
-            .ok()
-            .and_then(|c| {
-                c.query_row("SELECT rev FROM issues WHERE id=?1", rusqlite::params![&card], |r| r.get(0))
-                    .ok()
-            });
-        let delivery = match rev {
-            Some(r) => fleet.deliver_about(&target, &text, &card, r).await,
-            None => fleet.deliver_work(&target, &text).await.map(|_|true),
-        };
-        match delivery {
-            Err(error)=>return nudge_delivery_failed(lane,&target,&card,&error).with_counts(eligible,open),
-            Ok(false)=>return LaneTrace::skip(lane,"unchanged-reminder","same card state already queued or delivered; no new worker turn").with_counts(eligible,open),
-            Ok(true)=>{},
-        }
-        // THE COOLDOWN IS PER LANE, AND A REVIEW ROUTE INVOLVES TWO OF THEM.
-        // `advance.nudged` is recorded under the REVIEWER (python:13817 — it
-        // once stamped the card owner's cooldown while the message went to the
-        // reviewer, so the reviewer's own cooldown was never touched). But then
-        // NOTHING stamps the OWNER's lane, and the owner's lane is what
-        // re-selects the same review card on the next tick. Measured live at
-        // 22:07/22:08/22:09: amux-agent was nudged about AC-233 on three
-        // consecutive ticks, 60s apart, stopping only when the per-CARD budget
-        // hit 3 — a bound meant to span 24h, spent in three minutes.
-        //
-        // So the route writes a second, cheap marker under the OWNER. It is a
-        // DIFFERENT type on purpose: `last_advance` counts it (the owner's lane
-        // goes quiet for 15 minutes) while the per-card budget counts only
-        // `advance.nudged`, so recording it cannot burn the reviewer's three
-        // nudges at twice the rate.
-        if kind == "review-routed" && target != lane {
-            crate::api::session_verbs::emit_event(
-                state,
-                lane,
-                "advance.routed",
-                Some(json!({"issue": card, "status": status, "reviewer": target})),
-                None,
-                "board-drive",
-            )
-            .await;
-        }
-        // BOTH renag arms write the same event TYPE — the type is the fault
-        // class and it should stay one thing. The arm is carried in `kind`
-        // inside the data, which is where a per-branch counter can read it
-        // without splitting the class (AMUX-3777).
-        let etype =
-            if kind.starts_with("renag") { "needsyou.renag" } else { "advance.nudged" };
-        let idem = if kind == "decompose-asked" {
-            Some(format!("decompose:{card}"))
-        } else {
-            None
-        };
-        // The event carries the card's STATUS, which Python kept only in memory.
-        // That is what makes "did the lane make progress since we spoke?"
-        // survive the restart this process takes on every deploy.
-        crate::api::session_verbs::emit_event(
-            state,
-            &target,
-            etype,
-            Some(json!({"issue": card, "status": status, "kind": kind})),
-            idem,
-            "board-drive",
-        )
-        .await;
-        return LaneTrace::acted(lane, kind, &card, format!("delivered to {target}"))
-            .with_counts(eligible, open);
-    }
 
     let advance_reason = match &advance {
         Advance::None { reason, detail } => (*reason, detail.clone()),
-        Advance::Nudge { .. } => unreachable!("handled above"),
+        Advance::Nudge { .. } => ("unchanged-reminder", "same card state already queued or delivered".into()),
     };
+    'reminder: {
+        if let Advance::Nudge { target, card, status, text, kind } = advance {
+            // A NUDGE IS ABOUT A CARD, so it carries that card's revision and the
+            // delivery loop drops it if the card moves first (AMUX-3659). Read
+            // here, at compute time, because that is the state the text describes.
+            // A card whose rev cannot be read delivers unconditionally — the same
+            // behaviour as before, since refusing to nudge because a read failed
+            // would be a worse trade than an occasionally-stale nudge.
+            let rev: Option<i64> = state
+                .store
+                .read()
+                .ok()
+                .and_then(|c| {
+                    c.query_row("SELECT rev FROM issues WHERE id=?1", rusqlite::params![&card], |r| r.get(0))
+                        .ok()
+                });
+            let delivery = match rev {
+                Some(r) => fleet.deliver_about(&target, &text, &card, r).await,
+                None => fleet.deliver_work(&target, &text).await.map(|_|true),
+            };
+            match delivery {
+                Err(error)=>return nudge_delivery_failed(lane,&target,&card,&error).with_counts(eligible,open),
+                Ok(false) => {
+                    tracing::info!(session = lane, card, verdict = "duplicate_reminder_yields_to_pickup",
+                        "board_drive: suppressed reminder does not suppress independent work");
+                    break 'reminder;
+                },
+                Ok(true)=>{},
+            }
+            // THE COOLDOWN IS PER LANE, AND A REVIEW ROUTE INVOLVES TWO OF THEM.
+            // `advance.nudged` is recorded under the REVIEWER (python:13817 — it
+            // once stamped the card owner's cooldown while the message went to the
+            // reviewer, so the reviewer's own cooldown was never touched). But then
+            // NOTHING stamps the OWNER's lane, and the owner's lane is what
+            // re-selects the same review card on the next tick. Measured live at
+            // 22:07/22:08/22:09: amux-agent was nudged about AC-233 on three
+            // consecutive ticks, 60s apart, stopping only when the per-CARD budget
+            // hit 3 — a bound meant to span 24h, spent in three minutes.
+            //
+            // So the route writes a second, cheap marker under the OWNER. It is a
+            // DIFFERENT type on purpose: `last_advance` counts it (the owner's lane
+            // goes quiet for 15 minutes) while the per-card budget counts only
+            // `advance.nudged`, so recording it cannot burn the reviewer's three
+            // nudges at twice the rate.
+            if kind == "review-routed" && target != lane {
+                crate::api::session_verbs::emit_event(
+                    state,
+                    lane,
+                    "advance.routed",
+                    Some(json!({"issue": card, "status": status, "reviewer": target})),
+                    None,
+                    "board-drive",
+                )
+                .await;
+            }
+            // BOTH renag arms write the same event TYPE — the type is the fault
+            // class and it should stay one thing. The arm is carried in `kind`
+            // inside the data, which is where a per-branch counter can read it
+            // without splitting the class (AMUX-3777).
+            let etype =
+                if kind.starts_with("renag") { "needsyou.renag" } else { "advance.nudged" };
+            let idem = if kind == "decompose-asked" {
+                Some(format!("decompose:{card}"))
+            } else {
+                None
+            };
+            // The event carries the card's STATUS, which Python kept only in memory.
+            // That is what makes "did the lane make progress since we spoke?"
+            // survive the restart this process takes on every deploy.
+            crate::api::session_verbs::emit_event(
+                state,
+                &target,
+                etype,
+                Some(json!({"issue": card, "status": status, "kind": kind})),
+                idem,
+                "board-drive",
+            )
+            .await;
+            return LaneTrace::acted(lane, kind, &card, format!("delivered to {target}"))
+                .with_counts(eligible, open);
+        }
+
+    }
 
     if let Some((card, cause)) = current_claim {
         // An exact runtime identity prevents a second claim, but cannot veto
@@ -6766,10 +6725,10 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
         // already sent about a raw prompt is not an executable task claim.
         let capture_exempt = state.store.read().ok()
             .and_then(|conn| bs::get_issue(&conn, &card).ok().flatten())
-            .is_some_and(|row| row.creator == "amux" && row.desc.starts_with("**Prompt:**"));
-        let recovery = matches!(&pickup, Some(Pickup::ReclaimStale { card: stale, .. }) if stale == &card)
+            .is_some_and(|row| bs::is_capture_shell(&row));
+        let recovery = matches!(&pickup, Pickup::ReclaimStale { card: stale, .. } if stale == &card)
             || (capture_exempt
-                && matches!(&pickup, Some(Pickup::Claim { .. } | Pickup::DrainBacklog { .. })));
+                && matches!(&pickup, Pickup::Claim { .. } | Pickup::DrainBacklog { .. }));
         if !recovery || fleet.active_child_work(lane) {
             return LaneTrace::skip(lane, "active-claim-current",
                 format!("{card} remains the exact runtime card ({cause}); canonical advancement: {} — {}",
@@ -6780,7 +6739,7 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
             "board_drive: idle runtime claim no longer vetoes guarded stale recovery or capture-shell WIP exemption");
     }
 
-    match pickup.expect("pickup computed whenever advance declined") {
+    match pickup {
         Pickup::Claim { card, prompt } => {
             // Only dispatch "work it now" if the atomic claim actually took —
             // the card could have been closed between select_pickup and here
@@ -9260,6 +9219,7 @@ mod tests {
         starts: std::sync::atomic::AtomicUsize,
         start_error: std::sync::Mutex<Option<String>>,
         delivery_error: std::sync::Mutex<Option<String>>,
+        suppress_about: std::sync::atomic::AtomicBool,
     }
     impl Default for BoundaryFleet {
         fn default() -> Self {
@@ -9272,7 +9232,8 @@ mod tests {
                 enabled: std::sync::atomic::AtomicBool::new(true),
                 isolated: std::sync::atomic::AtomicBool::new(false),
                 starts: std::sync::atomic::AtomicUsize::new(0),
-                start_error: std::sync::Mutex::new(None), delivery_error: std::sync::Mutex::new(None) }
+                start_error: std::sync::Mutex::new(None), delivery_error: std::sync::Mutex::new(None),
+                suppress_about: std::sync::atomic::AtomicBool::new(false) }
         }
     }
     impl Fleet for BoundaryFleet {
@@ -9299,6 +9260,10 @@ mod tests {
             if let Some(error) = self.delivery_error.lock().unwrap().clone() { return Err(error); }
             self.deliver(lane, text).await;
             Ok(())
+        }
+        async fn deliver_about(&self, lane: &str, text: &str, _: &str, _: i64) -> Result<bool, String> {
+            if self.suppress_about.load(std::sync::atomic::Ordering::SeqCst) { return Ok(false); }
+            self.deliver_work(lane, text).await.map(|_| true)
         }
         async fn deliver_blocker_recovery(&self, lane: &str, text: &str, _card: &str, _rev: i64, identity: &str) -> Result<bool, String> {
             self.deliver_resume(lane, text, identity).await.map(|d| d == ResumeDelivery::Queued)
@@ -9659,6 +9624,43 @@ mod tests {
             )?;
             Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
         }).unwrap();
+    }
+
+    #[tokio::test]
+    async fn suppressed_review_reminder_does_not_starve_ready_work() {
+        let (_dir, state, store) = drive_state();
+        drive_card(&store, "REVIEW-1", "review", "agent", "code");
+        drive_card(&store, "READY-1", "todo", "agent", "code");
+        let fleet = BoundaryFleet::default();
+        fleet.suppress_about.store(true, std::sync::atomic::Ordering::SeqCst);
+        let trace = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(trace.outcome, "assigned", "{trace:?}");
+        assert_eq!(drive_status(&store, "READY-1"), "doing");
+        assert_eq!(drive_status(&store, "REVIEW-1"), "review");
+        assert_eq!(fleet.delivered.lock().unwrap().len(), 1, "only new work consumes a turn");
+    }
+
+    #[test]
+    fn already_asked_receipts_cannot_hide_older_pending_intake() {
+        let conn = board_db();
+        for n in 0..45 {
+            let id = format!("RAW-{n:02}");
+            add_card(&conn,&id,"lane","backlog","Fix parser","**Prompt:** Fix the parser regression");
+            conn.execute("UPDATE issues SET creator='amux',source='capture',created=?2,updated=?2 WHERE id=?1",rusqlite::params![id,n+1]).unwrap();
+            if n>0 {
+                conn.execute("INSERT INTO session_events(ts,session,type,data,idem,source) VALUES (1,'lane','advance.nudged','{}',?1,'test')",[format!("decompose:{id}")]).unwrap();
+            }
+        }
+        assert_eq!(unnudged_capture_cleanup(&conn,"lane"),Some("RAW-00".into()));
+    }
+
+    #[test]
+    fn queued_capture_gets_intake_even_with_an_existing_review_card() {
+        let conn = board_db();
+        add_card(&conn, "REVIEW-1", "lane", "review", "Review parser fix", "SCOPE: tests");
+        add_card(&conn, "RAW-1", "lane", "backlog", "1", "**Prompt:** 1. Fix parser\n2. Add regression");
+        conn.execute("UPDATE issues SET creator='amux',source='capture' WHERE id='RAW-1'", []).unwrap();
+        assert!(matches!(select_advance(&conn,"lane",&[],now_f64()), Advance::Nudge { card, kind: "decompose-asked", .. } if card=="RAW-1"));
     }
 
     #[tokio::test]

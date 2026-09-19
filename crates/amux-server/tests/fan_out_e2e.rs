@@ -363,6 +363,7 @@ async fn fan_out_reassigns_children_and_writes_env_files() {
         "callback routes back to the orchestrator"
     );
     assert_eq!(cb["state"].as_str().unwrap(), "armed");
+    assert!(!cb["prompt"].as_str().unwrap_or_default().contains("rm -f"), "completion is not authorization to delete a worker");
 
     // DB: epic log updated
     let epic_after = get_card(&r.app, eid).await;
@@ -638,7 +639,7 @@ async fn env_files_carry_the_full_ephemeral_contract() {
         ("CC_TAGS", "ephemeral"),
         ("CC_CREATOR", "launch:env-test-parent"),
         ("AMUX_BOARD_DELEGATION", "0"),
-        ("AMUX_DISPATCH_BACKLOG_WHEN_IDLE", "0"),
+        ("AMUX_DISPATCH_BACKLOG_WHEN_IDLE", "1"),
     ];
     for (key, expected) in &required {
         let actual = env.get(*key).map(|s| s.as_str());
@@ -686,4 +687,97 @@ async fn launch_deduplicates_worker_names() {
     let w1 = children[0]["worker"].as_str().unwrap();
     let w2 = children[1]["worker"].as_str().unwrap();
     assert_ne!(w1, w2, "duplicate titles must get distinct worker names");
+}
+
+#[tokio::test]
+async fn launch_retry_reuses_graph_and_preserves_paused_child_configuration() {
+    let r = rig();
+    write_parent_env(&r.home, "retry-parent");
+    let request = json!({"title":"Retry receipt", "priorities":["Verify parser regression"],
+        "parent_session":"retry-parent", "model":"haiku"});
+    let (status, _, first) = send(&r.app,"POST","/api/board/launch",Some(request.clone()),
+        &[("x-amux-session","retry-parent")]).await;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+    let child = first["children"][0]["id"].as_str().unwrap();
+    let worker = first["children"][0]["worker"].as_str().unwrap();
+    let path = r.home.join("sessions").join(format!("{worker}.env"));
+    let original = std::fs::read_to_string(&path).unwrap();
+    let paused = format!("{original}\nCC_PAUSED=1\nCC_DESC='Owner changed description'\n");
+    std::fs::write(&path, &paused).unwrap();
+    let rev = get_card(&r.app,child).await["rev"].clone();
+    let (status, _, second) = send(&r.app,"POST","/api/board/launch",Some(request),
+        &[("x-amux-session","retry-parent")]).await;
+    assert_eq!(status, StatusCode::CREATED, "{second}");
+    assert_eq!(second["epic"], first["epic"]);
+    assert_eq!(second["idempotent"],true);
+    assert_eq!(second["children"], first["children"]);
+    assert_eq!(get_card(&r.app,child).await["rev"], rev);
+    assert_eq!(std::fs::read_to_string(path).unwrap(), paused);
+    assert!(second["failed"][0]["error"].as_str().unwrap().contains("paused"));
+}
+
+#[tokio::test]
+async fn fan_out_retry_keeps_assignment_after_retitle_and_does_not_start_dependents() {
+    let r = rig();
+    write_parent_env(&r.home,"retry-fanout");
+    let epic = create(&r.app,json!({"title":"Parser rollout", "type":"epic", "session":"retry-fanout"})).await;
+    let eid = epic["id"].as_str().unwrap();
+    let first = create(&r.app,json!({"title":"Implement parser fix", "status":"todo", "session":"retry-fanout"})).await;
+    let id = first["id"].as_str().unwrap();
+    let blocked = create(&r.app,json!({"title":"Run rollout after parser", "status":"backlog", "session":"retry-fanout"})).await;
+    let blocked_id = blocked["id"].as_str().unwrap();
+    for (card,patch) in [(id,json!({"epic":eid})),(blocked_id,json!({"epic":eid,"depends_on":[id]}))] {
+        let (status,_,body)=send(&r.app,"PATCH",&format!("/api/board/{card}"),Some(patch),&[("x-amux-session","retry-fanout")]).await;
+        assert!(status.is_success(),"{body}");
+    }
+    let path = format!("/api/board/{eid}/fan-out");
+    let (status,_,result)=send(&r.app,"POST",&path,Some(json!({})),&[("x-amux-session","retry-fanout")]).await;
+    assert_eq!(status,StatusCode::CREATED,"{result}");
+    assert_eq!(result["n_considered"],1);
+    let assigned = get_card(&r.app,id).await;
+    let worker = assigned["session"].as_str().unwrap();
+    let env_path=r.home.join("sessions").join(format!("{worker}.env"));
+    let paused=format!("{}\nCC_PAUSED=1\n",std::fs::read_to_string(&env_path).unwrap());
+    std::fs::write(&env_path,&paused).unwrap();
+    send(&r.app,"PATCH",&format!("/api/board/{id}"),Some(json!({"title":"Renamed parser repair"})),&[("x-amux-session",worker)]).await;
+    let before=get_card(&r.app,id).await;
+    let epic_before=get_card(&r.app,eid).await;
+    let (status,_,result)=send(&r.app,"POST",&path,Some(json!({})),&[("x-amux-session","retry-fanout")]).await;
+    assert_eq!(status,StatusCode::CREATED,"{result}");
+    assert_eq!(get_card(&r.app,id).await["session"],before["session"]);
+    assert_eq!(get_card(&r.app,id).await["rev"],before["rev"]);
+    assert_eq!(get_card(&r.app,eid).await["rev"],epic_before["rev"]);
+    assert_eq!(get_card(&r.app,blocked_id).await["session"],"retry-fanout");
+    assert_eq!(std::fs::read_to_string(env_path).unwrap(),paused);
+}
+
+#[tokio::test]
+async fn launch_cannot_put_work_on_another_workers_board() {
+    let r = rig();
+    write_parent_env(&r.home, "unrelated-owner");
+    let (status,_,result) = send(&r.app,"POST","/api/board/launch",Some(json!({
+        "parent_session":"unrelated-owner", "priorities":["Fix parser"]
+    })),&[("x-amux-session","other-worker")]).await;
+    assert_eq!(status,StatusCode::FORBIDDEN,"{result}");
+    assert_eq!(result["code"],"cross_board_launch_forbidden");
+}
+
+#[tokio::test]
+async fn fan_out_consumes_completed_inputs_without_cross_worker_execution_dependencies() {
+    let r=rig();
+    write_parent_env(&r.home,"ready-parent");
+    let epic=create(&r.app,json!({"title":"Independent rollout","type":"epic","session":"ready-parent"})).await;
+    let eid=epic["id"].as_str().unwrap();
+    let input=create(&r.app,json!({"title":"Collect rollout inputs","type":"chore","status":"done","session":"ready-parent"})).await;
+    let input_id=input["id"].as_str().unwrap();
+    let task=create(&r.app,json!({"title":"Apply rollout inputs","status":"todo","session":"ready-parent"})).await;
+    let id=task["id"].as_str().unwrap();
+    let (status,_,body)=send(&r.app,"PATCH",&format!("/api/board/{id}"),Some(json!({"epic":eid,"depends_on":[input_id]})),&[("x-amux-session","ready-parent")]).await;
+    assert!(status.is_success(),"{body}");
+    let (status,_,body)=send(&r.app,"POST",&format!("/api/board/{eid}/fan-out"),Some(json!({})),&[("x-amux-session","ready-parent")]).await;
+    assert_eq!(status,StatusCode::CREATED,"{body}");
+    let after=get_card(&r.app,id).await;
+    assert_ne!(after["session"],"ready-parent");
+    assert_eq!(after["depends_on"],json!([]));
+    assert!(after["log"].as_str().unwrap().contains(input_id), "completed input remains auditable");
 }

@@ -4037,7 +4037,7 @@ fn configured_model_with_default(
 /// fleet table, which reads CC_MODEL with no provider test; and a worker
 /// swapped INTO ollama that kept `--model` in CC_FLAGS would hit the inert-flag
 /// WARN on every launch. One key set, one key cleared, decided in one place.
-fn route_model_to_env(cfg: &mut EnvFile, provider: &str, model: &str, flags_no_model: &str) -> String {
+pub(crate) fn route_model_to_env(cfg: &mut EnvFile, provider: &str, model: &str, flags_no_model: &str) -> String {
     if model_lives_in_cc_model(provider) {
         cfg.set("CC_MODEL", model);
         return flags_no_model.to_string();
@@ -4891,7 +4891,7 @@ pub(crate) fn format_captured_desc(body: &str) -> String {
     }
 }
 
-fn mint_capture_card(
+pub(crate) fn mint_capture_card(
     conn: &rusqlite::Connection,
     session_name: &str,
     body: &str,
@@ -5041,7 +5041,7 @@ fn mint_capture_card(
     // its current card. Keep follow-ups visible without claiming concurrent
     // execution or redispatching a prompt the worker already received.
     let (active_count, active_card): (i64, Option<String>) = conn.query_row(
-        "SELECT COUNT(*), MIN(id) FROM issues WHERE session=?1 AND status='doing' AND COALESCE(archived,0)=0",
+        "SELECT COUNT(*), MIN(id) FROM issues WHERE session=?1 AND status='doing' AND deleted IS NULL AND COALESCE(archived,0)=0",
         [session_name], |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let capture_status = if active_count > 0 { "backlog" } else { "doing" };

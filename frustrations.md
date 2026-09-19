@@ -3356,3 +3356,25 @@ FIX: 831cc0cb + a35d850f. Added `encode_waiting_on` mirroring
    per ethos rule 4 -- both servers here reported "healthy" the whole time, so
    nothing about the failure was wrong-looking from either process's own vantage
    point.
+
+## Numbered request captured as an active task named 1
+AREA: board
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-19
+SESSION: codex-lifecycle-adherence
+CARD: CLA-1
+SYMPTOM: MFEM1-53 was Doing with title `1` derived from `1. lets ensure ...`; separate capture producers and delivery-only holds left raw requests looking like executable work. An already-delivered advance reminder also returned before independent pickup.
+COST: User could not identify active work from the board; audit required all 31 active workers and 1,298 open cards to distinguish execution from intake and stale reminders.
+FIX: Consolidate capture and structured-intake predicates, strip list syntax before sentence extraction, and yield suppressed reminders to guarded pickup. Cross-board create correctly refused filing this on amux-frustrations; track on the originating board under the user's worker-ownership rule. Originator acceptance remains pending.
+
+## Launch retries duplicate cards and disable backlog draining
+AREA: board
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-19
+SESSION: codex-lifecycle-adherence
+CARD: CLA-1
+SYMPTOM: Launch-created workers had three identical priority cards and AMUX_DISPATCH_BACKLOG_WHEN_IDLE=0; fan-out enabled the flag. Repeating either endpoint rewrote child env files, and title-derived identities could collide or change on retitle.
+COST: Three workers each held three copies of the same priority, while the harness could not drain their backlogs after completing the current task.
+FIX: Share ephemeral provisioning, reuse an identical open launch graph, retain assigned identity across retries, preserve pause/configuration, and fan out only ready independent tasks. Originator acceptance remains pending.

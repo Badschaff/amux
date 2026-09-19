@@ -6442,6 +6442,84 @@ async fn decompose_item(
 
 // ---- Ephemeral fan-out (plan task #6) -----------------------------------
 
+fn ephemeral_completion_notice(card: &str, worker: &str) -> String {
+    format!("Fan-out outcome {card} on {worker} reached its completion boundary. Read its evidence and update the owning epic; preserve any other work assigned to the worker. The harness owns worker retirement and worktree cleanup.")
+}
+
+struct EphemeralConfig<'a> {
+    parent: &'a str,
+    provider: &'a str,
+    model: &'a str,
+    flags: &'a str,
+    creator: &'a str,
+}
+
+/// One provisioning policy for both launch and fan-out. A retry may resume a
+/// failed start, but cannot overwrite a worker's configuration or pause state.
+async fn provision_ephemeral(
+    state: &AppState,
+    child: &IssueRow,
+    name: &str,
+    config: &EphemeralConfig<'_>,
+) -> Result<(), String> {
+    use crate::api::session_verbs::{self, EnvFile, env_path};
+    if !session_verbs::valid_session_name(name) { return Err("invalid ephemeral worker name".into()); }
+    static PROVISIONING: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    let provisioning = PROVISIONING.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+    let path = env_path(name);
+    let mut env = EnvFile::load(&path);
+    if path.exists() {
+        if env.get("CC_EPHEMERAL") != Some("1") || env.get("CC_PARENT") != Some(config.parent)
+            || env.get("CC_BOARD_CARD").is_some_and(|id| id != child.id) {
+            return Err(format!("worker {name} already belongs to another assignment"));
+        }
+        if env.get("CC_PAUSED") == Some("1") || env.get("CC_ARCHIVED") == Some("1") {
+            return Err(format!("worker {name} is paused or archived; preserving lifecycle state"));
+        }
+        if session_verbs::is_running(name).await {
+            tracing::info!(session = name, card = %child.id, verdict = "ephemeral_reused",
+                "fan-out retry reused running worker without restarting it");
+            return Ok(());
+        }
+    } else {
+        let parent = session_verbs::parse_env(config.parent);
+        if parent.get("CC_PAUSED") == Some("1") || parent.get("CC_ARCHIVED") == Some("1") {
+            return Err("parent worker is paused or archived".into());
+        }
+        env.set("CC_DIR", parent.get_or("CC_DIR", ""));
+        env.set("CC_WORKTREE", "1");
+        env.set("CC_EPHEMERAL", "1");
+        env.set("CC_PARENT", config.parent);
+        env.set("CC_BOARD_CARD", &child.id);
+        env.set("CC_PROVIDER", config.provider);
+        env.set("CC_TAGS", "ephemeral");
+        env.set("CC_CREATOR", config.creator);
+        env.set("AMUX_BOARD_DELEGATION", "0");
+        env.set("AMUX_DISPATCH_BACKLOG_WHEN_IDLE", "1");
+        let base_flags = if config.provider == "claude" {
+            format!("--dangerously-skip-permissions {}", config.flags)
+        } else { config.flags.to_string() };
+        let flags = session_verbs::route_model_to_env(&mut env, config.provider, config.model, base_flags.trim());
+        env.set("CC_FLAGS", &flags);
+        if let Some(criteria) = child.acceptance_criteria.as_deref() {
+            env.set("CC_ACCEPTANCE_CRITERIA", criteria);
+        }
+        env.set("CC_DESC", &format!("Ephemeral worker for: {}", child.title.chars().take(120).collect::<String>()));
+        env.write(&path).map_err(|e| format!("env write: {e}"))?;
+    }
+    drop(provisioning);
+    let (ok, detail) = session_verbs::start_session(state, name, "", true).await;
+    if ok {
+        tracing::info!(session = name, card = %child.id, parent = config.parent,
+            verdict = "ephemeral_started", "canonical ephemeral provisioner started worker");
+        Ok(())
+    } else {
+        tracing::warn!(session = name, card = %child.id, error = %detail,
+            verdict = "ephemeral_start_failed", "ephemeral assignment retained for retry");
+        Err(detail)
+    }
+}
+
 #[derive(Deserialize)]
 struct FanOutBody {
     model: Option<String>,
@@ -6464,8 +6542,6 @@ async fn fan_out_item(
     headers: HeaderMap,
     Json(body): Json<FanOutBody>,
 ) -> Response {
-    use crate::api::session_verbs::{self, EnvFile, env_path, start_session};
-
     let (_, actor) = actor_from_headers(&headers);
     if actor == "api-anonymous" {
         return err(
@@ -6519,7 +6595,7 @@ async fn fan_out_item(
 
             let child_ids: Vec<String> = {
                 let mut stmt = conn.prepare(
-                    "SELECT id FROM issues WHERE epic=?1 AND deleted IS NULL ORDER BY created,id",
+                    "SELECT id FROM issues WHERE epic=?1 AND deleted IS NULL AND COALESCE(archived,0)=0 ORDER BY created,id",
                 )?;
                 let ids = stmt.query_map(rusqlite::params![id_w], |r| r.get::<_, String>(0))?
                     .flatten()
@@ -6530,39 +6606,45 @@ async fn fan_out_item(
                 return finish(&slot_w, Out::NoChildren, no_write());
             }
 
-            let terminal: HashSet<&str> = ["done", "verified", "discarded"].iter().copied().collect();
             let now = now_secs();
             let stamp = chrono::Local::now().format("%H:%M").to_string();
             let mut events = Vec::new();
             let mut children = Vec::new();
 
-            let mut used_names: HashSet<String> = HashSet::new();
             for cid in &child_ids {
-                let Some(mut child) = bs::get_issue(conn, cid)? else {
-                    continue;
-                };
-                if terminal.contains(child.status.as_str()) {
+                let Some(mut child) = bs::get_issue(conn, cid)? else { continue };
+                if bs::execution_is_terminal(&child.status, &child.item_type) { continue; }
+                let existing_assignment = child.callback_session.as_deref() == Some(actor_w.as_str())
+                    && child.session.as_deref().is_some_and(|owner| owner != actor_w);
+                if existing_assignment {
+                    let owner = child.session.clone().expect("checked above");
+                    children.push((child, owner));
                     continue;
                 }
-                let base = slugify_name(&child.title, 30);
-                let mut eph_name = if base.is_empty() {
-                    let suffix = if cid.len() > 8 { &cid[..8] } else { cid };
-                    format!("{actor_w}-eph-{suffix}")
-                } else {
-                    base
-                };
-                if used_names.contains(&eph_name) {
-                    let suffix = if cid.len() > 4 { &cid[..4] } else { cid };
-                    eph_name = format!("{eph_name}-{suffix}");
+                if child.session.as_deref().is_some_and(|owner| owner != actor_w) {
+                    tracing::warn!(card = %child.id, owner = ?child.session,
+                        verdict = "fan_out_foreign_child_skipped", "epic link does not authorize taking another worker's assignment");
+                    continue;
                 }
-                used_names.insert(eph_name.clone());
-
+                // Only independent ready work fans out. Other states retain their
+                // owner and gates; no worker starts merely to wait on a sibling.
+                if !matches!(child.status.as_str(), "todo" | "backlog")
+                    || child.blocked_on.as_deref().is_some_and(|v| !v.trim().is_empty())
+                    || child.depends_on.iter().any(|id| !bs::dependency_resolved(conn, id).unwrap_or(false)) {
+                    tracing::info!(card = %child.id, verdict = "fan_out_not_ready", "child retained on owner board until its gates clear");
+                    continue;
+                }
+                let eph_name = format!("{}-eph-{}", slugify_name(&actor_w, 30), cid);
+                if !child.depends_on.is_empty() {
+                    // Ready dependencies are completed inputs now. Retain their
+                    // provenance without creating cross-worker execution edges.
+                    child.log = Some(bs::append_log(child.log.as_deref(), &stamp,
+                        &format!("fan-out: completed prerequisites consumed before assignment: {}", child.depends_on.join(", "))));
+                    child.depends_on.clear();
+                }
                 child.session = Some(eph_name.clone());
                 child.callback_session = Some(actor_w.clone());
-                child.callback_prompt = Some(format!(
-                    "ephemeral worker {eph_name} finished card {}. stop and clean up: amux stop {eph_name} && rm -f ~/.amux/sessions/{eph_name}.env",
-                    cid,
-                ));
+                child.callback_prompt = Some(ephemeral_completion_notice(cid, &eph_name));
                 child.callback_state = Some("armed".into());
                 if child.status == "backlog" {
                     child.status = "todo".into();
@@ -6588,19 +6670,21 @@ async fn fan_out_item(
 
             // Log on the epic itself
             let mut epic = parent;
-            epic.updated = now;
-            epic.rev += 1;
-            epic.version += 1;
-            epic.log = Some(bs::append_log(
-                epic.log.as_deref(),
-                &stamp,
-                &format!(
-                    "fan-out: {} ephemeral worker(s) created by {actor_w} (model={model_w})",
-                    children.len(),
-                ),
-            ));
-            bs::save_patched(conn, &mut epic)?;
-            events.push(ev_snap(&epic, MutationKind::Updated));
+            if !events.is_empty() {
+                epic.updated = now;
+                epic.rev += 1;
+                epic.version += 1;
+                epic.log = Some(bs::append_log(
+                    epic.log.as_deref(),
+                    &stamp,
+                    &format!(
+                        "fan-out: {} ephemeral worker(s) created by {actor_w} (model={model_w})",
+                        children.len(),
+                    ),
+                ));
+                bs::save_patched(conn, &mut epic)?;
+                events.push(ev_snap(&epic, MutationKind::Updated));
+            }
 
             finish(
                 &slot_w,
@@ -6609,7 +6693,7 @@ async fn fan_out_item(
                     children,
                 },
                 WriteOutcome {
-                    applied: true,
+                    applied: !events.is_empty(),
                     events,
                 },
             )
@@ -6637,81 +6721,15 @@ async fn fan_out_item(
         ),
         Some(Out::Fanned { epic, children }) => {
             // Phase 2: async work (env files + start sessions)
-            let parent_cfg = session_verbs::parse_env(&actor);
-            let parent_dir = parent_cfg.get_or("CC_DIR", "");
             let mut started = Vec::new();
             let mut failed = Vec::new();
-
-            for (child, eph_name) in &children {
-                let mut env = EnvFile::load(std::path::Path::new(""));
-                env.set("CC_DIR", parent_dir);
-                env.set("CC_WORKTREE", "1");
-                env.set("CC_EPHEMERAL", "1");
-                env.set("CC_PARENT", &actor);
-                env.set("CC_PROVIDER", &provider);
-                env.set("CC_TAGS", "ephemeral");
-                env.set("CC_CREATOR", &format!("fan-out:{actor}"));
-                env.set("AMUX_BOARD_DELEGATION", "0");
-                // Ephemeral workers have exactly their own cards; they must
-                // drain backlog when idle or a self-parked card sits forever.
-                env.set("AMUX_DISPATCH_BACKLOG_WHEN_IDLE", "1");
-
-                let model_flag = format!("--model {} --dangerously-skip-permissions", model);
-                let flags = if extra_flags.is_empty() {
-                    model_flag
-                } else {
-                    format!("{model_flag} {extra_flags}")
-                };
-                env.set("CC_FLAGS", &flags);
-
-                if let Some(ac) = child.acceptance_criteria.as_deref() {
-                    env.set("CC_ACCEPTANCE_CRITERIA", ac);
-                }
-                env.set("CC_DESC", &format!(
-                    "Ephemeral worker for: {}",
-                    child.title.chars().take(120).collect::<String>()
-                ));
-
-                let ep = env_path(eph_name);
-                if let Err(e) = env.write(&ep) {
-                    tracing::error!(
-                        session = %eph_name,
-                        error = %e,
-                        "fan-out: failed to write env file"
-                    );
-                    failed.push(json!({
-                        "name": eph_name,
-                        "error": format!("env write: {e}"),
-                    }));
-                    continue;
-                }
-
-                let (ok, detail) = start_session(&state, eph_name, "", true).await;
-                if ok {
-                    tracing::info!(
-                        target: "amux::board",
-                        session = %eph_name,
-                        card = %child.id,
-                        model = %model,
-                        epic = %epic.id,
-                        parent = %actor,
-                        verdict = "ephemeral_started",
-                        measured = true,
-                        "fan-out: ephemeral worker started"
-                    );
-                    started.push(eph_name.clone());
-                } else {
-                    tracing::warn!(
-                        target: "amux::board",
-                        session = %eph_name,
-                        card = %child.id,
-                        error = %detail,
-                        "fan-out: failed to start ephemeral worker"
-                    );
-                    failed.push(json!({
-                        "name": eph_name,
-                        "error": detail,
-                    }));
+            let creator = format!("fan-out:{actor}");
+            let config = EphemeralConfig { parent: &actor, provider: &provider, model: &model,
+                flags: &extra_flags, creator: &creator };
+            for (child, name) in &children {
+                match provision_ephemeral(&state, child, name, &config).await {
+                    Ok(()) => started.push(name.clone()),
+                    Err(error) => failed.push(json!({"name": name, "error": error})),
                 }
             }
 
@@ -6826,7 +6844,7 @@ async fn launch_priorities(
     headers: HeaderMap,
     Json(body): Json<LaunchBody>,
 ) -> Response {
-    use crate::api::session_verbs::{self, EnvFile, env_path, start_session};
+    use crate::api::session_verbs::env_path;
 
     let (_, actor) = actor_from_headers(&headers);
     if actor == "api-anonymous" {
@@ -6843,6 +6861,9 @@ async fn launch_priorities(
         );
     }
     for (i, p) in body.priorities.iter().enumerate() {
+        if p.name_override().is_some_and(|name| !crate::api::session_verbs::valid_session_name(name)) {
+            return err(StatusCode::BAD_REQUEST, json!({"error":"invalid worker name", "priority":i+1}));
+        }
         if p.text().trim().is_empty() {
             return err(
                 StatusCode::BAD_REQUEST,
@@ -6852,6 +6873,14 @@ async fn launch_priorities(
     }
 
     let parent_session = body.parent_session.clone();
+    if actor != parent_session && !super::org::is_verified_local_member(&headers) {
+        tracing::warn!(caller = %actor, requested_owner = %parent_session,
+            verdict = "cross_board_launch_forbidden", "worker launch must remain on its own board");
+        return err(StatusCode::FORBIDDEN, json!({
+            "code":"cross_board_launch_forbidden", "caller":actor, "requested_owner":parent_session,
+            "error":"workers may launch outcomes only on their own board"
+        }));
+    }
     let parent_env_path = env_path(&parent_session);
     if !parent_env_path.exists() {
         return err(
@@ -6872,6 +6901,7 @@ async fn launch_priorities(
     struct Created {
         epic: IssueRow,
         children: Vec<(IssueRow, String)>, // (card, ephemeral_name)
+        reused: bool,
     }
 
     let priorities = body.priorities;
@@ -6894,6 +6924,26 @@ async fn launch_priorities(
                 .map(|(i, p)| format!("{}. {}", i + 1, p.text().trim()))
                 .collect::<Vec<_>>()
                 .join("\n");
+            let previous: Option<String> = conn.query_row(
+                "SELECT id FROM issues WHERE session=?1 AND source='launch' AND type='epic' \
+                 AND title=?2 AND desc=?3 AND deleted IS NULL AND COALESCE(archived,0)=0 \
+                 AND status IN ('doing','todo','backlog','review') ORDER BY created DESC LIMIT 1",
+                rusqlite::params![parent_session_w, epic_title, format!("**Prompt:** {epic_desc}")], |r| r.get(0),
+            ).optional()?;
+            if let Some(id) = previous {
+                let epic = bs::get_issue(conn, &id)?.expect("selected epic exists in transaction");
+                let ids = conn.prepare("SELECT id FROM issues WHERE epic=?1 AND deleted IS NULL AND COALESCE(archived,0)=0 ORDER BY created,id")?
+                    .query_map([&id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut children = Vec::new();
+                for id in ids {
+                    if let Some(row) = bs::get_issue(conn, &id)? {
+                        if let Some(owner) = row.session.clone() { children.push((row, owner)); }
+                    }
+                }
+                tracing::info!(epic = %epic.id, verdict = "launch_reused", "identical open launch reused durable graph");
+                *slot_w.lock().expect("launch slot poisoned") = Some(Created { epic, children, reused: true });
+                return Ok(no_write());
+            }
             let epic_new = bs::NewIssue {
                 title: epic_title,
                 desc: format!("**Prompt:** {epic_desc}"),
@@ -6940,7 +6990,7 @@ async fn launch_priorities(
                 let base_name = if let Some(name) = priority.name_override() {
                     name.to_string()
                 } else {
-                    slugify_name(trimmed, 30)
+                    format!("{}-{}-{}", slugify_name(trimmed, 24), epic.id.to_ascii_lowercase(), idx + 1)
                 };
                 let mut eph_name = base_name.clone();
                 if used_names.contains(&eph_name) || eph_name.is_empty() {
@@ -6975,12 +7025,11 @@ async fn launch_priorities(
                     source: Some("launch".into()),
                     requested_by: Some(actor_w.clone()),
                     callback_session: Some(parent_session_w.clone()),
-                    callback_prompt: Some(format!(
-                        "ephemeral worker {eph_name} finished card. stop and clean up: amux stop {eph_name} && rm -f ~/.amux/sessions/{eph_name}.env",
-                    )),
+                    callback_prompt: None,
                 };
                 let mut child = bs::create_issue(conn, &child_new, now)?;
                 child.epic = Some(epic.id.clone());
+                child.callback_prompt = Some(ephemeral_completion_notice(&child.id, &eph_name));
                 child.callback_state = Some("armed".into());
                 child.log = Some(bs::append_log(
                     child.log.as_deref(),
@@ -7000,6 +7049,7 @@ async fn launch_priorities(
             *slot_w.lock().expect("launch slot poisoned") = Some(Created {
                 epic,
                 children,
+                reused: false,
             });
             Ok(WriteOutcome {
                 applied: true,
@@ -7018,82 +7068,16 @@ async fn launch_priorities(
     };
 
     // Phase 2: write env files and start sessions (outside the DB transaction)
-    let parent_cfg = session_verbs::parse_env(&parent_session);
-    let parent_dir = parent_cfg.get_or("CC_DIR", "");
     let mut started = Vec::new();
     let mut failed = Vec::new();
-
-    for (child, eph_name) in &created.children {
-        let mut env = EnvFile::load(std::path::Path::new(""));
-        env.set("CC_DIR", parent_dir);
-        env.set("CC_WORKTREE", "1");
-        env.set("CC_EPHEMERAL", "1");
-        env.set("CC_PARENT", &parent_session);
-        env.set("CC_PROVIDER", &provider);
-        env.set("CC_TAGS", "ephemeral");
-        env.set("CC_CREATOR", &format!("launch:{actor}"));
-        env.set("AMUX_DISPATCH_BACKLOG_WHEN_IDLE", "0");
-        env.set("AMUX_BOARD_DELEGATION", "0");
-
-        let model_flag = format!("--model {} --dangerously-skip-permissions", model);
-        let flags = if extra_flags.is_empty() {
-            model_flag
-        } else {
-            format!("{model_flag} {extra_flags}")
-        };
-        env.set("CC_FLAGS", &flags);
-
-        if let Some(ac) = child.acceptance_criteria.as_deref() {
-            env.set("CC_ACCEPTANCE_CRITERIA", ac);
-        }
-        env.set(
-            "CC_DESC",
-            &format!(
-                "Ephemeral worker for: {}",
-                child.title.chars().take(120).collect::<String>()
-            ),
-        );
-
-        let ep = env_path(eph_name);
-        if let Err(e) = env.write(&ep) {
-            tracing::error!(
-                session = %eph_name,
-                error = %e,
-                "launch: failed to write env file"
-            );
-            failed.push(json!({
-                "name": eph_name,
-                "error": format!("env write: {e}"),
-            }));
-            continue;
-        }
-
-        let (ok, detail) = start_session(&state, eph_name, "", true).await;
-        if ok {
-            tracing::info!(
-                target: "amux::board",
-                session = %eph_name,
-                card = %child.id,
-                model = %model,
-                epic = %created.epic.id,
-                parent = %parent_session,
-                verdict = "launch_ephemeral_started",
-                measured = true,
-                "launch: ephemeral worker started"
-            );
-            started.push(eph_name.clone());
-        } else {
-            tracing::warn!(
-                target: "amux::board",
-                session = %eph_name,
-                card = %child.id,
-                error = %detail,
-                "launch: failed to start ephemeral worker"
-            );
-            failed.push(json!({
-                "name": eph_name,
-                "error": detail,
-            }));
+    let creator = format!("launch:{actor}");
+    let config = EphemeralConfig { parent: &parent_session, provider: &provider, model: &model,
+        flags: &extra_flags, creator: &creator };
+    for (child, name) in &created.children {
+        if bs::execution_is_terminal(&child.status, &child.item_type) { continue; }
+        match provision_ephemeral(&state, child, name, &config).await {
+            Ok(()) => started.push(name.clone()),
+            Err(error) => failed.push(json!({"name": name, "error": error})),
         }
     }
 
@@ -7116,6 +7100,7 @@ async fn launch_priorities(
         Json(json!({
             "ok": true,
             "epic": created.epic.id,
+            "idempotent": created.reused,
             "model": model,
             "priorities": created.children.len(),
             "workers_started": started.len(),
