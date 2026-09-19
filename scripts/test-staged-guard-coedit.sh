@@ -45,8 +45,8 @@ git init -q "$TMP/r"
   git add settled.txt dirty.txt; git commit -qm base
   printf 'uncommitted edit\n' >> dirty.txt ) >/dev/null 2>&1
 
-run_case() { # $1 = python dict for one shared-file entry
-  python3 - "$HOOK" "$TMP/r" "$1" <<'PY' 2>&1
+run_case() { # $1 = python dict for one shared-file entry, $2 = STAGED_LARGE_LINES (optional)
+  python3 - "$HOOK" "$TMP/r" "$1" "${2:-200}" <<'PY' 2>&1
 import io, json, os, subprocess, sys, time, ast
 src = open(sys.argv[1]).read()
 os.chdir(sys.argv[2])
@@ -77,6 +77,7 @@ g = {
     # asserted output by pointing the ledger at a path this test owns.
     "MIRROR_NOTICE_LOG": os.path.join(os.environ.get("TMPDIR", "/tmp"), "test-mirror-notices.jsonl"),
     "GUARD_VERSION": 0,
+    "STAGED_LARGE_LINES": int(sys.argv[4]) if len(sys.argv) > 4 else 200,
 }
 exec(helper, g)
 exec(notice_helper, g)
@@ -108,6 +109,44 @@ if printf '%s' "$out" | grep -q "git apply --cached"; then ok "(b) a file with r
 else bad "(b) the full warning must survive when content IS in dispute" "$out"; fi
 if printf '%s' "$out" | grep -q "UNCORROBORATED co-edit claim"; then bad "(b) must not downgrade a file that has uncommitted content" "$out"
 else ok "(b) no downgrade when there is something to dispute"; fi
+
+# -- AF-929: `has_unstaged_changes` is empty for a pathspec commit -----------
+#
+# `git commit <path>` stages the pathspec's own current working-tree bytes
+# into git's throwaway commit-time index before this hook ever runs, so
+# `git diff` (unstaged) for that exact path is empty by construction --
+# confirmed empirically in a scratch repo, 2026-09-18. The two cells below
+# use a false `has_unstaged_changes` throughout (the value that field would
+# actually carry for a real pathspec-commit sweep) and vary only the STAGED
+# size, which is reachable in both commit shapes.
+( cd "$TMP/r"
+  printf 'base\n' > big.txt; printf 'base\n' > small.txt
+  git add big.txt small.txt; git commit -qm base2
+  seq 1 250 > big.txt; git add big.txt
+  printf 'base\nedit\n' > small.txt; git add small.txt ) >/dev/null 2>&1
+
+# (f) THE FIX: a large staged sweep on a shared path escalates to WARNING even
+#     though `has_unstaged_changes` is false, using the STAGED_LARGE_LINES=200
+#     default -- 250 new lines against a 1-line base clears it comfortably.
+out=$(run_case "{'path':'big.txt','owner':'peer','peer':True,'age_secs':600,'has_unstaged_changes':False,'mine_provenance':'transcript','their_provenance':'transcript'}")
+if printf '%s' "$out" | grep -q "amux staged-guard: WARNING"; then ok "(f) a large pathspec-commit sweep escalates to WARNING via staged size alone"
+else bad "(f) expected WARNING from the staged-size fallback" "$out"; fi
+
+# (g) CONTROL: the fallback has a real threshold. A small, ordinary staged
+#     edit on a shared path must stay NOTE, or (f) would just mean "shared
+#     always warns" and the size check would be theater.
+out=$(run_case "{'path':'small.txt','owner':'peer','peer':True,'age_secs':600,'has_unstaged_changes':False,'mine_provenance':'transcript','their_provenance':'transcript'}")
+if printf '%s' "$out" | grep -q "amux staged-guard: NOTE"; then ok "(g) an ordinary small staged edit stays NOTE, not WARNING"
+else bad "(g) the staged-size fallback must not fire below its threshold" "$out"; fi
+
+# (h) DISCRIMINATING MUTATION CONTROL: the same large sweep against a
+#     threshold ABOVE its own staged size must NOT fire. This is the cell that
+#     proves (f) is testing the boundary and not just "shared is always
+#     WARNING" -- big.txt's real numstat is 250 insertions / 1 deletion = 251
+#     (measured directly with `git diff --cached --numstat`), so 300 must miss.
+out=$(run_case "{'path':'big.txt','owner':'peer','peer':True,'age_secs':600,'has_unstaged_changes':False,'mine_provenance':'transcript','their_provenance':'transcript'}" 300)
+if printf '%s' "$out" | grep -q "amux staged-guard: NOTE"; then ok "(h) raising the threshold above the fixture's own size reverts it to NOTE"
+else bad "(h) the threshold must be a real comparison, not always-true" "$out"; fi
 
 # (c) CONTROL: a transcript-backed claim on BOTH sides is not the weak claim and
 #     must never be downgraded, even on settled content.
