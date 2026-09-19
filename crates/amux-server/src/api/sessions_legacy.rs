@@ -600,11 +600,38 @@ static SESSIONS_RUNTIME_EPOCH: std::sync::atomic::AtomicU64 =
 /// invalidate ~every request and resurrect the AR-135 pool-starvation
 /// stampede this cache exists to prevent. Content edits inside an env file
 /// don't move the set — those paths already invalidate explicitly.
-fn registry_fingerprint() -> u64 {
+/// `None` means THE MEASUREMENT DID NOT RUN, and it is a distinct answer from
+/// any hash (AMUX-4838).
+///
+/// This used to `return 0` when the directory could not be read, and every
+/// caller compares fingerprints for EQUALITY, so "could not read" was compared
+/// against real hashes as though it were one. Instrumenting `race_verdict` to
+/// name which half moved showed every registry race in an `api::` run had the
+/// shape `<hash>->0` or `0-><hash>`: one sample succeeding and the other
+/// failing to read, reported as a change.
+///
+/// A sentinel could not have been chosen safely either, because 0 is a
+/// REACHABLE value here: `acc` starts at 0 and the loop XORs into it, so a
+/// directory with no `.env` files hashes to 0 legitimately. An empty registry
+/// and an unreadable one were the same number. `Option` separates all three
+/// states (`Some(0)` empty, `Some(h)` populated, `None` unmeasured) and makes
+/// the third impossible to read as a value by accident.
+fn registry_fingerprint() -> Option<u64> {
+    registry_fingerprint_at(&amux_home().join("sessions"))
+}
+
+/// The measurement itself, taking its directory as an argument.
+///
+/// Split out so the three states can be tested without touching `AMUX_HOME`.
+/// That global is exactly what makes this area flaky: parallel tests swap the
+/// process-wide home through `test_env::set_home()`, which is what produced the
+/// interleaved `<hash>->0` samples in the first place. A test that set the home
+/// to prove a point about reading the home would be racing the bug it is
+/// describing.
+fn registry_fingerprint_at(dir: &std::path::Path) -> Option<u64> {
     use std::hash::{Hash, Hasher};
-    let dir = amux_home().join("sessions");
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return 0;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return None;
     };
     let mut acc = 0u64;
     for e in entries.flatten() {
@@ -617,7 +644,7 @@ fn registry_fingerprint() -> u64 {
             }
         }
     }
-    acc
+    Some(acc)
 }
 
 /// Drop the cached session list so the very next GET rebuilds (AMUX-2926).
@@ -2743,7 +2770,16 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
             // invalidate_sessions_cache(). Rebuild — and say so, because
             // this line firing is how the next missing call site announces
             // itself instead of shipping another flaky-stale list.
-            if c.registry == registry_fingerprint() {
+            //
+            // UNMEASURED IS NOT A MATCH, and here that is the conservative
+            // direction rather than the damaging one (AMUX-4838). This arm only
+            // decides whether to reuse a cached list: an unreadable registry
+            // means the guard cannot confirm the cached worker set is still
+            // current, so it rebuilds. That costs one build. The race check at
+            // the end of the build makes the OPPOSITE call on the same
+            // `None` because the cost there is a 503 for every caller, and a
+            // rebuild is not a refusal.
+            if registry_fingerprint().is_some_and(|f| c.registry == f) {
                 return Ok(c.json.clone());
             }
             tracing::info!(
@@ -2830,7 +2866,7 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
             if c.store.ptr_eq(&store_key)
                 && !c.json.is_empty()
                 && c.epoch == epoch_now
-                && c.registry == registry_fingerprint()
+                && registry_fingerprint().is_some_and(|f| c.registry == f)
             {
                 return Ok(c.json.clone());
             }
@@ -2848,7 +2884,7 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
                 if c.store.ptr_eq(&store_key)
                     && !c.json.is_empty()
                     && c.epoch == epoch_now
-                    && c.registry == registry_fingerprint()
+                    && registry_fingerprint().is_some_and(|f| c.registry == f)
                 {
                     return Ok(c.json.clone());
                 }
@@ -2880,7 +2916,7 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
             && !c.json.is_empty()
             && c.epoch == epoch_now
             && c.runtime_epoch == runtime_epoch_now
-            && c.registry == registry_fingerprint()
+            && registry_fingerprint().is_some_and(|f| c.registry == f)
         {
             return Ok(c.json.clone());
         }
@@ -2906,27 +2942,46 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
         registry_start,
         registry_fingerprint(),
     ) {
-        Ok(()) => {
-            if let Ok(mut c) = build_array_cache().lock() {
+        RaceVerdict::Fresh => {
+            // `Fresh` is only reachable with both samples measured, so this
+            // binding always takes. It is written as a conditional rather than
+            // an unwrap because an unwrap here would be a panic in the request
+            // path if the verdict ever gained a fourth state.
+            if let (Ok(mut c), Some(registry)) = (build_array_cache().lock(), registry_start) {
                 *c = ListSnapshot {
                     store: store_key,
                     stamp: now,
                     json: json.clone(),
                     epoch: epoch_start,
                     runtime_epoch: runtime_epoch_start,
-                    registry: registry_start,
+                    registry,
                 };
             }
         }
-        Err(raced) => {
+        RaceVerdict::Raced => {
             // Fail closed as well as refusing the cache write. Returning JSON that
             // predates an isolation/delete/config change would leak the old fleet
             // shape to the one request that happened to race the change.
             tracing::warn!(
                 target: "amux::sessions",
+                verdict = "sessions_build_raced", measured = true, n_considered = 1,
                 "session-list build raced a structural change — refusing the stale response"
             );
-            return Err(raced.into());
+            return Err(DiscoveryRaced.into());
+        }
+        RaceVerdict::Unverifiable => {
+            // SERVE, BUT DO NOT CACHE (AMUX-4838). The registry could not be
+            // read, so "did anything move" has no answer; the old code called
+            // that a race and 503'd, which is a positive asserted from a probe
+            // that never fired. `measured = false` is the field a sweep reads,
+            // and it is the same contract every /api/debug route already keeps:
+            // publish whether the measurement ran, beside the thing it decided.
+            tracing::warn!(
+                target: "amux::sessions",
+                verdict = "sessions_registry_unmeasured", measured = false, n_considered = 0,
+                "registry fingerprint could not be sampled; serving this build without \
+                 caching it, since whether it raced cannot be established"
+            );
         }
     }
     Ok(json)
@@ -2985,16 +3040,61 @@ impl std::error::Error for BuilderBusy {}
 /// Serve a finished build only if neither the epoch nor the on-disk registry
 /// moved while it ran. Extracted so the construction of [`DiscoveryRaced`] is
 /// pinned by a test rather than only the classifier that reads it.
+/// Three answers, because there are three states (AMUX-4838).
+#[derive(Debug, PartialEq, Eq)]
+enum RaceVerdict {
+    /// Nothing moved and both registry samples were measured. Safe to serve AND
+    /// to cache.
+    Fresh,
+    /// Something demonstrably moved. The caller gets a 503 with `Retry-After`.
+    Raced,
+    /// A registry sample could not be taken, so whether anything moved is
+    /// unknown. Serve the build, but do NOT cache it.
+    Unverifiable,
+}
+
+/// Serve a finished build only if neither the epoch nor the on-disk registry
+/// moved while it ran. Extracted so the construction of [`DiscoveryRaced`] is
+/// pinned by a test rather than only the classifier that reads it.
+///
+/// THE THIRD CASE IS A DELIBERATE CHOICE, and the card asked for it to be named
+/// rather than defaulted (AMUX-4838). When a registry sample is `None` the
+/// honest answer is "cannot tell", and the two obvious policies are both wrong
+/// on their own:
+///
+/// - Failing closed treats a non-measurement as proof of a change, which is the
+///   defect being fixed: it asserts a positive from a probe that could not fire.
+///   Worse, it does not degrade gracefully. A read failure that PERSISTS makes
+///   every `GET /api/sessions` 503 forever, and every retry re-fails the same
+///   way, so a filesystem blip becomes a total outage of the endpoint the whole
+///   fleet polls.
+/// - Treating it as unchanged removes the 503 but lets a snapshot that really
+///   did race get written into the cache, where later callers keep reading it
+///   long after the blip ended.
+///
+/// So the choice is neither: SERVE, BUT DO NOT CACHE. The caller gets an answer
+/// built from a real read of the database, which is the thing they asked for,
+/// and the one durable consequence of being wrong is refused. The cost is a
+/// rebuild on the next request instead of a cache hit, which is the same cost
+/// the old code paid on every one of these — it just paid it behind a 503.
+///
+/// An epoch move is still decisive on its own: those counters are in-process
+/// and always measured, so `None` never reaches this branch.
 fn race_verdict(
     epoch_start: u64,
     epoch_now: u64,
-    registry_start: u64,
-    registry_now: u64,
-) -> Result<(), DiscoveryRaced> {
-    if epoch_now == epoch_start && registry_now == registry_start {
-        Ok(())
-    } else {
-        Err(DiscoveryRaced)
+    registry_start: Option<u64>,
+    registry_now: Option<u64>,
+) -> RaceVerdict {
+    if epoch_now != epoch_start {
+        return RaceVerdict::Raced;
+    }
+    match (registry_start, registry_now) {
+        (Some(a), Some(b)) if a == b => RaceVerdict::Fresh,
+        (Some(_), Some(_)) => RaceVerdict::Raced,
+        // At least one sample never ran. `Some(0)` is NOT this case: an empty
+        // registry is a measured 0 and compares like any other value.
+        _ => RaceVerdict::Unverifiable,
     }
 }
 
@@ -7071,9 +7171,15 @@ mod discovery_race_tests {
     #[tokio::test]
     async fn a_discovery_race_is_503_with_retry_after_and_other_failures_stay_500() {
         // The construction site: a moved epoch or a moved registry is the race.
-        assert!(race_verdict(1, 1, 7, 7).is_ok());
-        assert!(race_verdict(1, 1, 7, 8).is_err(), "a registry change alone is a race");
-        let raced: anyhow::Error = race_verdict(1, 2, 7, 7).unwrap_err().into();
+        // AMUX-4838 made the samples Option; measured values behave as before.
+        assert_eq!(race_verdict(1, 1, Some(7), Some(7)), RaceVerdict::Fresh);
+        assert_eq!(
+            race_verdict(1, 1, Some(7), Some(8)),
+            RaceVerdict::Raced,
+            "a registry change alone is a race"
+        );
+        assert_eq!(race_verdict(1, 2, Some(7), Some(7)), RaceVerdict::Raced);
+        let raced: anyhow::Error = DiscoveryRaced.into();
 
         let r = discovery_failure(&raced, raced.to_string());
         assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -7098,6 +7204,115 @@ mod discovery_race_tests {
         assert!(r.headers().get(axum::http::header::RETRY_AFTER).is_none());
         let db = anyhow::anyhow!("database query failed");
         assert_eq!(discovery_failure(&db, db.to_string()).status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// AMUX-4838: an unreadable registry is NOT a changed registry.
+    ///
+    /// These are the exact shapes the live instrumentation caught. Annotating
+    /// `race_verdict` to name which half moved (with `eprintln!`, because
+    /// `tracing` emits nothing in tests) showed all 18 races in one `api::` run
+    /// were `<hash>->0` or `0-><hash>`: one sample read the directory and the
+    /// other failed to, reported as a change and served as a 503 on a build
+    /// that raced with nothing.
+    #[test]
+    fn an_unreadable_registry_is_not_a_changed_registry() {
+        assert_eq!(
+            race_verdict(1, 1, Some(11720959678383719654), None),
+            RaceVerdict::Unverifiable,
+            "the end sample failing to read is not evidence the registry moved"
+        );
+        assert_eq!(
+            race_verdict(1, 1, None, Some(4361722783805985690)),
+            RaceVerdict::Unverifiable,
+            "the start sample failing to read is not evidence either"
+        );
+        assert_eq!(race_verdict(1, 1, None, None), RaceVerdict::Unverifiable);
+    }
+
+    /// The sentinel that could not have worked: 0 is a REACHABLE fingerprint.
+    ///
+    /// `registry_fingerprint` seeds its accumulator at 0 and XORs into it, so a
+    /// directory containing no `.env` files hashes to 0 legitimately. Under the
+    /// old `return 0` an empty registry and an unreadable one were one value,
+    /// which is why this had to become `Option` rather than a reserved number.
+    #[test]
+    fn an_empty_registry_is_a_measured_zero_and_compares_like_any_other_value() {
+        assert_eq!(
+            race_verdict(1, 1, Some(0), Some(0)),
+            RaceVerdict::Fresh,
+            "an empty registry that stayed empty did not race"
+        );
+        assert_eq!(
+            race_verdict(1, 1, Some(0), Some(99)),
+            RaceVerdict::Raced,
+            "a registry that went from empty to populated really did change"
+        );
+        // And the pair the old code could not tell apart at all.
+        assert_ne!(
+            race_verdict(1, 1, Some(0), Some(0)),
+            race_verdict(1, 1, None, None),
+            "empty and unreadable must not be the same verdict"
+        );
+    }
+
+    /// An epoch move decides on its own, whatever the registry did. Those
+    /// counters are in-process and always measured, so a `None` registry must
+    /// never soften a real epoch race into `Unverifiable`.
+    #[test]
+    fn a_moved_epoch_is_a_race_even_when_the_registry_is_unmeasured() {
+        assert_eq!(race_verdict(1, 2, None, None), RaceVerdict::Raced);
+        assert_eq!(race_verdict(1, 2, Some(7), None), RaceVerdict::Raced);
+    }
+
+    /// The three states AT THE SOURCE, which is where the sentinel used to
+    /// collapse two of them into one number.
+    ///
+    /// Deliberately NOT via `AMUX_HOME`: swapping that global is the mechanism
+    /// behind the flake this card came from, so a test that set it to make a
+    /// point about reading it would be racing the very bug it describes.
+    #[test]
+    fn the_fingerprint_tells_unreadable_from_empty_from_populated() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let missing = dir.path().join("no-such-sessions-dir");
+        assert_eq!(
+            registry_fingerprint_at(&missing),
+            None,
+            "an unreadable directory is a NON-MEASUREMENT, not a fingerprint"
+        );
+
+        let empty = dir.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        assert_eq!(
+            registry_fingerprint_at(&empty),
+            Some(0),
+            "a readable directory with no .env files is a measured 0"
+        );
+
+        let populated = dir.path().join("populated");
+        std::fs::create_dir(&populated).unwrap();
+        std::fs::write(populated.join("alpha.env"), "X=1").unwrap();
+        let one = registry_fingerprint_at(&populated).expect("readable");
+        assert_ne!(one, 0, "a populated registry must not hash to the empty value");
+
+        // The pair the old `return 0` could not tell apart, stated as the
+        // inequality that used to be an equality.
+        assert_ne!(
+            registry_fingerprint_at(&missing),
+            registry_fingerprint_at(&empty),
+            "unreadable and empty must not be the same answer"
+        );
+
+        // And the set really is a set: adding a name moves it, order does not.
+        std::fs::write(populated.join("beta.env"), "X=2").unwrap();
+        let two = registry_fingerprint_at(&populated).expect("readable");
+        assert_ne!(one, two, "a new .env must move the fingerprint");
+        std::fs::write(populated.join("gamma.meta.json"), "{}").unwrap();
+        assert_eq!(
+            registry_fingerprint_at(&populated),
+            Some(two),
+            "a non-.env file must not move it; .meta.json churn is why this hashes the name set"
+        );
     }
 
     /// AMUX-4764: the SECOND refusal in the same function. AMUX-4637 typed the
