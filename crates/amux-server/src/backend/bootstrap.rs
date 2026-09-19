@@ -408,13 +408,26 @@ impl Bootstrap {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            crate::runtime_jobs::registry::tick(crate::runtime_jobs::registry::ids::BOOTSTRAP);
+            // AMUX-4828: bracket the pass; the one-shot records no duration.
+            crate::runtime_jobs::registry::tick_start(
+                crate::runtime_jobs::registry::ids::BOOTSTRAP,
+            );
             match self.pass_once().await {
                 Ok(r) if !r.is_empty() => {
                     tracing::info!(report = %serde_json::to_string(&r).unwrap_or_default(),
                         "bootstrap pass");
+                    // BOTH Ok arms stamp. Stamping only the empty-report arm
+                    // would leave a pass that actually did work unreported, so
+                    // the busiest passes would be the ones reading as stalled.
+                    crate::runtime_jobs::registry::tick_end(
+                        crate::runtime_jobs::registry::ids::BOOTSTRAP,
+                    );
                 }
-                Ok(_) => {}
+                Ok(_) => {
+                    crate::runtime_jobs::registry::tick_end(
+                        crate::runtime_jobs::registry::ids::BOOTSTRAP,
+                    );
+                }
                 Err(e) => tracing::warn!(error = %e, "bootstrap pass failed"),
             }
         }

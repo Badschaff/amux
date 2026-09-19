@@ -249,11 +249,28 @@ impl Runtime {
         let mut tick_n: u64 = 0;
         loop {
             interval.tick().await;
-            crate::runtime_jobs::registry::tick(crate::runtime_jobs::registry::ids::ORCH_RUNTIME);
             tick_n += 1;
             let heartbeat = tick_n.is_multiple_of(self.heartbeat_every.max(1));
-            if let Err(e) = self.tick_once(heartbeat).await {
-                tracing::warn!(error = %e, "orchestrator tick failed");
+            // AMUX-4828: BRACKET the pass, do not stamp a one-shot before it.
+            //
+            // `registry::tick` sets last_start and last_end to the same instant,
+            // so `last_ms` is never written, and `classify_observed` uses that
+            // field for exactly one thing: upgrading `ok` to `slow`. With it
+            // permanently None this job could only ever read `ok` or `stalled`,
+            // and `stalled` is the word a reader acts on. Measured at median
+            // 402ms and worst 49336ms over 17,199 blocking-poll samples, this is
+            // precisely a job whose slowness was indistinguishable from death.
+            //
+            // tick_end sits in the Ok arm only: a failing pass that still
+            // stamped would make a dead orchestrator read as a working one.
+            crate::runtime_jobs::registry::tick_start(
+                crate::runtime_jobs::registry::ids::ORCH_RUNTIME,
+            );
+            match self.tick_once(heartbeat).await {
+                Ok(()) => crate::runtime_jobs::registry::tick_end(
+                    crate::runtime_jobs::registry::ids::ORCH_RUNTIME,
+                ),
+                Err(e) => tracing::warn!(error = %e, "orchestrator tick failed"),
             }
         }
     }
@@ -3253,5 +3270,54 @@ mod rate_limit_recovery_tests {
             }
         }
         assert_eq!(second, 0, "one announcement per exhaustion episode");
+    }
+}
+
+#[cfg(test)]
+mod tick_bracket_guard {
+    /// AMUX-4828: `run` must report a pass that FINISHED, with its duration.
+    ///
+    /// `registry::tick` sets last_start and last_end to the same instant, so it
+    /// writes no duration and marks a pass that had only STARTED.
+    /// `classify_observed` reads `last_tick_ms` for exactly one purpose,
+    /// upgrading `ok` to `slow`, so with the one-shot that branch is dead and a
+    /// job that merely runs LONG can only present as `ok` or `stalled`.
+    ///
+    /// Source-reading is the weaker instrument and the one that fits: driving
+    /// `run` means an interval loop that never returns.
+    #[test]
+    fn the_orchestrator_brackets_its_tick_and_only_stamps_a_completed_one() {
+        let src = include_str!("runtime.rs");
+        // BOUND THE SLICE TO THE FUNCTION. A fixed window sweeps into this test,
+        // whose assertions contain the literal being searched for, and the guard
+        // then matches its own source. That trap has fired repeatedly here.
+        let start = src.find("pub async fn run(self: Arc<Self>)").expect("run exists");
+        let rest = &src[start..];
+        let body = &rest[..rest.find("\n    }\n").map(|i| i + 6).expect("run is closed")];
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let start_at = code.find("tick_start(").expect("the pass is bracketed with tick_start");
+        let work_at = code.find("self.tick_once(").expect("the loop runs the pass");
+        let end_at = code.find("tick_end(").expect("the loop records a tick_end");
+        let ok_at = code.find("Ok(()) =>").expect("the completed arm is matched explicitly");
+        assert!(start_at < work_at, "tick_start must precede the pass");
+        assert!(
+            work_at < end_at,
+            "tick_end must come AFTER the pass: a tick stamped first reports one that STARTED"
+        );
+        assert!(
+            ok_at < end_at,
+            "tick_end must sit in the Ok arm: a failing pass that still stamps makes a dead \
+             orchestrator read as a working one"
+        );
+        assert!(
+            !code.contains("registry::tick("),
+            "the one-shot cannot express a duration, which is what made this job's slowness \
+             indistinguishable from death"
+        );
     }
 }

@@ -15275,11 +15275,21 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
 pub async fn steer_deliver_loop(state: AppState) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(STEER_TICK_SECS)).await;
-        crate::runtime_jobs::registry::tick(crate::runtime_jobs::registry::ids::STEER_DELIVER);
+        // AMUX-4828: bracket the pass rather than stamping a one-shot before it.
+        // The one-shot writes no duration, so `classify_observed`'s only `slow`
+        // branch was dead for this job and a long tick could only present as
+        // `ok` or `stalled`. tick_end is in the Ok arm only, so a panicking
+        // delivery tick cannot read as a working one.
+        crate::runtime_jobs::registry::tick_start(
+            crate::runtime_jobs::registry::ids::STEER_DELIVER,
+        );
         // A panic in one tick must not kill delivery for the whole fleet.
         let st = state.clone();
-        if let Err(e) = crate::db::interactions::spawn(async move { steer_deliver_tick(&st).await }).await {
-            tracing::warn!(error = %e, "steering delivery tick panicked");
+        match crate::db::interactions::spawn(async move { steer_deliver_tick(&st).await }).await {
+            Ok(_) => crate::runtime_jobs::registry::tick_end(
+                crate::runtime_jobs::registry::ids::STEER_DELIVER,
+            ),
+            Err(e) => tracing::warn!(error = %e, "steering delivery tick panicked"),
         }
         // Time-gated so the 5s steering cadence does not become a 5s fleet-wide
         // pane capture (AMUX-2820).
@@ -27959,6 +27969,50 @@ CLAUDE-POSTFIX-COMPLETE
         assert!(pane.try_wait().unwrap().is_none(), "pane shell must survive");
         assert!(peer.try_wait().unwrap().is_none(), "unrelated worker must survive");
         pane.kill().await.unwrap(); peer.kill().await.unwrap();
+    }
+
+    /// AMUX-4828: steering delivery must report a tick that FINISHED, with its
+    /// duration. Same defect and same fix as the reconciler guard below.
+    ///
+    /// This loop is one of the two the card named first, because it is already
+    /// known to run long: a job whose slowness can only present as `stalled` is
+    /// one a reader will act on as if it were dead.
+    #[test]
+    fn steer_delivery_brackets_its_tick_and_only_stamps_a_completed_one() {
+        let src = include_str!("session_verbs.rs");
+        // BOUND THE SLICE TO THE FUNCTION, for the reason the sibling guard
+        // states: a fixed window reaches this test module, whose assertions
+        // contain the literal being searched for.
+        let start = src
+            .find("pub async fn steer_deliver_loop(")
+            .expect("steer_deliver_loop exists");
+        let rest = &src[start..];
+        let body = &rest[..rest.find("\n}\n").map(|i| i + 2).expect("the loop is closed")];
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let start_at = code.find("tick_start(").expect("the tick is bracketed with tick_start");
+        let work_at = code.find("steer_deliver_tick(").expect("the loop runs the tick");
+        let end_at = code.find("tick_end(").expect("the loop records a tick_end");
+        let ok_at = code.find("Ok(_) =>").expect("the completed arm is matched explicitly");
+        assert!(start_at < work_at, "tick_start must precede the work");
+        assert!(
+            work_at < end_at,
+            "tick_end must come AFTER the work: a tick stamped first reports one that STARTED"
+        );
+        assert!(
+            ok_at < end_at,
+            "tick_end must sit in the Ok arm: a panicking delivery tick that still stamps makes \
+             a dead deliverer read as a working one"
+        );
+        assert!(
+            !code.contains("registry::tick("),
+            "the one-shot cannot express a duration, so a long tick could only ever present as \
+             ok or stalled"
+        );
     }
 
     /// AMUX-4814: the reconciler must report a tick that FINISHED, and how
