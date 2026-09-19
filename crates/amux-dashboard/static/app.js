@@ -10831,7 +10831,30 @@ function togglePeekIssuesAll() {
   renderPeekIssues();
 }
 
+// AMUX-4863: THE ACTIVITY STRIP IS RENDERED AFTER THE LIST, NOT BEFORE IT.
+//
+// `_renderBoardActivity` puts the strip INSIDE `#peek-issues-list`, because that
+// is the element carrying `overflow-y: auto` and the strip has to scroll away
+// with the board (085f5a16; before it the strip sat in the non-scrolling flex
+// parent and held fixed vertical space on a phone).
+//
+// Inside is exactly what `list.innerHTML = ...` destroys, and every exit path of
+// the render below assigns it: the empty-board line, the list view, and both
+// branches of the kanban view. Calling the strip first, as the body used to,
+// created it and then wiped it on every single render. Seven e2e specs across
+// all three browser projects failed on `#peek-issues-list-activity` not being
+// found, and the message reads like a stale selector rather than a render order.
+//
+// Wrapped rather than fixed at each `list.innerHTML` site. There are five exit
+// paths today and the next branch added would have to remember; here the strip
+// is re-rendered after the body returns, whatever route it took.
 function renderPeekIssues() {
+  _renderPeekIssuesBody();
+  // Re-read the host: the body may have replaced the panel's contents.
+  const list = document.getElementById('peek-issues-list');
+  if (list) _renderBoardActivity(list, _peekIssuesAllSessions ? '' : peekSession);
+}
+function _renderPeekIssuesBody() {
   // Don't rebuild mid-drag — a board SSE refresh would destroy the active Sortable.
   if (document.body.classList.contains('board-dragging')) return;
   // NOT LOADED IS NOT EMPTY (Ethan, 2026-08-06 — screenshot of the amux worker's
@@ -10857,7 +10880,9 @@ function renderPeekIssues() {
       .finally(() => { _peekIssuesFetching = false; renderPeekIssues(); });
   }
   const list = document.getElementById('peek-issues-list');
-  _renderBoardActivity(list, _peekIssuesAllSessions ? '' : peekSession);
+  // The strip used to be rendered HERE and was destroyed by every
+  // `list.innerHTML` below. It is now rendered by the wrapper, after this
+  // body returns (AMUX-4863).
   const count = document.getElementById('peek-issues-count');
   const allScope = _peekIssuesAllSessions;
   // The per-session panel shows the lane's FULL record including archived, so
@@ -11501,7 +11526,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.993';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.994';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
