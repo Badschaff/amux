@@ -2143,8 +2143,14 @@ impl IssueRow {
             "decision_question": self.decision_question,
             "decision_rationale": self.decision_rationale,
             "decision_supersedes": self.decision_supersedes,
-            "waiting_on": self.waiting_on.as_deref()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
+            // AF-930: was `.and_then(|s| serde_json::from_str(s).ok())`, which
+            // reports the same `null` for "empty" and "holds real content
+            // that failed to parse" -- same defect `parse_json_or_raw_string`
+            // exists to fix for `acceptance_criteria` (AF-711), unfixed here.
+            // A pre-fix plain-string value (or one written by a client that
+            // never JSON-encoded it) rendered as `null` with no sign anything
+            // was wrong.
+            "waiting_on": parse_json_or_raw_string(self.waiting_on.as_deref()),
             "requested_by": self.requested_by,
             "callback": self.callback_session.as_ref().map(|session| serde_json::json!({
                 "session": session,

@@ -4114,6 +4114,41 @@ fn encode_acceptance_criteria(v: &Value) -> Result<Option<String>, String> {
     }
 }
 
+/// Validates and JSON-encodes a PATCH value for `waiting_on` (AF-930).
+/// `None` = clear; `Some(s)` = the string to store, already JSON-encoded so
+/// `snapshot_fields`'s read side (`serde_json::from_str(s).ok()`) round-trips
+/// it exactly. `waiting_on` is documented (migrations/0048) as a JSON object
+/// `{"actor":...,"type":...,"question":...,"unblocks":...}` -- the exact
+/// shape `advance()`'s Gap-4 logic writes when a card enters NeedsYou.
+///
+/// Before this, `waiting_on` routed through plain `set_opt`, i.e.
+/// `body_opt_str`'s `Some(v) => Some(v.as_str().map(str::to_string))`. An
+/// incoming JSON OBJECT -- the field's own documented, correct shape --
+/// makes `Value::as_str()` return `None`, INDISTINGUISHABLE from an explicit
+/// null-clears-the-field request in that same match arm. The write proceeded
+/// as a silent CLEAR, not a rejected write and not a no-op, with the response
+/// still reporting `applied:true` and the log recording `waiting_on` as
+/// changed. Same defect AF-711 already fixed for `acceptance_criteria` a few
+/// lines above; unfixed here.
+///
+/// Accepts an object (encoded to canonical JSON, matching what `advance()`
+/// itself writes) or a non-empty string (encoded as a JSON string, so a
+/// plain human-readable note also survives the read side's JSON-decode
+/// instead of silently rendering as `null`). Rejects any other JSON shape
+/// (number, bool, array) rather than silently coercing it into a clear.
+fn encode_waiting_on(v: &Value) -> Result<Option<String>, String> {
+    match v {
+        Value::Null => Ok(None),
+        Value::String(s) if s.trim().is_empty() => Ok(None),
+        Value::String(_) => Ok(Some(serde_json::to_string(v).expect("a JSON string always encodes"))),
+        Value::Object(map) if map.is_empty() => Ok(None),
+        Value::Object(_) => Ok(Some(serde_json::to_string(v).expect("a JSON object always encodes"))),
+        other => Err(format!(
+            "waiting_on must be an object ({{\"actor\":...,\"type\":...,\"question\":...,\"unblocks\":...}}), a string, or null, got {other}"
+        )),
+    }
+}
+
 /// tags/depends_on style list: array of strings; a bare string is coerced to
 /// a one-element list (SP-539: iterating a str exploded it into one tag per
 /// character — 200, no error, silently corrupted card).
@@ -10292,7 +10327,30 @@ pub async fn patch_item(
             set_opt("decision_question", &mut next.decision_question, &mut changed);
             set_opt("decision_rationale", &mut next.decision_rationale, &mut changed);
             set_opt("decision_supersedes", &mut next.decision_supersedes, &mut changed);
-            set_opt("waiting_on", &mut next.waiting_on, &mut changed);
+            // AF-930: was plain `set_opt`, same defect AF-711 fixed for
+            // acceptance_criteria a few lines above -- see encode_waiting_on's
+            // own doc comment for why a JSON object silently cleared instead
+            // of being rejected or stored.
+            if let Some(v) = map.get("waiting_on") {
+                match encode_waiting_on(v) {
+                    Ok(encoded) => {
+                        if next.waiting_on != encoded {
+                            next.waiting_on = encoded;
+                            changed.push("waiting_on".into());
+                        }
+                    }
+                    Err(msg) => {
+                        return finish(
+                            &slot_w,
+                            PatchOut::Refused(
+                                StatusCode::BAD_REQUEST,
+                                json!({"error": msg, "item": row.id}),
+                            ),
+                            no_write(),
+                        );
+                    }
+                }
+            }
             if next.epic != row.epic {
                 if let Some(parent) = next.epic.as_deref() {
                     if let Some(cycle) = bs::epic_cycle(conn, &row.id, parent)? {
@@ -14346,6 +14404,191 @@ mod af711_acceptance_criteria_tests {
         let row = current(&store, &id);
         assert_eq!(
             row.snapshot()["acceptance_criteria"],
+            json!("a plain string stored before this fix, not JSON-encoded"),
+            "legacy non-JSON content must not read back as null"
+        );
+    }
+}
+
+/// AF-930. Same defect AF-711 fixed for `acceptance_criteria`, on
+/// `waiting_on`: a PATCH carrying the field's own documented JSON-object
+/// shape was silently treated as an explicit clear.
+#[cfg(test)]
+mod af930_waiting_on_tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    fn fixture() -> (AppState, crate::db::SharedStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            crate::db::Store::open(&dir.path().join("af930-waiting-on.db")).expect("open store"),
+        );
+        std::mem::forget(dir);
+        let state = AppState {
+            store: store.clone(),
+            started: std::time::Instant::now(),
+            build_hash: "af930-waiting-on-test".into(),
+            auth_token: None,
+            reconciled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        (state, store)
+    }
+
+    fn seed(store: &crate::db::SharedStore, waiting_on: Option<&str>) -> String {
+        let slot = Arc::new(Mutex::new(None));
+        let slot_w = slot.clone();
+        let waiting_on = waiting_on.map(str::to_string);
+        store
+            .write(move |conn| {
+                let mut row = bs::create_issue(
+                    conn,
+                    &bs::NewIssue {
+                        acceptance_criteria: None,
+                        next_action: None,
+                        title: "AF-930 fixture card".into(),
+                        desc: "fixture".into(),
+                        status: "needsyou".into(),
+                        session: Some("mvs-research".into()),
+                        item_type: "code".into(),
+                        creator: "test".into(),
+                        owner_type: "agent".into(),
+                        due: None,
+                        due_time: None,
+                        reviewer: None,
+                        shepherd: None,
+                        gate: vec![],
+                        depends_on: vec![],
+                        tags: vec![],
+                        ask_type: None,
+                        ask_question: None,
+                        ask_unblocks: None,
+                        ask_actor: None,
+                        source: Some("test".into()),
+                        requested_by: None,
+                        callback_session: None,
+                        callback_prompt: None,
+                    },
+                    1_700_000_000,
+                )?;
+                row.waiting_on = waiting_on;
+                bs::save_patched(conn, &mut row)?;
+                *slot_w.lock().unwrap() = Some(row.id);
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .expect("seed");
+        let id = slot.lock().unwrap().clone().unwrap();
+        id
+    }
+
+    async fn patch_as(state: &AppState, id: &str, body: Value) -> (StatusCode, Value) {
+        let response =
+            patch_item(State(state.clone()), Path(id.to_string()), HeaderMap::new(), Json(body))
+                .await;
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.expect("read response");
+        (status, serde_json::from_slice(&bytes).expect("json response"))
+    }
+
+    fn current(store: &crate::db::SharedStore, id: &str) -> bs::IssueRow {
+        bs::get_issue(&store.read().expect("read"), id).expect("query").expect("card")
+    }
+
+    /// The exact real-world shape: PATCHing the field's own documented
+    /// object, not an array or a plain string.
+    #[tokio::test]
+    async fn an_object_patch_stores_and_reads_back_the_object_instead_of_clearing_it() {
+        let (state, store) = fixture();
+        let id = seed(&store, None);
+        let ask = json!({
+            "actor": "Ethan",
+            "type": "decision",
+            "question": "is this ok?",
+            "unblocks": "either answer moves it",
+        });
+        let (status, body) = patch_as(&state, &id, json!({"waiting_on": ask})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["waiting_on"], ask,
+            "the PATCH response must echo the object back, not null: {body}"
+        );
+        let row = current(&store, &id);
+        assert_eq!(
+            row.snapshot()["waiting_on"], ask,
+            "a subsequent read must still show the object, not a silently cleared field"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_string_patch_reads_back_the_identical_string() {
+        let (state, store) = fixture();
+        let id = seed(&store, None);
+        let (status, body) =
+            patch_as(&state, &id, json!({"waiting_on": "waiting on infra to add a label"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["waiting_on"],
+            json!("waiting on infra to add a label"),
+            "a plain string must read back as the identical string, not null: {body}"
+        );
+        let row = current(&store, &id);
+        assert_eq!(row.snapshot()["waiting_on"], json!("waiting on infra to add a label"));
+    }
+
+    /// The real incident shape: a PATCH that also touches an unrelated field
+    /// in the same call must not lose waiting_on either.
+    #[tokio::test]
+    async fn a_mixed_field_patch_does_not_lose_waiting_on() {
+        let (state, store) = fixture();
+        let id = seed(&store, None);
+        let ask = json!({"actor": "Ethan", "type": "decision", "question": "q", "unblocks": "u"});
+        let (status, body) = patch_as(
+            &state,
+            &id,
+            json!({"waiting_on": ask, "next_action": "keep going"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["waiting_on"], ask);
+        assert_eq!(body["next_action"], json!("keep going"));
+        let row = current(&store, &id);
+        assert_eq!(row.snapshot()["waiting_on"], ask);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_shape_is_rejected_and_does_not_clear_an_existing_value() {
+        let (state, store) = fixture();
+        let existing = json!({"actor": "Ethan", "type": "decision", "question": "q", "unblocks": "u"});
+        let id = seed(&store, Some(&serde_json::to_string(&existing).unwrap()));
+        let (status, body) = patch_as(&state, &id, json!({"waiting_on": 5})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let row = current(&store, &id);
+        assert_eq!(
+            row.snapshot()["waiting_on"], existing,
+            "a rejected write must never silently clear the existing value: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_null_still_clears_it() {
+        let (state, store) = fixture();
+        let existing = json!({"actor": "Ethan", "type": "decision", "question": "q", "unblocks": "u"});
+        let id = seed(&store, Some(&serde_json::to_string(&existing).unwrap()));
+        let (status, body) = patch_as(&state, &id, json!({"waiting_on": null})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let row = current(&store, &id);
+        assert_eq!(row.waiting_on, None);
+    }
+
+    /// The second, distinct bug: legacy/plain content that never went
+    /// through JSON encoding must still be VISIBLE on read, not silently
+    /// substituted with null just because it fails to parse as JSON.
+    #[tokio::test]
+    async fn legacy_non_json_content_reads_back_as_the_raw_string_not_null() {
+        let (_state, store) = fixture();
+        let id = seed(&store, Some("a plain string stored before this fix, not JSON-encoded"));
+        let row = current(&store, &id);
+        assert_eq!(
+            row.snapshot()["waiting_on"],
             json!("a plain string stored before this fix, not JSON-encoded"),
             "legacy non-JSON content must not read back as null"
         );
