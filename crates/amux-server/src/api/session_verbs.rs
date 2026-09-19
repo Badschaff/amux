@@ -14949,9 +14949,27 @@ pub const PIPE_RECONCILE_SECS: u64 = 60;
 pub async fn pipe_reconcile_loop() {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(PIPE_RECONCILE_SECS)).await;
-        crate::runtime_jobs::registry::tick(crate::runtime_jobs::registry::ids::PIPE_RECONCILE);
-        if let Err(e) = crate::db::interactions::spawn(pipe_reconcile_tick()).await {
-            tracing::error!(error = %e, "pipe reconcile tick panicked");
+        // AMUX-4814: bracket the work; do not stamp a one-shot before it.
+        //
+        // The old line stamped `registry::tick(...)` BEFORE the tick ran. That
+        // is the defect invariants::monitor::one_pass already fixed, and its
+        // guard states both halves: the one-shot "sets last_start and last_end
+        // to the same instant, so it can neither express a duration nor
+        // separate start from finish", and "a tick taken first means a pass
+        // that was STARTED, while every reader takes ticks to mean a pass that
+        // is DONE".
+        //
+        // Both bit here. `last_tick_ms` read `never` through 36 ticks, so the
+        // only branch in `classify_observed` that can say `slow` was dead for
+        // this job, and a tick that merely ran LONG surfaced as `stalled`.
+        crate::runtime_jobs::registry::tick_start(crate::runtime_jobs::registry::ids::PIPE_RECONCILE);
+        match crate::db::interactions::spawn(pipe_reconcile_tick()).await {
+            // Only a COMPLETED tick may stamp the end: a panicking tick that
+            // still stamped would make a dead reconciler read as a working one.
+            Ok(_) => crate::runtime_jobs::registry::tick_end(
+                crate::runtime_jobs::registry::ids::PIPE_RECONCILE,
+            ),
+            Err(e) => tracing::error!(error = %e, "pipe reconcile tick panicked"),
         }
     }
 }
@@ -27941,6 +27959,61 @@ CLAUDE-POSTFIX-COMPLETE
         assert!(pane.try_wait().unwrap().is_none(), "pane shell must survive");
         assert!(peer.try_wait().unwrap().is_none(), "unrelated worker must survive");
         pane.kill().await.unwrap(); peer.kill().await.unwrap();
+    }
+
+    /// AMUX-4814: the reconciler must report a tick that FINISHED, and how
+    /// long it took.
+    ///
+    /// The card read `status: stalled, ticks: 36, last_tick_ms: never`. Both
+    /// halves came from stamping a one-shot `registry::tick(` BEFORE the work:
+    /// that call sets last_start and last_end to the same instant, so no
+    /// duration is ever recorded, and it marks a tick that had only STARTED.
+    /// `classify_observed` uses `last_tick_ms` for exactly one thing, upgrading
+    /// `ok` to `slow`, so with it permanently None a long tick could only ever
+    /// present as `stalled`.
+    ///
+    /// Mirrors the guard on `invariants::monitor::one_pass`, same shape and
+    /// same fix. Source-reading is the weaker instrument and the one that fits:
+    /// driving this loop means a 60s sleep and a fleet-wide tmux sweep.
+    #[test]
+    fn the_reconciler_brackets_its_tick_and_only_stamps_a_completed_one() {
+        let src = include_str!("session_verbs.rs");
+        // BOUND THE SLICE TO THE FUNCTION. A fixed window sweeps into this very
+        // test, whose assertions contain the literal being searched for, and
+        // the guard then matches its own source. That trap is documented in
+        // invariants/monitor.rs and it is real.
+        let start = src
+            .find("pub async fn pipe_reconcile_loop(")
+            .expect("pipe_reconcile_loop exists");
+        let rest = &src[start..];
+        let body = &rest[..rest.find("\n}\n").map(|i| i + 2).expect("the loop is closed")];
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let start_at = code.find("tick_start(").expect("the tick is bracketed with tick_start");
+        let work_at = code.find("pipe_reconcile_tick(").expect("the loop runs the tick");
+        let end_at = code.find("tick_end(").expect("the loop records a tick_end");
+        let ok_at = code.find("Ok(_) =>").expect("the completed arm is matched explicitly");
+
+        assert!(start_at < work_at, "tick_start must precede the work");
+        assert!(
+            work_at < end_at,
+            "tick_end must come AFTER the work: a tick stamped first reports a reconcile that \
+             was STARTED, and every reader takes a tick to mean one that is DONE"
+        );
+        assert!(
+            ok_at < end_at,
+            "tick_end must sit in the Ok arm: a panicking tick that still stamps makes a dead \
+             reconciler indistinguishable from a working one"
+        );
+        assert!(
+            !code.contains("registry::tick("),
+            "the one-shot tick cannot express a duration, which is why this job reported \
+             last_tick_ms=never through 36 ticks and read as stalled rather than slow"
+        );
     }
 
     /// AMUX-4826: a killed child is a ZOMBIE, and a zombie is not a live child.
