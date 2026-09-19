@@ -3325,3 +3325,34 @@ FIX: 831cc0cb + a35d850f. Added `encode_waiting_on` mirroring
  (already used for `acceptance_criteria`), so legacy non-JSON content also
  stops rendering as null. 6 new tests, mutation-verified: reverting the object
  arm to `Ok(None)` reddened exactly the 2 tests exercising that shape.
+
+  ## A second amux-server-rs opened the shared production DB for 13h with zero warning
+  AREA: instruments
+  SEVERITY: slows
+  STATUS: open
+  DATE: 2026-09-19
+  SESSION: amux-frustrations
+  CARD: AF-937
+  SYMPTOM: found a live, healthy-looking `amux-server-rs` process (pid 21435, port
+   8823) that had been running since the prior afternoon, started manually from a
+   bare Terminal.app shell with no AMUX_RS_PORT set, so it fell onto the compiled-in
+   `DEFAULT_PORT` (8823, config.rs) and the default `AMUX_HOME` -- landing on the
+   *exact same* `~/.amux/amux.db` the real, launchd-managed server (8824) already
+   held open. `lsof` showed identical .db/.wal/.shm inodes on both pids. Both
+   `/health` endpoints reported success the entire time; nothing anywhere logged,
+   counted, or surfaced that two writers existed. This is the same underlying shape
+   AEAB-11 reported a month earlier (2026-08-17) and it recurred with zero
+   detection in between.
+  COST: unmeasured but real -- the original AEAB-11 instance of this exact pattern
+   dropped a batch of request-log rows to lock contention and doubled that day's log
+   volume. This time nobody was watching for it; it was found by accident while
+   resolving an unrelated stale board card, not by any instrument. 13 hours is a
+   lower bound on how long it could silently run, since only self-adoption (an
+   unrelated mechanism) kept it alive that long by re-exec'ing it onto every new
+   build.
+  FIX: not applied here (killed the orphan process, which fixes this ONE instance,
+   not the class). Filed AF-937: Store::open (or a lib.rs startup check) should
+   probe for an existing writer on the same db_path and log a loud WARN naming it,
+   per ethos rule 4 -- both servers here reported "healthy" the whole time, so
+   nothing about the failure was wrong-looking from either process's own vantage
+   point.
