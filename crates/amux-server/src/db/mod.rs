@@ -715,6 +715,46 @@ fn parse_entity_type(raw: &str) -> amux_core::revision::EntityType {
         .unwrap_or_else(|_| EntityType::Other(raw.to_string()))
 }
 
+/// `cache_size` AND `mmap_size` ARE DELIBERATELY LEFT AT SQLITE'S DEFAULTS.
+///
+/// They are absent on purpose, not by oversight, and the measurement is written
+/// down here so the next person to notice "2MB of page cache against a 4.6GB
+/// database" does not re-derive it (AMUX-4842 — which I filed myself, arguing
+/// the cache should be raised, and then disproved).
+///
+/// RAISING IT IS SLOWER ON THIS BOX. Measured 2026-09-19 against the live 4.62GB
+/// database, 600 random point lookups per round over `_amux_request_log`
+/// (3.45M rows) and `token_ledger`, 16 rounds, arms INTERLEAVED with the order
+/// reshuffled each round and an identical key sequence per round:
+///   cache_size=-2000    (2MB)    median 3.8ms   p25 3.5  p75 4.0
+///   cache_size=-65536   (64MB)   median 4.3ms   p25 4.2  p75 5.0   +14.7%
+///   cache_size=-262144  (256MB)  median 4.2ms   p25 4.2  p75 4.3   +13.0%
+///
+/// WHY, and the arithmetic is the whole argument: 3.8ms for 600 lookups is
+/// 6.3us each. An NVMe read is ~100us, so those pages were already in memory.
+/// The host has 103GB of RAM with 54GB free or reclaimable against a 4.62GB
+/// file, so the OS page cache holds the entire database. SQLite's own cache
+/// therefore saves no I/O at all and can only add hash and LRU bookkeeping on
+/// top of a cache that already has the page. That is the cost the numbers show.
+///
+/// AND THE FIRST MEASUREMENT SAID THE OPPOSITE, which is why the method is
+/// recorded and not just the result. A block-ordered A-B-A run (2MB, then
+/// 512MB, then 2MB again) showed 48ms -> 36ms -> 48ms and looked conclusive:
+/// the control returned to baseline, so OS warming appeared to be ruled out.
+/// It was not. A-B-A only controls for MONOTONIC drift, and this box compiles
+/// and tests continuously, so a quieter middle arm produces exactly that shape.
+/// Interleaving the arms is what a noisy host actually requires, and the effect
+/// disappeared and then reversed once it was applied.
+///
+/// `mmap_size` stays 0 for a different reason, a risk one rather than a
+/// measured one: with mmap, an I/O error reaches the process as SIGBUS instead
+/// of a return code, so a read fault becomes a crash of the fleet's control
+/// plane rather than a handled error. There is no measured benefit here to pay
+/// for that, since the OS already holds the file.
+///
+/// What would change this: a host where the database no longer fits in RAM, or
+/// a working set that outgrows the page cache. Re-measure with interleaved arms
+/// before changing either value.
 fn configure_connection(c: &Connection) -> rusqlite::Result<()> {
     c.pragma_update(None, "journal_mode", "WAL")?;
     c.pragma_update(None, "synchronous", "NORMAL")?;
@@ -1600,5 +1640,73 @@ mod af937_writer_lock_tests {
             "a same-process reopen is not a second OS process and must not warn: {logs}"
         );
         drop(first);
+    }
+}
+
+/// AMUX-4842: the absent pragmas are a DECISION, and a decision that lives only
+/// in a comment gets deleted by the next person who reads the comment as an
+/// oversight.
+#[cfg(test)]
+mod pragma_decision_tests {
+    /// Setting `cache_size` or `mmap_size` must redden, so whoever does it has
+    /// to read why they are absent first.
+    ///
+    /// This reads the SOURCE because there is no runtime observation that
+    /// distinguishes "deliberately default" from "nobody thought about it":
+    /// both produce a connection reporting cache_size=-2000. The guard is bound
+    /// to `configure_connection`'s own body rather than the file, because
+    /// `cache_size` appears in the doc comment above it and a file-wide search
+    /// would fail on the explanation rather than on the behaviour.
+    #[test]
+    fn cache_size_and_mmap_stay_at_their_defaults_until_someone_re_measures() {
+        let src = include_str!("mod.rs");
+        let at = src
+            .find("fn configure_connection(c: &Connection)")
+            .expect("configure_connection exists");
+        let rest = &src[at..];
+        let end = rest.find("\n}").map(|i| at + i).unwrap_or(src.len());
+        let body = &src[at..end];
+
+        for pragma in ["cache_size", "mmap_size"] {
+            assert!(
+                !body.contains(pragma),
+                "`{pragma}` is set in configure_connection, but it is absent BY MEASUREMENT: \
+                 on a host whose OS page cache already holds the whole database, raising \
+                 cache_size measured 13-15% SLOWER (600 point lookups, 16 interleaved rounds, \
+                 2026-09-19) because SQLite's cache then saves no I/O and only adds \
+                 bookkeeping. If the host changed, re-measure with INTERLEAVED arms (a \
+                 block-ordered A-B-A gave the opposite answer on this box) and rewrite the \
+                 doc comment above this function before setting it. Body was: {body}"
+            );
+        }
+    }
+
+    /// And the reasoning has to survive too: a guard that only checks absence
+    /// would stay green if someone deleted the explanation and left the pragma
+    /// out by accident, which is how the next person ends up re-deriving it.
+    ///
+    /// SCOPED TO THE PRODUCTION HALF, and that is not a detail. The first
+    /// version of this searched the whole file, which includes this test's own
+    /// assertion message — so it matched its own label and would have stayed
+    /// green with the doc comment gutted. Found by mutating the comment and
+    /// watching nothing redden.
+    #[test]
+    fn the_measurement_behind_that_decision_is_still_written_down() {
+        let src = include_str!("mod.rs");
+        // The DOC BLOCK of configure_connection, not the file and not
+        // "everything before the first test module" — there is a `#[cfg(test)]`
+        // earlier in this file, so that split lands above this comment and the
+        // guard fails for the wrong reason.
+        let at = src
+            .find("fn configure_connection(c: &Connection)")
+            .expect("configure_connection exists");
+        let doc = &src[at.saturating_sub(2600)..at];
+        for needle in ["AMUX-4842", "INTERLEAVED", "SIGBUS"] {
+            assert!(
+                doc.contains(needle),
+                "the pragma decision's rationale lost `{needle}`; without it the absence \
+                 reads as an oversight and gets 'fixed'"
+            );
+        }
     }
 }
