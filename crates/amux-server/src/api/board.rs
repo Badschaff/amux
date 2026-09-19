@@ -4640,6 +4640,28 @@ pub(crate) fn todo_unreachable_on_isolated_lane(
     requested_todo && !lane.is_empty() && is_isolated(lane)
 }
 
+/// AMUX-4860. Tell the caller the status it asked for is not the status it got.
+///
+/// ONE FUNCTION FOR EVERY RESPONSE ARM, because the first version of this
+/// change set the fields inline on the `Applied` arm only. Asking for `todo` on
+/// an isolated lane whose card is ALREADY `backlog` adjusts the target, leaves
+/// nothing to write, and returns through `Noop`, so the caller got `backlog`
+/// after asking for `todo` with nothing in the reply saying why. That is the
+/// AMUX-4776 silent-adjustment trap on the one path where it is hardest to
+/// notice, and it survived a green unit suite because the unit test covered the
+/// DECISION and not the disclosure. A third success arm must call this too.
+///
+/// `None` writes nothing, so an ordinary response is untouched.
+pub(crate) fn note_status_adjustment(body: &mut Value, adjusted_from: Option<&str>, lane: &str) {
+    let Some(from) = adjusted_from else { return };
+    body["status_adjusted_from"] = json!(from);
+    body["status_adjusted_reason"] = json!(format!(
+        "lane '{lane}' is isolated, so board_drive never offers its todo cards; stored as \
+         backlog, which is unbounded and claims nothing. Clear CC_ISOLATED on the lane to take \
+         board automation, or send as the owner."
+    ));
+}
+
 pub async fn create_item(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -5369,14 +5391,7 @@ pub async fn create_item(
             // so a caller reading only `id` could not tell. The code stays 201
             // because a card really was created; this field is how the caller
             // learns the queue it named was not the queue it got.
-            if let Some(from) = status_adjusted_from {
-                v["status_adjusted_from"] = json!(from);
-                v["status_adjusted_reason"] = json!(format!(
-                    "lane '{session}' is isolated, so board_drive never offers its todo cards; \
-                     filed as backlog, which is unbounded and claims nothing. Clear CC_ISOLATED \
-                     on the lane to take board automation, or send as the owner."
-                ));
-            }
+            note_status_adjustment(&mut v, status_adjusted_from, &session);
             if !ignored.is_empty() {
                 v["ignored_fields"] = json!(ignored);
             }
@@ -12970,10 +12985,27 @@ pub async fn patch_item(
             if changed.is_empty() {
                 // Invariant 37: nothing changed -> applied:false, rev/version
                 // untouched, unknown keys named.
+                //
+                // AMUX-4860: THE NO-OP ARM DISCLOSES TOO, and it is the arm
+                // that needs it most. Asking for `todo` on an isolated lane
+                // whose card is ALREADY `backlog` adjusts the target, finds
+                // nothing left to change, and lands here. Without this the
+                // caller asked for todo, got backlog, and the reply said
+                // `applied: false` with no reason. That is the silent
+                // adjustment the Applied arm's disclosure exists to prevent,
+                // reappearing on the path where nothing moved. Found by
+                // exercising the live build rather than by a test, which is
+                // why the guard below now covers this arm as well.
+                let mut body = detail_body(&row);
+                note_status_adjustment(
+                    &mut body,
+                    target_adjusted_from,
+                    next.session.as_deref().unwrap_or(""),
+                );
                 return finish(
                     &slot_w,
                     PatchOut::Noop {
-                        body: detail_body(&row),
+                        body,
                         ignored,
                         all_ignored,
                     },
@@ -13420,15 +13452,11 @@ pub async fn patch_item(
             // and for the same reason: a write that silently becomes something
             // else is the AMUX-4776 trap, and a caller reading only the status
             // code cannot tell. The code stays 200 because the patch applied.
-            if let Some(from) = target_adjusted_from {
-                body["status_adjusted_from"] = json!(from);
-                body["status_adjusted_reason"] = json!(format!(
-                    "lane '{}' is isolated, so board_drive never offers its todo cards; \
-                     stored as backlog, which is unbounded and claims nothing. Clear \
-                     CC_ISOLATED on the lane to take board automation, or send as the owner.",
-                    next.session.as_deref().unwrap_or("")
-                ));
-            }
+            note_status_adjustment(
+                &mut body,
+                target_adjusted_from,
+                next.session.as_deref().unwrap_or(""),
+            );
             finish(
                 &slot_w,
                 PatchOut::Applied {
@@ -16246,6 +16274,56 @@ mod isolation_designation_tests {
             asked.borrow().is_empty(),
             "the empty lane must short-circuit before the predicate is consulted, got {:?}",
             asked.borrow()
+        );
+    }
+
+    /// AMUX-4860. Every response arm that can carry an adjusted status says so.
+    ///
+    /// WHY THIS CELL EXISTS, and it is a correction to my own first version.
+    /// The decision above was tested and green while the DISCLOSURE was wired
+    /// into the `Applied` arm only. Exercising the shipped build found it:
+    /// asking for `todo` on an isolated lane whose card was already `backlog`
+    /// adjusted the target, left nothing to write, and returned through `Noop`
+    /// with `applied: false` and no reason. The caller asked for todo, got
+    /// backlog, and the reply was silent about it, which is the AMUX-4776 trap
+    /// this field exists to prevent.
+    ///
+    /// A green decision test could not catch that, because the defect was in a
+    /// path the decision never sees. All three arms now call one function, so
+    /// this pins the function; the comment on it names the obligation for any
+    /// arm added later.
+    #[test]
+    fn an_adjusted_status_is_disclosed_and_an_ordinary_one_is_left_alone() {
+        // ADJUSTED: both fields present, and the reason names the lane so the
+        // reader knows WHICH lane's isolation moved their card.
+        let mut body = json!({"id": "X-1", "status": "backlog"});
+        note_status_adjustment(&mut body, Some("todo"), "desktop");
+        assert_eq!(
+            body["status_adjusted_from"], "todo",
+            "the caller must learn the status it asked for: {body}"
+        );
+        let reason = body["status_adjusted_reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("desktop"),
+            "the reason must name the lane whose isolation caused it: {reason}"
+        );
+        assert!(
+            reason.contains("backlog"),
+            "and the status it got instead: {reason}"
+        );
+
+        // NOT ADJUSTED: nothing is written. Without this arm a helper that
+        // stamped the fields unconditionally would pass the first assertions
+        // and label every ordinary response as adjusted.
+        let mut plain = json!({"id": "X-2", "status": "todo"});
+        note_status_adjustment(&mut plain, None, "amux");
+        assert!(
+            plain.get("status_adjusted_from").is_none(),
+            "an unadjusted response must carry no adjustment field: {plain}"
+        );
+        assert!(
+            plain.get("status_adjusted_reason").is_none(),
+            "nor a reason: {plain}"
         );
     }
 
