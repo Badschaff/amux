@@ -55,6 +55,29 @@ form: a set-difference over one file cannot see a MOVE and reports it as a
 deletion every time. The idle commit-nudge prints this directive by name when a
 dirty append-only file is in the set, but the operation is yours to run.
 
+**A PR branch is a DIFFERENT append-order hazard than a stranded checkout —
+check this even when the checkout above reads clean.** Two isolated,
+individually-clean feature branches that each independently append to this
+file will merge fine on their own but conflict with EACH OTHER the moment the
+first one lands and the second tries to catch up: both wrote at the same last
+line of the same base. Hit three times in one day on PRs #132/#133/#136
+(AEAB-40/AF-658). The expensive half is not the conflict itself, it is that
+GitHub does not run PR workflows on a head it cannot merge — the PR shows NO
+CHECKS AT ALL rather than a failure, and "no checks reported" and "all checks
+passed" are one glance apart in `gh pr checks`.
+
+Interim recipe (validated repeatedly; the deeper one-file-per-entry redesign
+this entry also proposed is a fleet-wide format change and stays parked at
+AEAB-40/AF-658, needs:you — this recipe is not that decision, only a way to
+stop paying for it while it's pending): right before you push or finalize the
+PR, `git fetch origin main`, take origin's CURRENT copy of this file, and
+re-append your entry VERBATIM on top of that — never let git interleave the
+two versions itself (a real merge here has spliced fragments of different
+entries together before, corrupting the `grep '^STATUS: open'` counts this
+file exists to keep honest; see the UNION-MERGE section above for why that
+same failure mode rules out `merge=union` in `.gitattributes` as a fix). Then
+run `scripts/frustrations_audit.py` before you push.
+
 This is not a diary. It is the input to deciding what to fix next, so it has to be
 greppable and it has to be honest about cost.
 
