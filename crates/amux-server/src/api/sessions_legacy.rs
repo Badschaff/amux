@@ -2868,9 +2868,7 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
                     "the single sessions builder did not publish a structurally safe snapshot \
                      before the wait deadline; refusing duplicate fleet work"
                 );
-                anyhow::bail!(
-                    "sessions list temporarily unavailable: builder busy after {wait_s:.1}s"
-                );
+                return Err(BuilderBusy { waited_s: wait_s }.into());
             }
         }
     };
@@ -2954,6 +2952,36 @@ impl std::fmt::Display for DiscoveryRaced {
 
 impl std::error::Error for DiscoveryRaced {}
 
+/// The single sessions builder was still working when this reader's wait ran
+/// out. Like [`DiscoveryRaced`] this is amux DECLINING, not amux failing: the
+/// request was well-formed and the answer exists once the in-flight build
+/// publishes. Refusing is deliberate, so a saturated builder does not get N
+/// duplicate fleet scans piled on top of it.
+///
+/// AMUX-4764: AMUX-4637 typed the discovery RACE and left this `bail!` untyped,
+/// so the second refusal in the same function kept reaching every 5xx sweep as
+/// a server fault. It filed as a new card the moment AMUX-4637 closed and
+/// stopped suppressing. One defect, fixed once, in the arm nobody re-read.
+///
+/// Display keeps the old message verbatim, the convention `DiscoveryRaced` set,
+/// because clients and tests quote it.
+#[derive(Debug)]
+pub struct BuilderBusy {
+    pub waited_s: f64,
+}
+
+impl std::fmt::Display for BuilderBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "sessions list temporarily unavailable: builder busy after {:.1}s",
+            self.waited_s
+        )
+    }
+}
+
+impl std::error::Error for BuilderBusy {}
+
 /// Serve a finished build only if neither the epoch nor the on-disk registry
 /// moved while it ran. Extracted so the construction of [`DiscoveryRaced`] is
 /// pinned by a test rather than only the classifier that reads it.
@@ -2970,19 +2998,41 @@ fn race_verdict(
     }
 }
 
-/// 503 with `Retry-After: 1` for the discovery race, 500 for any other build
-/// failure, both as `{"error": message}`. Decided on the TYPE, so rewording the
+/// 503 with `Retry-After` for the two REFUSALS, 500 for any other build
+/// failure, all as `{"error": message}`. Decided on the TYPE, so rewording the
 /// message cannot move the status.
-pub(crate) fn discovery_failure(e: &anyhow::Error, message: String) -> Response {
+///
+/// The two refusals get different hints because they are different waits.
+/// [`DiscoveryRaced`] means the answer exists a moment later, so `1`.
+/// [`BuilderBusy`] means the caller already burned `AMUX_SESSIONS_BUILD_WAIT_S`
+/// (30s by default) and the build is still going, so `1` would mostly bounce.
+/// `5` comes off the measured distribution rather than taste: over 48h to
+/// 2026-09-18, n=6708, 78.2% of `GET /api/sessions` finished within 5s
+/// (27.7% served from cache under 100ms, 49.9% in the 1-5s build band), 95.2%
+/// within 10s, and 0.3% reached 30s at all.
+fn retry_after_hint(e: &anyhow::Error) -> Option<&'static str> {
     if e.downcast_ref::<DiscoveryRaced>().is_some() {
-        let mut r = (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": message }))).into_response();
-        r.headers_mut().insert(
-            axum::http::header::RETRY_AFTER,
-            axum::http::HeaderValue::from_static("1"),
-        );
-        r
+        Some("1")
+    } else if e.downcast_ref::<BuilderBusy>().is_some() {
+        Some("5")
     } else {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": message }))).into_response()
+        None
+    }
+}
+
+pub(crate) fn discovery_failure(e: &anyhow::Error, message: String) -> Response {
+    match retry_after_hint(e) {
+        Some(secs) => {
+            let mut r = (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": message }))).into_response();
+            r.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static(secs),
+            );
+            r
+        }
+        None => {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": message }))).into_response()
+        }
     }
 }
 
@@ -6919,5 +6969,54 @@ mod discovery_race_tests {
         assert!(r.headers().get(axum::http::header::RETRY_AFTER).is_none());
         let db = anyhow::anyhow!("database query failed");
         assert_eq!(discovery_failure(&db, db.to_string()).status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// AMUX-4764: the SECOND refusal in the same function. AMUX-4637 typed the
+    /// race and left the builder-busy `bail!` untyped, so a saturated builder
+    /// kept answering 500 and reaching every 5xx sweep as a server fault.
+    ///
+    /// The untyped control is what makes this a test of the TYPE rather than of
+    /// the wording: the identical message built with `anyhow!` must still be a
+    /// 500, so a future `bail!` reintroducing the defect cannot pass by having
+    /// the right words in it.
+    #[tokio::test]
+    async fn a_busy_builder_is_503_with_its_own_retry_hint_and_the_same_words_untyped_are_not() {
+        let busy: anyhow::Error = BuilderBusy { waited_s: 30.0 }.into();
+        let message = busy.to_string();
+        assert_eq!(
+            message, "sessions list temporarily unavailable: builder busy after 30.0s",
+            "Display must keep the pre-AMUX-4764 wording, which clients quote"
+        );
+
+        let r = discovery_failure(&busy, message.clone());
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            r.headers().get(axum::http::header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
+            Some("5"),
+            "a caller that already waited 30s should not be told to retry in 1s; \
+             that hint belongs to DiscoveryRaced, whose answer exists a moment later"
+        );
+        let body = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"], message);
+
+        // Wrapped in context, the way sessions-git reports it, still a refusal.
+        let wrapped =
+            anyhow::Error::from(BuilderBusy { waited_s: 30.0 }).context("session list unavailable");
+        assert_eq!(discovery_failure(&wrapped, format!("{wrapped:#}")).status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // THE CONTROL: identical words, untyped, is the shape this card is
+        // about and must stay a 500 with no Retry-After.
+        let untyped = anyhow::anyhow!("sessions list temporarily unavailable: builder busy after 30.0s");
+        let r = discovery_failure(&untyped, untyped.to_string());
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(r.headers().get(axum::http::header::RETRY_AFTER).is_none());
+
+        // And the two refusals stay distinguishable, so collapsing them into
+        // one arm with one hint would redden this.
+        let raced: anyhow::Error = DiscoveryRaced.into();
+        assert_eq!(retry_after_hint(&raced), Some("1"));
+        assert_eq!(retry_after_hint(&busy), Some("5"));
+        assert_eq!(retry_after_hint(&untyped), None);
     }
 }
