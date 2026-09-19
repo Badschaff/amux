@@ -1973,6 +1973,16 @@ fn detect_latency_with_scan_cap(
     // a reader can check against the evidence line it feeds.
     struct OutlierGroup {
         n: u64,
+        /// Rows above this route's OWN bound (AMUX-4780).
+        ///
+        /// `n` counts rows over the global outlier floor, but the filing gate
+        /// uses `design_budget_ms` for a LONG_BY_DESIGN route. So a budgeted
+        /// route's card reported a count taken against a bound the DECISION did
+        /// not use, and counted its design as breach: /api/email/inbox filed "5
+        /// request(s) exceeded 10s" when, over 48h, 52 of 99 requests passed
+        /// 10s and exactly ONE passed its 30s budget. Equal to `n` when the
+        /// route has no budget, so the untouched case stays untouched.
+        n_over_budget: u64,
         worst_ms: f64,
         last_ts: f64,
         sample: String,
@@ -2148,10 +2158,13 @@ fn detect_latency_with_scan_cap(
                 // coarse target deliberately: a 500 is a 500 whatever the verb,
                 // and its rollup wants the route shape.
                 let target = rl::normalize_target_verb(&path);
+                // Computed BEFORE the entry call, which moves `target`.
+                let row_budget = design_budget_ms(&target);
                 let e = seen
                     .entry((method.clone(), target))
                     .or_insert_with(|| OutlierGroup {
                         n: 0,
+                        n_over_budget: 0,
                         worst_ms: 0.0,
                         last_ts: ts,
                         sample: format!("{method} {path} → {status}"),
@@ -2161,6 +2174,9 @@ fn detect_latency_with_scan_cap(
                         remote_n: 0,
                     });
                 e.n += 1;
+                if ms > row_budget {
+                    e.n_over_budget += 1;
+                }
                 // AMUX-4818. Loopback is the only thing that means "no client
                 // network in this number"; an absent client_ip is counted as
                 // neither, so a missing column reads as unmeasured rather than
@@ -2440,6 +2456,7 @@ fn detect_latency_with_scan_cap(
         (method, target),
         OutlierGroup {
             n,
+            n_over_budget,
             worst_ms: worst,
             last_ts,
             sample,
@@ -2452,9 +2469,14 @@ fn detect_latency_with_scan_cap(
     {
         // AMUX-3485: for long-by-design endpoints the effective threshold is
         // their design budget, not the global outlier floor.
-        if worst <= design_budget_ms(&target) {
+        let budget = design_budget_ms(&target);
+        if worst <= budget {
             continue;
         }
+        // The bound the DECISION used, which is what the card must quote. A
+        // budgeted route reporting the floor advised the reader to add a
+        // LONG_BY_DESIGN entry that already existed.
+        let effective_bound = if budget > 0.0 { budget } else { outlier_ms() };
         // ALREADY TOLD YOU, AS PART OF A WIDER FAULT (AMUX-4717).
         //
         // The rollup arm and this arm see the same rows through different
@@ -2503,7 +2525,11 @@ fn detect_latency_with_scan_cap(
         out.push(Finding {
             kind: DetectorKind::Latency,
             signature: format!("latency|outlier|{method}|{target}|{}", last_ts as i64),
-            title: format!("{method} {target} took {:.1}s ({n}x over {:.0}s)", worst / 1000.0, outlier_ms() / 1000.0),
+            title: format!(
+                "{method} {target} took {:.1}s ({n_over_budget}x over {:.0}s)",
+                worst / 1000.0,
+                effective_bound / 1000.0
+            ),
             evidence: vec![
                 // SAYS WHAT IT MEASURED (AMUX-3869). This read "This is not a
                 // percentile shift — it is individual requests going wrong, so
@@ -2515,18 +2541,45 @@ fn detect_latency_with_scan_cap(
                 // conclusion its own grouping cannot support is ethos rule 4,
                 // and this one stated it in the very field a reader trusts most.
                 ("verdict".into(), format!(
-                    "{n} request(s) to {method} {target} exceeded {:.0}s in the last {:.1}h; \
-                     worst {:.1}s. This counts rows over a FIXED floor and does not compare \
-                     them to this target's own baseline, so a route whose normal work takes \
-                     seconds can appear here on an ordinary tail. Check this target's p50/p99 \
-                     before treating it as a fault; if the duration is by design, the fix is a \
-                     LONG_BY_DESIGN entry derived from the route's own bounds, not a threshold \
-                     nudge.",
-                    outlier_ms() / 1000.0, window_h(), worst / 1000.0
+                    "{n_over_budget} request(s) to {method} {target} exceeded {:.0}s in the \
+                     last {:.1}h; worst {:.1}s.{}",
+                    effective_bound / 1000.0,
+                    window_h(),
+                    worst / 1000.0,
+                    if budget > 0.0 {
+                        format!(
+                            " That bound is this route's OWN {:.0}s LONG_BY_DESIGN budget, not \
+                             the global {:.0}s floor, and it is the same bound the filing \
+                             decision used. {n} request(s) passed the floor in this window and \
+                             are this endpoint doing its designed work; do NOT size the incident \
+                             from that number. Past the budget means the route's own bounds \
+                             failed to contain the call, which is the one latency story here \
+                             that IS wrong.",
+                            budget / 1000.0,
+                            outlier_ms() / 1000.0
+                        )
+                    } else {
+                        " This counts rows over a FIXED floor and does not compare them to this \
+                         target's own baseline, so a route whose normal work takes seconds can \
+                         appear here on an ordinary tail. Check this target's p50/p99 before \
+                         treating it as a fault; if the duration is by design, the fix is a \
+                         LONG_BY_DESIGN entry derived from the route's own bounds, not a \
+                         threshold nudge."
+                            .to_string()
+                    }
                 )),
                 ("worst_ms".into(), format!("{worst:.0}")),
                 ("sample_request".into(), sample),
-                ("threshold_ms".into(), format!("{:.0}", outlier_ms())),
+                ("threshold_ms".into(), format!("{effective_bound:.0}")),
+                // BOTH BOUNDS, so the reader can see which one the count used
+                // and that the other exists (AMUX-4780).
+                ("floor_ms".into(), format!("{:.0}", outlier_ms())),
+                ("design_budget_ms".into(), if budget > 0.0 {
+                    format!("{budget:.0}")
+                } else {
+                    "none: this route has no LONG_BY_DESIGN entry".into()
+                }),
+                ("n_over_floor".into(), n.to_string()),
                 ("last_seen".into(), rl::local_when(last_ts)),
                 // THE COUNT BESIDE THE COUNT (AMUX-3907). `n` above is what
                 // SURVIVED two filters, and until now the card published only
@@ -12980,6 +13033,93 @@ mod tests {
     /// baseline defect per-endpoint; a run PAST the design budget still
     /// files, because that means the endpoint's own timeout failed to bound
     /// the call, which is the one latency story there that IS wrong.
+    #[tokio::test]
+    async fn a_budgeted_route_counts_breaches_against_its_own_bound() {
+        let (st, _d) = state();
+        let now = unix_now();
+        // /api/email/inbox carries a 30s LONG_BY_DESIGN budget. Four requests
+        // sit ABOVE the 10s floor and inside that budget — this route is
+        // Gmail-quota-bound at ~12-15s, so those are it working — and ONE
+        // breaches the budget. The live shape this reproduces: 52 of 99
+        // requests over 48h passed 10s, exactly 1 passed 30s.
+        for (i, ms) in [12_000.0, 14_000.0, 18_000.0, 22_000.0].iter().enumerate() {
+            log_row(&st, Row {
+                ts: now - 500.0 + i as f64,
+                method: "GET", path: "/api/email/inbox", family: "/api/email",
+                status: 200, body: "", worker: "", ua: "curl/8", ms: *ms,
+            });
+        }
+        log_row(&st, Row {
+            ts: now - 100.0,
+            method: "GET", path: "/api/email/inbox", family: "/api/email",
+            status: 200, body: "", worker: "", ua: "curl/8", ms: 59_621.0,
+        });
+
+        let (f, _) = detect_latency(&st.store.read().unwrap(), now);
+        let card = f
+            .iter()
+            .find(|x| x.signature.contains("/api/email/inbox"))
+            .expect("a request past the 30s budget must still file");
+        let ev: BTreeMap<_, _> = card.evidence.iter().cloned().collect();
+
+        // THE COUNT IS THE POINT. Five rows cleared the 10s floor; ONE cleared
+        // the budget the filing decision actually used. Reporting 5 counts this
+        // route's design as breach.
+        assert!(
+            ev["verdict"].starts_with("1 request(s)"),
+            "the count must be over the BUDGET, not the floor: {}",
+            ev["verdict"]
+        );
+        assert!(
+            card.title.contains("(1x over 30s)"),
+            "the title must quote the bound the decision used: {}",
+            card.title
+        );
+        assert_eq!(ev["threshold_ms"], "30000", "threshold must be the budget");
+        assert_eq!(ev["n_over_floor"], "5", "the floor count stays available, just not as THE count");
+        assert_eq!(ev["design_budget_ms"], "30000");
+        assert!(
+            ev["verdict"].contains("do NOT size the incident from that number"),
+            "the card must say the floor count is not the incident size: {}",
+            ev["verdict"]
+        );
+        // And it must NOT advise adding an entry that already exists.
+        assert!(
+            !ev["verdict"].contains("the fix is a LONG_BY_DESIGN entry"),
+            "a budgeted route must not be told to add the budget it already has: {}",
+            ev["verdict"]
+        );
+    }
+
+    /// THE CONTROL: an UNBUDGETED route must be completely unchanged, or this
+    /// fix would silently rewrite every latency card on the board.
+    #[tokio::test]
+    async fn an_unbudgeted_route_still_counts_and_advises_against_the_floor() {
+        let (st, _d) = state();
+        let now = unix_now();
+        for (i, ms) in [11_000.0, 12_000.0].iter().enumerate() {
+            log_row(&st, Row {
+                ts: now - 300.0 + i as f64,
+                method: "GET", path: "/api/no-such-budget", family: "/api/no-such-budget",
+                status: 200, body: "", worker: "", ua: "curl/8", ms: *ms,
+            });
+        }
+        let (f, _) = detect_latency(&st.store.read().unwrap(), now);
+        let card = f
+            .iter()
+            .find(|x| x.signature.contains("/api/no-such-budget"))
+            .expect("an unbudgeted route over the floor must file");
+        let ev: BTreeMap<_, _> = card.evidence.iter().cloned().collect();
+        assert!(ev["verdict"].starts_with("2 request(s)"), "{}", ev["verdict"]);
+        assert_eq!(ev["threshold_ms"], "10000", "no budget means the floor IS the bound");
+        assert!(
+            ev["verdict"].contains("the fix is a LONG_BY_DESIGN entry"),
+            "an unbudgeted route must still get the original advice: {}",
+            ev["verdict"]
+        );
+        assert!(ev["design_budget_ms"].starts_with("none:"));
+    }
+
     #[tokio::test]
     async fn a_long_by_design_endpoint_files_only_past_its_own_budget() {
         let (st, _d) = state();
