@@ -74,10 +74,34 @@ fn cold_sessions_cache_has_exactly_one_builder_and_does_not_lease_the_request_po
         1,
         "there must be exactly one build call site, protected by the single flight"
     );
+    // AMUX-4764 / AMUX-4826: this used to assert `SRC.contains("anyhow::bail!")`,
+    // and that assertion pinned the SPELLING rather than the property. When the
+    // busy path was given a typed `BuilderBusy` error so the handler could answer
+    // 503 instead of 500, the last `bail!` in the file disappeared and this went
+    // red over a change that preserved everything it cared about.
+    //
+    // The property is: when the single builder is still busy past the bound, the
+    // loser RETURNS AN ERROR and does not build. Assert that on the arm itself,
+    // so a regression that falls through to a duplicate build is caught and a
+    // rename of the error machinery is not.
+    let busy_arm = {
+        let at = SRC.find("match acquired {").expect("the single-flight acquire is in this file");
+        let tail = &SRC[at..];
+        &tail[..tail.find("\n        }\n").map(|i| i + 10).unwrap_or(tail.len())]
+    };
     assert!(
-        SRC.contains("anyhow::bail!"),
-        "when the single builder is still busy past the overall bound, the function must fail \
+        busy_arm.contains("None => {"),
+        "the acquire must still have a loser arm: {busy_arm}"
+    );
+    assert!(
+        busy_arm.contains("return Err("),
+        "when the single builder is still busy past the overall bound, the loser must fail \
          safely rather than start duplicate work on an already-struggling substrate"
+    );
+    assert!(
+        !busy_arm.contains("build_array("),
+        "the loser arm must NOT build: that is the N-builders-one-pool failure this file exists \
+         to prevent"
     );
     assert!(
         SRC.contains("sessions_cache_stuck"),
