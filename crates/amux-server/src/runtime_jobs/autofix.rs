@@ -411,6 +411,25 @@ const LONG_BY_DESIGN: &[(&str, f64)] = &[
     // family and this entry is the only thing watching the route. If archive's
     // ladder is ever retuned, retune this number with it.
     ("/api/sessions/{name}/archive", 30_000.0),
+    // GET /api/sessions (AMUX-4817, AMUX-4778). The duration IS the fleet
+    // projection: a cold build was measured end-to-end at 4875ms, a warm one
+    // at ~2500ms, and the distribution over 48h (n=6827) is 27.7% cache hits
+    // under 100ms with ~72% paying a real build in a 1-10s band. A 10s floor
+    // therefore fires on this route's NORMAL work, which is the
+    // threshold-below-baseline defect this table exists for.
+    //
+    // 30s is the route's OWN bound, not a padded guess: a reader that waits
+    // out `AMUX_SESSIONS_BUILD_WAIT_S` (30s, sessions_legacy.rs) while the
+    // single builder is busy is REFUSED with `BuilderBusy` -> 503. So past 30s
+    // the endpoint's own wait failed to bound the call, which is the one
+    // latency story on this route that IS wrong, and it stays detectable.
+    //
+    // Measured against 48h of real traffic before adding it: 325 requests
+    // crossed the 10s floor and would file today; 21 cross 30s and still will.
+    // So this silences 304 filings about the design and keeps every one that
+    // means the refusal did not work. Worst in that window was 127749ms, which
+    // a 30s budget still reports.
+    ("/api/sessions", 30_000.0),
 ];
 
 fn design_budget_ms(target: &str) -> f64 {
@@ -13698,6 +13717,59 @@ mod tests {
     /// this closes), too high and a scrollback capture wedged at its own 30s
     /// timeout is swallowed (the one archive story that IS wrong). A budget is
     /// only meaningful as an interval.
+    /// AMUX-4817 / AMUX-4778: GET /api/sessions is long BY DESIGN, and the
+    /// budget has to bracket the design without hiding a broken refusal.
+    ///
+    /// The route's normal work is a fleet projection: measured end-to-end at
+    /// 4875ms cold and ~2500ms warm, with ~72% of 6827 requests over 48h paying
+    /// a real build in a 1-10s band. A 10s floor fires on that, which is the
+    /// threshold-below-baseline defect this table exists for. It is also what
+    /// produced AMUX-4817, a 9-endpoint rollup whose fleet-wide "slowdown"
+    /// turned out to be request MIX: /api/health in the same window ran 9ms
+    /// against its own 21ms baseline for that load band.
+    ///
+    /// 30s is the route's OWN bound: past `AMUX_SESSIONS_BUILD_WAIT_S` a reader
+    /// waiting on the single builder is refused with BuilderBusy -> 503, so a
+    /// request that takes longer means that refusal did not work.
+    #[test]
+    fn the_sessions_budget_covers_the_build_band_but_not_a_failed_refusal() {
+        // PIN THE LOOKUP, NOT JUST THE TABLE, for the same reason the archive
+        // cell below does: `design_budget_ms` matches `target == *p` against
+        // whatever `normalize_target_verb` produces, so an entry the
+        // normaliser never yields is a budget nothing consults.
+        let real_target = crate::api::request_log::normalize_target_verb("/api/sessions");
+        assert_eq!(
+            real_target, "/api/sessions",
+            "the LONG_BY_DESIGN key must be what the detector actually computes"
+        );
+        let b = design_budget_ms(&real_target);
+        assert!(
+            b > 0.0,
+            "the entry must be reachable through the real target, not merely present in the table"
+        );
+
+        // AN INTERVAL, because either bound alone is satisfiable by a wrong
+        // number. Too low and the routine multi-second build files forever;
+        // too high and a builder whose 30s wait failed to refuse is swallowed.
+        assert!(
+            b > 10_000.0,
+            "must sit ABOVE the 10s floor, or the design band keeps filing: {b}"
+        );
+        assert_eq!(
+            b, 30_000.0,
+            "must equal the route's own AMUX_SESSIONS_BUILD_WAIT_S bound (30s), not a padded guess"
+        );
+
+        // The sibling entry must NOT be what answered: `/api/sessions` and
+        // `/api/sessions/{name}/archive` are different routes, and a lookup
+        // that fell through to the wildcard would pass every assertion above
+        // while budgeting the wrong thing.
+        assert_ne!(
+            real_target, "/api/sessions/{name}/archive",
+            "the bare list route must not resolve to the archive verb's entry"
+        );
+    }
+
     #[test]
     fn the_archive_budget_brackets_the_sleep_ladder_without_hiding_a_wedge() {
         // PIN THE LOOKUP, NOT JUST THE TABLE. The first version of this cell
