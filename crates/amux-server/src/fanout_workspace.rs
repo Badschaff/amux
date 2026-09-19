@@ -105,7 +105,22 @@ pub async fn ensure(home: &Path, name: &str, configured_repo: &str) -> Result<Wo
         }
         let current = git(&path, &["branch", "--show-current"]).await?;
         if current.is_empty() {
-            git(&path, &["switch", "-c", &branch]).await?;
+            // Adoption only names the current commit. Checkout can invoke
+            // filters/hooks and rewrite files even when HEAD stays the same.
+            let head = git(&path, &["rev-parse", "HEAD"]).await?;
+            let reference = format!("refs/heads/{branch}");
+            if let Ok(existing_head) = git(&repo, &["rev-parse", "--verify", &reference]).await {
+                let worktrees = git(&repo, &["worktree", "list", "--porcelain"]).await?;
+                if existing_head != head || worktrees.lines().any(|line| line == format!("branch {reference}")) {
+                    return Err("workspace branch already belongs to another head or checkout; preserved".into());
+                }
+            } else {
+                git(&repo, &["branch", &branch, &head]).await?;
+            }
+            if git(&path, &["rev-parse", "HEAD"]).await? != head {
+                return Err("workspace changed during adoption; preserved for retry".into());
+            }
+            git(&path, &["symbolic-ref", "HEAD", &reference]).await?;
         } else if current != branch {
             return Err(format!(
                 "workspace uses {current}, expected {branch}; preserved"
@@ -570,6 +585,27 @@ mod tests {
         write_integration_status(&home, "child", &status);
         assert!(load(&home, "child").is_none());
         assert_eq!(integration_status(&home, "child"), status);
+    }
+
+    #[tokio::test]
+    async fn legacy_adoption_names_head_without_checkout_hooks_or_file_changes() {
+        use std::os::unix::fs::PermissionsExt;
+        let (d, w) = fixture().await;
+        git(&w.path, &["switch", "--detach"]).await.unwrap();
+        git(&w.repo, &["branch", "-D", &w.branch]).await.unwrap();
+        std::fs::remove_file(record_path(&d.path().join("home"), "child-a")).unwrap();
+        std::fs::write(Path::new(&w.path).join("app.txt"), "uncommitted work\n").unwrap();
+        let hook = Path::new(&w.repo).join(".git/hooks/post-checkout");
+        std::fs::write(&hook, "#!/bin/sh\nprintf 'checkout must not run during adoption' >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let head = git(&w.path, &["rev-parse", "HEAD"]).await.unwrap();
+        let index = git(&w.path, &["ls-files", "--stage"]).await.unwrap();
+        let adopted = ensure(&d.path().join("home"), "child-a", &w.repo).await.unwrap();
+        assert!(adopted.base.is_empty());
+        assert_eq!(git(&w.path, &["rev-parse", "HEAD"]).await.unwrap(), head);
+        assert_eq!(git(&w.path, &["ls-files", "--stage"]).await.unwrap(), index);
+        assert_eq!(git(&w.path, &["branch", "--show-current"]).await.unwrap(), w.branch);
+        assert_eq!(std::fs::read_to_string(Path::new(&w.path).join("app.txt")).unwrap(), "uncommitted work\n");
     }
 
     async fn fixture() -> (tempfile::TempDir, Workspace) {
