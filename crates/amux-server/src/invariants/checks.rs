@@ -6944,6 +6944,50 @@ pub struct UnrecordedScheduleOutcome {
     /// Whether any later run of this schedule has succeeded. False means the
     /// tick is still in doubt right now.
     pub recovered: bool,
+    /// The schedule's own period in seconds, from `ScheduleExpr::parse` on its
+    /// `schedule_expr`. `None` when the schedule is gone or its expression does
+    /// not parse, and a `None` cadence is never called overdue -- an unknown
+    /// deadline is not a missed one.
+    pub cadence_s: Option<i64>,
+    /// Whether the schedule can still fire. A disabled or deleted schedule can
+    /// never record a success, so its last unknown stays outstanding forever and
+    /// must not be read as a live fault (AMUX-4805).
+    pub can_fire: bool,
+}
+
+/// How far past its own cadence a schedule must sit before its unrecorded tick
+/// is a FAULT rather than a tick waiting for its next turn.
+///
+/// Measured over 7 days of live data (AMUX-4805): 38 of 39 unknowns recovered on
+/// their own, and every recovery time WAS the schedule's cadence -- `every 15m`
+/// came back in 14-15m, `every 30m` in 29-30m, `every 4h` in 240m, `daily` in
+/// 1440m. Two of those overshot by a few seconds (30m12s on an every-30m tick),
+/// so a bound at exactly 1.0 cadence would fire on the overshoot. Half a cadence
+/// of grace clears that by minutes while still catching a schedule that has
+/// genuinely stopped within one and a half turns.
+const OVERDUE_CADENCE_NUM: i64 = 3;
+const OVERDUE_CADENCE_DEN: i64 = 2;
+
+impl UnrecordedScheduleOutcome {
+    /// Is this tick genuinely missing, as opposed to waiting for its next fire?
+    ///
+    /// The check this backs used to ask only "has it succeeded since", which on
+    /// a box that restarts on every commit is guaranteed-true for up to one full
+    /// cadence after any interrupted fire. That is why it logged 10700
+    /// occurrences without self-healing: it was reporting the normal recovery
+    /// window as a fault (AMUX-4805).
+    pub fn is_overdue(&self) -> bool {
+        if self.recovered || !self.can_fire {
+            return false;
+        }
+        match self.cadence_s {
+            Some(c) if c > 0 => {
+                self.outstanding_s > c.saturating_mul(OVERDUE_CADENCE_NUM) / OVERDUE_CADENCE_DEN
+            }
+            // No derivable deadline, so there is nothing to be late against.
+            _ => false,
+        }
+    }
 }
 
 /// AF-582. `delivery='unknown'` is the honest discriminator
@@ -7011,8 +7055,15 @@ pub fn unrecorded_schedule_outcomes_are_visible(
             .then_with(|| b.count.cmp(&a.count))
             .then_with(|| a.schedule_id.cmp(&b.schedule_id))
     });
-    let (out_now, recovered): (Vec<&&UnrecordedScheduleOutcome>, Vec<&&UnrecordedScheduleOutcome>) =
-        sorted.iter().partition(|r| !r.recovered);
+    // THREE OUTCOMES, NOT TWO (AMUX-4805). "has not succeeded yet" splits into a
+    // tick still inside its own cadence, which is the normal recovery window and
+    // clears itself, and a tick that has blown past that deadline, which is the
+    // only one a reader can act on. Folding them together is what made this check
+    // fail 10700 times without ever self-healing.
+    let (out_now, waiting): (Vec<&&UnrecordedScheduleOutcome>, Vec<&&UnrecordedScheduleOutcome>) =
+        sorted.iter().filter(|r| !r.recovered).partition(|r| r.is_overdue());
+    let recovered: Vec<&&UnrecordedScheduleOutcome> =
+        sorted.iter().filter(|r| r.recovered).collect();
     let row = |r: &&&UnrecordedScheduleOutcome| {
         serde_json::json!({
             "schedule_id": r.schedule_id,
@@ -7021,6 +7072,8 @@ pub fn unrecorded_schedule_outcomes_are_visible(
             "session": r.session,
             "outstanding_s": r.outstanding_s,
             "recovered": r.recovered,
+            "cadence_s": r.cadence_s,
+            "can_fire": r.can_fire,
         })
     };
     // BOTH LISTS IN BOTH ARMS. "no restart interrupted a fire" and "several did
@@ -7031,44 +7084,62 @@ pub fn unrecorded_schedule_outcomes_are_visible(
         "window_h": window_h,
         "schedules_still_out": out_now.len(),
         "schedules_recovered": recovered.len(),
+        "schedules_waiting": waiting.len(),
         "still_out": out_now.iter().map(row).collect::<Vec<_>>(),
         "recovered": recovered.iter().map(row).collect::<Vec<_>>(),
+        "waiting": waiting.iter().map(row).collect::<Vec<_>>(),
         "recovered_note": "these schedules fired again and succeeded, so the interrupted tick \
                            cost one cadence and nothing is outstanding. The restart is real and \
                            is not a defect in the schedule.",
+        "waiting_note": "these schedules have not succeeded yet and are not late either: their \
+                         next fire is still due. An interrupted tick costs one cadence, so this \
+                         is the normal recovery window and it clears without anyone acting. \
+                         Schedules that can never fire again (disabled or deleted) are counted \
+                         here too, because a success they cannot record is not one they owe.",
     });
     if out_now.is_empty() {
         let mut ok = InvariantResult::pass(ID);
         ok.evidence = ev;
         return vec![ok];
     }
+    // The cadence travels with every name. "outstanding 41m" is not actionable
+    // on its own; "outstanding 41m on an every-15m tick" says it has missed most
+    // of three fires and is the whole reason this row is here rather than in
+    // `waiting`.
     let named: Vec<String> = out_now
         .iter()
         .map(|r| {
             let mins = r.outstanding_s / 60;
+            let due = match r.cadence_s {
+                Some(c) if c > 0 => format!(" on a {}m cadence", c / 60),
+                _ => String::new(),
+            };
             if r.title.is_empty() {
-                format!("{} x{} (outstanding {}m)", r.schedule_id, r.count, mins)
+                format!("{} x{} (outstanding {}m{})", r.schedule_id, r.count, mins, due)
             } else {
                 format!(
-                    "{} x{} outstanding {}m ({}, {})",
-                    r.schedule_id, r.count, mins, r.title, r.session
+                    "{} x{} outstanding {}m{} ({}, {})",
+                    r.schedule_id, r.count, mins, due, r.title, r.session
                 )
             }
         })
         .collect();
     let mut out = InvariantResult::new(ID, Status::Fail);
-    out.expected =
-        format!("every delivery='unknown' run in the last {window_h}h is followed by a success");
+    out.expected = format!(
+        "every delivery='unknown' run in the last {window_h}h is followed by a success within \
+         the schedule's own cadence"
+    );
     out.observed = format!(
-        "{} schedule(s) of the {total} unrecorded fire(s) in the last {window_h}h have NOT \
-         succeeded since: {}. The server restarted mid-fire (AF-515); status='error' on these \
-         rows is not a job failure, it is an unrecorded outcome, and for these the work may \
-         simply not have happened. A further {} schedule(s) were interrupted and have already \
-         caught up on their own next tick — those are in evidence.recovered and cost one \
-         cadence each.",
+        "{} schedule(s) of the {total} unrecorded fire(s) in the last {window_h}h are PAST their \
+         own next fire and still have not succeeded: {}. The server restarted mid-fire (AF-515); \
+         status='error' on these rows is not a job failure, it is an unrecorded outcome, and for \
+         these the work may simply not have happened. A further {} schedule(s) were interrupted \
+         and have already caught up on their own next tick, and {} more are still inside their \
+         cadence with a fire yet to come; both are in evidence and neither is a fault.",
         out_now.len(),
         named.join("; "),
         recovered.len(),
+        waiting.len(),
     );
     out.evidence = ev;
     vec![out]
@@ -7208,6 +7279,9 @@ mod unrecorded_schedule_outcome_tests {
     /// Still-outstanding by default, so every test written before AMUX-4546
     /// keeps exercising the FAIL arm it was written against. Those tests are
     /// about how a failure READS, and that is unchanged.
+    /// Still-outstanding AND past its deadline by default (outstanding 3600s on
+    /// a 600s cadence), so every test written before AMUX-4805 keeps exercising
+    /// the FAIL arm it was written against.
     fn row(id: &str, count: i64, title: &str, session: &str) -> UnrecordedScheduleOutcome {
         UnrecordedScheduleOutcome {
             schedule_id: id.into(),
@@ -7216,6 +7290,8 @@ mod unrecorded_schedule_outcome_tests {
             session: session.into(),
             outstanding_s: 3600,
             recovered: false,
+            cadence_s: Some(600),
+            can_fire: true,
         }
     }
 
@@ -7228,6 +7304,22 @@ mod unrecorded_schedule_outcome_tests {
             session: String::new(),
             outstanding_s,
             recovered: true,
+            cadence_s: Some(600),
+            can_fire: true,
+        }
+    }
+
+    /// Interrupted, not yet succeeded, and NOT late: its next fire is still due.
+    fn waiting_row(id: &str, outstanding_s: i64, cadence_s: i64) -> UnrecordedScheduleOutcome {
+        UnrecordedScheduleOutcome {
+            schedule_id: id.into(),
+            count: 1,
+            title: String::new(),
+            session: String::new(),
+            outstanding_s,
+            recovered: false,
+            cadence_s: Some(cadence_s),
+            can_fire: true,
         }
     }
 
@@ -7308,6 +7400,13 @@ mod unrecorded_schedule_outcome_tests {
     /// SCHED-346 fires daily, took 1, and was still outstanding 22.4 hours
     /// later. Ordering by count puts the harmless one first and the reader
     /// spends their attention on a 15-minute blip.
+    ///
+    /// AMUX-4805 RESCORED THE SCENARIO, NOT THE PROPERTY. 22.4 hours on a DAILY
+    /// schedule is inside its own cadence, so that row is now `waiting` and the
+    /// result would be a pass. The daily tick here has therefore missed its fire
+    /// outright (40h, well past the one-and-a-half-cadence bound), which is the
+    /// same reader-facing situation the cell was written about and is still a
+    /// fault. What this test pins is unchanged: the long-outstanding tick leads.
     #[test]
     fn a_long_outstanding_tick_outranks_a_frequent_but_recovered_one() {
         let rows = vec![
@@ -7317,8 +7416,10 @@ mod unrecorded_schedule_outcome_tests {
                 count: 1,
                 title: "rb2b inbound tick".into(),
                 session: "gtm-ticker".into(),
-                outstanding_s: 22 * 3600 + 24 * 60,
+                outstanding_s: 40 * 3600,
                 recovered: false,
+                cadence_s: Some(86_400),
+                can_fire: true,
             },
         ];
         let out = unrecorded_schedule_outcomes_are_visible(24, &rows);
@@ -7326,7 +7427,7 @@ mod unrecorded_schedule_outcome_tests {
         assert!(out[0].observed.contains("SCHED-346"), "the outstanding one leads: {}", out[0].observed);
         assert!(!out[0].observed.contains("SCHED-320 x4"),
                 "the recovered 4x must not be in the headline: {}", out[0].observed);
-        assert!(out[0].observed.contains("1344m"), "the cost is stated in the headline: {}", out[0].observed);
+        assert!(out[0].observed.contains("2400m"), "the cost is stated in the headline: {}", out[0].observed);
         assert_eq!(out[0].evidence["schedules_still_out"], serde_json::json!(1));
         assert_eq!(out[0].evidence["schedules_recovered"], serde_json::json!(1));
         // SHOWN, NOT DROPPED. The recovered schedule stays in the payload: a
@@ -7346,14 +7447,22 @@ mod unrecorded_schedule_outcome_tests {
     ///
     /// Both rows here are STILL OUT, so the partition cannot decide it, and
     /// their two keys disagree: count puts the 4x first, outstanding time puts
-    /// the 22-hour one first. That is the live shape on 2026-09-16, where
+    /// the much older one first. That is the live shape on 2026-09-16, where
     /// ordering by count would have led with four recovered 15-minute blips.
+    ///
+    /// AMUX-4805: both rows now carry a cadence they are genuinely PAST, which
+    /// is what keeps them in the same partition. Under the corrected bound the
+    /// old numbers (15m outstanding on an every-15m tick, 22h on a daily) are
+    /// both inside their own cadence, so neither would have reached the
+    /// headline and this cell would have stopped discriminating anything.
     #[test]
     fn among_outstanding_schedules_the_costliest_leads_not_the_most_frequent() {
         let mut frequent = row("SCHED-FREQ", 4, "every 15m tick", "mvs-infra");
-        frequent.outstanding_s = 15 * 60;
+        frequent.cadence_s = Some(15 * 60);
+        frequent.outstanding_s = 40 * 60;
         let mut costly = row("SCHED-DAILY", 1, "daily tick", "gtm-ticker");
-        costly.outstanding_s = 22 * 3600;
+        costly.cadence_s = Some(86_400);
+        costly.outstanding_s = 42 * 3600;
         let out = unrecorded_schedule_outcomes_are_visible(24, &[frequent, costly]);
         assert_eq!(out[0].status, Status::Fail);
         let pos_costly = out[0].observed.find("SCHED-DAILY").expect("daily present");
@@ -7408,6 +7517,76 @@ mod unrecorded_schedule_outcome_tests {
         assert!(out[0].expected.contains("6h"), "{}", out[0].expected);
         assert!(out[0].observed.contains("6h"), "{}", out[0].observed);
         assert_eq!(out[0].evidence["window_h"], 6);
+    }
+
+    /// AMUX-4805, the defect this check was filed 10700 times for.
+    ///
+    /// An interrupted tick cannot succeed until the schedule fires again, so
+    /// "has not succeeded since" is GUARANTEED TRUE for up to one full cadence
+    /// after every restart. On a box whose auto-builder restarts the server on
+    /// every commit that condition is permanent, which is why it never
+    /// self-healed. Measured over 7 days: 38 of 39 unknowns recovered on their
+    /// own and every recovery time was the schedule's own cadence.
+    #[test]
+    fn a_tick_inside_its_own_cadence_is_waiting_not_failing() {
+        // 10 minutes into a 4-hour cadence: the live SCHED-173 shape.
+        let out = unrecorded_schedule_outcomes_are_visible(24, &[waiting_row("SCHED-173", 600, 14_400)]);
+        assert_eq!(out[0].status, Status::Pass, "observed: {}", out[0].observed);
+        assert_eq!(out[0].evidence["schedules_waiting"], 1);
+        assert_eq!(out[0].evidence["schedules_still_out"], 0);
+    }
+
+    /// The other side of the same bound, or the check would pass on everything.
+    #[test]
+    fn a_tick_past_its_own_cadence_still_fails_and_says_the_cadence() {
+        // 41 minutes outstanding on an every-15m tick: nearly three missed fires.
+        let out = unrecorded_schedule_outcomes_are_visible(24, &[waiting_row("SCHED-320", 2_460, 900)]);
+        assert_eq!(out[0].status, Status::Fail, "evidence: {}", out[0].evidence);
+        assert!(out[0].observed.contains("15m cadence"), "the cadence is the reason it is late: {}", out[0].observed);
+    }
+
+    /// A disabled schedule can never record a success, so its last unknown stays
+    /// outstanding for as long as the row survives. Reading that as a live fault
+    /// is a false positive nobody can ever clear: the honest move is to stop
+    /// asking a schedule that cannot fire to prove that it did.
+    #[test]
+    fn a_schedule_that_can_never_fire_again_is_not_an_outstanding_fault() {
+        let mut r = waiting_row("SCHED-455", 4_308 * 60, 7_200);
+        r.can_fire = false;
+        let out = unrecorded_schedule_outcomes_are_visible(24, &[r]);
+        assert_eq!(out[0].status, Status::Pass, "observed: {}", out[0].observed);
+        assert_eq!(out[0].evidence["schedules_waiting"], 1);
+    }
+
+    /// An underivable cadence is not a missed deadline. A schedule whose
+    /// expression does not parse has no next fire to be late against, and
+    /// guessing one would reintroduce exactly the false positive above.
+    #[test]
+    fn an_unknown_cadence_is_never_called_overdue() {
+        let mut r = waiting_row("SCHED-X", 99_999, 900);
+        r.cadence_s = None;
+        let out = unrecorded_schedule_outcomes_are_visible(24, &[r]);
+        assert_eq!(out[0].status, Status::Pass, "observed: {}", out[0].observed);
+    }
+
+    /// The three buckets are independent, and a real fault must still surface
+    /// when it is sitting beside healthy rows. This is the shape the live fleet
+    /// produces: a burst of restarts, most already caught up, some mid-cadence,
+    /// one genuinely stuck.
+    #[test]
+    fn one_genuine_fault_is_not_hidden_by_the_healthy_rows_beside_it() {
+        let rows = vec![
+            recovered_row("SCHED-A", 2, 900),
+            waiting_row("SCHED-B", 600, 14_400),
+            waiting_row("SCHED-C", 2_460, 900),
+        ];
+        let out = unrecorded_schedule_outcomes_are_visible(24, &rows);
+        assert_eq!(out[0].status, Status::Fail);
+        assert_eq!(out[0].evidence["schedules_recovered"], 1);
+        assert_eq!(out[0].evidence["schedules_waiting"], 1);
+        assert_eq!(out[0].evidence["schedules_still_out"], 1);
+        assert!(out[0].observed.contains("SCHED-C"), "{}", out[0].observed);
+        assert!(!out[0].observed.contains("SCHED-B"), "a waiting tick must not be named as a fault: {}", out[0].observed);
     }
 }
 

@@ -799,6 +799,27 @@ fn schedule_kind_check(state: &AppState) -> Vec<InvariantResult> {
 /// same fact reaches every lane that already reads
 /// `GET /api/health/invariants` instead of only whoever thinks to grep
 /// server-rs.log.
+/// A schedule's period in seconds, taken from the SAME parser the scheduler
+/// fires on so this cannot drift from the cadence the fleet actually runs.
+///
+/// Derived from consecutive fire times rather than a per-shape table, which
+/// keeps cron working without a second implementation of `*/4`. The widest of
+/// several gaps wins: a weekday schedule's Friday-to-Monday gap is three days
+/// while its other gaps are one, and taking a narrow gap there would call a
+/// perfectly healthy Saturday overdue.
+fn cadence_seconds(expr: &str) -> Option<i64> {
+    use crate::runtime_jobs::scheduler::ScheduleExpr;
+    let parsed = ScheduleExpr::parse(expr).ok()?;
+    let mut at = chrono::Local::now();
+    let mut widest = 0i64;
+    for _ in 0..8 {
+        let Some(next) = parsed.next_run_after(at) else { break };
+        widest = widest.max((next - at).num_seconds());
+        at = next;
+    }
+    (widest > 0).then_some(widest)
+}
+
 fn unrecorded_schedule_outcomes_check(state: &AppState) -> Vec<InvariantResult> {
     const ID: &str = "scheduler.unrecorded_delivery_outcomes";
     let window_h: i64 = std::env::var("AMUX_UNRECORDED_SCHEDULE_WINDOW_H")
@@ -835,7 +856,9 @@ fn unrecorded_schedule_outcomes_check(state: &AppState) -> Vec<InvariantResult> 
                     (SELECT MIN(n.ran_at) FROM schedule_runs n \
                        WHERE n.schedule_id = r.schedule_id \
                          AND n.ran_at > MAX(r.ran_at) \
-                         AND n.status IN ('ok','delivered','queued')) AS recovered_at \
+                         AND n.status IN ('ok','delivered','queued')) AS recovered_at, \
+                    s.schedule_expr, \
+                    (s.id IS NOT NULL AND COALESCE(s.enabled,0)=1 AND s.deleted IS NULL) AS can_fire \
              FROM schedule_runs r LEFT JOIN schedules s ON s.id = r.schedule_id \
              WHERE r.delivery='unknown' AND r.ran_at > ?1 \
              GROUP BY r.schedule_id",
@@ -844,6 +867,7 @@ fn unrecorded_schedule_outcomes_check(state: &AppState) -> Vec<InvariantResult> 
             st.query_map([cutoff], |r| {
                 let newest_unknown: f64 = r.get(4)?;
                 let recovered_at: Option<f64> = r.get(5)?;
+                let expr: Option<String> = r.get(6)?;
                 Ok(checks::UnrecordedScheduleOutcome {
                     schedule_id: r.get(0)?,
                     count: r.get(1)?,
@@ -855,6 +879,11 @@ fn unrecorded_schedule_outcomes_check(state: &AppState) -> Vec<InvariantResult> 
                     // different facts and must not render as the same number.
                     outstanding_s: (recovered_at.unwrap_or(now) - newest_unknown).max(0.0) as i64,
                     recovered: recovered_at.is_some(),
+                    // The schedule's OWN deadline, from the same parser the
+                    // scheduler fires on, so the check cannot drift from the
+                    // cadence the fleet actually runs (AMUX-4805).
+                    cadence_s: expr.as_deref().and_then(cadence_seconds),
+                    can_fire: r.get::<_, i64>(7)? == 1,
                 })
             })
             .map(|it| it.flatten().collect::<Vec<_>>())
@@ -3759,4 +3788,53 @@ mod section_timing_tests {
         );
     }
 
+}
+
+/// AMUX-4805. `cadence_seconds` is the deadline the unrecorded-outcome check
+/// measures every schedule against, so a wrong number here silently moves the
+/// bound for the whole fleet: too small and the check goes back to crying wolf
+/// during normal recovery, too large and a dead schedule never surfaces.
+#[cfg(test)]
+mod cadence_seconds_tests {
+    use super::cadence_seconds;
+
+    /// The shapes the live fleet actually runs, with the periods measured off
+    /// `schedule_runs` on 2026-09-19: every-15m recovered in 14-15m, every-30m
+    /// in 29-30m, every-4h in 240m, daily in 1440m.
+    #[test]
+    fn the_interval_and_daily_shapes_give_their_own_period() {
+        assert_eq!(cadence_seconds("every 15m"), Some(900));
+        assert_eq!(cadence_seconds("every 30m"), Some(1_800));
+        assert_eq!(cadence_seconds("every 120m"), Some(7_200));
+        assert_eq!(cadence_seconds("every 4h"), Some(14_400));
+        assert_eq!(cadence_seconds("daily at 08:27"), Some(86_400));
+    }
+
+    /// Cron is the shape a per-expression table would have had to reimplement.
+    /// SCHED-173 and SCHED-184 are both 4-hourly and both spelled as cron.
+    #[test]
+    fn cron_periods_come_out_without_a_second_parser() {
+        assert_eq!(cadence_seconds("7 */4 * * *"), Some(14_400));
+        assert_eq!(cadence_seconds("37 */4 * * *"), Some(14_400));
+        assert_eq!(cadence_seconds("0 9 * * *"), Some(86_400));
+    }
+
+    /// The WIDEST gap wins. A weekday schedule runs Monday to Friday, so its
+    /// Friday-to-Monday gap is three days while every other gap is one. Taking
+    /// a narrow gap would call a perfectly healthy Saturday overdue, which is
+    /// the same false positive this whole change exists to remove.
+    #[test]
+    fn a_weekday_schedule_is_measured_by_its_weekend_gap() {
+        let got = cadence_seconds("every weekday at 09:00").expect("weekday parses");
+        assert_eq!(got, 3 * 86_400, "Friday to Monday is the gap that matters, got {got}s");
+    }
+
+    /// An expression nobody can parse yields no deadline, and the check treats
+    /// `None` as "never overdue". Returning a plausible default here would put
+    /// the guesswork back one layer down where no test would see it.
+    #[test]
+    fn an_unparseable_expression_yields_no_deadline() {
+        assert_eq!(cadence_seconds("whenever ethan says so"), None);
+        assert_eq!(cadence_seconds(""), None);
+    }
 }
