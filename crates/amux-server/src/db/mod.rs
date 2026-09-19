@@ -734,6 +734,7 @@ fn writer_loop(
         // Reset first: a mutation that fails before committing must not report
         // the PREVIOUS write's commit time as its own.
         LAST_COMMIT_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+        LAST_BEGIN_MS.store(0, std::sync::atomic::Ordering::Relaxed);
         // A panicking caller must not kill the sole writer and strand every
         // later mutation. The transaction guard rolls back during unwinding.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -745,17 +746,37 @@ fn writer_loop(
                 std::io::Error::other("writer mutation panicked; transaction rolled back"))))
         });
         let work_ms = started.elapsed().as_millis() as u64;
-        // SPLIT THE HOLD (AMUX-4830). `work_ms` alone cannot say whether a slow
-        // write is slow WORK or a slow COMMIT, and on this box it is the
-        // commit: `stmt_ms` near zero with `commit_ms` near `work_ms` means
-        // per-site optimisation will not move the number.
+        // SPLIT THE HOLD (AMUX-4830, corrected by AMUX-4837). This comment used
+        // to assert "on this box it is the commit". THE MEASUREMENT SAYS THE
+        // OPPOSITE and the wrong sentence is what kept AMUX-4781's chain aimed
+        // at the commit: across 130 writer_slow lines carrying the split, all of
+        // them ok=true, `commit_ms` was 3.2% of `work_ms` and SUB-MILLISECOND on
+        // 118 of 130. The commit is free; the hold is everything before it.
+        //
+        // So the split goes one level further. `stmt_ms` was derived as
+        // everything-that-is-not-commit, which lumps acquiring the write lock in
+        // with running the statements. Those need separating, because the
+        // cheapest site in the fleet refutes the statement explanation on its
+        // own: api/interactions.rs does ONE indexed SELECT plus ONE INSERT and
+        // returns no events, so it never touches the `_amux_state_events` loop,
+        // and it still averaged 466ms with a 0ms commit. One indexed lookup and
+        // one insert are not 466ms of statement execution.
+        //
+        // `begin_ms` is the candidate that fits the rest of the evidence:
+        // BEGIN IMMEDIATE takes the write lock, and SQLite's busy handler backs
+        // off in 1/2/5/10/25/50/100ms steps, which quantises a contended
+        // acquisition into exactly the site-independent floor observed here.
+        // It also explains why the number does not track host load (measured
+        // r = -0.002 against load1 over the same 130 lines): a backoff schedule
+        // is a function of contention, not of CPU.
         let commit_ms = LAST_COMMIT_MS.load(std::sync::atomic::Ordering::Relaxed);
-        let stmt_ms = work_ms.saturating_sub(commit_ms);
+        let begin_ms = LAST_BEGIN_MS.load(std::sync::atomic::Ordering::Relaxed);
+        let stmt_ms = work_ms.saturating_sub(commit_ms).saturating_sub(begin_ms);
         if work_ms >= 250 || queued_ms >= 1000 {
             // Function identity only; never record the request body or SQL
             // values. Separate the slow writer from callers waiting behind it.
             tracing::warn!(target: "store", verdict = "writer_slow", origin = req.origin,
-                site = %req.site, queued_ms, work_ms, commit_ms, stmt_ms, ok = result.is_ok(),
+                site = %req.site, queued_ms, work_ms, commit_ms, begin_ms, stmt_ms, ok = result.is_ok(),
                 measured = true, n_considered = 1,
                 "serialized write delayed; origin identifies the blocking mutation");
         }
@@ -787,6 +808,12 @@ fn writer_loop(
 /// green, which is how I found out.
 static LAST_COMMIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Milliseconds spent acquiring the write lock in `BEGIN IMMEDIATE`, published
+/// the same way and for the same reason as [`LAST_COMMIT_MS`]: an atomic rather
+/// than a thread-local, because `writer_loop` owns the connection and a
+/// thread-local reads 0 forever from a test's own thread.
+static LAST_BEGIN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn apply_write(
     conn: &Connection,
     work: WriteFn,
@@ -796,7 +823,12 @@ fn apply_write(
     // Roll back EVERY failure path, including revision/event writes, failed
     // COMMIT and unwinding. A bare BEGIN left the connection in a transaction
     // after those errors, making all later mutations fail until restart.
+    // STAMPED AROUND THE BEGIN ITSELF (AMUX-4837), because this is where the
+    // busy handler sleeps. Stamping after `work` would fold the lock wait back
+    // into statement time, which is the conflation this split exists to end.
+    let begin_started = std::time::Instant::now();
     let transaction = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    LAST_BEGIN_MS.store(begin_started.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
     let outcome = work(&transaction)?;
     let mut committed_events = Vec::new();
     let rev = if outcome.applied {
@@ -1092,6 +1124,7 @@ mod amux4744_write_queue_tests {
             "origin = req.origin",
             "site = %req.site",
             "commit_ms",
+            "begin_ms",
             "stmt_ms",
         ] {
             assert!(
@@ -1154,6 +1187,71 @@ mod amux4744_write_queue_tests {
             0,
             "a write that never committed must report commit_ms 0, not the last \
              successful write's commit time"
+        );
+    }
+
+    /// AMUX-4837: `begin_ms` must capture the WRITE-LOCK WAIT, not round to zero.
+    ///
+    /// This is the half `stmt_ms` was hiding. `stmt_ms` was derived as
+    /// everything-that-is-not-commit, so a write that spent 400ms asleep in
+    /// SQLite's busy handler waiting for the lock reported 400ms of "statement"
+    /// time, and the fleet then went looking for a slow query that does not
+    /// exist. The live shape that motivated this: `api/interactions.rs` does one
+    /// indexed SELECT and one INSERT, emits no events, and still averaged 466ms
+    /// with a 0ms commit.
+    ///
+    /// A RESET TEST CANNOT COVER THIS and that is why the test is contention
+    /// rather than a sentinel. `writer_loop` zeroes the atomic before every
+    /// write, and an uncontended BEGIN also leaves 0, so "stamped 0" and "never
+    /// stamped" are the same observation on a quiet database. Only a BEGIN that
+    /// genuinely has to wait can tell them apart.
+    #[test]
+    fn begin_ms_measures_the_wait_for_the_write_lock() {
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("beginwait.db");
+        let store = Store::open(&path).unwrap();
+        store
+            .write(|conn| {
+                conn.execute("CREATE TABLE IF NOT EXISTS t_begin (k INTEGER)", [])?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+
+        // A SECOND connection holds the write lock for a while. The store's
+        // writer must sit in BEGIN IMMEDIATE until this one commits.
+        let blocker = Connection::open(&path).unwrap();
+        blocker.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE; INSERT INTO t_begin (k) VALUES (99);").unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let held_ms = 400;
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(held_ms));
+            blocker.execute_batch("COMMIT;").unwrap();
+            let _ = tx.send(());
+        });
+
+        store
+            .write(|conn| {
+                conn.execute("INSERT INTO t_begin (k) VALUES (1)", [])?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+        rx.recv_timeout(std::time::Duration::from_secs(10)).expect("blocker committed");
+
+        let begin = LAST_BEGIN_MS.load(std::sync::atomic::Ordering::Relaxed);
+        // Generous floor: the point is that the wait lands in `begin_ms` at all,
+        // not that the busy handler wakes on any particular step of its backoff.
+        assert!(
+            begin >= held_ms / 2,
+            "begin_ms must carry the write-lock wait; the lock was held ~{held_ms}ms and \
+             begin_ms reported {begin}ms. A 0 here means the wait is being charged to \
+             stmt_ms, which is the conflation AMUX-4837 exists to end"
+        );
+        assert!(
+            begin < 60_000,
+            "a begin time of {begin}ms is not a measurement, it is a stuck clock"
         );
     }
 
