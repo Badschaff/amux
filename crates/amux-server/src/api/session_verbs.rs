@@ -31801,9 +31801,9 @@ mod composer_state_tests {
             include_str!("../../tests/fixtures/boundary/gemini-0.58-idle.txt"),
             include_str!("../../tests/fixtures/boundary/gemini-0.59-yolo-idle.txt"),
         ] {
-            assert!(claude_ui_visible(frame));
-            assert!(!claude_ui_visible("cd /tmp && gemini --model auto --yolo --skip-trust"));
-            assert!(!claude_ui_visible("Gemini CLI v0.59.0\n│ ● 1. Yes\n│   2. Yes, and remember the directories as trusted"));
+            assert!(agent_ui_visible(frame));
+            assert!(!agent_ui_visible("cd /tmp && gemini --model auto --yolo --skip-trust"));
+            assert!(!agent_ui_visible("Gemini CLI v0.59.0\n│ ● 1. Yes\n│   2. Yes, and remember the directories as trusted"));
             assert_eq!(detect_claude_status(frame), "idle");
             assert!(pane_is_at_boundary(frame));
             assert!(matches!(composer_state(frame), ComposerState::Placeholder(_)));
