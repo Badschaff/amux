@@ -1297,6 +1297,33 @@ fn describe_window_load(loads: &mut [f64]) -> String {
 }
 
 /// One family's p95 excursion, held until the fan-in can count them (AMUX-3646).
+/// Which single sample the window p95 resolves to, and whether that is thin
+/// enough that the multiple rests on one or two requests.
+///
+/// Extracted so the SENTENCE is pinned by a test rather than only the evidence
+/// block that reads it, the same reason `race_verdict` is its own function.
+fn p95_position(win_n: usize, multiple: f64) -> String {
+    let n = win_n.max(1);
+    // Mirrors `request_log::percentile_sorted`: sorted[ceil(0.95n) - 1].
+    let rank = ((0.95 * n as f64).ceil() as usize).clamp(1, n);
+    let from_slowest = n - rank + 1;
+    let ordinal = match from_slowest {
+        1 => "slowest".to_string(),
+        2 => "2nd slowest".to_string(),
+        3 => "3rd slowest".to_string(),
+        k => format!("{k}th slowest"),
+    };
+    let thin = if from_slowest <= 2 {
+        format!(
+            " At this width the p95 IS that single request, so the {multiple:.1}x is \
+             directional and its magnitude rests on {from_slowest} sample(s)."
+        )
+    } else {
+        String::new()
+    };
+    format!("sample {rank} of {n} ascending, the {ordinal} request in the window.{thin}")
+}
+
 struct P95Hit {
     fam: String,
     p95_w: f64,
@@ -1361,6 +1388,23 @@ fn p95_finding(h: &P95Hit, mult: f64, min_n: i64, now: f64) -> Finding {
                 "nearest-rank over the sorted window (same function /api/logs/stats reports)"
                     .into(),
             ),
+            // WHICH SAMPLE THE WINDOW p95 ACTUALLY IS (AMUX-4768, ethos rule 4).
+            //
+            // `percentile_sorted` is `sorted[ceil(0.95n) - 1]`, so on a thin
+            // window p95 is not a shape, it is one specific request: at n=30 it
+            // is the 2nd slowest, and at n<=20 it is the max exactly. AMUX-4768
+            // filed "/api/branding p95 265ms, 19.7x" off 30 samples, and the
+            // same family re-checked at 17 samples reported p95_ms == max_ms to
+            // the decimal. The DIRECTION was right that time (a real fix
+            // followed), so this does not gate or suppress anything; it tells
+            // the reader how much of the magnitude rests on one request.
+            //
+            // `window_samples` alone does not carry this: 30 reads as a sample
+            // size rather than as "the 2nd slowest sets the number". Computed
+            // from win_n, and the thin-window clause only appears when it is
+            // true, so neither half can be a constant wearing a variable's
+            // clothes.
+            ("p95_position".into(), p95_position(h.win_n, h.p95_w / h.p95_b)),
             // WHETHER THE SCAN SAW THE WHOLE PERIOD (AMUX-3910, ethos rule 4).
             // The row cap used to truncate the NEWEST rows — the window itself —
             // and say nothing on the card: one filed "p95 7173ms over 30
@@ -12473,6 +12517,50 @@ mod tests {
             "state the threshold: {ev:?}"
         );
         assert!(ev.contains_key("window_samples") && ev.contains_key("baseline_samples"));
+        assert!(
+            ev.contains_key("p95_position"),
+            "the card must say which sample its p95 is: {ev:?}"
+        );
+    }
+
+    /// AMUX-4768: `window_samples: 30` does not tell the reader that nearest-
+    /// rank p95 on 30 samples IS the 2nd slowest request. The card that sent me
+    /// here said "19.7x its trailing norm" off exactly that, and re-checking the
+    /// same family at 17 samples returned p95_ms == max_ms to the decimal.
+    ///
+    /// Both halves must VARY, or this is a constant wearing a variable's
+    /// clothes: the rank moves with n, and the thin-window sentence appears only
+    /// when the p95 really does rest on one or two requests.
+    #[test]
+    fn the_p95_position_names_its_sample_and_warns_only_when_thin() {
+        // n=17: ceil(.95*17)=17, the MAX itself. This is the live re-check shape.
+        let s = p95_position(17, 19.7);
+        assert!(s.contains("sample 17 of 17"), "{s}");
+        assert!(s.contains("the slowest request"), "{s}");
+        assert!(s.contains("19.7x is directional"), "{s}");
+
+        // n=30: ceil(28.5)=29, the 2nd slowest. This is the filing shape.
+        let s = p95_position(30, 19.7);
+        assert!(s.contains("sample 29 of 30"), "{s}");
+        assert!(s.contains("2nd slowest"), "{s}");
+        assert!(s.contains("rests on 2 sample(s)"), "{s}");
+
+        // A WIDE window: the warning must DISAPPEAR, or it says nothing.
+        let s = p95_position(200, 4.0);
+        assert!(s.contains("sample 190 of 200"), "{s}");
+        assert!(s.contains("11th slowest"), "{s}");
+        assert!(
+            !s.contains("directional"),
+            "a 200-sample p95 is a distribution; the thin warning must not fire: {s}"
+        );
+
+        // The boundary: 40 samples is the last width where p95 is the 2nd
+        // slowest (ceil(38)=38, 40-38+1=3 at n=40 -> 3rd). Pin where it flips.
+        assert!(p95_position(40, 3.0).contains("3rd slowest"));
+        assert!(!p95_position(40, 3.0).contains("directional"));
+
+        // Degenerate input must not panic or divide by zero.
+        assert!(p95_position(0, 0.0).contains("sample 1 of 1"));
     }
 
     /// AMUX-3646: three families regressing at once is ONE event, not three
