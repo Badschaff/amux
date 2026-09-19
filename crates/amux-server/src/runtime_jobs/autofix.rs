@@ -430,6 +430,52 @@ const LONG_BY_DESIGN: &[(&str, f64)] = &[
     // means the refusal did not work. Worst in that window was 127749ms, which
     // a 30s budget still reports.
     ("/api/sessions", 30_000.0),
+    // POST /api/workers/{id}/resume (AMUX-4852). A resume is not one operation:
+    // `change_pause` -> `fleet::start_session` (api/session_verbs.rs) walks a
+    // tmux session back to a shell prompt and then waits for the agent UI to
+    // paint. The budget is that path's OWN deliberate waiting, added up off the
+    // `tmux_exists` reuse arm that a resume actually takes:
+    //
+    //   2 x   100ms  C-c / C-u settle before retyping the prompt
+    //   2 x  3000ms  poll_shell_prompt after HISTFILE and after `cd`
+    //       3000ms  poll_shell_prompt after the `tmux show-environment` import
+    //       3000ms  poll_shell_prompt after `unset ANTHROPIC_API_KEY`
+    //        150ms  settle between send_literal and Enter
+    //  20 x   500ms  the launch watch loop waiting for the agent UI to paint
+    //   = 22_350ms
+    //
+    // Measured over 7 days BEFORE choosing the number, and the two agree
+    // independently: n=49, worst 19_980ms, which sits UNDER the derived bound
+    // rather than setting it.
+    //
+    // The population is sharply BIMODAL, which is the part that matters for
+    // reading this route. 24 of 49 requests land in 0.9-22.8ms and 25 land in
+    // 847-19_980ms, with a 37.2x gap and nothing in between. The split is
+    // STRUCTURAL, read off the code rather than inferred from the numbers:
+    // api/workers.rs `change_pause` returns 200 {"applied":false} for a resume
+    // of an already-active worker BEFORE any tmux work ("A repeated Resume is a
+    // no-op"), which is the fast mode together with the 404s. Only the slow mode
+    // reaches the ladder above. So the route has no single "normal" for a flat
+    // 10s threshold to sit beside.
+    //
+    // A SECOND, INDEPENDENT FIELD agrees with that boundary: where resp_bytes
+    // is recorded the modes do not overlap at all, 44-76 bytes for the no-op
+    // body against 91-105 for the real wake. Something other than latency, and
+    // other than load, separates the population in the same place.
+    //
+    // NOT load, though a load-band split is the obvious first read and it
+    // MISLEADS here. Banding suggests a 450x load sensitivity, which is an
+    // artefact of mode mix per band: the modes OVERLAP in load (fast runs occur
+    // up to load1 39.4, slow runs down to 8.8), so load does not separate them.
+    // Inside the slow mode load does modulate the wake, Pearson r=+0.44 (n=25),
+    // so this is not a claim that load is irrelevant. It is a claim that load
+    // does not produce the gap, and the endpoint should not be blamed for it.
+    //
+    // Still reportable: every `tmux_capture` on this path carries its own 10s
+    // timeout, and the watch loop runs 20 of them. A tmux server wedged enough
+    // to pin even one capture at its limit clears this budget and still files,
+    // which is the one latency story on this route that IS wrong.
+    ("/api/workers/{id}/resume", 22_350.0),
 ];
 
 /// WARN/ERROR lines the server logged INSIDE one request's own window.
@@ -14363,6 +14409,68 @@ mod tests {
         );
     }
 
+    /// AMUX-4852. The resume budget must be the wake path's own sleep ladder,
+    /// and must still report a wedged tmux.
+    #[test]
+    fn the_resume_budget_covers_the_wake_ladder_but_not_a_wedged_capture() {
+        // PIN THE LOOKUP, NOT JUST THE TABLE. `/api/workers/{id}/resume` has a
+        // variable segment, so the entry is only ever consulted if
+        // `normalize_target_verb` collapses a real request back onto exactly
+        // this key. An entry keyed on a string the normaliser never yields is a
+        // budget nothing reads, and it is green either way.
+        let real_target =
+            crate::api::request_log::normalize_target_verb("/api/workers/gtm-engine/resume");
+        assert_eq!(
+            real_target, "/api/workers/{id}/resume",
+            "the LONG_BY_DESIGN key must be what the detector actually computes"
+        );
+        let b = design_budget_ms(&real_target);
+        assert!(
+            b > 0.0,
+            "the entry must be reachable through the real target, not merely present in the table"
+        );
+
+        // The derived bound, read off `fleet::start_session`'s `tmux_exists`
+        // reuse arm (the arm a resume takes): two 100ms settles, two 3000ms
+        // prompt polls for HISTFILE and `cd`, a 3000ms poll after the
+        // environment import, a 3000ms poll after `unset ANTHROPIC_API_KEY`, a
+        // 150ms settle before Enter, and the 20-iteration launch watch loop at
+        // 500ms per turn.
+        let derived_ms =
+            2.0 * 100.0 + 2.0 * 3_000.0 + 3_000.0 + 3_000.0 + 150.0 + 20.0 * 500.0;
+        assert_eq!(
+            b, derived_ms,
+            "budget {b} must BE the wake path's own ladder ({derived_ms}ms), not a number chosen to cover a sample"
+        );
+
+        // Above the flat floor, or the entry changes nothing: every value in
+        // the slow mode crosses 10s and would keep filing.
+        assert!(
+            b > outlier_ms(),
+            "budget {b} must sit above the {}ms outlier floor to suppress anything",
+            outlier_ms()
+        );
+
+        // And it must clear every value measured on the route in the 7 days
+        // that produced this entry (worst 19_980ms). Asserted SEPARATELY from
+        // the derivation above: that the two agree is the evidence the budget
+        // was derived rather than fitted, and collapsing them into one
+        // assertion would destroy exactly that.
+        assert!(
+            b > 19_980.0,
+            "budget {b} must clear the measured worst resume"
+        );
+
+        // THE HALF AN OVER-EAGER FIX DESTROYS. Every `tmux_capture` on this
+        // path carries its own 10s timeout and the watch loop runs 20 of them.
+        // A tmux server wedged enough to pin even ONE capture at its limit must
+        // still cross the budget and file.
+        assert!(
+            b < derived_ms + 10_000.0,
+            "budget {b} must not swallow a resume whose tmux capture wedged at its own 10s timeout"
+        );
+    }
+
     /// AMUX-3940. A budgeted route must be RECORDED as suppressed, not silently
     /// dropped.
     ///
@@ -14406,6 +14514,67 @@ mod tests {
             hit.reason.contains("LONG_BY_DESIGN") && hit.reason.contains("30s budget"),
             "the suppression must name the budget that applied: {}",
             hit.reason
+        );
+    }
+
+    /// AMUX-4852. The resume budget must hold on the SHIPPED detector path, not
+    /// just in a `design_budget_ms` lookup.
+    ///
+    /// The table entry and the filter are different layers: the key has a
+    /// variable segment, so the budget only ever applies if a real request path
+    /// survives `normalize_target_verb` onto it AND the filter then consults it.
+    /// The lookup test above pins the first half. This pins both at once, in
+    /// both directions, which is the behaviour the card asked for: the 14.4s
+    /// sample stops filing, and a wedged tmux still does.
+    #[tokio::test]
+    async fn a_resume_inside_its_ladder_is_suppressed_and_a_wedged_one_still_files() {
+        let insert = |st: &AppState, ts: f64, ms: f64, path: &str| {
+            let p = path.to_string();
+            st.store
+                .write(move |conn| {
+                    conn.execute(
+                        "INSERT INTO _amux_request_log (ts, method, path, family, status,                          latency_ms, client_ip, user_agent, amux_session, worker, answered_by)                          VALUES (?1,'POST',?2,'/api/workers',200,?3,                         '127.0.0.1','curl/8','','','native')",
+                        rusqlite::params![ts, p, ms],
+                    )?;
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                })
+                .unwrap();
+        };
+
+        // THE CARD'S OWN SAMPLE: 14376ms against a real worker id, so the row
+        // exercises the normalisation rather than being handed the template.
+        // Over the 10s floor, inside the 22_350ms ladder.
+        let (st, _d) = state();
+        let now = unix_now();
+        insert(&st, now - 300.0, 14_376.0, "/api/workers/gtm-engine/resume");
+        let conn = st.store.read().unwrap();
+        let (f, sup) = detect_latency_at(&conn, now, None);
+
+        assert!(
+            !f.iter().any(|x| x.signature.contains("resume")),
+            "a resume inside its own wake ladder must not file: {f:?}"
+        );
+        let hit = sup
+            .iter()
+            .find(|x| x.signature.contains("resume"))
+            .expect("...and the decision must be RECORDED, or a suppressed filing and an unreachable budget entry are the same absence");
+        assert!(
+            hit.reason.contains("LONG_BY_DESIGN"),
+            "the suppression must name the budget that applied: {}",
+            hit.reason
+        );
+        drop(conn);
+
+        // THE HALF AN OVER-EAGER FIX DESTROYS, on the shipped path. One
+        // `tmux_capture` pinned at its own 10s timeout puts the request past the
+        // ladder, and that is the one latency story this route can still tell.
+        let (st2, _d2) = state();
+        insert(&st2, now - 300.0, 22_350.0 + 10_000.0, "/api/workers/gtm-engine/resume");
+        let conn2 = st2.store.read().unwrap();
+        let (f2, _s2) = detect_latency_at(&conn2, now, None);
+        assert!(
+            f2.iter().any(|x| x.signature.contains("resume")),
+            "a resume past its ladder is a wedge and must still file: {f2:?}"
         );
     }
 
