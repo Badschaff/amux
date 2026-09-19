@@ -11429,7 +11429,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.990';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.991';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -32465,7 +32465,7 @@ async function _orchLoad() {
         return (s && s.ephemeral) || (ch.session || '').includes('-eph-');
       });
       if (hasEph) addEpic(c);
-      if (c.item_type === 'epic') addEpic(c);
+      if (c.type === 'epic') addEpic(c);
       if (c.source === 'launch') addEpic(c);
       if ((c.title || '').startsWith('[EPIC]')) addEpic(c);
     });
