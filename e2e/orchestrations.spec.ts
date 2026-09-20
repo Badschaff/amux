@@ -73,7 +73,7 @@ async function linkChild(
 // No live worker launches: these fixtures exercise the deployed view/handlers.
 const workers = [
   {name:'parent',role:'orchestrator',provider:'codex',profile:{provider:'codex',model:'gpt-5'},lifecycle:'active',running:true},
-  {name:'child',ephemeral:true,ephemeral_parent:'parent',lifecycle:'active',running:true,status:'active',task_board_id:'B',profile:{provider:'claude',model:'haiku'},worktree_active:true,branch:'amux/fanout/child',worktree_integration:{status:'requires_work',detail:'Validation failed: fix on this worker'}},
+  {name:'child',ephemeral:true,ephemeral_parent:'parent',lifecycle:'active',running:true,status:'active',task_board_id:'B',runtime_board:{measured:true,status:'linked',runtime_status:'active',card_id:'B'},profile:{provider:'claude',model:'haiku'},worktree_active:true,branch:'amux/fanout/child',worktree_integration:{status:'requires_work',detail:'Validation failed: fix on this worker'}},
   {name:'second',ephemeral:true,ephemeral_parent:'parent',lifecycle:'active',running:false,profile:{provider:'gemini',model:'gemini-2.5-flash'}},
   {name:'orphan',ephemeral:true,lifecycle:'active',running:false},
   {name:'paused-child',ephemeral:true,ephemeral_parent:'paused-parent',lifecycle:'paused',running:false},
@@ -138,6 +138,32 @@ test.describe('global orchestration groups',()=>{
     }
     await page.locator('.orch-filter-pill[data-filter="active"]').click();
     await expect(page.locator('#orch-list .orch-node')).toHaveCount(3);
+  });
+  test('retained task links require measured active work before showing Working now',async({page})=>{
+    let currentWorkers:any[]=workers;
+    await page.route('**/api/sessions',r=>r.fulfill({json:currentWorkers}));
+    await page.route('**/api/board/orchestrations',r=>r.fulfill({json:{...snapshot,workers:currentWorkers}}));
+    await page.goto('/');await page.locator('#tab-orchestrations').click();
+    const child=page.locator('[data-orch-id="orchestrator:parent"] [data-orch-worker="child"]');
+    await child.locator('.orch-tasks-toggle').click();
+    const cases=[
+      {status:'active',running:true,lifecycle:'active',truth:'linked',live:true},
+      {status:'idle',running:true,lifecycle:'active',truth:'runtime-not-active',live:false},
+      {status:'waiting',running:true,lifecycle:'active',truth:'runtime-not-active',live:false},
+      {status:'active',running:true,lifecycle:'paused',truth:'linked',live:false},
+      {status:'active',running:false,lifecycle:'active',truth:'linked',live:false},
+      {status:'active',running:true,lifecycle:'expired',truth:'linked',live:false},
+      {status:'active',running:true,lifecycle:'active',truth:'unlinked',live:false},
+      {status:'active',running:true,lifecycle:'active',truth:'unmeasured',live:false},
+    ];
+    for(const scenario of cases){
+      currentWorkers=workers.map(w=>w.name==='child'?{...w,...scenario,runtime_board:{measured:scenario.truth!=='unmeasured',status:scenario.truth,runtime_status:scenario.status,card_id:'B'}}:w);
+      await page.evaluate(()=> (window as any)._orchLoad());
+      await expect(child.locator('.orch-active-task strong')).toHaveText(scenario.live?'Working now':'Current task');
+      await expect(child.locator('.orch-active-task')).toContainText('Follow-up without an epic link');
+      await expect(child.locator('.orch-task.working-now')).toHaveCount(scenario.live?1:0);
+      expect(await child.evaluate(el=>el.classList.contains('working-now'))).toBe(scenario.live);
+    }
   });
   test('ordinary epics alone do not turn into orchestrations',async({page})=>{
     await page.route('**/api/sessions',r=>r.fulfill({json:[]}));

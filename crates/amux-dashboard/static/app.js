@@ -5214,12 +5214,16 @@ function _cardDoingItem(name) {
 // Runtime activity remains visible even when its task is filtered out, the
 // board has not loaded, or the last claim no longer matches a Doing card.
 // An observed stale claim is a navigation aid, never promoted to a live claim.
+function _workerHasLiveActivity(s) {
+  if (!s?.running || s.archived || ['paused','archived','expired'].includes(s.lifecycle)) return false;
+  const truth = s.runtime_board || {};
+  return truth.measured === true ? truth.runtime_status === 'active' : s.status === 'active';
+}
+
 function _boardActivityEntries(workerName) {
   return (sessions || []).filter(s => {
     if (workerName && s.name !== workerName) return false;
-    if (!s.running || s.archived || s.lifecycle === 'paused' || s.lifecycle === 'archived') return false;
-    const truth = s.runtime_board || {};
-    return truth.measured === true ? truth.runtime_status === 'active' : s.status === 'active';
+    return _workerHasLiveActivity(s);
   }).map(s => {
     const truth = s.runtime_board || {};
     const cardId = _runtimeBoardCardId(s);
@@ -11543,7 +11547,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.1002';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.1003';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -32684,6 +32688,7 @@ function _orchRenderFilters(epics) {
 }
 
 const _orchExpanded = new Set();
+let _orchActivitySignature = '';
 function _orchToggle(id) {
   if (_orchExpanded.has(id)) _orchExpanded.delete(id); else _orchExpanded.add(id);
   if (_orchData) _orchRender(_orchData);
@@ -32709,6 +32714,7 @@ function _orchRender(data) {
   filtered.sort((a,b) => order[a._orchGroup]-order[b._orchGroup] || b.updated-a.updated || a.id.localeCompare(b.id));
   const taskLink = c => '<button type="button" class="orch-task-link" onclick="event.stopPropagation();switchView(\'board\');setTimeout(function(){openBoardDetail(\''+escJs(c.id)+'\')},300)">'+esc(c.id)+' · '+esc(c.title)+'</button>';
   const progress = rows => rows.length ? rows.filter(c => c.execution_terminal === true).length+'/'+rows.length+' terminal' : 'No tasks yet';
+  const activity = [];
   const workerRow = (name,role,group) => {
     const worker = sessMap[name];
     const rows = byWorker.get(name) || [];
@@ -32716,7 +32722,10 @@ function _orchRender(data) {
     // coordinator's whole board belongs to this orchestration.
     const board = role === 'Orchestrator' && !worker?.orchestrator ? rows.filter(c => group.epics.some(e => e.id === c.id)) : rows;
     const tasks = board.filter(c => c.type !== 'epic');
-    const active = tasks.find(c => c.id === worker?.task_board_id);
+    const linkedId = _runtimeBoardCardId(worker);
+    const current = tasks.find(c => c.id === (linkedId || worker?.task_board_id));
+    const active = !!current && !current.execution_terminal && _workerHasLiveActivity(worker) && linkedId === current.id;
+    activity.push({name,card:current?.id || '',active});
     const key = 'tasks:'+group.id+':'+name;
     const expanded = _orchExpanded.has(key);
     const lifecycle = worker?.lifecycle || 'unknown';
@@ -32727,10 +32736,10 @@ function _orchRender(data) {
     if (worker?.worktree_integration?.status) html += '<span class="orch-integration" title="'+esc(worker.worktree_integration.detail || '')+'">'+esc(worker.worktree_integration.status.replace(/_/g,' '))+'</span>';
     if (worker?.worktree_active) html += '<span class="orch-worktree" title="'+esc(worker.branch || 'Detached worktree')+'">'+esc(worker.branch || 'Detached worktree')+'</span>';
     html += '</div>';
-    if (active) html += '<div class="orch-active-task"><strong>Working now</strong> '+taskLink(active)+'</div>';
+    if (current) html += '<div class="orch-active-task"><strong>'+(active?'Working now':'Current task')+'</strong> '+taskLink(current)+'</div>';
     if (board.length) {
       html += '<button type="button" class="orch-tasks-toggle" aria-expanded="'+expanded+'" onclick="_orchToggle(\''+escJs(key)+'\')">'+(expanded?'Hide':'Show')+' board tasks ('+board.length+')</button>';
-      if (expanded) html += '<div class="orch-worker-tasks">'+board.map(c => '<div class="orch-task'+(active?.id===c.id?' working-now':'')+'">'+taskLink(c)+'<span class="status-badge '+esc(c.status || 'todo')+'">'+esc(c.status || 'todo')+'</span></div>').join('')+'</div>';
+      if (expanded) html += '<div class="orch-worker-tasks">'+board.map(c => '<div class="orch-task'+(active && current.id===c.id?' working-now':'')+'">'+taskLink(c)+'<span class="status-badge '+esc(c.status || 'todo')+'">'+esc(c.status || 'todo')+'</span></div>').join('')+'</div>';
     } else html += '<div class="orch-worker-empty">'+(role==='Orchestrator'?'No coordination tasks yet':'No board tasks yet')+'</div>';
     return html+'</div>';
   };
@@ -32746,6 +32755,12 @@ function _orchRender(data) {
     }
     return html+'</section>';
   }).join('')+'</div>';
+  const signature = JSON.stringify(activity);
+  if (signature !== _orchActivitySignature) {
+    _orchActivitySignature = signature;
+    amuxTrack('orchestration_activity_projection', {measured:true,n_considered:activity.length,
+      working_now:activity.filter(a=>a.active).length,retained_task_links:activity.filter(a=>a.card && !a.active).length});
+  }
 }
 
 // ── Board status GATES (confirm-on-move checklists) ──

@@ -3557,3 +3557,14 @@ CARD: CLA-7
 SYMPTOM: Full server runs failed before exercising Stop or Pause because fake tools were assumed ready after 150ms or one second. The sticky board-status fixture likewise exhausted five discovery attempts during process-wide epoch churn.
 COST: Broad validation could not distinguish lifecycle failures from setup that had never reached the required state.
 FIX: Wait on bounded readiness conditions, publish the fake provider PID atomically and clean up its process before reporting failure. Use the existing deadline-based real-handler discovery helper while retaining its error/refusal controls. Stop must still interrupt actual busy work within the original five-second deadline; readiness failures name the unmet condition.
+
+## Orchestrations labels retained task links as live work
+AREA: ui
+SEVERITY: wrong-state
+STATUS: open
+DATE: 2026-09-20
+SESSION: codex-lifecycle-adherence
+CARD: CLA-7
+SYMPTOM: The deployed Orchestrations view showed Working now on audit-and-disable-unused and full-e2e-test-coverage while their measured runtime states were waiting and idle. It used task_board_id without the runtime activity verdict.
+COST: The new orchestration view contradicted its own worker status and made retained board claims look like execution.
+FIX: Share the board's runtime activity predicate, require a measured linked current task for live highlighting, and retain navigation under Current task when execution is not confirmed. Report changed activity projection counts and exercise active, idle, waiting, paused, stopped, expired, unlinked and unmeasured states in the browser.

@@ -6533,7 +6533,8 @@ input.mdai-edge-path-input:focus { border-color: var(--accent); box-shadow: 0 0 
 .orch-task-link { flex:1; font-size:.8rem; }
 .orch-task .status-badge { font-size:.65rem; flex-shrink:0; }
 .orch-active-task { display:flex; gap:8px; align-items:baseline; margin-top:6px; font-size:.8rem; }
-.orch-active-task strong { color:var(--green); flex-shrink:0; }
+.orch-active-task strong { color:var(--muted); flex-shrink:0; }
+.orch-worker.working-now .orch-active-task strong { color:var(--green); }
 .orch-worker.working-now { background:color-mix(in srgb,var(--accent) 5%,var(--surface)); }
 .orch-task.working-now { border-left:3px solid var(--accent); padding-left:8px; }
 .orch-empty,.orch-worker-empty { padding:8px 0; color:var(--dim); font-size:.8rem; }
