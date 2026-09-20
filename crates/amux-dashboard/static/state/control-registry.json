@@ -1,6 +1,6 @@
 {
   "measured": true,
-  "n_considered": 2054,
+  "n_considered": 2065,
   "command_handlers": {
     "_applyEmbedView": {
       "kind": "command._applyEmbedView",
@@ -1286,6 +1286,18 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_launchLoadModels": {
+      "kind": "command._launchLoadModels",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_launchProviderChanged": {
+      "kind": "command._launchProviderChanged",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_libOpenBook": {
       "kind": "command._libOpenBook",
       "feedback_required": true,
@@ -2566,6 +2578,12 @@
     },
     "_toggleArchivedSection": {
       "kind": "command._toggleArchivedSection",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_toggleLaunchBar": {
+      "kind": "command._toggleLaunchBar",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"

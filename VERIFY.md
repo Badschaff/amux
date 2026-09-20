@@ -71,7 +71,16 @@ or substitute for a real compiler check of the private link-output path.
 
 ```bash
 node --check crates/amux-dashboard/static/app.js
+npm run build:state
+bash scripts/spa-lint.sh
+npm run test:state
 ```
+
+Commit the regenerated `static/state/control-registry.json` and `kernel.js`
+when handlers change. `spa-lint.sh` checks their freshness before ESLint; a
+targeted Playwright configuration can skip that preflight and pass against a
+stale interaction bundle. When testing candidate assets against a running
+server, set `AMUX_E2E_STATE_KERNEL` alongside the candidate app/HTML/CSS paths.
 
 Then bump `APP_VER` (`app.js`) and `CACHE` (`sw.js`) **together**. A change to
 one without the other ships code nobody's browser will fetch.
