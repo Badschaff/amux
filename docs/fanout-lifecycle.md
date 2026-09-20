@@ -2,6 +2,24 @@
 
 Fan-out execution uses the existing board, worker configuration and git worktree lifecycle. Orchestrations is a compact read-only projection (`GET /api/board/orchestrations`), not another task store. Its response declares measurement and the number of rows considered, includes full child boards and standalone ephemeral workers, and omits long prompt/history fields. Worker lifecycle controls pause classification; the shared type-specific terminal predicate controls progress. Code Done is not Verified. The compact response includes configuration-derived worker metadata; the page renders it immediately and reuses the normal single-flight status refresh without waiting for cold runtime probes.
 
+## Global Orchestrations view
+
+The global tab groups actual fan-out workers under their recorded coordinator
+(`CC_PARENT`), with one worker row per group. Ordinary board epics are not
+orchestrations. Dedicated coordinators also appear before their first child is
+provisioned; unassigned and retired fan-outs remain visible. Each row shows its
+role/model, lifecycle, active task, board progress and worktree/integration state.
+Expand the worker's board to inspect tasks without duplicating the worker for
+every task. Nested child epics remain within that board.
+
+The compact API selects the complete boards of fan-out workers and dedicated
+coordinators, plus linked ancestors for context. It excludes unrelated ordinary
+parent backlog and epics. `n_considered` and `n_excluded_unrelated` expose the
+population behind the projection; `orchestration_projection` emits the same
+counts at debug level. Configured parent/model/lifecycle metadata is available
+before runtime status finishes loading. Current configuration takes precedence
+over an older retained retirement record, and scoped views hide foreign parents.
+
 ## Ownership and execution
 
 The Board's Launch priorities form creates one real orchestrator worker and one

@@ -809,17 +809,26 @@ async fn retry_does_not_restart_existing_children_of_a_paused_parent() {
 #[tokio::test]
 async fn orchestration_projection_and_integration_configuration_use_public_routes() {
     let r=rig().await;
+    write_parent_env(&r.home,"parent");
     write_parent_env(&r.home,"child");
-    std::fs::write(r.home.join("sessions/child.env"),"CC_DIR=/tmp\nCC_EPHEMERAL=1\n").unwrap();
+    std::fs::write(r.home.join("sessions/child.env"),"CC_DIR=/tmp\nCC_EPHEMERAL=1\nCC_PARENT=parent\n").unwrap();
     let epic=create(&r.app,json!({"title":"Integration epic","type":"epic","session":"parent"})).await;
     let assignment=create(&r.app,json!({"title":"Assigned outcome","session":"child","epic":epic["id"]})).await;
+    let (linked,_,assignment)=send(&r.app,"PATCH",&format!("/api/board/{}",assignment["id"].as_str().unwrap()),Some(json!({"epic":epic["id"]})),&[]).await;
+    assert_eq!(linked,StatusCode::OK,"{assignment}");
+    assert_eq!(assignment["epic"],epic["id"]);
     let followup=create(&r.app,json!({"title":"Whole-board follow-up","session":"child","desc":"long private history"})).await;
+    let unrelated=create(&r.app,json!({"title":"Ordinary epic outside fanout","session":"parent","type":"epic"})).await;
     let (st,_,v)=send(&r.app,"GET","/api/board/orchestrations",None,&[]).await;
     assert_eq!(st,StatusCode::OK,"{v}");
     assert_eq!(v["measured"],true);
     let cards=v["cards"].as_array().unwrap();
+    assert!(cards.iter().any(|c|c["id"]==epic["id"]));
     assert!(cards.iter().any(|c|c["id"]==assignment["id"]));
     assert!(cards.iter().any(|c|c["id"]==followup["id"]));
+    assert!(!cards.iter().any(|c|c["id"]==unrelated["id"]));
+    assert!(v["workers"].as_array().unwrap().iter().any(|w|w["name"]=="parent" && w["role"]=="orchestrator" && w["orchestrator"]==false));
+    assert_eq!(v["n_excluded_unrelated"],1);
     assert!(!v.to_string().contains("long private history"));
     let (st,_,v)=send(&r.app,"PATCH","/api/sessions/child/config",Some(json!({"worktree_verify":"npm test"})),&[]).await;
     assert_eq!(st,StatusCode::OK,"{v}");

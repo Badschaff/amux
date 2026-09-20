@@ -103,11 +103,11 @@ test('orchestration shows coordinator and child models plus the coordinator own 
   ]}}));
   await page.goto('/');
   await page.locator('#tab-orchestrations').click();
-  const epic=page.locator('[data-orch-id="E"]');
-  await expect(epic).toContainText('Orchestrator · codex · gpt-5');
+  const epic=page.locator('[data-orch-id="orchestrator:coordinator"]');
+  await expect(epic.locator('[data-orch-worker="coordinator"]')).toContainText('codex · gpt-5');
   await expect(epic).toContainText('0/2');
-  await epic.locator('.orch-node-chevron').click();
-  await expect(epic).toContainText('Fan-out · claude · haiku');
+  await expect(epic.locator('[data-orch-worker="child"]')).toContainText('claude · haiku');
+  await epic.locator('[data-orch-worker="coordinator"] .orch-tasks-toggle').click();
   await expect(epic).toContainText('Resolve the release contract');
   await expect(epic).toContainText('amux/fanout/child');
   await expect(page.locator('[data-orch-id="worker:coordinator"]')).toHaveCount(0);

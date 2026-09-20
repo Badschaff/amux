@@ -3512,3 +3512,14 @@ CARD: CLA-5
 SYMPTOM: The launch form offered one shared provider/model pair and an Orchestrator (self) workspace selector. A launch created child workers without a dedicated coordinator profile; the user could not select distinct coordinator and fan-out models or see those roles in Orchestrations.
 COST: One user-reported orchestration workflow blocked; coordinator ownership and model choices required manual worker setup.
 FIX: CLA-5 creates a coordinating worker using the existing worker/epic primitives, separates role profiles and per-child overrides, preserves exact retry intent, and records coordinator provision/start verdicts. Browser/API validation and live deployment tracked on the card.
+
+## Global Orchestrations lists ordinary epics and repeats fan-out workers per task
+AREA: board
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-20
+SESSION: codex-lifecycle-adherence
+CARD: CLA-6
+SYMPTOM: The global tab promoted ordinary epics into orchestration roots and rendered full fan-out boards as repeated worker rows. The live snapshot contained 13 fan-out workers under three parents, but 199 epics in the projection and nearly 200 displayed entries.
+COST: User could not find the actual coordinator/fan-out structure in the global tab after the role/model launcher change.
+FIX: Project actual tracked worker boards and linked ancestors, then group by recorded coordinator ownership. Show each worker once with expandable board tasks, active work, model and workspace state. Report included/excluded populations through orchestration_projection and API fields; preserve scoped and retired inventory.
