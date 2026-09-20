@@ -2447,19 +2447,31 @@ pub(crate) async fn reap_ephemeral_workers(state: &AppState) -> EphemeralReaperR
     report.n_considered = ephemeral_sessions.len();
     if ephemeral_sessions.is_empty() { return report; }
 
+    let eph_names: Vec<String> = ephemeral_sessions.iter().map(|(n, _)| n.clone()).collect();
     let cards_by_session: HashMap<String, Vec<(String, String)>> = match state.store.read() {
         Ok(conn) => {
             let mut map: HashMap<String, Vec<(String, String)>> = HashMap::new();
-            if let Ok(mut stmt) = conn.prepare(
-                "SELECT id, session, status FROM issues WHERE session IN \
-                 (SELECT DISTINCT session FROM issues WHERE session LIKE '%-eph-%')"
-            ) {
-                let rows = stmt.query_map([], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
-                });
-                if let Ok(rows) = rows {
-                    for row in rows.flatten() {
-                        map.entry(row.1).or_default().push((row.0, row.2));
+            // Query cards for every session name the env-file scan found, not a
+            // name pattern. The launch endpoint names workers from the card title
+            // (e.g. "audit-and-disable-unused"), not with an "-eph-" infix, so the
+            // old LIKE '%-eph-%' missed every launch-created worker (AMUX-5001).
+            for chunk in eph_names.chunks(50) {
+                let placeholders: String = chunk.iter().enumerate()
+                    .map(|(i, _)| format!("?{}", i + 1))
+                    .collect::<Vec<_>>().join(",");
+                let sql = format!(
+                    "SELECT id, session, status FROM issues WHERE session IN ({placeholders})"
+                );
+                if let Ok(mut stmt) = conn.prepare(&sql) {
+                    let params: Vec<&dyn rusqlite::types::ToSql> =
+                        chunk.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+                    let rows = stmt.query_map(params.as_slice(), |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+                    });
+                    if let Ok(rows) = rows {
+                        for row in rows.flatten() {
+                            map.entry(row.1).or_default().push((row.0, row.2));
+                        }
                     }
                 }
             }
@@ -2583,34 +2595,64 @@ pub(crate) async fn reap_ephemeral_workers(state: &AppState) -> EphemeralReaperR
             "reaping ephemeral worker"
         );
 
-        // Stop the tmux session
+        // Full decommission: stop, clean worktree, remove all registration
+        // files so the worker disappears from the dashboard (not just STOPPED).
+        // Matches delete_post in session_verbs.rs.
+
+        // 1. Kill tmux
         let stq = format!("={name}");
         let _ = tokio::process::Command::new("tmux")
             .args(["kill-session", "-t", &stq])
             .output()
             .await;
 
-        // Archive the env file (rename to .env.reaped)
-        let env_path = sessions_dir.join(format!("{name}.env"));
-        let archive_path = sessions_dir.join(format!("{name}.env.reaped"));
-        if let Err(e) = std::fs::rename(&env_path, &archive_path) {
-            tracing::warn!(
-                session = %name,
-                error = %e,
-                "ephemeral reaper: failed to archive env file"
-            );
-            report.errors += 1;
-        }
-
-        // Clean up worktree if present
+        // 2. Clean up worktree if present. Discover parent repo from .git file
+        //    since the worktree may belong to any repo (e.g. mixpeek, not amux).
         let wt_path = home.join("worktrees").join(name);
         if wt_path.exists() {
-            let _ = tokio::process::Command::new("git")
-                .args(["worktree", "remove", "--force"])
-                .arg(&wt_path)
-                .output()
-                .await;
+            let parent_repo = std::fs::read_to_string(wt_path.join(".git"))
+                .ok()
+                .and_then(|content| {
+                    content.strip_prefix("gitdir: ").and_then(|g| {
+                        let gitdir = g.trim();
+                        gitdir.find("/.git/worktrees/").map(|pos| {
+                            std::path::PathBuf::from(&gitdir[..pos])
+                        })
+                    })
+                });
+            let mut cmd = tokio::process::Command::new("git");
+            if let Some(ref repo) = parent_repo {
+                cmd.arg("-C").arg(repo);
+            }
+            cmd.args(["worktree", "remove", "--force"]).arg(&wt_path);
+            let out = cmd.output().await;
+            if out.as_ref().map(|o| !o.status.success()).unwrap_or(true) {
+                let mut cmd2 = tokio::process::Command::new("git");
+                if let Some(ref repo) = parent_repo {
+                    cmd2.arg("-C").arg(repo);
+                }
+                cmd2.args(["worktree", "remove", "--force", "--force"]).arg(&wt_path);
+                let _ = cmd2.output().await;
+            }
         }
+
+        // 3. Remove registration files (env, mem, meta, log) so the session
+        //    disappears from the fleet, not just shows as STOPPED.
+        let env_path = sessions_dir.join(format!("{name}.env"));
+        let _ = std::fs::remove_file(&env_path);
+        let _ = std::fs::remove_file(home.join("sessions").join(format!("{name}.mem")));
+        let _ = std::fs::remove_file(home.join("sessions").join(format!("{name}.meta")));
+        let _ = std::fs::remove_file(home.join("sessions").join(format!("{name}.log")));
+
+        // 4. Invalidate session cache so the dashboard picks up the removal
+        crate::api::sessions_legacy::invalidate_sessions_cache();
+
+        // 5. Clean up steering queue
+        let n = name.to_string();
+        let _ = state.store.write_async(move |conn| {
+            let _ = conn.execute("DELETE FROM steering_queue WHERE session=?", [&n]);
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).await;
 
         // Log the card back to the parent if parked
         if action == "parked" && !parent.is_empty() {
