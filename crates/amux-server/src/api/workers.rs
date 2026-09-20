@@ -2075,7 +2075,7 @@ mod tests {
     }
 
     /// Like `read_fixture_sessions`, but bounded by a DEADLINE instead of an
-    /// attempt count, for the two tests that read the REAL handler.
+    /// attempt count, for tests that read the REAL handler.
     ///
     /// AMUX-4647. `SESSIONS_EPOCH` is process-wide, 12 call sites bump it, and
     /// cargo runs this binary's tests in parallel, so a sibling create or delete
@@ -2113,8 +2113,8 @@ mod tests {
         }
     }
 
-    // AF-766: both phases of the sticky truth fixture share this bounded
-    // response policy. Other tests may invalidate the process-wide epoch.
+    // The attempt-count policy has its own stub-router negative control below.
+    // Real-handler tests use the settled-read deadline above under epoch churn.
     async fn read_fixture_sessions(app: &axum::Router, stage: &str) -> (StatusCode, HeaderMap, Value) {
         for attempt in 0..5 {
             let result = send(app, "GET", "/api/sessions", None).await;

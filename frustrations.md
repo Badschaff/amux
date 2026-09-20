@@ -3546,3 +3546,14 @@ CARD: CLA-7
 SYMPTOM: Overlapping board reads published in response order. An older successful response could clear a newer board/status read failure and show Live while the board was unavailable; an old failure could likewise overwrite a recovery.
 COST: The iOS outage acceptance test intermittently displayed Live instead of Sync error, hiding actionable failure state from the user.
 FIX: Validate each response batch before publishing and order publication by read generation. Older reads may finish while a newer read is pending, but cannot replace a newer completed result. Emit board_read_superseded and test both failure and recovery with deliberately reversed responses.
+
+## Lifecycle fixtures confuse host scheduling with product failure
+AREA: tests
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-20
+SESSION: codex-lifecycle-adherence
+CARD: CLA-7
+SYMPTOM: Full server runs failed before exercising Stop or Pause because fake tools were assumed ready after 150ms or one second. The sticky board-status fixture likewise exhausted five discovery attempts during process-wide epoch churn.
+COST: Broad validation could not distinguish lifecycle failures from setup that had never reached the required state.
+FIX: Wait on bounded readiness conditions, publish the fake provider PID atomically and clean up its process before reporting failure. Use the existing deadline-based real-handler discovery helper while retaining its error/refusal controls. Stop must still interrupt actual busy work within the original five-second deadline; readiness failures name the unmet condition.

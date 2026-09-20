@@ -28839,8 +28839,16 @@ CLAUDE-POSTFIX-COMPLETE
         let pt = pt(&name);
         let typed = tmux(&["send-keys", "-t", &pt, "/bin/sh -c 'sleep 120 & wait'", "Enter"]).await.unwrap();
         assert!(typed.status.success(), "{}", String::from_utf8_lossy(&typed.stderr));
-        sleep_ms(150).await;
-        assert_eq!(pane_has_live_child(&name).await, Some(true), "busy-tool fixture must be running");
+        // Readiness is a condition, not a 150ms scheduling assumption. The
+        // Stop deadline below still measures the actual interruption time.
+        let ready_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let busy = pane_has_live_child(&name).await;
+            if busy == Some(true) { break; }
+            assert!(std::time::Instant::now() < ready_deadline,
+                "busy-tool fixture did not become ready within 10s; live child: {busy:?}");
+            sleep_ms(50).await;
+        }
         let state = AppState {store:Arc::new(crate::db::Store::open(&home.path().join("stop.db")).unwrap()),
             started:std::time::Instant::now(),build_hash:"test".into(),auth_token:None,
             reconciled:Arc::new(std::sync::atomic::AtomicBool::new(true))};
