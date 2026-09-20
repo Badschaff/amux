@@ -5,9 +5,9 @@ message remains the receipt and source of truth; its `intake_result` records the
 interpretation, canonical task IDs, and measured model-call count. Creation,
 revision checks, graph links and message association commit in one transaction.
 
-Enable the staged controller through `AMUX_COMMAND_LIFECYCLE=1` at worker,
-group or global scope. During validation it is enabled only on the canary
-workers. Disabling it preserves the existing capture path.
+Structured intake is the default when the configured model client is available.
+`AMUX_COMMAND_LIFECYCLE=0` at worker, group or global scope explicitly retains
+the legacy capture path. Paused and isolated workers retain their boundaries.
 
 - Search includes older and completed work across boards, with compact ranked
   candidates. A cross-worker match can be verified without overwriting its owner.
@@ -15,8 +15,11 @@ workers. Disabling it preserves the existing capture path.
   require a named earlier output and a concrete reason, never mere relatedness.
 - Repeated active commands reuse their committed root without another model call.
   Refinements preserve canonical tasks and reuse their open command epic.
-- Information and questions stay in Messages; failed interpretation stays pending
-  instead of minting a runnable fallback task.
+- Information and questions stay in Messages. After two unsuccessful interpretation
+  attempts and expiry of the in-flight attempt lease, a receipt becomes one
+  structured intake investigation on its owner's board. Its gate requires mapping
+  the original request to canonical outcomes before implementation. Failed responses,
+  errors and token measurements remain attached to the receipt; duplicates reuse it.
 - Tasks enter the existing board dispatcher without `source_ref` parking markers.
   Leases, worker pause, delivery, dependency promotion and transition gates remain
   authoritative. Epics require all required successful output states; discarded
@@ -31,7 +34,8 @@ readiness, completion and unchanged-receipt recovery make zero model calls.
 `AMUX_INTAKE_CANDIDATES` defaults to 8 compact candidates (maximum 200).
 `AMUX_INTAKE_CALLS_PER_HOUR` defaults to a conservative shared 60-call ceiling.
 At most two interpretations run concurrently and a receipt has at most two
-attempts. A failed/uncertain interpretation remains visible on the receipt.
+attempts. A failed/uncertain interpretation remains visible on the receipt and
+then hands recovery to the same board dispatcher, without a third helper call.
 No generic endless retry or repeated capture-disposal prompt is produced by this
 controller. `/api/board-lifecycle?session=<worker>` exposes decisions, pending
 requests and durable call counts. Character counts are explicitly not presented
@@ -54,9 +58,12 @@ and live rounds can spend provider tokens. Do not claim full lifecycle effective
 from a worker saying it finished: inspect the resulting board and artifacts.
 
 The [three-round validation](command-lifecycle-validation-2026-09-15.md) scored
-2, 3 and 5 out of 10. Automatic intake failed the final live trial, so this
-controller remains opt-in. The separately tested global approval policy is
-enabled; the old fleet backlog has not been bulk migrated.
+2, 3 and 5 out of 10; those scores remain the historical evidence, not a claim
+that all lifecycle paths passed. Subsequent existing-worker receipts successfully
+used canonical intake. The September 19 consolidation makes that path the default
+and adds a bounded owner-recovery outcome for interpretation failure. No fourth
+Haiku validation worker was created. The old fleet backlog has not been bulk
+closed or represented as verified.
 
 ## Conservative execution and recovery
 

@@ -7,7 +7,9 @@ visible for intake.
 
 ## Shared boundaries
 
-1. **Capture:** both session delivery and orchestrator delivery call
+1. **Receipt:** owner commands use the durable command lifecycle before execution
+   by default (see `command-lifecycle.md`). Explicit opt-outs and model-free
+   operation retain legacy capture. Legacy session and orchestrator delivery call
    `session_verbs::mint_capture_card`. It redacts secrets, excludes control/status
    chatter, deduplicates identical open receipts, and derives a readable title.
    Markdown list markers are removed before finding the first sentence.
@@ -18,10 +20,13 @@ visible for intake.
    textual acceptance criteria even when `**Prompt:**` provenance remains.
    Its SQL mirror is parity-tested. Structuring a receipt releases only the
    harness's delivery marker, never a genuine approval or event hold.
-3. **Selection:** continue the exact current claim, subject to the existing
-   idle/stale recovery rules; otherwise select eligible owned work. A suppressed
-   per-card reminder falls through to guarded pickup. Captured backlog requests
-   can receive the same once-per-card intake action as Doing receipts.
+3. **Selection:** use positive current provider evidence, including a bounded
+   pane probe when a structured hook expires. Unknown, empty and busy panes never
+   authorize delivery. Scan Doing/Review candidates past refusals and confirmed
+   unchanged reminders without a fixed prefix cutoff. Selection and enqueue share the durable reminder lookup.
+   WIP and verification share one execution-slot predicate: raw captures, epics
+   and held work do not block independent verification. An already-reviewed
+   blocker suppresses repeated blocker prompts, not unrelated completion work.
 4. **Parallel execution:** fan-out assigns independent ready outcomes to stable
    child identities. Connected prerequisite chains remain together on the owner
    board; moving one prerequisite cannot strand its dependents on another board.
@@ -30,7 +35,10 @@ visible for intake.
    worktrees and backlog draining enabled. It preserves existing configuration,
    pause/archive state, and assignments on retry. An identical open launch graph
    is reused and the response reports `idempotent: true`.
-5. **Completion:** the assignment ends at its type's completion boundary, not at
+5. **Completion:** verification batches select up to eight oldest unoffered
+   outcomes. Partial progress releases other candidates; unchanged output/contract
+   fingerprints stay quiet, while changed evidence or gates re-arm verification.
+   The assignment ends at its type's completion boundary, not at
    receipt delivery or a generic Done label. Runtime changes still require
    verification. Discard/quarantine stop execution but do not satisfy dependent
    outcomes. The reaper uses actual ephemeral membership, retains workers with
@@ -43,11 +51,15 @@ are harness decisions. Decomposition, semantic equivalence and whether evidence
 proves a result require model judgment. Do not claim otherwise or replace those
 judgments with a title-similarity threshold.
 
-This consolidation adds no model probes or periodic model calls. Existing nudge
-budgets and suppression remain. The opt-in model intake controller remains
-opt-in; enabling a controller whose prior lifecycle trial did not succeed is not
-a substitute for resolving its failures. Paused and isolated workers remain
-excluded from automation.
+Scheduling adds no model probes. Semantic command intake uses the existing
+compact helper and bounded budget; exhaustion creates one owned intake investigation
+through the normal board lifecycle rather than an immortal pending command.
+Unchanged reminders remain suppressed. Paused and isolated workers remain excluded
+from automation. The live global and amux-group verification gates now require the
+owning worker to reproduce results and record evidence; they no longer create a
+mandatory dependency on a different worker. Tests, integration, deployment where
+applicable and regression checks remain required. Explicit custom gates still resolve
+through the same card/worker/group/global/type precedence.
 
 A bulk historical import is an intake inventory, not hundreds of ready tasks.
 Reconcile it in bounded batches against current artifacts and existing outcomes;
@@ -61,3 +73,9 @@ historical task failed or permission to close it.
 readiness and pause/configuration preservation. Run with one test thread because
 its fixtures set AMUX_HOME. These tests do not require model execution. The fleet
 audit is retained outside the repository because its board contents are private.
+
+Git contention is scoped to the worker’s own checkout and index. A worker must not
+wait on a fleet-wide `pgrep -f "git commit"`: that expression matches the waiting
+shell’s own command line and can never clear. Use the worktree’s actual Git
+result/lock state and a bounded retry; inspect the concrete holder before taking
+any recovery action. A process existing is not evidence of task progress.

@@ -1329,6 +1329,14 @@ impl FleetSignals {
             }
             return None;
         }
+        if !structured && status == "idle" && pane_boundary == Some(true) {
+            let key = format!("measured-fallback-boundary:{name}");
+            if crate::log_dedupe::first_this_bucket(&key, crate::log_dedupe::hour_bucket(self.now)) {
+                tracing::info!(target: "status_truth", session = name, measured = true, n_considered = 1,
+                    verdict = "idle_boundary_measured_without_current_hook",
+                    "recognized live composer restores dispatch after absent or expired structured report");
+            }
+        }
         if measured && ex["decided_by"] == "codex_stale_active_refused" {
             let key = format!("structured-boundary:{name}");
             if crate::log_dedupe::first_this_bucket(&key, crate::log_dedupe::hour_bucket(self.now)) {
@@ -1400,12 +1408,19 @@ impl FleetSignals {
     /// scrollback count as evidence by stuffing the map.
     pub fn pane_probe_candidate(&self, name: &str) -> bool {
         let act = self.activity.get(&format!("amux-{name}")).copied().unwrap_or(0) as f64;
-        // Hookless providers have no structured turn-boundary signal. An idle
-        // Gemini terminal stops painting; aging out its only observable signal
-        // makes a future queued task permanently ineligible for delivery.
-        // Keep measuring these lanes. A nonempty recognized composer is still
-        // required by turn_boundary_status; silence itself never permits sends.
-        self.now - act < self.contradiction_window() || self.hookless_workers.contains(name)
+        let report_current = self.reports.get(name).is_some_and(|r| {
+            report_applies(
+                r["state"].as_str().unwrap_or(""), r["ts"].as_f64().unwrap_or(0.0),
+                self.started.get(name).copied().unwrap_or(0.0), self.now,
+            )
+        });
+        // Losing a hook must not also disable its fallback. A quiet worker
+        // whose report expired still needs a bounded current pane observation.
+        // This admits measurement, never delivery: the boundary classifier
+        // still requires a recognized nonempty composer and rejects live work.
+        self.now - act < self.contradiction_window()
+            || self.hookless_workers.contains(name)
+            || (self.agent_running(&format!("amux-{name}")) && !report_current)
     }
 
     /// Raw pane for a lane whose evidence is admissible: recently painted and
@@ -6049,6 +6064,28 @@ Claude usage limit reached. Your limit will reset at 3pm.
         assert_ne!(s.turn_boundary_status(lane).as_deref(),Some("idle"));
         s.panes.insert(lane.into(),String::new());
         assert!(s.turn_boundary_status(lane).is_none());
+    }
+
+    #[test]
+    fn expired_hook_keeps_fallback_observable_without_authorizing_unknown_or_busy_panes() {
+        for state in ["active", "blocked", "idle"] {
+            let mut s = signals();
+            let lane = "expired-hook";
+            s.running.insert(format!("amux-{lane}"));
+            s.started.insert(lane.into(), s.now - 200_000.0);
+            s.activity.insert(format!("amux-{lane}"), (s.now - 7200.0) as i64);
+            s.reports = json!({lane: {"state":state,"ts":s.now - 100_000.0,"subagents":{"count":0}}});
+            assert!(s.pane_probe_candidate(lane), "expired {state} must not suppress the fallback measurement");
+            assert!(s.turn_boundary_status(lane).is_none(), "an absent capture is not idle evidence");
+            s.panes.insert(lane.into(), "Claude Code\n❯ \n────────────────────\n⏵⏵ bypass permissions on (shift+tab to cycle)".into());
+            assert_eq!(s.turn_boundary_status(lane).as_deref(), Some("idle"), "expired {state}");
+            s.panes.insert(lane.into(), WORKING_BAR.into());
+            assert_ne!(s.turn_boundary_status(lane).as_deref(), Some("idle"), "busy {state}");
+            s.panes.insert(lane.into(), "unrecognized provider output".into());
+            assert!(s.turn_boundary_status(lane).is_none(), "unknown {state}");
+            s.panes.insert(lane.into(), String::new());
+            assert!(s.turn_boundary_status(lane).is_none(), "empty {state}");
+        }
     }
 
     #[test]

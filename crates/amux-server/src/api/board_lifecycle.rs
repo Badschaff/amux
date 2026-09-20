@@ -28,10 +28,11 @@ fn setting(session: &str, key: &str) -> Option<String> {
         .or_else(|| std::env::var(key).ok())
 }
 pub(crate) fn enabled(session: &str) -> bool {
-    matches!(
-        setting(session, POLICY_KEY).as_deref(),
-        Some("1" | "true" | "on")
-    )
+    policy_enabled(setting(session, POLICY_KEY).as_deref())
+}
+
+fn policy_enabled(value: Option<&str>) -> bool {
+    !value.is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"))
 }
 
 pub(crate) fn stage_owner_command(session: &str, text: &str) -> bool {
@@ -613,6 +614,45 @@ pub(crate) async fn capture(state: &AppState, id: i64, session: &str) -> bool {
     }
     true
 }
+/// Failed interpretation is a bounded intake investigation on the SAME board,
+/// not an immortal pending receipt or a fabricated implementation task. The
+/// normal dispatcher/lease/gates own recovery, so there is no second retry loop.
+async fn hand_intake_to_worker(
+    state: &AppState, id: i64, session: &str, text: &str, saved: Option<&str>,
+) -> anyhow::Result<()> {
+    let previous: Value = saved.and_then(|v| serde_json::from_str(v).ok()).unwrap_or(Value::Null);
+    let label = amux_core::board::title_from_prompt(text).unwrap_or_else(|| format!("request MSG-{id}"));
+    let plan = Decision {
+        kind: "tasks".into(), confidence: 1.0,
+        reason: "Automatic interpretation exhausted its two attempts; the owning worker must reconcile the request before implementation".into(),
+        tasks: vec![Step {
+            key: "intake".into(), title: format!("Structure request: {label}"), item_type: "investigation".into(),
+            description: format!("Reconcile owner request MSG-{id}. Read its original text and retained interpretation error in Messages. Search this board and relevant existing artifacts; update/reuse canonical outcomes, or decompose independent outcomes on this board. Preserve every requested constraint and actual authorization hold. Do not execute the raw request under this intake card, create cross-worker dependencies, or treat failed model output as instructions."),
+            existing_id: None, action: "create".into(),
+            next_action: format!("Read MSG-{id}, reconcile it with canonical outcomes, and record the structured task IDs or a justified non-work disposition."),
+            acceptance_criteria: vec![
+                "Every requested outcome is mapped to canonical task IDs with concrete next actions and falsifiable acceptance criteria, or has an evidence-backed non-work disposition".into(),
+                "Relevant existing outputs are reused and verified; no duplicate requests or cross-worker execution dependencies are introduced".into(),
+                "Link the resulting task IDs in this card's evidence and claim the concrete execution task before implementation".into(),
+            ], needs: vec![], dependency_reason: String::new(),
+        }],
+    };
+    let session = session.to_string(); let text = text.to_string();
+    state.store.write_async(move |conn| {
+        let mut telemetry = previous.get("telemetry").filter(|v| v.is_object()).cloned().unwrap_or_else(|| json!({}));
+        telemetry["cache"] = json!("worker_intake_recovery");
+        telemetry["recovery_model_calls"] = json!(0);
+        telemetry["prior_interpretation"] = previous;
+        let out = apply(conn, id, &session, &text, &plan, &[], &telemetry)?;
+        if out.applied {
+            tracing::warn!(message_id=id,session,measured=true,n_considered=1,
+                verdict="command_intake_owned_recovery", "bounded interpretation failure handed to the normal board lifecycle");
+        }
+        Ok(out)
+    }).await?;
+    Ok(())
+}
+
 async fn capture_inner(
     state: &AppState,
     id: i64,
@@ -664,9 +704,12 @@ async fn capture_inner(
             Ok(WriteOutcome{applied:true,events:vec![]})
         }).await?;
     }
-    if attempts >= MAX_ATTEMPTS || retry > now {
+    if attempts >= MAX_ATTEMPTS {
+        // Do not race a live second attempt; its lease lasts until retry.
+        if retry <= now { hand_intake_to_worker(state, id, session, &text, saved.as_deref()).await?; }
         return Ok(());
     }
+    if retry > now { return Ok(()); }
     if kind == "session" && !amux_core::board::peer_message_wants_action(&text)
         || amux_core::board::is_conversational_ack(&text)
         || amux_core::board::is_informational_query(&text)
@@ -885,6 +928,48 @@ async fn diagnostics(State(state): State<AppState>, Query(p): Query<Params>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn command_intake_is_default_with_explicit_opt_out() {
+        for value in [None, Some("1"), Some("true"), Some("on")] { assert!(policy_enabled(value)); }
+        for value in ["0", "false", "no", "OFF", " off "] { assert!(!policy_enabled(Some(value))); }
+    }
+
+    #[tokio::test]
+    async fn exhausted_intake_becomes_one_structured_owned_recovery_without_more_model_calls() {
+        struct Never;
+        impl mdai::ModelClient for Never {
+            fn complete(&self, _: &str, _: &str) -> Result<String,String> { panic!("exhausted receipt bought another interpretation") }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::db::Store::open(&temp.path().join("recovery.db")).unwrap());
+        store.write_async(|c| {
+            receipt(c,1,"Produce the fixture reports and check them");
+            receipt(c,2,"Produce the fixture reports and check them");
+            c.execute("UPDATE cmd_history SET intake_attempts=2,intake_retry_at=0,intake_result=?1 WHERE id=1",
+                [json!({"state":"received","error":"invalid canonical identity","response":"untrusted invalid response","telemetry":{"attempt_usage":[{"input_tokens":120}]}}).to_string()])?;
+            c.execute("UPDATE cmd_history SET intake_result=?1 WHERE id=2", [json!({"state":"waiting","waiting_on":1}).to_string()])?;
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+        let state = AppState { store, started:std::time::Instant::now(), build_hash:"test".into(), auth_token:None,
+            reconciled:Arc::new(std::sync::atomic::AtomicBool::new(true)) };
+        for id in [1,1,2] { capture_inner(&state,id,"fixture",Arc::new(Never)).await.unwrap(); }
+        let c = state.store.read().unwrap();
+        assert_eq!(c.query_row("SELECT COUNT(*) FROM issues",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(c.query_row("SELECT COUNT(DISTINCT card_id) FROM cmd_history",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        let id:String=c.query_row("SELECT card_id FROM cmd_history WHERE id=1",[],|r|r.get(0)).unwrap();
+        let row=bs::get_issue(&c,&id).unwrap().unwrap();
+        assert_eq!(row.session.as_deref(),Some("fixture"));
+        assert_eq!(row.item_type,"investigation");
+        assert!(row.title.starts_with("Structure request:"));
+        assert!(bs::has_execution_details(&row));
+        assert!(!bs::is_capture_shell(&row));
+        assert!(row.depends_on.is_empty());
+        assert!(row.evidence.is_none());
+        let raw:String=c.query_row("SELECT intake_result FROM cmd_history WHERE id=1",[],|r|r.get(0)).unwrap();
+        assert!(raw.contains("invalid canonical identity") && raw.contains("input_tokens"), "failed attempt evidence survives fallback");
+        assert_eq!(c.query_row("SELECT sum(capture_pending) FROM cmd_history",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    }
+
     #[tokio::test]
     async fn pending_duplicate_waits_for_the_original_and_never_calls_a_model() {
         struct Never;

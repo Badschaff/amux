@@ -1476,6 +1476,28 @@ pub(crate) fn doing_is_unblocked(conn: &Connection, row: &bs::IssueRow) -> bool 
         && deps_blocking(conn, row).is_empty()
 }
 
+/// Containers, captures and held work do not consume an execution slot.
+/// Status is supplied by the caller: this also applies to verification readiness.
+fn holds_execution_slot(conn: &Connection, row: &bs::IssueRow) -> bool {
+    !bs::is_capture_shell(row)
+        && !matches!(row.item_type.as_str(), "tripwire" | "watch" | "epic")
+        && !row.tags.iter().any(|t| t.to_ascii_lowercase().starts_with("needs:you"))
+        && doing_is_unblocked(conn, row)
+}
+
+fn open_execution_count(conn: &Connection, session: &str) -> rusqlite::Result<usize> {
+    let mut stmt = conn.prepare("SELECT id FROM issues WHERE session=?1 AND deleted IS NULL \
+        AND COALESCE(archived,0)=0 AND status IN ('doing','review') AND owner_type='agent'")?;
+    let ids = stmt.query_map([session], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut count = 0;
+    for id in ids {
+        if let Some(row) = bs::get_issue(conn, &id)? {
+            count += usize::from(holds_execution_slot(conn, &row));
+        }
+    }
+    Ok(count)
+}
+
 /// AMUX-3757: manual claims, status claims, frontier capacity and pickup must
 /// agree about which Doing rows hold a slot. Read the real capture predicate,
 /// including its whitespace handling, instead of maintaining SQL lookalikes.
@@ -1501,10 +1523,7 @@ pub(crate) fn wip_holding_ids(
                 capture_shells += 1;
                 continue;
             }
-            if matches!(row.item_type.as_str(), "tripwire" | "watch" | "epic")
-                || row.tags.iter().any(|t| t.to_ascii_lowercase().starts_with("needs:you"))
-                || !doing_is_unblocked(conn, &row)
-            {
+            if !holds_execution_slot(conn, &row) {
                 continue;
             }
             holding.push(id);
@@ -3671,9 +3690,21 @@ fn needs_human_sql() -> &'static str {
      AND lower(t.tag) LIKE 'needs:you%')"
 }
 
+/// Verification reacts to output/contract changes, never heartbeat revisions.
+fn verification_contract(conn: &Connection, id: &str) -> rusqlite::Result<Option<String>> {
+    use sha2::{Digest, Sha256};
+    let Some(row) = bs::get_issue(conn, id)? else { return Ok(None) };
+    let gate = bs::effective_gate_configured(conn, &row, TaskStatus::Verified);
+    let human_hold = row.tags.iter().any(|t| t.to_ascii_lowercase().starts_with("needs:you"));
+    let state = json!([row.id, row.session, row.status, row.item_type, row.archived,
+        row.owner_type, human_hold, row.acceptance_criteria, row.evidence, gate]);
+    Ok(Some(format!("{:x}", Sha256::digest(state.to_string().as_bytes()))))
+}
+
 /// Hold an unchanged verification batch, but immediately offer the next batch
-/// after the worker resolves the previous one. A lane-wide 24h timer used to
-/// throttle a successful worker to eight cards per day regardless of progress.
+/// after the worker makes terminal progress in the previous one. Previously
+/// one unresolved card starved every unoffered card for a day. Selection excludes
+/// recently offered cards, so partial progress cannot repeat the same held work.
 fn verify_batch_pending(conn: &Connection, session: &str, now: f64) -> bool {
     let previous: Option<String> = conn.query_row(
         "SELECT data FROM session_events WHERE session=?1 AND type='verify.nudge' AND ts>?2 ORDER BY ts DESC,id DESC LIMIT 1",
@@ -3684,34 +3715,58 @@ fn verify_batch_pending(conn: &Connection, session: &str, now: f64) -> bool {
     let Some(cards) = data.get("cards").and_then(Value::as_array).filter(|ids| !ids.is_empty()) else {
         return true; // Legacy event has no identity; retain its bounded cooldown.
     };
-    cards.iter().any(|id| {
+    cards.iter().all(|id| {
         let Some(id) = id.as_str() else { return true };
-        conn.query_row(&format!(
-            "SELECT EXISTS(SELECT 1 FROM issues WHERE id=?1 AND session=?2 AND status='done' \
-             AND deleted IS NULL AND COALESCE(archived,0)=0 AND owner_type='agent' {} {})",
-            unverifiable_types_sql(), needs_human_sql()),
-            rusqlite::params![id, session], |r| r.get::<_, bool>(0)).unwrap_or(true)
+        let Some(previous) = data.get("contracts").and_then(|v| v.get(id)).and_then(Value::as_str) else {
+            // Legacy batches did not record the gate they asked for. Re-measure
+            // once; subsequent batches retain a fingerprint and stay bounded.
+            return false;
+        };
+        match verification_contract(conn, id) {
+            Ok(Some(current)) => current == previous,
+            Ok(None) => false,
+            Err(_) => true, // Unreadable is not permission to spend a turn.
+        }
     })
 }
 
 /// Cards in `done` that this session could verify. Returns (id, title, type)
 /// tuples, capped at 8 for prompt brevity.
 fn done_verify_candidates(conn: &Connection, session: &str) -> Vec<(String, String, String)> {
-    conn.prepare(&format!(
-        "SELECT id, title, COALESCE(type,'code') FROM issues \
-         WHERE session=?1 AND status='done' AND deleted IS NULL \
-         AND COALESCE(archived,0)=0 AND owner_type='agent' {} {} \
-         ORDER BY updated DESC LIMIT 8",
-        unverifiable_types_sql(),
-        needs_human_sql()
-    ))
-    .and_then(|mut st| {
-        st.query_map(rusqlite::params![session], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
-        })
-        .map(|rows| rows.flatten().collect())
+    let measured = (|| -> rusqlite::Result<Vec<(String, String, String)>> {
+        let mut recent = conn.prepare("SELECT data FROM session_events WHERE session=?1 AND type='verify.nudge' AND ts>?2")?;
+        let history = recent.query_map(rusqlite::params![session, now_f64() - VERIFY_NUDGE_COOLDOWN_S], |r|r.get::<_,String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut offered = std::collections::HashSet::new();
+        for raw in history {
+            if let Ok(Value::Object(data)) = serde_json::from_str::<Value>(&raw) {
+                if let Some(contracts) = data.get("contracts").and_then(Value::as_object) {
+                    for (id, signature) in contracts {
+                        if let Some(signature) = signature.as_str() { offered.insert((id.clone(), signature.to_string())); }
+                    }
+                }
+            }
+        }
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id,title,COALESCE(type,'code') FROM issues WHERE session=?1 AND status='done' \
+             AND deleted IS NULL AND COALESCE(archived,0)=0 AND owner_type='agent' {} {} ORDER BY updated ASC,id ASC",
+            unverifiable_types_sql(), needs_human_sql()))?;
+        let rows = stmt.query_map([session], |r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?;
+        let mut selected = Vec::new();
+        for row in rows {
+            let row = row?;
+            if verification_contract(conn, &row.0)?.is_some_and(|signature| !offered.contains(&(row.0.clone(), signature))) {
+                selected.push(row);
+                if selected.len() == 8 { break; }
+            }
+        }
+        Ok(selected)
+    })();
+    measured.unwrap_or_else(|error| {
+        tracing::warn!(session,measured=false,n_considered=0,%error,verdict="verification_selection_unmeasured",
+            "verification selection failed; no worker turn queued");
+        Vec::new()
     })
-    .unwrap_or_default()
 }
 
 /// Total count of done cards for this session (for the "and N more" line).
@@ -3746,31 +3801,18 @@ fn verify_nudge_text(cards: &[(String, String, String)], total: i64) -> String {
     }
     let list = lines.join("\n");
     format!(
-        "[amux] You have no queued work (no todo/doing/review cards), but {total} of your \
-         cards sit in `done` awaiting verification.\n\n\
+        "[amux verification] No executable work is currently queued; {total} runtime-changing \
+         outcomes still need verification. This batch contains up to eight oldest unoffered cards:\n\n\
          {list}\n\n\
-         For each card, read its RESOLVED gate first — GET /api/board/contract?card=<id> — \
-         and move to `verified` only when EVERY criterion there holds, with evidence of \
-         what you checked. The gate resolves card -> worker -> group -> global -> type \
-         default, so it varies by card; this nudge deliberately does not restate it \
-         (AMUX-3477: a previous version hardcoded four criteria the board does not use, \
-         and following the instruction literally moved cards on the wrong basis — the \
-         AF-112 family, one layer up). If you cannot satisfy the resolved gate honestly, \
-         leave the card in `done`. If the work is stale or was superseded, archive it \
-         with a note explaining why.\n\n\
-         To see ALL of them (this list is the 8 most recent): \
-         GET /api/board?status=done&done_limit=0 scoped to you. NOTE: the UNSCOPED \
-         /api/board caps terminal (done/verified/discarded) cards at 100, so a done card \
-         of yours can look ABSENT there while it is very much on the board — check by id \
-         (GET /api/board/<id>) or with the scoped query above, not the capped default \
-         (this is the exact trap that read as 'these cards do not exist', 2026-08-13).\n\n\
-         Cards that genuinely cannot be verified by you (e.g., they require a human \
-         decision or access you lack) should be tagged `needs:you` — with the ask and \
-         what unblocks it — to mark them human-blocked. Be honest about what that does \
-         today: it moves the card into the dashboard needs:you view, and NOTHING pushes \
-         it to the owner (there is no digest/alert/email path for needs:you as of \
-         2026-09-03, AC-413). So tag it only when a human genuinely owes the next step; \
-         it is not an escape hatch that makes the card someone else's problem."
+         Read GET /api/board/contract?card=<id> for each current gate. Reproduce the result from \
+         actual output assets, record the checks and results, and advance to verified only when \
+         every criterion holds. Own the remaining implementation, integration and verification \
+         on this board. If a card was superseded, record the canonical survivor and evidence \
+         before retiring it. Do not fabricate completion or another worker's sign-off.\n\n\
+         Use Needs You only for the configured authorization categories. Preserve actual access \
+         restrictions and explicit owner holds, record the precise blocker, and continue \
+         independent work. Record a disposition for each offered card so one unresolved outcome \
+         does not strand the rest. Full inventory: GET /api/board?session=<your-worker>&status=done&done_limit=0."
     )
 }
 
@@ -4080,91 +4122,20 @@ fn outstanding_work(
 mod continue_nudge_ask_tests {
     use super::continue_nudge_text;
 
-    /// AMUX-3561. The nudge must ask for what its RECIPIENT can do.
-    ///
-    /// It said "verify each in prod or archive if superseded" to a lane that
-    /// cannot verify: the resolved `verified` gate in a reviewing group requires
-    /// a DIFFERENT worker who checked it themselves. Measured 2026-08-23 —
-    /// 3,383 unarchived `done` cards fleet-wide, 141 naming a reviewer, so 96%
-    /// of what this listed could not be advanced by the lane reading it, 25-50
-    /// times a day.
-    ///
-    /// AMUX-2903 narrowed the TRIGGER for exactly this reason and left the
-    /// sentence doing the thing the narrowing was for.
     #[test]
-    fn the_done_section_asks_for_a_reviewer_when_none_is_named() {
-        let blocked = vec![("B-1".to_string(), "a blocker".to_string())];
-        let done = vec![
-            ("D-1".to_string(), "shipped a thing".to_string(), String::new()),
-            ("D-2".to_string(), "shipped another".to_string(), String::new()),
-        ];
-        let t = continue_nudge_text(1, 2, &blocked, &done, &[]);
-
-        assert!(
-            t.contains("amux board reviewer"),
-            "the ONE step the lane can take must be named: {t}"
-        );
-        assert!(t.contains("(no reviewer)"), "each card must say whether it has one: {t}");
-        assert!(
-            !t.contains("verify each in prod"),
-            "it must NOT instruct a verification the recipient cannot perform — that \
-             sentence is the defect: {t}"
-        );
-
-        // AND THE OTHER BRANCH, which is the control: when a reviewer IS named
-        // the ask changes, so this is not just a blanket removal of the verify
-        // instruction. A fix that deleted the sentence unconditionally would
-        // pass the assertions above and fail here.
-        let reviewed = vec![(
-            "D-3".to_string(),
-            "shipped".to_string(),
-            "amux-frustrations".to_string(),
-        )];
-        let t2 = continue_nudge_text(1, 1, &blocked, &reviewed, &[]);
-        assert!(t2.contains("reviewer: amux-frustrations"), "name the peer: {t2}");
-        assert!(
-            t2.contains("amux board ask") && !t2.contains("amux board reviewer"),
-            "with a reviewer named, the ask becomes chasing THEM, not naming one: {t2}"
-        );
+    fn continuation_reads_current_contract_instead_of_inventing_foreign_review_debt() {
+        for reviewer in ["", "peer-lane"] {
+            let done=vec![("D-1".into(),"shipped outcome".into(),reviewer.into())];
+            let text=continue_nudge_text(0,1,&[],&done,&[]);
+            assert!(text.contains("/api/board/contract?card=<id>"));
+            assert!(text.contains("Done is terminal for non-runtime outcomes"));
+            assert!(text.contains("code, ops, blocker and tripwire outcomes still require verified"));
+            assert!(!text.contains("amux board reviewer") && !text.contains("blocked on someone else"));
+            assert!(text.contains("actual results") && text.contains("explicit authorization holds"));
+            assert!(text.contains("D-1"));
+        }
     }
 
-    /// AMUX-3819: `done` is a resting place, and the drive must not say
-    /// otherwise.
-    ///
-    /// The closing sentence read "keep going until everything is verified,
-    /// archived, or genuinely blocked", which is STRICTER THAN THE RULE IT
-    /// ENFORCES — the owner's wording is "you MAY move an issue to `verified`
-    /// only after ALL of these hold". Permission with a bar, not an obligation.
-    /// Enforcing the stricter reading converts an opt-in ladder into a standing
-    /// debt: amux-frustrations reported 143 done cards of which ~112 name no
-    /// reviewer and therefore cannot advance at all, and asked what routes them
-    /// to a peer. Nothing should. Nobody decided those 112 warranted a peer's
-    /// time; this sentence decided it for them.
-    #[test]
-    fn the_drive_does_not_demand_verification_of_every_done_card() {
-        let done: Vec<(String, String, String)> =
-            (0..3).map(|i| (format!("D-{i}"), "shipped".into(), String::new())).collect();
-        let t = continue_nudge_text(0, 3, &[], &done, &[]);
-
-        assert!(t.contains("done, verified, archived"), "`done` must be a listed terminal: {t}");
-        assert!(
-            t.contains("legitimate resting place") && t.contains("not a backlog"),
-            "and the done section must say so, or the closing line is the only signal: {t}"
-        );
-        // THE CONTROL, and the reason this is not just deleting the ask: the
-        // step a lane CAN take is still named, and still framed as a judgement
-        // about which cards warrant a peer rather than as coverage of all of
-        // them. A version that dropped the reviewer mechanics entirely would
-        // pass both assertions above and remove the only path to `verified`.
-        assert!(t.contains("amux board reviewer"), "the mechanics stay available: {t}");
-        assert!(
-            t.contains("worth a peer's time"),
-            "framed as judgement, not as a quota to clear: {t}"
-        );
-        // And the count is still REPORTED. Hiding the number would be the
-        // opposite failure to demanding it be zero.
-        assert!(t.contains("3 of the 3") || t.contains("name no reviewer"), "{t}");
-    }
 }
 
 fn last_continue_nudge_counts(conn: &Connection, lane: &str) -> Option<(i64, i64)> {
@@ -4258,102 +4229,24 @@ fn continue_nudge_text(
         if done_count > done.len() as i64 {
             lines.push(format!("  ... and {} more", done_count - done.len() as i64));
         }
-        // ASK FOR WHAT THE RECIPIENT CAN ACTUALLY DO (AMUX-3561).
-        //
-        // This said "verify each in prod or archive if superseded" — an
-        // instruction the lane cannot follow for almost any card it names. The
-        // resolved `verified` gate in a reviewing group requires "Peer-reviewed
-        // by a DIFFERENT worker (name them)" and "That peer verified it
-        // themselves": unsatisfiable by the author BY CONSTRUCTION. Measured
-        // 2026-08-23: 3,383 unarchived `done` cards fleet-wide, 141 naming a
-        // reviewer — 4.2%. So 96% of what this section listed could not be
-        // advanced by the lane reading it, ~25-50 times a day.
-        //
-        // AMUX-2903 already fixed the TRIGGER for this reason and its comment
-        // says the done count "still rides along in the message as context".
-        // It did not ride as context; it rode as an imperative. The trigger was
-        // narrowed and the sentence was left doing the thing the narrowing was
-        // for. Ethos rule 3 survives a fix aimed at its cause if the wording is
-        // not fixed too.
-        //
-        // What a lane CAN do is name the peer, and that is now the ask — which
-        // also produces the exact input the gate requires (12af7ab refuses a
-        // `verified` transition with no reviewer), so the nudge starts feeding
-        // the gate instead of demanding an output the recipient cannot make.
-        // `done` IS A RESTING PLACE (AMUX-3819). The owner's own rule reads
-        // "You MAY move an issue to `verified` only after ALL of these hold" —
-        // a permission with a bar on it, not an obligation. This nudge used to
-        // tell every lane to name a reviewer for every done card, which turns
-        // an opt-in ladder into a standing debt: amux-frustrations reported 143
-        // done cards of which ~112 name no reviewer, and asked, correctly, what
-        // routes them. Nothing should. Nobody decided those 112 warranted a
-        // peer's time; the nudge decided it for them.
-        //
-        // So the ask is now about JUDGEMENT rather than coverage: which of
-        // these is worth a peer, and the mechanics for that one. A count of
-        // unreviewed cards is still reported, because the number is real and
-        // hiding it would be the opposite failure.
-        let unreviewed = done.iter().filter(|(_, _, rv)| rv.is_empty()).count();
-        let ask = if unreviewed > 0 {
-            format!(
-                "{done_count} done card(s); {unreviewed} of the {} listed name no reviewer. \
-                 `done` is a legitimate resting place and most cards belong there — \
-                 `verified` is for work whose correctness is worth a peer's time, and it \
-                 needs a DIFFERENT worker who checked it themselves, which you cannot \
-                 supply on your own. If any of these IS worth that, name the peer: \
-                 `amux board reviewer <id> <peer-session>`. Archive the ones that were \
-                 superseded. Leaving the rest in `done` is not a backlog.",
-                done.len()
-            )
-        } else {
-            // AF-695: this used to point at `amux board ask <id>`, which does
-            // not do what this sentence claims. `ask`/`status_request` pings
-            // the card's OWNER for a status report and ignores `reviewer`
-            // entirely, and it refuses outright on ANY terminal status
-            // (TERMINAL_STATUSES includes `done`) regardless of who it would
-            // have pinged. Measured by mixpeek-funnel: 8 of 8 done+reviewer
-            // cards refused. The verb that actually notifies the named
-            // reviewer is a transition INTO `review` (reviewer_notify fires
-            // there, board.rs AMUX-3771), which is not terminal and keeps the
-            // already-named reviewer if none is passed.
-            //
-            // NOT UNIVERSAL (mixpeek-funnel, ran this against a real batch):
-            // `review`'s gate is TYPE-SCOPED, and for `code` it asks for
-            // "Implemented and self-tested" + "Diff / PR is up" -- both false
-            // for a card whose work has not actually shipped (blocked on
-            // something else, superseded mid-flight). Moving THAT card to
-            // review would force the same false attestation the sibling nudge
-            // arm above already warns about. 6 of 8 in the real batch moved
-            // cleanly; the other 2 were exactly this case.
-            format!(
-                "{done_count} done card(s), each with a reviewer named — put them back in \
-                 review so the reviewer is actually notified (`amux board review <id>`, the \
-                 named reviewer is preserved), or verify the ones where YOU are the named \
-                 reviewer. Archive instead if the work was superseded. If the card is `code` \
-                 typed and the work genuinely has not shipped, `review`'s gate cannot be \
-                 attested honestly either -- leave it in `done` rather than attest either \
-                 gate falsely. `amux board ask <id>` does NOT reach a reviewer here: it pings \
-                 the card's OWNER for a status report, and it refuses outright on any \
-                 terminal status including `done` (measured by mixpeek-funnel, 2026-09-10: \
-                 8 of 8 refused). AF-695 has detail."
-            )
-        };
+        let ask = format!(
+            "{done_count} done card(s) remain. Read GET /api/board/contract?card=<id> for each \
+             current gate and type. Done is terminal for non-runtime outcomes; \
+             code, ops, blocker and tripwire outcomes still require verified. Own that verification: reproduce current output, record checks \
+             and actual results, and advance only when every resolved criterion holds. A named \
+             reviewer is context, not a reason to wait on another worker. Do not re-open work just \
+             to notify a reviewer or fabricate a peer sign-off. If code has not shipped, satisfy \
+             its actual merge/deployment gates first. Preserve explicit authorization holds."
+        );
         sections.push(format!("{ask}\n{}", lines.join("\n")));
     }
 
     format!(
-        // `done` IS IN THE LIST NOW (AMUX-3819). This sentence made `verified`
-        // the only non-archive terminal state, which is stricter than the rule
-        // it is enforcing: the owner's own wording is "you MAY move an issue to
-        // `verified` only after ALL of these hold". Permission with a bar, not
-        // an obligation — and a drive that says "keep going until everything is
-        // verified" converts an opt-in ladder into a standing debt for every
-        // lane, which is what produced a 143-card pile with ~112 unreviewable
-        // by construction.
         "[amux auto-continue] Your todo queue is empty but you still have \
          outstanding work:\n\n{}\n\n\
-         Keep going until everything is done, verified, archived, or genuinely \
-         blocked on someone else. Don't stop between cards.",
+         Complete each outcome through its type's terminal state. Own prerequisites on this board; \
+         another worker's availability is not a dependency. Preserve actual access and authorization \
+         restrictions, record a precise blocker when necessary, and continue independent work.",
         sections.join("\n\n")
     )
 }
@@ -4771,53 +4664,15 @@ pub fn select_advance_with(
         }
     }
 
-    // NO `done` TIER (py:13460, Ethan 2026-08-08: "we shouldnt be sending
-    // commands to idle workers that genuinely have no more work"). `done` was
-    // briefly selected here so something drove done->verified. Removing it was
-    // right on its own terms: this loop re-woke lanes per card, per cooldown —
-    // 294 advance nudges/day against 25 human prompts, 46% repeats, each wake
-    // replaying a 400-600k context. A lane whose only remaining cards are `done`
-    // has nothing IN FLIGHT.
-    //
-    // THE HANDOFF NAMED HERE DOES NOT EXIST (AMUX-2782). This comment used to
-    // say "the daily verification sweep took that job and does it better — one
-    // batched message once a day". There is no such sweep. Searched: every
-    // `jobs::spawn_loop` registration in lib.rs (board-drive, autofix,
-    // commit-nudge, ghost-rescue, pipe-reconcile, invariants-monitor,
-    // event-processors, orchestrator-runtime, scan, bootstrap, self-adopt,
-    // legacy-port); all 114 schedules, where the only ENABLED sweeps are LOG
-    // sweeps (SCHED-329, SCHED-331 — docs/rust-migration/log-sweep.md, a
-    // different contract that the name collides with) and the amux lane's own
-    // SCHED-276 board-triage entry is enabled=0; and the whole repo, where the
-    // sole hit for "verification sweep" was THIS COMMENT citing itself.
-    //
-    // The claim is deleted rather than kept, per ethos rule 6: implement the
-    // promise or delete it — an unimplemented handoff that reads as implemented
-    // is what stopped anyone checking for three days.
-    //
-    // MEASURED CONSEQUENCE, cards reaching `verified` per day:
-    //     08-07: 256   08-08: 121 (tier removed)   08-09: 38   08-10: 2
-    // against 1,153 unarchived `done` cards, 876 of them older than a day. The
-    // count is a last-touch proxy (`updated`; only 29 rows carry
-    // `last_verified_at`), which INFLATES recent days rather than deflating
-    // them, so the collapse is a floor, not an artefact.
-    //
-    // DO NOT FIX THIS BY RE-ADDING THE TIER — that was removed with a
-    // measurement and the owner's words behind it. What replaces it is an open
-    // design question that pairs with AMUX-2466's NEEDS-YOU on whether
-    // fleet-wide `verified` is the right gate at all.
-    //
-    // CANDIDATES, not LIMIT 1 (py:13439, AMUX-2498). Taking the single
-    // highest-priority card meant an exhausted per-card budget silenced every
-    // OTHER card the lane held — and because the ordering puts `doing` first, a
-    // lane that peer-reviews continuously always has a populated review tier, so
-    // the lanes using reviewers most were starved hardest.
+    // Done runtime outcomes use the separate batched verifier. Scan the complete
+    // Doing/Review frontier so a held or suppressed candidate cannot starve its
+    // siblings. At most one delivery is accepted per lane/tick.
     let mut cands: Vec<(String, String)> = conn
         .prepare(
             "SELECT id, status FROM issues WHERE session=?1 AND deleted IS NULL \
              AND COALESCE(archived,0)=0 AND status IN ('doing','review') AND owner_type='agent' \
              AND NOT (COALESCE(type,'')='epic' AND status='doing') \
-             ORDER BY CASE status WHEN 'doing' THEN 0 ELSE 1 END, updated DESC LIMIT 40",
+             ORDER BY CASE status WHEN 'doing' THEN 0 ELSE 1 END, updated DESC, id ASC",
         )
         .and_then(|mut st| {
             st.query_map(rusqlite::params![session], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -4845,12 +4700,40 @@ pub fn select_advance_with(
             cands.insert(0, c);
         }
     }
-    let Some((card_id, status)) = cands.into_iter().next() else {
-        return Advance::None {
-            reason: "no-open-card",
-            detail: "no agent-owned doing/review card to drive".into(),
-        };
-    };
+    let mut refusal = Advance::None { reason: "no-open-card", detail: "no agent-owned doing/review card to drive".into() };
+    for (card_id, status) in cands {
+        let next = advance_card(conn, session, tags, now, reviewer_unreachable, card_id, status);
+        if let Advance::Nudge { target, card, text, .. } = &next {
+            let measured = (|| -> rusqlite::Result<bool> {
+                let Some(row) = bs::get_issue(conn, card)? else { return Ok(false) };
+                let started: f64 = conn.query_row(
+                    "SELECT coalesce(max(ts),0) FROM session_events WHERE session=?1 AND type='session.started'",
+                    [target], |r| r.get(0))?;
+                let identity = reminder_identity(target, text, &row, started);
+                let (sent, queued) = crate::api::session_verbs::state_reminder_status(conn, target, &identity)?;
+                Ok(sent || queued.is_some_and(|(_, rev)| rev == Some(row.rev)))
+            })();
+            match measured {
+                Ok(true) => {
+                    tracing::debug!(session, card, measured=true, n_considered=1,
+                        verdict="advance_suppressed_candidate_yielded", "unchanged reminder yields to the next candidate");
+                    refusal = Advance::None { reason: "unchanged-reminder", detail: format!("{card}: same state already queued or delivered") };
+                    continue;
+                }
+                Err(error) => return Advance::None { reason: "reminder-unmeasured", detail: error.to_string() },
+                Ok(false) => return next,
+            }
+        }
+        refusal = next;
+    }
+    refusal
+}
+
+fn advance_card(
+    conn: &Connection, session: &str, tags: &[String], now: f64,
+    reviewer_unreachable: &dyn Fn(&str, &str) -> Option<String>,
+    card_id: String, status: String,
+) -> Advance {
     let Ok(Some(row)) = bs::get_issue(conn, &card_id) else {
         return Advance::None { reason: "card-vanished", detail: card_id };
     };
@@ -6359,10 +6242,14 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 // post-start selector sends the complete candidate set.
                 Resume::Conflicting { .. } => true,
                 Resume::Current { .. } => true,
-                Resume::None => matches!(
-                    select_pickup(&conn, lane, now_f64()),
-                    Pickup::Claim { .. } | Pickup::DrainBacklog { .. }
-                ),
+                Resume::None => {
+                    matches!(select_pickup(&conn, lane, now_f64()), Pickup::Claim { .. } | Pickup::DrainBacklog { .. })
+                        || matches!(select_advance(&conn, lane, &fleet.tags(lane), now_f64()),
+                            Advance::Nudge { kind: "advance-nudged" | "decompose-asked", .. })
+                        || (eligible == 0 && open_execution_count(&conn,lane).ok() == Some(0)
+                            && !verify_batch_pending(&conn,lane,now_f64())
+                            && !done_verify_candidates(&conn,lane).is_empty())
+                },
             },
             Err(_) => return LaneTrace::skip(lane, "store-unavailable", "could not preflight stopped worker")
                 .with_counts(eligible, open),
@@ -6742,10 +6629,9 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
         // already sent about a raw prompt is not an executable task claim.
         let capture_exempt = state.store.read().ok()
             .and_then(|conn| bs::get_issue(&conn, &card).ok().flatten())
-            .is_some_and(|row| bs::is_capture_shell(&row));
+            .is_some_and(|row| bs::is_capture_shell(&row) || row.item_type == "epic");
         let recovery = matches!(&pickup, Pickup::ReclaimStale { card: stale, .. } if stale == &card)
-            || (capture_exempt
-                && matches!(&pickup, Pickup::Claim { .. } | Pickup::DrainBacklog { .. }));
+            || capture_exempt;
         if !recovery || fleet.active_child_work(lane) {
             return LaneTrace::skip(lane, "active-claim-current",
                 format!("{card} remains the exact runtime card ({cause}); canonical advancement: {} — {}",
@@ -7001,6 +6887,7 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
         Pickup::None { reason, detail } => {
             // Before generic verification/triage: missing continuations and
             // parked Backlog were invisible to the old blocked-only nudge.
+            let mut unchanged_recoveries = 0;
             if fleet.auto_continue_enabled(lane) && dispatch_backlog_when_idle(lane) {
                 let recovery_lane = lane.to_string();
                 let recoveries = state.store.read_async(move |conn| {
@@ -7031,13 +6918,7 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                         }
                     }
                 }
-                if considered > 0 {
-                    // Do not spend a generic triage/continue turn on the same
-                    // work that already has a durable specific recovery.
-                    return LaneTrace::skip(lane, "blocker-recovery-unchanged",
-                        format!("{considered} parked/incomplete cards already reviewed or queued; waiting for a substantive change"))
-                        .with_counts(eligible, open);
-                }
+                unchanged_recoveries = considered;
             }
             // VERIFY NUDGE — options A+B. When a session has no todo/doing/
             // review work but holds `done` cards, nudge it to verify them.
@@ -7047,12 +6928,13 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
             //   - 24h cooldown (the old tier nudged per card per cooldown)
             //   - the session decides what to verify, not the loop
             let verify_trace = 'verify: {
-                if eligible > 0 || open > 0 {
-                    break 'verify None;
+                if eligible > 0 { break 'verify None; }
+                let Ok(conn) = state.store.read() else { break 'verify None; };
+                match open_execution_count(&conn, lane) {
+                    Ok(0) => {},
+                    Ok(_) => break 'verify None,
+                    Err(error) => break 'verify Some(format!("execution population unmeasured: {error}")),
                 }
-                let Ok(conn) = state.store.read() else {
-                    break 'verify None;
-                };
                 let total = done_card_count(&conn, lane);
                 if total == 0 {
                     break 'verify None;
@@ -7067,6 +6949,10 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 if cards.is_empty() {
                     break 'verify None;
                 }
+                let contracts: serde_json::Map<String, Value> = cards.iter().filter_map(|(id,_,_)|
+                    verification_contract(&conn,id).ok().flatten().map(|signature|(id.clone(),json!(signature)))
+                ).collect();
+                if contracts.len() != cards.len() { break 'verify Some("verification contracts unmeasured".into()); }
                 drop(conn);
                 let text = verify_nudge_text(&cards, total);
                 if let Err(error) = fleet.deliver_work(lane, &text).await {
@@ -7076,13 +6962,13 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                     state,
                     lane,
                     "verify.nudge",
-                    Some(json!({"done_count": total, "cards": cards.iter().map(|(id,_,_)| id.as_str()).collect::<Vec<_>>()})),
+                    Some(json!({"done_count": total, "cards": cards.iter().map(|(id,_,_)| id.as_str()).collect::<Vec<_>>(), "contracts":contracts})),
                     None,
                     "board-drive",
                 )
                 .await;
-                tracing::info!(session = lane, total, batch_size = cards.len(),
-                    verdict = "verify_batch_queued",
+                tracing::info!(session = lane, total, batch_size = cards.len(), unchanged_recoveries,
+                    measured=true, n_considered=total, verdict = "verify_batch_queued",
                     "board_drive: verification batch accepted; next batch becomes eligible when these cards are resolved");
                 return LaneTrace::acted(
                     lane,
@@ -7092,6 +6978,15 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 )
                 .with_counts(eligible, open);
             };
+
+            if unchanged_recoveries > 0 {
+                // Suppress generic repetition of the held work, not unrelated
+                // verification. Preserve the real holds and their diagnostics.
+                let verify = verify_trace.map(|v| format!(" | verify: {v}")).unwrap_or_default();
+                return LaneTrace::skip(lane, "blocker-recovery-unchanged",
+                    format!("{unchanged_recoveries} parked/incomplete cards already reviewed; independent verification considered{verify}"))
+                    .with_counts(eligible, open);
+            }
 
             // BACKLOG TRIAGE NUDGE. Sessions accumulate backlog cards
             // (findings, investigations, decomposed work) that nobody ever
@@ -8801,12 +8696,12 @@ mod tests {
     /// reviewer (`amux board review`, which fires `reviewer_notify` on entry
     /// into `review`) and must not recommend `ask` for this population.
     #[test]
-    fn the_reviewer_named_nudge_recommends_review_not_ask() {
+    fn the_reviewer_named_nudge_keeps_verification_on_the_owners_board() {
         let done = vec![("D-1".to_string(), "a done card".to_string(), "peer-lane".to_string())];
         let text = continue_nudge_text(0, 1, &[], &done, &[]);
         assert!(
-            text.contains("amux board review"),
-            "must recommend the verb that notifies the named reviewer: {text}"
+            text.contains("Own that verification") && text.contains("/api/board/contract"),
+            "must resolve the actual gate locally instead of adding a peer wait: {text}"
         );
         assert!(
             !text.contains("ask them to verify"),
@@ -9186,7 +9081,7 @@ mod tests {
 
         let text = verify_nudge_text(&cards, total);
         assert!(text.contains("... and 3 more"), "11 - 8 = 3; got: {text}");
-        assert!(text.contains("11 of your"), "the headline must state the true total");
+        assert!(text.contains("11 runtime-changing"), "the headline must state the true total");
         // Every listed card must actually appear, or the list and the count
         // describe different sets.
         for (id, _, _) in &cards {
@@ -9720,6 +9615,140 @@ mod tests {
         assert_eq!(drive_status(&store, "REAL"), "doing");
         assert_eq!(drive_status(&store, "SHELL"), "doing", "never silently discard the user's captured request");
         assert_eq!(fleet.delivered.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reviewed_blocker_yields_to_independent_verification_and_preserves_hold() {
+        let (_dir, state, store) = drive_state();
+        drive_card(&store, "HELD", "backlog", "agent", "code");
+        drive_card(&store, "READY", "done", "agent", "code");
+        store.write(|conn| {
+            conn.execute("UPDATE issues SET blocked_on='explicit owner deployment hold' WHERE id='HELD'", [])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let fleet = BoundaryFleet::default();
+        assert_eq!(drive_lane(&state, &fleet, "lane").await.outcome, "blocker-recovery");
+        let second = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(second.outcome, "verify-nudge", "{second:?}");
+        assert_eq!(second.card.as_deref(), Some("READY"));
+        assert_eq!(drive_status(&store, "HELD"), "backlog");
+        assert_eq!(drive_events(&store, "task.blocker_recovery"), 1);
+        assert_eq!(drive_lane(&state, &fleet, "lane").await.reason, "blocker-recovery-unchanged");
+        assert_eq!(fleet.delivered.lock().unwrap().len(), 2, "neither held work nor unchanged verification repeats");
+    }
+
+    #[tokio::test]
+    async fn container_and_already_asked_capture_do_not_hide_child_verification() {
+        for capture in [false, true] {
+            let (_dir, state, store) = drive_state();
+            drive_card(&store, "CONTAINER", "doing", "agent", if capture { "code" } else { "epic" });
+            drive_card(&store, "CHILD", "done", "agent", "code");
+            drive_claim(&store, "CONTAINER");
+            if capture {
+                store.write(|conn| {
+                    conn.execute("UPDATE issues SET creator='amux',source='capture',desc='**Prompt:** continue please' WHERE id='CONTAINER'", [])?;
+                    conn.execute("INSERT INTO session_events(ts,session,type,data,idem) VALUES(1,'lane','advance.nudged','{}','decompose:CONTAINER')", [])?;
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                }).unwrap();
+            }
+            let fleet = BoundaryFleet::default();
+            let result = drive_lane(&state, &fleet, "lane").await;
+            assert_eq!(result.outcome, "verify-nudge", "capture={capture}: {result:?}");
+            assert_eq!(drive_status(&store, "CONTAINER"), "doing", "selection never fabricates completion");
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_verification_progress_offers_other_cards_without_repeating_unresolved_ones() {
+        let (_dir, state, store) = drive_state();
+        for n in 0..10 { drive_card(&store, &format!("VERIFY-{n}"), "done", "agent", "code"); }
+        let fleet = BoundaryFleet::default();
+        assert_eq!(drive_lane(&state, &fleet, "lane").await.outcome, "verify-nudge");
+        assert_eq!(drive_events(&store, "verify.nudge"), 1);
+        drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(drive_events(&store, "verify.nudge"), 1, "no progress means no extra paid turn");
+        store.write(|conn| {
+            conn.execute("UPDATE issues SET status='verified' WHERE id='VERIFY-0'", [])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let second = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(second.outcome, "verify-nudge", "{second:?}");
+        let messages = fleet.delivered.lock().unwrap();
+        assert!(messages[1].1.contains("VERIFY-8") && messages[1].1.contains("VERIFY-9"));
+        assert!(!messages[1].1.contains("VERIFY-1"), "unresolved member of previous batch stays quiet");
+        assert_eq!(drive_status(&store, "VERIFY-1"), "done");
+    }
+
+    #[tokio::test]
+    async fn stopped_worker_with_only_verification_work_wakes_once() {
+        let (_dir,state,store)=drive_state();
+        drive_card(&store,"DONE","done","agent","code");
+        let fleet=BoundaryFleet::default();
+        fleet.running.store(false,std::sync::atomic::Ordering::SeqCst);
+        let result=drive_lane(&state,&fleet,"lane").await;
+        assert_eq!(result.outcome,"verify-nudge","{result:?}");
+        assert_eq!(fleet.starts.load(std::sync::atomic::Ordering::SeqCst),1);
+        fleet.running.store(false,std::sync::atomic::Ordering::SeqCst);
+        drive_lane(&state,&fleet,"lane").await;
+        assert_eq!(fleet.starts.load(std::sync::atomic::Ordering::SeqCst),1,"unchanged batch cannot repeatedly restart a worker");
+    }
+
+    #[tokio::test]
+    async fn changed_verification_gate_rearms_once_but_log_churn_does_not() {
+        let (_dir, state, store) = drive_state();
+        drive_card(&store,"DONE","done","agent","code");
+        let fleet=BoundaryFleet::default();
+        assert_eq!(drive_lane(&state,&fleet,"lane").await.outcome,"verify-nudge");
+        store.write(|c| {
+            c.execute("UPDATE issues SET rev=rev+1,log='checked again' WHERE id='DONE'",[])?;
+            Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
+        }).unwrap();
+        drive_lane(&state,&fleet,"lane").await;
+        assert_eq!(drive_events(&store,"verify.nudge"),1);
+        store.write(|c| {
+            c.execute("INSERT INTO session_gates(session,status,gate) VALUES('lane','verified',?1)", [json!(["Reproduce the current output with recorded evidence"]).to_string()])?;
+            Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
+        }).unwrap();
+        assert_eq!(drive_lane(&state,&fleet,"lane").await.outcome,"verify-nudge");
+        drive_lane(&state,&fleet,"lane").await;
+        assert_eq!(drive_events(&store,"verify.nudge"),2);
+        assert_eq!(drive_status(&store,"DONE"),"done");
+    }
+
+    #[test]
+    fn asked_capture_prefix_cannot_hide_review_work_beyond_the_old_scan_limit() {
+        let conn = board_db();
+        for n in 0..45 {
+            let id=format!("RAW-{n}");
+            add_card(&conn,&id,"lane","doing","1","**Prompt:** 1. Fix parser");
+            conn.execute("UPDATE issues SET creator='amux',source='capture' WHERE id=?1",[&id]).unwrap();
+            conn.execute("INSERT INTO session_events(ts,session,type,data,idem) VALUES(1,'lane','advance.nudged','{}',?1)",
+                [format!("decompose:{id}")]).unwrap();
+        }
+        add_card(&conn,"REVIEW","lane","review","Verify the parser bounds","SCOPE: parser regression");
+        assert!(matches!(select_advance(&conn,"lane",&[],now_f64()), Advance::Nudge { card, .. } if card == "REVIEW"));
+    }
+
+    #[test]
+    fn advance_scans_past_asked_captures_and_confirmed_reminders() {
+        let conn = board_db();
+        add_card(&conn, "RAW", "lane", "doing", "1", "**Prompt:** 1. Fix parser");
+        add_card(&conn, "REVIEW", "lane", "review", "Verify parser bounds", "SCOPE: parser regression");
+        conn.execute("UPDATE issues SET creator='amux',source='capture' WHERE id='RAW'", []).unwrap();
+        conn.execute("INSERT INTO session_events(ts,session,type,data,idem) VALUES(1,'lane','advance.nudged','{}','decompose:RAW')", []).unwrap();
+        let next = select_advance(&conn, "lane", &[], now_f64());
+        assert!(matches!(&next, Advance::Nudge { card, .. } if card == "REVIEW"));
+        let Advance::Nudge { target, card, text, .. } = next else { unreachable!() };
+        let row = bs::get_issue(&conn, &card).unwrap().unwrap();
+        let identity = reminder_identity(&target, &text, &row, 0.0);
+        conn.execute("INSERT INTO steering_history(id,session,text,queued_at,delivered_at,outcome) VALUES(?1,'lane',?2,1,2,'sent')",
+            rusqlite::params![format!("{identity}:{}", row.rev), text]).unwrap();
+        add_card(&conn, "OTHER", "lane", "review", "Verify unrelated fix", "SCOPE: separate regression");
+        conn.execute("UPDATE issues SET updated=1 WHERE id='OTHER'", []).unwrap();
+        assert!(matches!(select_advance(&conn,"lane",&[],now_f64()), Advance::Nudge { card, .. } if card == "OTHER"));
+        // A failed/voided attempt is not confirmation and must not be skipped.
+        conn.execute("UPDATE steering_history SET outcome='void:card-stale'", []).unwrap();
+        assert!(matches!(select_advance(&conn,"lane",&[],now_f64()), Advance::Nudge { card, .. } if card == "REVIEW"));
     }
 
     #[tokio::test]
@@ -12900,14 +12929,12 @@ mod tests {
         conn.execute("UPDATE issues SET reviewer='peer' WHERE id='B-1'", []).expect("rev");
         add_card(&conn, "D-1", "lane", "doing", "dependent", "SCOPE: x");
         conn.execute("UPDATE issues SET depends_on='[\"B-1\"]' WHERE id='D-1'", []).expect("dep");
-        // `doing` sorts ahead of `review`, so D-1 is the selected candidate.
-        match select_advance(&conn, "lane", &[], now_f64()) {
-            Advance::None { reason, detail } => {
-                assert_eq!(reason, "dep-not-actionable");
-                assert!(detail.contains("B-1"), "{detail}");
-            }
-            Advance::Nudge { text, .. } => panic!("must not nudge an unactionable dependency: {text}"),
-        }
+        // The dependent cannot be advanced; the independently actionable
+        // review is still considered instead of the first refusal ending the lane.
+        assert!(matches!(advance_card(&conn, "lane", &[], now_f64(), &|_,_|None,
+            "D-1".into(), "doing".into()), Advance::None { reason: "dep-not-actionable", .. }));
+        assert!(matches!(select_advance(&conn, "lane", &[], now_f64()),
+            Advance::Nudge { card, .. } if card == "B-1"));
     }
 
     /// GCA-91: the dependency nudge told an agent to "drive its blocker through

@@ -6031,19 +6031,31 @@ pub(crate) async fn steer_enqueue_idempotent_report(
     .await
 }
 
+/// Shared read-side disposition for selection and enqueue. A suppressed card
+/// must yield to another candidate, while voided attempts remain retryable.
+type StateReminderStatus = (bool, Option<(String, Option<i64>)>);
+pub(crate) fn state_reminder_status(
+    conn: &rusqlite::Connection, name: &str, identity: &str,
+) -> rusqlite::Result<StateReminderStatus> {
+    use rusqlite::OptionalExtension;
+    let prefix = format!("{identity}:*");
+    let mut stmt = conn.prepare("SELECT outcome FROM steering_history WHERE id GLOB ?1 AND session=?2")?;
+    let outcomes = stmt.query_map([&prefix, name], |r| r.get::<_, Option<String>>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let queued = conn.query_row(
+        "SELECT id,precond_rev FROM steering_queue WHERE id GLOB ?1 AND session=?2 ORDER BY queued_at LIMIT 1",
+        [&prefix, name], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+    Ok((outcomes.iter().flatten().any(|v| matches!(submit_verdict_of(v), Some("confirmed" | "retried"))), queued))
+}
+
 /// Only a confirmed prior submission suppresses this state. Voided/failed
 /// attempts are observable refusals, never mislabeled as successful delivery.
 pub(crate) async fn enqueue_state_reminder(store:&crate::db::SharedStore,name:&str,text:&str,guard:&str,card:&str,rev:i64,identity:&str)->Result<bool,String> {
-    use rusqlite::OptionalExtension;
-    let prefix=format!("{identity}:*");
-    let session=name.to_string();
-    let (already_sent,queued_id)=store.read_async(move |c| {
-        let mut stmt=c.prepare("SELECT outcome FROM steering_history WHERE id GLOB ?1 AND session=?2")?;
-        let outcomes=stmt.query_map([&prefix, &session],|r|r.get::<_,Option<String>>(0))?
-            .collect::<Result<Vec<_>,_>>()?;
-        let queued_id=c.query_row("SELECT id,precond_rev FROM steering_queue WHERE id GLOB ?1 AND session=?2 ORDER BY queued_at LIMIT 1",[&prefix, &session],|r|Ok((r.get::<_,String>(0)?, r.get::<_,Option<i64>>(1)?))).optional()?;
-        Ok((outcomes.iter().flatten().any(|v|matches!(submit_verdict_of(v),Some("confirmed"|"retried"))),queued_id))
-    }).await.map_err(|e|e.to_string())?;
+    let session = name.to_string();
+    let lookup_identity = identity.to_string();
+    let (already_sent,queued_id) = store.read_async(move |c|
+        Ok(state_reminder_status(c, &session, &lookup_identity)?)
+    ).await.map_err(|e|e.to_string())?;
     if already_sent || queued_id.as_ref().is_some_and(|(_,queued_rev)| *queued_rev == Some(rev)) { return Ok(false); }
     store.write_async(|c|{ensure_fleet_tables(c)?;Ok(crate::db::WriteOutcome{applied:false,events:vec![]})}).await.map_err(|e|e.to_string())?;
     // A revision only distinguishes previously voided attempts. Confirmed
@@ -28626,18 +28638,28 @@ CLAUDE-POSTFIX-COMPLETE
         use tokio::io::{AsyncBufReadExt, BufReader};
         use std::process::Stdio;
         let mut pane = tokio::process::Command::new("sh")
-            .args(["-c", "sh -c 'sleep 120 & wait' & echo $!; read done"])
+            .args(["-c", "sh -c 'sleep 120 & echo grandchild:$!; wait' & echo child:$!; read done"])
             .stdin(Stdio::piped()).stdout(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
         let mut lines = BufReader::new(pane.stdout.take().unwrap()).lines();
-        let child: i32 = lines.next_line().await.unwrap().unwrap().parse().unwrap();
+        // Observe both forks instead of assuming the grandchild started within
+        // 100ms on a machine running the fleet and the full test suite.
+        let mut fixture = std::collections::HashMap::new();
+        for _ in 0..2 {
+            let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+                .await.expect("process fixture did not start").unwrap().unwrap();
+            let (kind, pid) = line.split_once(':').unwrap();
+            fixture.insert(kind.to_string(), pid.parse::<i32>().unwrap());
+        }
+        let child = fixture["child"];
+        let grandchild = fixture["grandchild"];
         let mut peer = tokio::process::Command::new("sleep").arg("120").kill_on_drop(true).spawn().unwrap();
-        sleep_ms(100).await;
         let ps = run_cmd("ps", &["-axo", "pid=,ppid="], OP_TIMEOUT).await.unwrap();
         let rows: Vec<(i32,i32)> = String::from_utf8_lossy(&ps.stdout).lines().filter_map(|l| {
             let mut w = l.split_whitespace(); Some((w.next()?.parse().ok()?, w.next()?.parse().ok()?))
         }).collect();
         let descendants = descendant_pids(pane.id().unwrap() as i32, &rows);
         assert!(descendants.contains(&child));
+        assert!(descendants.contains(&grandchild));
         assert!(descendants.len() >= 2, "fixture must include a running tool grandchild");
         terminate_pane_children(pane.id().unwrap() as i32).await.unwrap();
         for pid in descendants {

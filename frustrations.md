@@ -3412,3 +3412,48 @@ CARD: CLA-3
 SYMPTOM: Active-board audit found seven cross-worker dependency edges on six cards. Delegation opt-in bypassed dependency validation, missing/unassigned references escaped it, and fan-out moved a prerequisite while leaving its dependent on the parent board. The existing fan-out retry test asserted that split ownership as success.
 COST: Repeated owner intervention to remove peer waits; six live cards required explicit ownership/next-action correction and a new regression covering the incoming side of reassignment.
 FIX: Enforce same-board graph writes in storage and API, retain connected work on its owner board during fan-out, and preserve prerequisite evidence when repairing legacy edges. Live verification also found gate refusals recommending peer reviewer/dependency waits; those now teach local completion. No model calls are needed for enforcement.
+
+
+## Idle board workers lose fallback observation after their hook expires
+AREA: scheduler
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-19
+SESSION: codex-lifecycle-adherence
+CARD: CLA-4
+SYMPTOM: In the 28-active-board audit, mvs-infra and amux displayed idle while board-drive refused their expired Active reports and did not admit a current pane probe. The fallback measurement was disabled by the same hook whose evidence had expired.
+COST: Two active workers with a combined 1,173 non-terminal outcomes could not cross the dispatch boundary at the measured snapshot.
+FIX: Admit bounded current pane measurement when a running worker's structured report expires; require a recognized idle boundary and log measured fallback recovery. Regression includes empty, unknown and busy controls.
+
+## Held reminders and epic containers suppress unrelated board completion
+AREA: board
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-19
+SESSION: codex-lifecycle-adherence
+CARD: CLA-4
+SYMPTOM: Already-delivered blocker recovery returned before verification; advancement queried 40 candidates but selected only the first; epics and raw captures blocked verification despite being exempt from pickup WIP. One unresolved verification batch member held all unoffered work for 24h. Global and amux-group Verified gates still required a different worker despite the owner's no-outside-dependency policy.
+COST: Audit found 1,689 runtime Done outcomes awaiting verification, including 44 homepage, 81 gtm-engine and 328 amux-frustrations outcomes behind unchanged blocker recovery. These are measured queued populations, not all attributed solely to this bug.
+FIX: Share execution-slot and reminder predicates; scan candidates past refusals; let independent verification pass held reminders; fingerprint batch output/contracts and release unoffered work on partial progress. Replace the live foreign-signoff criteria with owner reproduction and recorded evidence while retaining test/deployment/regression gates.
+
+## Failed command interpretation leaves a request pending without an execution owner
+AREA: board
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-19
+SESSION: codex-lifecycle-adherence
+CARD: CLA-4
+SYMPTOM: Structured intake remained opt-in, while an exhausted two-attempt receipt stayed pending indefinitely. Active-board audit found 120 raw-capture candidates; repeated legacy launches also left three byte-equivalent full-e2e assignments.
+COST: A request could consume its interpretation budget without becoming owned work, and identical fan-out copies occupied two additional Todo slots.
+FIX: Default to bounded durable intake; exhausted interpretation creates one structured intake investigation on the same board using the existing dispatcher, with original errors and usage preserved. Archive only the two proven FETC duplicates against canonical FETC-3; preserve differing same-title outcomes for semantic reconciliation.
+
+## Worker shell waits count themselves as another Git commit
+AREA: workflow
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-19
+SESSION: codex-lifecycle-adherence
+CARD: CLA-4
+SYMPTOM: Six shell commands on two active fan-out workers had waited 5–6 hours on fleet-wide pgrep -f "git commit". Their own shell command lines contain that expression, so each wait keeps itself blocked.
+COST: full-e2e-test-coverage and mixpeek-fanout-eph-MF-1239 retained live shell work with no task progress despite separate durable workspaces.
+FIX: Record exact PID/parent/worker evidence, terminate only confirmed self-matching wait shells after rechecking active lifecycle and child processes, and record the repair on their current boards. Document checkout-local bounded Git recovery; never delete another worker’s lock or treat process existence as progress.
