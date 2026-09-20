@@ -3675,6 +3675,39 @@ fn last_human_ts_from_user_messages(
     out
 }
 
+/// AMUX-4879 / last_board_change_ts. The age of a lane's most recent board
+/// transition, so `status` is never read bare.
+///
+/// `status` is an INSTANTANEOUS between-turn sample. A lane that closes a card
+/// every half hour reads `idle` on most samples and is indistinguishable from
+/// one that has not moved a card in thirty hours. That ambiguity has produced
+/// the same wrong conclusion twice: Ethan reported three fan-out workers as
+/// stalled (AMUX-4777) and the lane triaging it repeated the error, before
+/// board_change_log showed 43 transitions in the preceding 24h with the most
+/// recent 19 minutes earlier.
+///
+/// `board_change_log` is the authoritative record and already exists; it was
+/// simply never joined to the thing a reader looks at.
+///
+/// Pure and DB-free for the same reason `last_human_ts_from_user_messages`
+/// above is: the property is then testable without standing up a connection.
+/// Takes the MAX per session rather than the last row seen, because the
+/// caller's query is grouped rather than ordered and must not depend on
+/// SQLite's row order to be correct.
+fn last_board_change_from_rows(rows: &[(String, f64)]) -> BTreeMap<String, f64> {
+    let mut out: BTreeMap<String, f64> = BTreeMap::new();
+    for (session, at) in rows {
+        if session.trim().is_empty() || !at.is_finite() || *at <= 0.0 {
+            continue;
+        }
+        let slot = out.entry(session.clone()).or_insert(*at);
+        if *at > *slot {
+            *slot = *at;
+        }
+    }
+    out
+}
+
 fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
     #[cfg(test)]
     if fleet_suppressed() {
@@ -4179,6 +4212,23 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
             vec![]
         };
         let last_human_ts = last_human_ts_from_user_messages(&user_msgs);
+        // AMUX-4879. One grouped query for the whole fleet, not one per lane:
+        // this runs on every /api/sessions poll. `changed_at` is FLOAT SECONDS
+        // here, unlike `cmd_history.ts` which is milliseconds, so it is passed
+        // through unscaled.
+        let last_board_change = {
+            let rows: Vec<(String, f64)> = conn
+                .prepare(
+                    "SELECT changed_by, MAX(changed_at) FROM board_change_log \
+                     WHERE changed_by IS NOT NULL AND changed_by != '' GROUP BY changed_by",
+                )
+                .and_then(|mut stmt| {
+                    stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))
+                        .map(|rows| rows.flatten().collect())
+                })
+                .unwrap_or_default();
+            last_board_change_from_rows(&rows)
+        };
         {
             for (session, text, card_id, ts_ms) in user_msgs {
                 let card_id = card_id.filter(|id| !id.trim().is_empty());
@@ -4353,6 +4403,13 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
             v["status"] = json!(truth.status);
             v["task_board_id"] = json!(truth.card_id);
             v["last_human_ts"] = json!(last_human_ts.get(&name).copied().unwrap_or(0));
+            // AMUX-4879. Beside `status`, so `idle` is never read bare. 0 means
+            // "this lane has never moved a card", which is a real answer and is
+            // NOT the same as "just now" — the same distinction task_updated
+            // makes a few lines below. The client must not render an age it
+            // does not have.
+            v["last_board_change_ts"] =
+                json!(last_board_change.get(&name).copied().unwrap_or(0.0));
             v["runtime_board"] = json!({
                 "measured": truth.measured,
                 // `status` is the compact client contract; retain the
@@ -7161,6 +7218,66 @@ Checked, nothing of mine was at risk, no action needed from you.
         assert_eq!(out.get("a"), Some(&2_000), "the LATER row for session a must win, not the first");
         assert_eq!(out.get("b"), Some(&5_000));
         assert_eq!(out.get("c"), None, "a session with no rows must be absent, not zero");
+    }
+
+    // AMUX-4879. A lane that has moved a card recently and one that has not
+    // must be DISTINGUISHABLE, because `status` alone cannot tell them apart:
+    // it is an instantaneous between-turn sample, so a working lane reads
+    // `idle` on most samples exactly like a stalled one. That ambiguity
+    // produced the same wrong conclusion twice, from two different readers.
+    //
+    // The ordering case is the one that can actually fail. The sibling above
+    // takes the LAST row seen because its caller orders by ts ASC; this
+    // caller GROUPs instead, so row order is not guaranteed and taking the
+    // last row would silently return an older timestamp. Feeding the newest
+    // row first is what separates a real MAX from a copied idiom.
+    #[test]
+    fn last_board_change_takes_the_max_per_session_regardless_of_row_order() {
+        let rows = vec![
+            ("busy".to_string(), 3_000.5_f64),
+            ("quiet".to_string(), 10.0_f64),
+            // Deliberately OUT OF ORDER: an older row after a newer one.
+            ("busy".to_string(), 1_000.0_f64),
+        ];
+        let out = last_board_change_from_rows(&rows);
+        assert_eq!(
+            out.get("busy").copied(),
+            Some(3_000.5),
+            "the MAX must win even when the older row arrives last; a last-row-wins \
+             implementation returns 1000.0 here"
+        );
+        assert_eq!(out.get("quiet").copied(), Some(10.0));
+        assert_eq!(
+            out.get("never").copied(),
+            None,
+            "a lane that has never moved a card must be ABSENT, so the caller's \
+             unwrap_or(0.0) means 'never' rather than 'just now'"
+        );
+        assert_ne!(
+            out.get("busy").copied(),
+            out.get("quiet").copied(),
+            "a recently-active lane and a long-quiet one must not read identically; \
+             that indistinguishability is the whole defect this field exists to fix"
+        );
+    }
+
+    // Junk must not become a timestamp. A 0.0 or a NaN reaching the payload
+    // would render as an age, and the caller cannot tell a parsed-but-invalid
+    // value from an absent one once it is a number.
+    #[test]
+    fn last_board_change_drops_unusable_rows_rather_than_publishing_them() {
+        let rows = vec![
+            ("".to_string(), 500.0_f64),
+            ("zero".to_string(), 0.0_f64),
+            ("negative".to_string(), -5.0_f64),
+            ("nan".to_string(), f64::NAN),
+            ("good".to_string(), 42.0_f64),
+        ];
+        let out = last_board_change_from_rows(&rows);
+        assert_eq!(out.get("good").copied(), Some(42.0));
+        for bad in ["", "zero", "negative", "nan"] {
+            assert_eq!(out.get(bad).copied(), None, "{bad} must not reach the payload");
+        }
     }
 
     #[test]

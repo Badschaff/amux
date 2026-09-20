@@ -5005,7 +5005,7 @@ function _workerExecutionBadge(s, runtimeBoard) {
   else if (s.status === 'waiting') badge = '<span class="status-badge waiting"' + _waitingTitle(s) + '>' + _waitingLabel(s) + '</span>';
   else if (s.status === 'rate_limited') badge = '<span class="status-badge rate-limited">rate limited</span>';
   else if (s.status === 'api_error') badge = `<button type="button" class="status-badge rate-limited" title="API Error ${esc(s.api_error_code || '5xx')} — server-side and retryable. Send &quot;continue&quot;." onclick="event.stopPropagation();_openStatusDetail('${escJs(s.name)}')">API ${esc(s.api_error_code || '5xx')} ▾</button>`;
-  else if (s.status === 'idle')    badge = '<span class="status-badge idle">idle</span>';
+  else if (s.status === 'idle')    badge = '<span class="status-badge idle"' + _idleMovedTitle(s) + '>idle' + _idleMovedSuffix(s) + '</span>';
 
   return badge;
 }
@@ -6172,6 +6172,38 @@ function _taskStaleAge(s) {
   if (!s.task_board_age) return '';
   return Math.floor(s.task_board_age / 86400) + 'd';
 }
+// AMUX-4879. `idle` is an INSTANTANEOUS between-turn sample, so a lane that
+// closes a card every half hour reads idle on most samples, identically to one
+// that has not moved a card in thirty hours. That ambiguity produced the same
+// wrong conclusion twice, from two different readers: Ethan reported three
+// fan-out workers as stalled, and the lane triaging that report repeated the
+// error before board_change_log showed 43 transitions in the previous 24h.
+//
+// So idle is never rendered bare. `last_board_change_ts` (float SECONDS, from
+// board_change_log) is the discriminator.
+//
+// 0 MEANS NEVER, NOT JUST NOW. timeAgo() returns '' for 0, which would put the
+// bare badge back, so the never case is spelled out instead of left blank.
+//
+// COMPACT ON PURPOSE: this badge sits in the worker list, which has to survive
+// 375px per .claude/rules/css-mobile.md. The badge carries "19m"; the full
+// sentence goes in the title where it costs no width.
+function _idleMovedAt(s) {
+  const at = Number(s && s.last_board_change_ts);
+  return Number.isFinite(at) && at > 0 ? at : 0;
+}
+function _idleMovedSuffix(s) {
+  const at = _idleMovedAt(s);
+  if (!at) return ' · never';
+  return ' · ' + esc(timeAgo(at).replace(/ ago$/, ''));
+}
+function _idleMovedTitle(s) {
+  const at = _idleMovedAt(s);
+  return at
+    ? ' title="Idle right now. Last moved a board card ' + esc(timeAgo(at)) + '."'
+    : ' title="Idle right now, and this lane has never moved a board card."';
+}
+
 function timeAgo(epoch) {
   if (!epoch) return '';
   const diff = Math.floor(Date.now()/1000) - epoch;
@@ -11547,7 +11579,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.1003';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.1004';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
