@@ -1363,6 +1363,68 @@ pub fn title_from_prompt(text: &str) -> Option<String> {
     Some(out)
 }
 
+/// Openers that point BACKWARD: a conjunction, a preposition, or an explicit
+/// reference phrase. A message that starts with one of these modifies something
+/// already said instead of stating a request of its own, which is why it is
+/// unreadable on a card by itself ("and TS", "from the accordions").
+///
+/// Every marker carries its trailing space so the test is a word boundary:
+/// without it `"or "` would fire on "order the parts".
+const QUALIFIER_OPENERS: [&str; 26] = [
+    "and ", "also ", "and also ", "oh and ", "plus ", "but ", "or ", "& ",
+    "with respect to ", "with regard to ", "w/r/t ", "regarding ", "re: ",
+    "in addition ", "as well as ", "along with ", "same for ", "same goes ",
+    "including ", "not just ", "from ", "for ", "btw ", "by the way ",
+    "specifically ", "ditto ",
+];
+
+/// Longest a follow-on can be and still read as a modifier rather than a brief.
+/// The longest measured qualifier in `cmd_history` runs 15 words ("for whats
+/// needed that is some things dont need to exist !!! use your judgement").
+pub const QUALIFIER_MAX_WORDS: usize = 15;
+
+/// Does this prompt read as a MODIFIER of a prompt that came before it?
+///
+/// SHAPE ONLY. It says nothing about when the message arrived, and on its own
+/// it is not a verdict: the caller owns the temporal half and the referent
+/// lookup (`session_verbs::qualifier_referent`). Shape alone is what shipped
+/// before and what AMUX-4881 is about — a two-word fragment was caught by a
+/// 12-character floor while a nine-word prepositional phrase read like a
+/// sentence and passed, though both were the same thing.
+///
+/// The discriminator against a genuinely new request sent seconds later is
+/// whether the message opens by POINTING BACK **and carries no directive of its
+/// own**. Both clauses are load-bearing, and the second was learned the
+/// expensive way: a marker test alone folds "Also make the tabs
+/// keyboard-navigable please" into the card before it, which is a second
+/// DELIVERABLE wearing a conjunction. `a_human_prompt_auto_captures_and_links_a_ledger_card`
+/// pins that as a contract — "the model gets both durable commands and decides
+/// whether to relate, merge, order, or decompose them; the harness must not
+/// erase one" — and it caught this.
+///
+/// So the verb test reuses [`capture_clause_starts_task`], which already strips
+/// a leading "also "/"and "/"please " before checking, rather than inventing a
+/// second list that would drift from it.
+///
+/// Measured over the 1864 `cmd_history` prompts that have a predecessor on
+/// their own lane: 22 match the marker shape inside two minutes, 5 of those
+/// open a directive and keep their own card, and the remaining 17 are
+/// refinements of the prompt before them. The new requests that arrived just as
+/// fast ("run the fuller pg-flat-vs-dense baseline sweep", 6s) never match at
+/// all, having no marker to begin with.
+pub fn reads_as_qualifier(text: &str) -> bool {
+    let collapsed = strip_capture_prefixes(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if collapsed.is_empty() || collapsed.split_whitespace().count() > QUALIFIER_MAX_WORDS {
+        return false;
+    }
+    let lower = collapsed.to_lowercase();
+    QUALIFIER_OPENERS.iter().any(|m| lower.starts_with(m))
+        && !capture_clause_starts_task(&lower)
+}
+
 const CAPTURE_TASK_VERBS: &[&str] = &[
     "add ", "audit ", "build ", "change ", "check ", "clean ", "close ", "commit ",
     "configure ", "create ", "delete ", "deploy ", "diagnose ", "document ", "edit ",
@@ -2109,6 +2171,70 @@ mod capture_tests {
         ] {
             assert_eq!(title_from_prompt(stamped), None, "stamped opt-out: {stamped}");
         }
+    }
+
+    /// The character floor above is exactly what AMUX-4881 is about: it caught
+    /// "and TS" and let a nine-word prepositional phrase through, and both were
+    /// modifiers of the prompt sent seconds earlier. Shape has to separate
+    /// pointing BACK from stating a directive, at any length.
+    #[test]
+    fn a_follow_on_that_points_back_reads_as_a_qualifier_at_any_length() {
+        // Specimens lifted from cmd_history, with the length the old
+        // 12-character floor sorted them by.
+        for s in [
+            "and TS",                                                          // 6 chars: caught before
+            "and verified",                                                    // 12: passed before
+            "from the accordions",                                             // 19
+            "And improve the UI accordingly",                                  // 30
+            "and do the same for kd@worldlabs.ai",                             // 35
+            "with respect to the full lifecycle (standalone and orchestrate/fanout)", // 70: the incident
+            "or sedro wooley",
+            "also this could be more aesthetic",
+            "[10:39 AM] with respect to the full lifecycle (standalone and orchestrate/fanout)",
+        ] {
+            assert!(reads_as_qualifier(s), "{s:?} modifies the prompt before it");
+        }
+    }
+
+    #[test]
+    fn a_request_that_states_its_own_directive_is_not_a_qualifier() {
+        // Every one of these arrived within 30s of an unrelated prompt on its
+        // own lane and deserved the card it got. The rule has to leave them
+        // alone or it trades a dropped refinement for a buried request.
+        for s in [
+            "run the fuller pg-flat-vs-dense baseline sweep",
+            "make sure all the tickers work (including rb2b)",
+            "we should have no python, its just rust !!!!",
+            "do the ful backlog and needs:you",
+            "it should be entirely powered by mixpeek too",
+            "order the replacement drive",  // "or " must not fire mid-word
+            "format the changelog images",  // "for " likewise
+        ] {
+            assert!(!reads_as_qualifier(s), "{s:?} stands on its own");
+        }
+        // A second DELIVERABLE wearing a conjunction. Measured specimens, all
+        // within 34s of the prompt before them, all of which earned their card.
+        // `a_human_prompt_auto_captures_and_links_a_ledger_card` pins the first
+        // of these and is what found the rule folding them.
+        for s in [
+            "Also make the tabs keyboard-navigable please",
+            "and test the full lifecycle",
+            "and make sure we have statuses on every worker card",
+            "also document the constraints in this folder",
+            "also make the bounding boxes stronger (thicker lines and the font more easy to read)",
+        ] {
+            assert!(
+                !reads_as_qualifier(s),
+                "{s:?} opens a directive; a conjunction in front of work does not erase the work"
+            );
+        }
+        // A long message that happens to open with a conjunction is a brief,
+        // not a clause. The word cap is what keeps those apart.
+        let long = format!("also {}", vec!["rebuild"; QUALIFIER_MAX_WORDS].join(" "));
+        assert!(
+            !reads_as_qualifier(&long),
+            "past {QUALIFIER_MAX_WORDS} words it is its own request"
+        );
     }
 
     #[test]
