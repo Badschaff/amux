@@ -7,9 +7,10 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use super::mdai::ModelClient;
 
 static MODEL: OnceLock<Arc<dyn ModelClient>> = OnceLock::new();
-/// AMUX-4655: a model call this slow is named in a WARN. The p50 is ~20 s on
-/// the amux Mac, so a lower floor would fire on most creates and teach nothing.
-const SLOW_MODEL_MS: u64 = 60_000;
+/// Fraction of the call's own deadline at which it is named in a WARN
+/// (AMUX-4847). See [`slow_model_ms`].
+const SLOW_MODEL_DEADLINE_NUM: u64 = 3;
+const SLOW_MODEL_DEADLINE_DEN: u64 = 4;
 type LaneLocks = std::collections::HashMap<String, Weak<tokio::sync::Mutex<()>>>;
 static LOCKS: OnceLock<Mutex<LaneLocks>> = OnceLock::new();
 
@@ -33,6 +34,37 @@ fn intake_model_timeout_ms() -> u64 {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(20_000)
         .max(1_000)
+}
+
+/// The WARN threshold for a slow classifier call, DERIVED from that call's own
+/// deadline rather than written as a second literal (AMUX-4847).
+///
+/// IT WAS A LITERAL AND IT WENT DEAD. `SLOW_MODEL_MS` was 60_000, chosen when
+/// the call was unbounded and its p50 was ~20 s. Then 184cdb22 (AMUX-4836) gave
+/// the call a 20 s deadline. `model_ms` is the duration of that call, so it can
+/// never reach 60 s: the warn at the use site below became structurally
+/// unreachable, and no input could produce it. Measured over 262 intake calls
+/// on 2026-09-19 (min 1,625 / p50 3,133 / p90 4,952 / p99 9,211 / max 14,122 ms)
+/// a 60,000 ms threshold warned on 0 of 262. A fix in one place silently
+/// invalidated a check in another, and nothing connected them.
+///
+/// Deriving it is the repair for that class, not just for this instance: raise
+/// `AMUX_INTAKE_MODEL_TIMEOUT_MS` and the threshold follows, where a fresh
+/// literal would quietly go dead again.
+///
+/// THE FRACTION IS THE POINT, not a percentile. The latency story worth telling
+/// here is "the classifier came close to being killed by its own deadline", so
+/// this sits just under the bound. At the 20 s default that is 15 s, which
+/// warns on none of the 262 measured calls — correctly, because none of them
+/// came close to dying. That is a check that CAN fire and currently has nothing
+/// to say, which is a different thing from the one it replaces, which could not
+/// fire at all.
+///
+/// `intake_model_timeout_ms` floors at 1,000 ms, so this is always strictly
+/// below it and never zero. `slow_model_never_exceeds_its_own_deadline` pins
+/// that, and would have caught the original the moment the deadline landed.
+fn slow_model_ms() -> u64 {
+    intake_model_timeout_ms() / SLOW_MODEL_DEADLINE_DEN * SLOW_MODEL_DEADLINE_NUM
 }
 
 pub async fn lock(session: &str, owner: &str) -> tokio::sync::OwnedMutexGuard<()> {
@@ -281,10 +313,12 @@ pub async fn plan(store: &Store, session: &str, owner: &str, title: &str, descri
             failed
         }
     };
-    if model_ms >= SLOW_MODEL_MS {
+    let slow_ms = slow_model_ms();
+    if model_ms >= slow_ms {
         tracing::warn!(target:"amux::board_intake", verdict = "board_intake_model_slow", session, model_ms,
-            threshold_ms = SLOW_MODEL_MS, n_considered = plan.n_considered, measured = true,
-            "board intake model call was slow; the create waited on it");
+            threshold_ms = slow_ms, deadline_ms = intake_model_timeout_ms(),
+            n_considered = plan.n_considered, measured = true,
+            "board intake model call came close to its own deadline; the create waited on it");
     }
     // A matching title alone never makes an unavailable model count as measured.
     if plan.decision.action == "create" { plan.decision.task_id = None; }
@@ -650,6 +684,63 @@ mod structured_skip_tests {
 #[cfg(test)]
 mod intake_deadline_tests {
     use super::*;
+
+    /// AMUX-4847. THE CHECK THIS FILE ALREADY SHIPPED COULD NOT FIRE.
+    /// `SLOW_MODEL_MS` was a 60_000 literal while the call it measures is
+    /// aborted at 20_000, so no input reached the WARN. This is the cell that
+    /// would have caught it the moment the deadline landed, and it is the one
+    /// that keeps the pair honest as either side moves.
+    ///
+    /// Asserting a specific number would not do it: the bug was a RELATIONSHIP
+    /// between two constants, and any literal here goes stale the same way the
+    /// original did.
+    #[test]
+    fn slow_model_never_exceeds_its_own_deadline() {
+        for knob in ["", "1000", "5", "20000", "45000", "600000"] {
+            if knob.is_empty() {
+                std::env::remove_var("AMUX_INTAKE_MODEL_TIMEOUT_MS");
+            } else {
+                std::env::set_var("AMUX_INTAKE_MODEL_TIMEOUT_MS", knob);
+            }
+            let deadline = intake_model_timeout_ms();
+            let slow = slow_model_ms();
+            assert!(
+                slow < deadline,
+                "knob {knob:?}: warn threshold {slow}ms must sit BELOW the {deadline}ms \
+                 deadline, or model_ms can never reach it and the WARN is dead"
+            );
+            assert!(
+                slow > 0,
+                "knob {knob:?}: a zero threshold warns on every call, which is the \
+                 opposite failure and just as useless"
+            );
+        }
+        std::env::remove_var("AMUX_INTAKE_MODEL_TIMEOUT_MS");
+    }
+
+    /// The threshold has to track the knob, not merely sit under it. A literal
+    /// that happened to be smaller than the default would pass the test above
+    /// and still go dead the moment someone raised the deadline.
+    #[test]
+    fn raising_the_deadline_raises_the_threshold_with_it() {
+        std::env::set_var("AMUX_INTAKE_MODEL_TIMEOUT_MS", "20000");
+        let at_default = slow_model_ms();
+        std::env::set_var("AMUX_INTAKE_MODEL_TIMEOUT_MS", "40000");
+        let at_double = slow_model_ms();
+        assert!(
+            at_double > at_default,
+            "doubling the deadline must move the threshold ({at_default} -> {at_double}); \
+             a hardcoded value is how this check died the first time"
+        );
+        std::env::remove_var("AMUX_INTAKE_MODEL_TIMEOUT_MS");
+        assert_eq!(
+            slow_model_ms(),
+            15_000,
+            "at the 20s default the warn fires only within 5s of the deadline; measured \
+             2026-09-19 over 262 intakes (p50 3133, p99 9211, max 14122) this is quiet, \
+             which is a check with nothing to say rather than one that cannot speak"
+        );
+    }
 
     /// The knob is bounded below, so a misconfiguration cannot disable the
     /// comparison by making the deadline unreachably small.
