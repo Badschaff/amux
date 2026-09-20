@@ -11,6 +11,21 @@ test.beforeEach(async ({page})=>{
   allowUnusedRoute(page,'**/api/**'); // Other routes may handle every request.
 });
 
+test('workspace choices arrive without reopening a launch draft',async ({page})=>{
+  let release!:()=>void;
+  const inventory=new Promise<void>(resolve=>{release=resolve;});
+  await page.route('**/api/sessions',async r=>{await inventory;await r.fulfill({json:[workspace]});});
+  await page.goto('/');
+  await page.locator('#tab-board').click();
+  await page.locator('.launch-header').click();
+  await page.locator('#launch-input').fill('Repair the parser');
+  await expect(page.locator('#launch-session option[value="workspace"]')).toHaveCount(0);
+  release();
+  await expect(page.locator('#launch-session option[value="workspace"]')).toHaveCount(1);
+  await page.locator('#launch-session').selectOption('workspace');
+  await expect(page.locator('#launch-input')).toHaveValue('Repair the parser');
+});
+
 test('independent profiles survive a failed launch and reload with an exact retry',async ({page})=>{
   await page.route('**/api/sessions',r=>r.fulfill({json:[workspace,{...workspace,name:'paused',lifecycle:'paused',running:false},{...workspace,name:'child',ephemeral:true}]}));
   // Unavailable discovery must preserve explicit model selection, not silently

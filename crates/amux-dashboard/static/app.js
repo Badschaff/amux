@@ -11543,7 +11543,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.998';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.999';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -32304,6 +32304,8 @@ function _toggleLaunchBar() {
   if (!open) {
     _restoreLaunchDraft();
     _populateLaunchSessions();
+    // Reuse the inventory request already in flight on a cold page load.
+    if (!sessions.length) fetchSessions().then(() => { if (body.style.display !== 'none') _populateLaunchSessions(); });
     ['orchestrator','worker'].forEach(_launchLoadModels);
     _renderLaunchOverrides();
     _launchControlsState();
