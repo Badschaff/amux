@@ -10157,3 +10157,47 @@ FIX: not chosen. Two independent fixes, and they are not the same one: (1) a
  to ship unilaterally — (1) changes the create contract every caller reads, (2)
  is a new recovery primitive — but leaving (2) missing means the NEXT accidental
  delete on this fleet has the same only-option: raw SQL against production.
+
+## A wholesale "taken from #182" merge-resolution commit silently deleted a fleet-wide invariant ten hours after it shipped
+VALIDATED: amux-frustrations | Restored under AF-943 (commit 27636729): GuardCheckout, guard_reaches_every_checkout
+and its 8-cell test module (checks.rs), guard_reach_check plus two wiring tests
+(monitor.rs), registered in evaluate_all. Verified live against a real specimen:
+GET /api/debug/invariants latest_per_invariant (build 52a096e0a8f67b3f) shows three
+genuine lagging checkouts -- /Users/ethan/Dev/mixpeek (2 behind, 778 firings/28
+lanes), /Users/ethan/Dev/amux-GTM (7 behind, 5 firings/2 lanes),
+/Users/ethan/Dev/ethan.dev-minimal (7 behind, 2 firings/1 lane) -- all three also
+surfaced in GET /api/health/invariants's failures array. Registration guard
+(the_guard_reach_check_is_registered_in_evaluate_all) mutation-tested with a real
+deletion of the out.extend call via scripts/mutate.sh: reddened correctly, reverted
+cleanly. cargo test -p amux-server --lib: 2769 passed, 0 failed. cargo clippy
+--workspace --all-targets -D warnings: clean. AF-410 and AF-943 both moved to
+verified on the board with this same evidence.
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-20
+SESSION: amux-frustrations
+CARD: AF-943
+SYMPTOM: re-verifying AF-410 (`guard_reaches_every_checkout`, a self-calibrating
+ invariant catching a checkout running a stale vendored staged-guard copy — the class
+ a 689-firing false-positive storm on Mixpeek's 9-day-stale copy was about), found it
+ absent from current source. `git log -S "guard_reaches_every_checkout"` shows exactly
+ two hits: added at 0b6b4dfe (AF-410's own commit, 2026-09-02), removed ~10 hours
+ later at 9c17d990 ("fix(hooks): adopt SubagentStart as the canonical start event,
+ AMUX-4052") — a commit about an unrelated subagent-lifecycle bug whose own message
+ says "checks.rs / monitor.rs taken WHOLESALE from #182" to resolve a merge conflict.
+ Taking those two files wholesale from a parallel PR dropped AF-410's addition (the
+ function plus its 8-cell test module) as an unacknowledged side effect — nothing in
+ 9c17d990's message mentions it. Confirmed no replacement exists: grepped every
+ `-> Vec<InvariantResult>` function currently in checks.rs; the only hit,
+ `report_hooks_wired`, checks something unrelated.
+COST: unmeasured directly (no incident has recurred yet, this was caught during
+ routine verification), but the exposure is real: the exact false-positive class
+ AF-410 was built to catch (a checkout running a stale vendored guard, 689 firings
+ across 31 lanes in the original report) currently has nothing fleet-wide watching
+ for it again, and nobody would know until the next multi-lane storm.
+FIX: not yet — filed as AF-943 (re-register the invariant against current
+ monitor.rs/checks.rs shape, restore its test module, and add a registration-level
+ guard so a future wholesale file replacement in this module cannot repeat this
+ silently, following the `route.callers_have_routes`/`dead_pub_api` pattern this
+ repo already uses for the same class of loss elsewhere).

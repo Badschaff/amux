@@ -3662,3 +3662,34 @@ CARD: CLA-8
 SYMPTOM: The upload restart scenario exhausted its 30-second test budget in page.goto waiting for load, before selecting a file. The failure snapshot already showed the rendered upload workers. Waiting for every page resource made unrelated resource completion part of the upload acceptance contract.
 COST: A complete browser shard failed before reaching the upload assertions; its other 273 scenarios passed.
 FIX: Wait for DOM content and the actual worker-terminal controls. Hold an unrelated image request open in the restart scenario and assert the page is still interactive while uploads recover. The old setup fails this controlled case; all 21 upload checks pass with the new readiness condition across desktop, mobile and Safari. Log upload-readiness when the pending-resource control is observed; retain every upload byte, count, timeout and cancellation assertion.
+
+## A refused `verified` PATCH (blocked:true) read back as a demoted, wiped card moments later
+AREA: gates
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-20
+SESSION: amux-frustrations
+CARD: AF-942
+SYMPTOM: sent `PATCH /api/board/AF-940 {"status":"verified","gate_ack":true}` against
+ a card confirmed `verified` (reviewer set, evidence recorded). Response was a clean
+ refusal: HTTP 409, `blocked:true`, `code:"verified_requires_gate_checked"`,
+ `discarded:[]`. A GET moments later showed `status:"done"`, `reviewer:null`, and the
+ entire `verification` object wiped (`state:"not_verified"`, all fields null).
+ Restored the card from its own prior evidence. Could NOT reproduce on a fresh
+ scratch card driven through the identical sequence (create->done->verified->same
+ PATCH): that one returned HTTP 200 `applied:false` with no change, before or after.
+ Reading board.rs's refusal branch, it explicitly calls `no_write()` — and AF-940's
+ own durable `log` field, checked after restoring, shows NO `verified -> done`
+ transition ever recorded, though every other real transition on that card is
+ logged. That absence makes a genuine write-path bug the less likely of two
+ explanations; a stale or racy read immediately following a refused PATCH is the
+ more likely one. Neither confirmed. Spot-checked 7 other cards verified this same
+ session — all clean, so this did not recur elsewhere.
+COST: real alarm and ~20 minutes of investigation (a scratch card created and
+ discarded, a source read, a 7-card spot-check) over what a board's own audit log
+ says never happened as a write. Whether or not this is a genuine bug, a refusal
+ response and a subsequent read disagreeing about a card's state — even briefly — is
+ exactly the shape this repo's own instruments are supposed to make impossible.
+FIX: not found. Parked on AF-942 with a concrete trigger (a clean reproduction with a
+ verified immediately-before state, or a recurrence caught during a future
+ verification pass) rather than continuing to chase an unreproduced anomaly.
