@@ -3580,3 +3580,14 @@ CARD: CLA-7
 SYMPTOM: The iPhone Paused/Archived order test queried bounding boxes in separate browser calls. Normal worker refresh replaced an accordion between element resolution and measurement, returning null while its replacement was visibly ordered correctly.
 COST: The otherwise passing final Rust/browser CI run was red. A WebKit refresh diagnostic reproduced detached geometry in 38 of 60 samples.
 FIX: Measure visibility, geometry and sibling order atomically in the page; check the initial frame and five actual worker refreshes. Emit measured frame counts and all rectangles in the test log, retain positive size checks, and require the entire live worker card to end above Paused.
+
+## Successful fan-out merge leaves verification on the previous daily cooldown
+AREA: board
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-20
+SESSION: codex-lifecycle-adherence
+CARD: CLA-8
+SYMPTOM: An idle fan-out had three Done code outcomes and a successful current-head integration receipt, but board-drive still reported previous verification batch pending (24h retry). Verification identity covered the card and gate but omitted integrated output, so satisfying the merge prerequisite did not resume verification.
+COST: The completed implementation remained unverified until an explicit continuation message; a normal board tick could not distinguish that new evidence from an unchanged wait.
+FIX: Persist the successful integrated head as a durable session event and include it in verification identity. Backfill existing successful receipts at the next boundary, ignore unchanged-head retries and other workers' merges, and re-enter the existing verification/wake selector without advancing any card automatically. The regression fails on the old identity, exercises a stopped worker, and asserts repeated receipts consume no additional turns.

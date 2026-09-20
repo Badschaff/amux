@@ -3755,8 +3755,15 @@ fn verification_contract(conn: &Connection, id: &str) -> rusqlite::Result<Option
     let Some(row) = bs::get_issue(conn, id)? else { return Ok(None) };
     let gate = bs::effective_gate_configured(conn, &row, TaskStatus::Verified);
     let human_hold = row.tags.iter().any(|t| t.to_ascii_lowercase().starts_with("needs:you"));
-    let state = json!([row.id, row.session, row.status, row.item_type, row.archived,
+    let mut state = json!([row.id, row.session, row.status, row.item_type, row.archived,
         row.owner_type, human_hold, row.acceptance_criteria, row.evidence, gate]);
+    // A merge can satisfy the final prerequisite without editing the card.
+    // Keep ordinary-worker signatures unchanged and ignore integration retry
+    // timestamps, so deploying/retrying this fix cannot wake the whole fleet.
+    if let Some(head) = row.session.as_deref()
+        .map(|worker| crate::fanout_workspace::integrated_head(conn, worker)).transpose()?.flatten() {
+        state.as_array_mut().unwrap().push(json!({"integrated_head":head}));
+    }
     Ok(Some(format!("{:x}", Sha256::digest(state.to_string().as_bytes()))))
 }
 
@@ -9754,6 +9761,35 @@ mod tests {
         fleet.running.store(false,std::sync::atomic::Ordering::SeqCst);
         drive_lane(&state,&fleet,"lane").await;
         assert_eq!(fleet.starts.load(std::sync::atomic::Ordering::SeqCst),1,"unchanged batch cannot repeatedly restart a worker");
+    }
+
+    #[tokio::test]
+    async fn integrated_head_rearms_verification_once_without_daily_delay() {
+        let (_dir, state, store) = drive_state();
+        drive_card(&store, "DONE", "done", "agent", "code");
+        let fleet = BoundaryFleet::default();
+        assert_eq!(drive_lane(&state, &fleet, "lane").await.outcome, "verify-nudge");
+        let original = verification_contract(&store.read().unwrap(), "DONE").unwrap();
+        crate::fanout_workspace::record_integrated_head(&store, "other-lane", "other").await;
+        drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(drive_events(&store, "verify.nudge"), 1, "another worker's merge cannot consume a turn");
+
+        crate::fanout_workspace::record_integrated_head(&store, "lane", "first").await;
+        assert_ne!(verification_contract(&store.read().unwrap(), "DONE").unwrap(), original);
+        // A stopped provider must also wake for the newly integrated output.
+        fleet.running.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(drive_lane(&state, &fleet, "lane").await.outcome, "verify-nudge");
+        assert_eq!(fleet.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        for _ in 0..3 {
+            crate::fanout_workspace::record_integrated_head(&store, "lane", "first").await;
+            drive_lane(&state, &fleet, "lane").await;
+        }
+        assert_eq!(drive_events(&store, "fanout.integrated"), 2, "one receipt per changed worker output");
+        assert_eq!(drive_events(&store, "verify.nudge"), 2, "receipt retries cannot spend more turns");
+        crate::fanout_workspace::record_integrated_head(&store, "lane", "second").await;
+        assert_eq!(drive_lane(&state, &fleet, "lane").await.outcome, "verify-nudge");
+        assert_eq!(drive_events(&store, "verify.nudge"), 3);
+        assert_eq!(drive_status(&store, "DONE"), "done", "integration never fabricates verification");
     }
 
     #[tokio::test]

@@ -358,6 +358,40 @@ pub fn integration_status(home: &Path, name: &str) -> serde_json::Value {
     .unwrap_or(serde_json::Value::Null)
 }
 
+/// Stable output identity for verification, independent of retries and receipt
+/// timestamps. Failed or in-flight integration never replaces a successful head.
+pub(crate) fn integrated_head(conn: &rusqlite::Connection, name: &str) -> rusqlite::Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT json_extract(data,'$.head') FROM session_events WHERE session=?1 \
+         AND type='fanout.integrated' ORDER BY id DESC LIMIT 1",
+        [name], |row| row.get(0),
+    ).optional().map(Option::flatten)
+}
+
+/// Backfill an existing successful receipt as well as recording new integrations.
+/// Restart/retry of the same head is a no-op; a new head re-arms verification.
+pub(crate) async fn record_integrated_head(store: &crate::db::SharedStore, name: &str, head: &str) {
+    if head.is_empty() { return; }
+    let (worker, head) = (name.to_string(), head.to_string());
+    let result = store.write_async(move |conn| {
+        if integrated_head(conn, &worker)?.as_deref() == Some(head.as_str()) {
+            return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+        }
+        conn.execute(
+            "INSERT INTO session_events(ts,session,type,data,source) VALUES(?1,?2,'fanout.integrated',?3,'board-drive')",
+            rusqlite::params![crate::config::now_f64(), worker, serde_json::json!({"head":head}).to_string()],
+        )?;
+        tracing::info!(session=%worker,head=%head,measured=true,n_considered=1,
+            verdict="integration_rearms_verification","integrated output changed; verification may resume immediately");
+        Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+    }).await;
+    if let Err(error) = result {
+        tracing::warn!(session=name,%error,verdict="integration_verification_receipt_retry",
+            "could not record integrated output; the next board boundary retries");
+    }
+}
+
 fn write_integration_status(home: &Path, name: &str, record: &serde_json::Value) {
     let path = home
         .join("workspaces")
@@ -517,6 +551,9 @@ pub async fn queue_integration(state: &crate::api::AppState, name: &str) -> bool
         && (previous["status"] == "integrated"
             || now - previous["at"].as_f64().unwrap_or(0.0) < 300.0)
     {
+        if previous["status"] == "integrated" {
+            record_integrated_head(&state.store, name, &head).await;
+        }
         return false;
     }
     write_integration_status(
@@ -539,6 +576,9 @@ pub async fn queue_integration(state: &crate::api::AppState, name: &str) -> bool
         let (status,detail)=match result { Ok(sha)=>("integrated",format!("Remote main contains {sha}; integration checks passed or the exact head was already present")),Err(e)=>("requires_work",crate::api::session_verbs::redact_secrets(&e).chars().take(4000).collect()) };
         let record = json!({"status":status,"detail":detail,"head":head,"at":crate::config::now_f64(),"fingerprint":fingerprint,"worktree":workspace.path,"branch":workspace.branch});
         write_integration_status(&home, &name, &record);
+        if status == "integrated" {
+            record_integrated_head(&state.store, &name, &head).await;
+        }
         tracing::info!(session=%name,verdict="fanout_integration",%status,%detail,"fan-out integration outcome");
         if previous["detail"] != detail && ready_board(&state, &name).is_ok() {
             let text=format!("[amux fan-out integration] {detail}. Continue on your own board and durable worktree {}. Configure the relevant repository test/lint command with PATCH /api/sessions/{name}/config {{\"worktree_verify\":\"<command>\"}}; the harness runs it on the exact merged candidate. For a legacy workspace, first inspect your unmerged history and then set worktree_base to the exact reviewed common ancestor of HEAD and origin/main through the same configuration endpoint. Resolve conflicts and test failures locally, commit the fix, and continue every remaining outcome through its gates. Do not create cross-worker dependencies or ordinary Needs You asks. Integration is evidence, not permission to acknowledge unverified criteria.",workspace.path);
