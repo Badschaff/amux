@@ -3704,3 +3704,15 @@ CARD: CLA-10
 SYMPTOM: Live MF-1238 integration repeatedly passed candidate validation, then received Mixpeek's pre-push no-ref/non-fast-forward refusal because remote main advanced during the checks. A subsequent attempt was killed at the harness's 120-second Git deadline even though repository pre-push gates take longer. TP-1 repeatedly returned to Backlog waiting for its own unmerged commit, leaving no integration candidate. The generic failure sent ordinary Git contention back to the model.
 COST: Multiple successful check runs and model turns without a landed candidate; two separate fleet audits found the same self-trigger on TP-1.
 FIX: CLA-10 rebuilds and revalidates up to three candidates when an observed remote ref changes, then retains an automatic retry state without another model reminder. Real unchanged-ref hook failures still require repair; hooks retain a bounded 30-minute budget and immediate lifecycle cancellation. Configuration changes invalidate in-flight checks. Real bare-remote regression tests pass and fail when candidate retry is removed; full-suite results and live adoption are tracked on CLA-10.
+
+## 2026-09-20 — A fan-out verifier can silently leave the merged candidate
+SESSION: codex-lifecycle-adherence
+AREA: gates
+SEVERITY: blocks
+DATE: 2026-09-20
+CARD: CLA-10
+SYMPTOM: test-priority rewrote its validation command to cd into its original worktree, and MF-1238 used an original-worktree fallback when a file was missing from the candidate. A green command could therefore test stale source instead of the proposed main merge.
+COST: Two live fan-outs could pass checks against different bytes from their main integration candidate; the incorrect command recurred after manual correction.
+WANTED: Every integration check exercises the combined candidate; bad source-path configuration fails before it can publish an unverified merge.
+STATUS: fixed
+FIX: Reject literal original-checkout paths (including canonical and home aliases) at configuration write and at integration for persisted settings; explain candidate-relative source paths and emit fanout_verification_source_path. This catches the observed configuration error, not arbitrary shell-script behavior. A real bare-remote regression proves original/fallback commands cannot push and candidate-relative checks see both peer and child changes.

@@ -274,6 +274,31 @@ async fn integration_git<F: Fn() -> Result<(), String>>(
 /// to resolve ordinary Git contention.
 const MAIN_ADVANCED_RETRY: &str = "Remote main advanced through three integration attempts; the harness will retry automatically with a fresh candidate";
 
+/// Catch source-checkout references that accidentally validate stale bytes.
+/// This is a configuration guard, not a shell sandbox: validation scripts must
+/// still use candidate-relative source paths, including inside invoked scripts.
+pub(crate) fn validate_verification_command(workspace: &Workspace, command: &str) -> Result<(), String> {
+    for source in [&workspace.path, &workspace.repo] {
+        let mut spellings = vec![source.clone()];
+        if let Ok(path) = std::fs::canonicalize(source) {
+            spellings.push(path.to_string_lossy().into_owned());
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            if let Ok(relative) = Path::new(source).strip_prefix(Path::new(&home)) {
+                for prefix in ["~", "$HOME", "${HOME}"] {
+                    spellings.push(format!("{prefix}/{}", relative.display()));
+                }
+            }
+        }
+        if spellings.iter().filter(|s| !s.is_empty()).any(|s| command.contains(s.as_str())) {
+            tracing::warn!(session=%workspace.branch.trim_start_matches("amux/fanout/"),
+                verdict="fanout_verification_source_path", "validation references the original source checkout");
+            return Err("worktree_verify references the original worker or shared checkout. Use source paths relative to the merged candidate (for example: cd server && python -m pytest tests); remove fallback cd commands. Use a runtime installed outside those source checkouts if needed.".into());
+        }
+    }
+    Ok(())
+}
+
 pub async fn integrate<F: Fn() -> Result<(), String>>(
     workspace: &Workspace,
     verification: &str,
@@ -333,6 +358,7 @@ async fn integrate_attempt<F: Fn() -> Result<(), String>>(
     if verification.trim().is_empty() {
         return Err("Set CC_WORKTREE_VERIFY to the repository's validation command; the harness will run it on the merged candidate".into());
     }
+    validate_verification_command(workspace, verification)?;
     let temp = tempfile::Builder::new()
         .prefix("amux-integrate-")
         .tempdir()
@@ -859,6 +885,31 @@ mod tests {
             main
         );
         assert!(Path::new(&w.path).join("child.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn verification_cannot_pass_against_original_checkout_or_fallback_to_it() {
+        let (_d, w) = fixture().await;
+        commit(&w, "child.txt", "child\n").await;
+        std::fs::write(Path::new(&w.repo).join("peer.txt"), "peer\n").unwrap();
+        git(&w.repo, &["add", "peer.txt"]).await.unwrap();
+        git(&w.repo, &["commit", "-m", "peer"]).await.unwrap();
+        git(&w.repo, &["push", "origin", "main"]).await.unwrap();
+        let before = git(&w.repo, &["rev-parse", "origin/main"]).await.unwrap();
+        for command in [
+            format!("cd '{}' && test -f child.txt && test ! -f peer.txt", w.path),
+            format!("test -f missing.txt || cd '{}'; test -f child.txt", w.path),
+            format!("cd '{}' && test -f peer.txt", w.repo),
+        ] {
+            let error = integrate(&w, &command, || Ok(())).await.unwrap_err();
+            assert!(error.contains("original worker or shared checkout"), "{error}");
+            assert_eq!(git(&w.repo, &["rev-parse", "origin/main"]).await.unwrap(), before);
+        }
+        // Independent positive control: only the actual combined candidate
+        // has both files. Rejecting every command is not a passing guard.
+        let merged = integrate(&w, "test -f child.txt && test -f peer.txt", || Ok(())).await.unwrap();
+        assert_ne!(merged, before);
+        assert!(!Path::new(&w.path).join("peer.txt").exists());
     }
     async fn peer_checkout(d: &Path, w: &Workspace) -> String {
         let peer = d.join("peer").to_string_lossy().into_owned();

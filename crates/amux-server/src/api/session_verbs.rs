@@ -22380,6 +22380,11 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
         let Some(command) = value.as_str().filter(|s| !s.trim().is_empty() && s.len() <= 8192) else {
             return jresp(StatusCode::BAD_REQUEST, json!({"error":"worktree_verify must be a nonempty command (maximum 8192 bytes)"}));
         };
+        if let Some(workspace) = crate::fanout_workspace::load(&home(), name) {
+            if let Err(error) = crate::fanout_workspace::validate_verification_command(&workspace, command) {
+                return jresp(StatusCode::BAD_REQUEST, json!({"error":error}));
+            }
+        }
         cfg.set("CC_WORKTREE_VERIFY", command);
         return match cfg.write(&f) {
             Ok(()) => j200(json!({"ok":true,"worktree_verify":command})),
