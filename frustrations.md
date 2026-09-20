@@ -3626,3 +3626,15 @@ CARD: CLA-8
 SYMPTOM: The parallel board suite queued another blocker-recovery turn after a progress-only edit. Its fixture left scoped settings unguarded while other tests changed AMUX_HOME; recovery identity correctly includes the approval policy, which differed between the real workspace and those temporary homes.
 COST: The unchanged-state assertion failed for a changed-policy scenario it had accidentally constructed.
 FIX: Hold the existing shared temporary-home guard in both recovery-identity tests. The policy remains fixed across progress-only edits, while real blocker/output changes must still rearm and explicit holds remain intact. Keep failed-test output as evidence rather than explaining it away as build contention.
+
+
+## Worker status UI update leaves generated interaction inventory stale
+AREA: tests
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-20
+SESSION: codex-lifecycle-adherence
+CARD: CLA-8
+SYMPTOM: The combined main revision failed every browser shard before execution because the new status helpers changed the SPA function count from 2066 to 2069 but the generated interaction registry and its embedded state bundle still reported 2066.
+COST: Browser verification could not run for the integration and delivery fixes after incorporating the concurrent main update.
+FIX: Regenerate both artifacts using npm run build:state and verify them with lint:spa. The bundle difference is exactly the inventory count; no handlers changed. Bump the dashboard and service-worker cache versions together so deployed clients receive the matching bundle.
