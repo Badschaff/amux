@@ -7,7 +7,9 @@ async function setup(page:Page) {
   await page.route(/\/api\/sessions(?:\?.*)?$/,r=>r.fulfill({json:['upload-a','upload-b'].map(name=>({name,running:true,status:'idle',dir:'/tmp/'+name}))}));
   await page.route(/\/api\/sessions\/upload-[ab]\/peek\?/,r=>r.fulfill({json:{name:r.request().url().includes('upload-a')?'upload-a':'upload-b',live:'Worker output',history:''}}));
   await page.route(/\/api\/sessions\/upload-[ab]\/subagents$/,r=>r.fulfill({json:{session:r.request().url().includes('upload-a')?'upload-a':'upload-b',subagents:[]}}));
-  await page.goto('/');
+  // Readiness belongs to the upload UI; unrelated pending assets must not
+  // prevent this scenario from exercising its actual upload contract.
+  await page.goto('/',{waitUntil:'domcontentloaded'});
   await page.waitForFunction(()=>typeof (window as any).openPeek==='function');
   await page.evaluate(()=>(window as any).openPeek('upload-a'));
   await expect(page.locator('#peek-overlay')).toHaveCSS('opacity','1');
@@ -78,6 +80,16 @@ test('removing a stalled upload releases its slot without retrying or losing oth
   await expect(chips(page)).toHaveCount(4);await expect(chips(page).locator('.chip-err')).toHaveCount(0);
 });
 test('a server restart during chunk upload recovers with a fresh upload ID',async({page})=>{
+  // A ready dashboard can still have an unrelated resource holding `load`.
+  // Keep that condition deterministic instead of relying on a slow CDN in CI.
+  let pendingAsset=false;
+  await page.route('**/e2e-upload-pending-image.png',()=>{pendingAsset=true;});
+  await page.addInitScript(()=>{
+    window.addEventListener('DOMContentLoaded',()=>{
+      const image=new Image();image.hidden=true;image.src='/e2e-upload-pending-image.png';
+      document.body.append(image);
+    },{once:true});
+  });
   let starts=0,chunks=0;
   await page.route(/\/api\/upload\//,r=>{
     const u=r.request().url();
@@ -85,7 +97,11 @@ test('a server restart during chunk upload recovers with a fresh upload ID',asyn
     if(u.includes('/chunk/')){chunks++;return r.fulfill({status:chunks===1?404:200,json:chunks===1?{error:'unknown upload'}:{ok:true}});}
     return r.fulfill({json:{path:'/uploads/x.png',url:'/api/uploads/x.png'}});
   });
-  await setup(page);await page.locator('#peek-file-input').setInputFiles(file());
+  await setup(page);
+  expect(pendingAsset).toBe(true);
+  expect(await page.evaluate(()=>document.readyState)).toBe('interactive');
+  console.log('[upload-readiness] upload UI ready while unrelated image keeps load pending');
+  await page.locator('#peek-file-input').setInputFiles(file());
   await expect(chips(page)).toContainText('✓');expect(starts).toBe(2);expect(chunks).toBe(2);
 });
 test('the timeout also covers a response body that never finishes',async({page})=>{

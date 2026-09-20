@@ -3650,3 +3650,15 @@ CARD: CLA-8
 SYMPTOM: The iOS host-metrics acceptance scenario failed while parsing an empty computed color after refresh. It resolved chip handles before evaluateAll, while the completed host request replaced those elements with the next render.
 COST: One browser scenario failed after the rest of its shard passed; a detached test element was mistaken for the current UI's contrast.
 FIX: Resolve the current semantic chip elements and all computed colors in one browser task. Require exactly three chips, six samples, the requested theme, valid measured colors, and the unchanged 4.5 contrast threshold. Attach raw colors and frame counts, and keep the independent production contrast beacon assertion.
+
+
+## Upload acceptance waits on unrelated page resources before testing uploads
+AREA: tests
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-20
+SESSION: codex-lifecycle-adherence
+CARD: CLA-8
+SYMPTOM: The upload restart scenario exhausted its 30-second test budget in page.goto waiting for load, before selecting a file. The failure snapshot already showed the rendered upload workers. Waiting for every page resource made unrelated resource completion part of the upload acceptance contract.
+COST: A complete browser shard failed before reaching the upload assertions; its other 273 scenarios passed.
+FIX: Wait for DOM content and the actual worker-terminal controls. Hold an unrelated image request open in the restart scenario and assert the page is still interactive while uploads recover. The old setup fails this controlled case; all 21 upload checks pass with the new readiness condition across desktop, mobile and Safari. Log upload-readiness when the pending-resource control is observed; retain every upload byte, count, timeout and cancellation assertion.
