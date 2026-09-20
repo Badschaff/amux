@@ -40,7 +40,11 @@ visible for intake.
    fingerprints stay quiet, while changed evidence or gates re-arm verification.
    The assignment ends at its type's completion boundary, not at
    receipt delivery or a generic Done label. Runtime changes still require
-   verification. Discard/quarantine stop execution but do not satisfy dependent
+   verification. Fan-out Verified requires a successful integration receipt for
+   the current clean worktree head; gate acknowledgements cannot substitute for
+   that artifact check. Evidenced prerequisites can integrate before queued
+   successors, while the shared Doing-slot rule protects active implementation.
+   Discard/quarantine stop execution but do not satisfy dependent
    outcomes. The reaper uses actual ephemeral membership, retains workers with
    queued work, and leaves worktree disposal to the worktree lifecycle.
 

@@ -4306,6 +4306,16 @@ fn needsyou_ask_refusal(verdict: bs::AskVerdict, id: &str, session: Option<&str>
     )
 }
 
+fn fanout_verification_refusal(id: &str, session: Option<&str>, detail: &str) -> Value {
+    tracing::warn!(card=id, session, measured=true, n_considered=1,
+        verdict="fanout_verification_requires_integration", detail,
+        "refused verification without a current clean integrated worktree");
+    json!({
+        "error":detail, "code":"fanout_verification_requires_integration", "item":id,
+        "how_to_fix":"Keep implemented work in review/done with evidence. Recover this worker's own workspace, set its reviewed worktree_base and worktree_verify command, and let the harness validate and integrate the committed candidate. Then verify the actual output. No outside worker or Needs You request is required."
+    })
+}
+
 /// The TAG door's twin of `needsyou_ask_refusal` (AMUX-4590, 2026-09-14).
 ///
 /// AF-318/AMUX-3929 closed the STATUS door: a card cannot enter `needsyou`
@@ -4840,6 +4850,11 @@ pub async fn create_item(
     }
 
     let status_in = body_str(&map, "status").unwrap_or_else(|| "todo".into());
+    if bs::parse_status(&status_in) == Some(TaskStatus::Verified) && !session.is_empty() {
+        if let Err(detail) = crate::fanout_workspace::verification_ready(&session).await {
+            return err(StatusCode::CONFLICT, fanout_verification_refusal("(new card)", Some(&session), &detail));
+        }
+    }
     // THE SAME PREDICATE ON THE CREATE DOOR (AMUX-3929). The transition gate
     // held — `PATCH {"status":"needsyou"}` and `amux board status <id> needsyou`
     // are both refused — while `POST {"status":"needsyou"}` returned 201 with
@@ -9952,6 +9967,24 @@ pub async fn patch_item(
     };
 
     let slot: Arc<Mutex<Option<PatchOut>>> = Arc::new(Mutex::new(None));
+    // Measure integration outside the writer. The revision/owner check inside
+    // the transaction prevents a concurrent reassignment from borrowing this
+    // observation. Gate acknowledgements and force cannot invent a merge.
+    let workspace_verification = if body_str(&map, "status").as_deref().and_then(bs::parse_status) == Some(TaskStatus::Verified) {
+        let lookup = id.clone();
+        let row = match state.store.read_async(move |conn| Ok(bs::get_issue(conn, &lookup)?)).await {
+            Ok(row) => row,
+            Err(e) => return err(StatusCode::SERVICE_UNAVAILABLE, json!({"error":e.to_string()})),
+        };
+        if let Some(row) = row {
+            let owner = if map.contains_key("session") { body_str(&map, "session") } else { row.session.clone() };
+            let verdict = match owner.as_deref() {
+                Some(name) => crate::fanout_workspace::verification_ready(name).await,
+                None => Ok(()),
+            };
+            Some((row.rev, owner, verdict))
+        } else { None }
+    } else { None };
     let slot_w = slot.clone();
     let id_w = id.clone();
     let caller_for_notify = caller_lane.clone();
@@ -11040,6 +11073,17 @@ pub async fn patch_item(
                     next.tags = tags.clone();
                     tags_change = Some(tags);
                     changed.push("tags".into());
+                }
+            }
+
+            if let Some((observed_rev, owner, verdict)) = &workspace_verification {
+                if row.rev != *observed_rev || next.session.as_deref() != owner.as_deref() {
+                    return finish(&slot_w, PatchOut::Refused(StatusCode::CONFLICT,
+                        json!({"error":"card changed during verification; re-read and retry", "code":"verification_observation_stale", "item":row.id})), no_write());
+                }
+                if let Err(detail) = verdict {
+                    return finish(&slot_w, PatchOut::Refused(StatusCode::CONFLICT,
+                        fanout_verification_refusal(&row.id, next.session.as_deref(), detail)), no_write());
                 }
             }
 

@@ -3490,3 +3490,14 @@ CARD: CLA-4
 SYMPTOM: Live screenshot inspection found a legacy task with its whole request as its title. The activity strip rendered every line and stretched all neighboring cards to the same height, displacing the board on a phone despite passing presence checks.
 COST: Current-work visibility consumed the space needed to see and operate the board.
 FIX: Limit the activity summary to three lines, preserve the complete accessible button text and full task destination, and align cards independently. The existing UI diagnostic reports activity-summary-too-tall; the browser fixture covers a paragraph-length title and detects removal of the clamp.
+
+## Fan-out verification accepts an unintegrated worktree
+AREA: gates
+SEVERITY: wrong-state
+STATUS: open
+DATE: 2026-09-19
+SESSION: codex-lifecycle-adherence
+CARD: CLA-4
+SYMPTOM: test-priority acknowledged Verified while its evidence still said push/CI pending. Its feature commit was not an ancestor of origin/main and the workspace had no creation base or integration receipt. The board accepted a textual assertion that contradicted the known artifact state.
+COST: A live terminal count overstated actual completion; dependent work could consume an unintegrated outcome. Requiring the whole board before integration would also deadlock a successor waiting for a verified prerequisite.
+FIX: Share a current-head/clean-worktree/integration-receipt check across Verified creation and transition, bind the async observation to the card revision/owner, and log fanout_verification_requires_integration. Integrate evidenced prerequisites before queued successors using the shared WIP predicate; active implementation and unevidenced review still refuse. Exercise real disposable Git integration and stale/dirty/missing-receipt controls through the API.

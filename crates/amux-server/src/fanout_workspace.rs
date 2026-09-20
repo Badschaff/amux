@@ -373,6 +373,32 @@ fn write_integration_status(home: &Path, name: &str, record: &serde_json::Value)
     }
 }
 
+/// Verification certifies the current artifact, not the worker's acknowledgement.
+/// Run Git outside the SQLite writer; the caller binds this observation to its
+/// card revision before changing state. Ordinary workers retain their own gates.
+pub(crate) async fn verification_ready(name: &str) -> Result<(), String> {
+    let env = crate::api::session_verbs::parse_env(name);
+    // An explicit manual-integration configuration retains its existing gates.
+    // Requiring a receipt from a controller the owner disabled has no exit.
+    if env.get("CC_EPHEMERAL") != Some("1") || env.get("CC_WORKTREE_AUTO_MERGE") == Some("0") {
+        return Ok(());
+    }
+    let home = crate::config::amux_home();
+    let workspace = load(&home, name).ok_or("Fan-out workspace is not recorded; recover this worker's own workspace first")?;
+    let record = integration_status(&home, name);
+    if record["status"] != "integrated" {
+        return Err(format!("Fan-out integration is not complete: {}", record["detail"].as_str().unwrap_or("no successful integration receipt")));
+    }
+    let head = git(&workspace.path, &["rev-parse", "HEAD"]).await?;
+    if record["head"].as_str() != Some(head.as_str()) {
+        return Err("The integration receipt covers an older worktree head; integrate the current commit first".into());
+    }
+    if !git(&workspace.path, &["status", "--porcelain"]).await?.is_empty() {
+        return Err("The worktree has uncommitted changes; preserve, commit and integrate them before verification".into());
+    }
+    Ok(())
+}
+
 fn ready_board(state: &crate::api::AppState, name: &str) -> Result<(String, String, i64), String> {
     let env = crate::api::session_verbs::parse_env(name);
     if env.get("CC_EPHEMERAL") != Some("1")
@@ -408,15 +434,21 @@ fn board_snapshot(
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| e.to_string())?;
     let tasks: Vec<_> = rows.iter().filter(|r| r.3 != "epic").collect();
-    if tasks.is_empty()
-        || tasks.iter().any(|r| {
-            !crate::db::board_store::execution_is_terminal(&r.2, &r.3)
-                && (!matches!(r.2.as_str(), "review" | "done") || r.4.trim().is_empty())
-        })
-    {
-        return Err("worker still owns unfinished board work".into());
+    // Integrate completed prerequisites before dispatching their successors.
+    // Waiting for the entire board made A(done) -> B(todo, needs A verified)
+    // impossible once verification correctly requires integration. Real Doing
+    // work still owns the workspace; containers/held captures use the same WIP
+    // predicate as pickup. Git independently refuses a dirty candidate.
+    if !crate::runtime_jobs::board_drive::wip_holding_ids(conn, name, None)
+        .map_err(|e| e.to_string())?.is_empty() {
+        return Err("worker still owns active implementation work".into());
     }
-    for task in &tasks {
+    let candidates: Vec<_> = tasks.iter().copied()
+        .filter(|r| matches!(r.2.as_str(), "review" | "done" | "verified")).collect();
+    if candidates.is_empty() || candidates.iter().any(|r| r.4.trim().is_empty()) {
+        return Err("worker has no fully evidenced integration candidate".into());
+    }
+    for task in &candidates {
         let deps: Vec<String> = serde_json::from_str(&task.5).map_err(|e| e.to_string())?;
         if !task.6.trim().is_empty()
             || deps
@@ -426,10 +458,10 @@ fn board_snapshot(
             return Err("worker still owns unresolved prerequisites".into());
         }
     }
-    let card = tasks
+    let card = candidates
         .iter()
         .find(|r| matches!(r.2.as_str(), "review" | "done"))
-        .unwrap_or(&tasks[0]);
+        .unwrap_or(&candidates[0]);
     Ok((
         serde_json::to_string(&rows).map_err(|e| e.to_string())?,
         card.0.clone(),
@@ -734,7 +766,7 @@ mod tests {
         assert!(Path::new(&w.path).join("child.txt").exists());
     }
     #[test]
-    fn integration_admission_requires_the_entire_owned_board_and_real_evidence() {
+    fn integration_admits_completed_prerequisites_before_their_successors() {
         let c = crate::db::migrate::test_memdb();
         c.execute_batch(
             "INSERT INTO issues(id,title,status,type,session,created,updated,evidence) VALUES
@@ -742,7 +774,10 @@ mod tests {
             ('B','followup','backlog','code','child',1,1,'');",
         )
         .unwrap();
-        assert!(board_snapshot(&c, "child").is_err());
+        c.execute("UPDATE issues SET depends_on='[\"A\"]' WHERE id='B'", []).unwrap();
+        assert!(board_snapshot(&c, "child").is_ok(), "completed prerequisite can integrate before its queued successor");
+        c.execute("UPDATE issues SET status='doing',depends_on='[]' WHERE id='B'", []).unwrap();
+        assert!(board_snapshot(&c, "child").is_err(), "active implementation still owns the worktree");
         c.execute("UPDATE issues SET status='review' WHERE id='B'", [])
             .unwrap();
         assert!(

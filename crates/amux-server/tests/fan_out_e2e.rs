@@ -826,3 +826,60 @@ async fn orchestration_projection_and_integration_configuration_use_public_route
     let (st,_,_)=send(&r.app,"PATCH","/api/sessions/child/config",Some(json!({"worktree_base":"HEAD"})),&[]).await;
     assert_eq!(st,StatusCode::BAD_REQUEST,"legacy adoption requires an exact reviewed commit");
 }
+
+#[tokio::test]
+async fn verified_requires_the_current_clean_fanout_head_to_be_integrated() {
+    let r = rig().await;
+    let name = "verified-child";
+    std::fs::write(r.home.join("sessions").join(format!("{name}.env")), "CC_EPHEMERAL=1\n").unwrap();
+    let item = create(&r.app, json!({"title":"Publish tested result", "session":name, "status":"done", "type":"code", "evidence":"result.txt tested in candidate"})).await;
+    let id = item["id"].as_str().unwrap();
+    let path = format!("/api/board/{id}");
+    let (_, _, contract) = send(&r.app, "GET", &format!("/api/board/contract?card={id}"), None, &[]).await;
+    let checked = contract["card_effective_gates"]["gates"]["verified"].clone();
+    assert!(checked.as_array().is_some_and(|a| !a.is_empty()));
+    for force in [false, true] {
+        let (status, _, refusal) = send(&r.app, "PATCH", &path,
+            Some(json!({"status":"verified", "gate_checked":checked,"force":force,"reason":"test that force cannot invent integration"})),
+            &[("x-amux-session",name)]).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refusal}");
+        assert_eq!(refusal["code"], "fanout_verification_requires_integration");
+        assert_eq!(get_card(&r.app,id).await["status"], "done");
+    }
+    let (status,_,refusal)=send(&r.app,"POST","/api/board",Some(json!({"title":"Created as verified", "session":name,"status":"verified","type":"code"})),&[]).await;
+    assert_eq!(status,StatusCode::CONFLICT,"{refusal}");
+    assert_eq!(refusal["code"],"fanout_verification_requires_integration");
+
+    fn git(path: &std::path::Path, args: &[&str]) -> String {
+        let out=std::process::Command::new("git").arg("-C").arg(path).args(args).output().unwrap();
+        assert!(out.status.success(),"{args:?}: {}",String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+    let repo=r._dir.path().join("repo");let remote=r._dir.path().join("remote.git");
+    std::fs::create_dir_all(&repo).unwrap();std::fs::create_dir_all(&remote).unwrap();
+    git(&repo,&["init","-b","main"]);git(&remote,&["init","--bare"]);
+    git(&repo,&["config","user.email","fixture@example.test"]);git(&repo,&["config","user.name","Fixture"]);
+    git(&repo,&["config","commit.gpgsign","false"]);git(&repo,&["config","core.hooksPath","/dev/null"]);
+    std::fs::write(repo.join("base.txt"),"base\n").unwrap();git(&repo,&["add","base.txt"]);git(&repo,&["commit","-m","base"]);
+    git(&repo,&["remote","add","origin",remote.to_str().unwrap()]);git(&repo,&["push","origin","HEAD:main"]);
+    let workspace=amux_server::fanout_workspace::ensure(&r.home,name,repo.to_str().unwrap()).await.unwrap();
+    let work=std::path::Path::new(&workspace.path);
+    std::fs::write(work.join("result.txt"),"verified fixture\n").unwrap();git(work,&["add","result.txt"]);git(work,&["commit","-m","result"]);
+    let head=git(work,&["rev-parse","HEAD"]);
+    let (status,_,_)=send(&r.app,"PATCH",&path,Some(json!({"status":"verified","gate_checked":checked})),&[("x-amux-session",name)]).await;
+    assert_eq!(status,StatusCode::CONFLICT,"a real workspace without integration still refuses");
+    amux_server::fanout_workspace::integrate(&workspace,"test -f result.txt",||Ok(())).await.unwrap();
+    std::fs::write(r.home.join("workspaces").join(format!("{name}.integration.json")),json!({"status":"integrated","head":head}).to_string()).unwrap();
+    let (status,_,body)=send(&r.app,"PATCH",&path,Some(json!({"status":"verified","gate_checked":checked})),&[("x-amux-session",name)]).await;
+    assert_eq!(status,StatusCode::OK,"{body}");assert_eq!(body["status"],"verified");
+
+    std::fs::write(work.join("result.txt"),"changed after verification\n").unwrap();
+    let (status,_,body)=send(&r.app,"PATCH",&path,Some(json!({"status":"verified","reverify":true,"gate_checked":checked})),&[("x-amux-session",name)]).await;
+    assert_eq!(status,StatusCode::CONFLICT,"dirty current work cannot reuse the old receipt: {body}");
+    git(work,&["add","result.txt"]);git(work,&["commit","-m","next outcome"]);
+    let (status,_,body)=send(&r.app,"PATCH",&path,Some(json!({"status":"verified","reverify":true,"gate_checked":checked})),&[("x-amux-session",name)]).await;
+    assert_eq!(status,StatusCode::CONFLICT,"a new head cannot reuse the old receipt: {body}");
+    assert_eq!(body["code"],"fanout_verification_requires_integration");
+    let ordinary=create(&r.app,json!({"title":"Ordinary worker outcome", "session":"ordinary","status":"verified","type":"research"})).await;
+    assert_eq!(ordinary["status"],"verified","ordinary worker gates remain independent of fan-out integration");
+}
