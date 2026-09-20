@@ -3638,3 +3638,15 @@ CARD: CLA-8
 SYMPTOM: The combined main revision failed every browser shard before execution because the new status helpers changed the SPA function count from 2066 to 2069 but the generated interaction registry and its embedded state bundle still reported 2066.
 COST: Browser verification could not run for the integration and delivery fixes after incorporating the concurrent main update.
 FIX: Regenerate both artifacts using npm run build:state and verify them with lint:spa. The bundle difference is exactly the inventory count; no handlers changed. Bump the dashboard and service-worker cache versions together so deployed clients receive the matching bundle.
+
+
+## Host contrast test reads a replaced node after refresh
+AREA: tests
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-20
+SESSION: codex-lifecycle-adherence
+CARD: CLA-8
+SYMPTOM: The iOS host-metrics acceptance scenario failed while parsing an empty computed color after refresh. It resolved chip handles before evaluateAll, while the completed host request replaced those elements with the next render.
+COST: One browser scenario failed after the rest of its shard passed; a detached test element was mistaken for the current UI's contrast.
+FIX: Resolve the current semantic chip elements and all computed colors in one browser task. Require exactly three chips, six samples, the requested theme, valid measured colors, and the unchanged 4.5 contrast threshold. Attach raw colors and frame counts, and keep the independent production contrast beacon assertion.

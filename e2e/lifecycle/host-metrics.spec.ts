@@ -49,23 +49,33 @@ test('LC-HOST: measured host analysis, refresh and related navigation work at ea
     const refreshed = page.waitForResponse(r => r.url().endsWith('/api/metrics/host'));
     await page.locator('#host-content').getByRole('button', { name: /Refresh/ }).click();
     expect((await refreshed).ok()).toBe(true);
-    const chips = page.locator('#host-content > div:nth-child(2) > span');
-    await expect(chips).toHaveCount(3);
-    const ratios = await chips.evaluateAll(elements => {
+    await expect(page.locator('#host-content .host-state-chip')).toHaveCount(3);
+    // A refresh replaces these nodes. Resolve nodes and computed styles in one
+    // browser task: locator handles can be detached before evaluateAll runs.
+    const frame = await page.evaluate(() => {
+      const elements = Array.from(document.querySelectorAll('#host-content .host-state-chip'));
+
       const luminance = (color: string) => {
-        const [r, g, b] = color.match(/[\d.]+/g)!.slice(0, 3).map(Number).map(v => {
+        const channels = color.match(/[\d.]+/g);
+        if (!channels || channels.length < 3) throw new Error(`Unmeasured host color in current DOM: ${JSON.stringify(color)}`);
+        const [r, g, b] = channels.slice(0, 3).map(Number).map(v => {
           const c = v / 255;
           return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
         });
         return .2126 * r + .7152 * g + .0722 * b;
       };
-      return elements.flatMap(chip => [chip, chip.querySelector('b')!].map(el => {
+      const ratios = elements.flatMap(chip => [chip, chip.querySelector('b')!].map(el => {
         const a = luminance(getComputedStyle(el).color), b = luminance(getComputedStyle(chip).backgroundColor);
-        return { text: el.textContent, ratio: (Math.max(a, b) + .05) / (Math.min(a, b) + .05) };
+        return { text: el.textContent, foreground: getComputedStyle(el).color, background: getComputedStyle(chip).backgroundColor, ratio: (Math.max(a, b) + .05) / (Math.min(a, b) + .05) };
       }));
+      return { light: document.body.classList.contains('light'), chips: elements.length, ratios };
     });
-    await info.attach(`host-contrast-${theme}`, { body: JSON.stringify(ratios), contentType: 'application/json' });
-    for (const sample of ratios) expect(sample.ratio, `${theme}: ${sample.text} must be readable`).toBeGreaterThanOrEqual(4.5);
+    await info.attach(`host-contrast-${theme}`, { body: JSON.stringify(frame), contentType: 'application/json' });
+    expect(frame.light).toBe(theme === 'light');
+    expect(frame.chips).toBe(3);
+    expect(frame.ratios).toHaveLength(6);
+    console.info(`[host-contrast] theme=${theme} measured=true chips=${frame.chips} samples=${frame.ratios.length} source=current-dom-frame`);
+    for (const sample of frame.ratios) expect(sample.ratio, `${theme}: ${sample.text} must be readable`).toBeGreaterThanOrEqual(4.5);
     await expect.poll(() => diagnostics.some(d => d.light === (theme === 'light') && d.verdict === 'readable' && d.n_considered === 6)).toBe(true);
     await checkpoint(page, info, `host-analysis-${theme}`);
   }
