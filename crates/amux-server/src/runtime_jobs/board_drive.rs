@@ -3441,6 +3441,26 @@ pub fn select_pickup_with(
         };
     }
 
+    // VERIFICATION-POLICY GATE (AMUX-5002). Ephemeral workers with
+    // CC_VERIFICATION_POLICY=production must not pick up new todo cards
+    // while they hold `done` cards that need verification. Without this,
+    // workers drift to side-quests and never verify their primary work.
+    {
+        let env = crate::api::session_verbs::parse_env(session);
+        if env.get("CC_VERIFICATION_POLICY").is_some_and(|v| v == "production") {
+            let unverified = done_card_count(conn, session);
+            if unverified > 0 {
+                return Pickup::None {
+                    reason: "verification-gate",
+                    detail: format!(
+                        "{unverified} done card(s) await production verification; \
+                         new todo pickup blocked until they reach verified or discarded"
+                    ),
+                };
+            }
+        }
+    }
+
     // py:14487 candidate selection. Board drag order IS the priority queue
     // (AMUX-2128): `pos` is what the user reorders in the UI, so dragging a card
     // up prioritizes it; `created` breaks ties for never-dragged cards.
@@ -5046,6 +5066,34 @@ fn advance_card(
                 detail: format!("{card_id} re-stated or already asked inside the window"),
             },
         };
+    }
+
+    // EPHEMERAL REVIEW AUTO-ADVANCE (AMUX-5003). An ephemeral worker has no
+    // external reviewer. `review` is a dead end: the card sits there with no
+    // reviewer to nudge, and the worker creates new side-quest cards instead.
+    // Measured 2026-09-20: UTSE-2, UTSE-4, RBAO-1 all parked in `review` with
+    // no reviewer for 24h+. For ephemeral workers, skip review entirely and
+    // tell the worker to self-verify and advance to done.
+    if status == "review" {
+        let env = crate::api::session_verbs::parse_env(session);
+        if env.get("CC_EPHEMERAL").is_some_and(|v| v == "1") {
+            let rev = row.reviewer.clone().unwrap_or_default().trim().to_string();
+            if rev.is_empty() || rev == session {
+                return Advance::Nudge {
+                    text: format!(
+                        "`{card_id}` ({}) is in `review` but you are an ephemeral worker with no \
+                         external reviewer. Self-review your work: verify it is correct and complete, \
+                         then advance to `done` with evidence. Do not wait for a reviewer that will \
+                         never come.",
+                        row.title
+                    ),
+                    target: session.to_string(),
+                    card: card_id,
+                    status,
+                    kind: "ephemeral-self-review",
+                };
+            }
+        }
     }
 
     // REVIEWER EDGE. A card whose next transition needs the reviewer's sign-off
@@ -7019,12 +7067,21 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
             //   - 24h cooldown (the old tier nudged per card per cooldown)
             //   - the session decides what to verify, not the loop
             let verify_trace = 'verify: {
-                if eligible > 0 { break 'verify None; }
+                // Ephemeral workers with verification policy skip this gate:
+                // they must verify done cards even when other todo cards exist,
+                // because the pickup gate (AMUX-5002) blocks those todos anyway.
+                let is_verification_policy = {
+                    let env = crate::api::session_verbs::parse_env(lane);
+                    env.get("CC_VERIFICATION_POLICY").is_some_and(|v| v == "production")
+                };
+                if eligible > 0 && !is_verification_policy { break 'verify None; }
                 let Ok(conn) = state.store.read() else { break 'verify None; };
-                match open_execution_count(&conn, lane) {
-                    Ok(0) => {},
-                    Ok(_) => break 'verify None,
-                    Err(error) => break 'verify Some(format!("execution population unmeasured: {error}")),
+                if !is_verification_policy {
+                    match open_execution_count(&conn, lane) {
+                        Ok(0) => {},
+                        Ok(_) => break 'verify None,
+                        Err(error) => break 'verify Some(format!("execution population unmeasured: {error}")),
+                    }
                 }
                 let total = done_card_count(&conn, lane);
                 if total == 0 {
