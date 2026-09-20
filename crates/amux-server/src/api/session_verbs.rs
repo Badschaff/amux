@@ -31612,8 +31612,9 @@ mod submission_gate_tests {
         struct Pane(String);
         impl Drop for Pane {
             fn drop(&mut self) {
+                let st = session_target(&self.0);
                 let _ = std::process::Command::new("tmux")
-                    .args(["kill-session", "-t", &session_target(&self.0)]).output();
+                    .args(["kill-session", "-t", &st]).output();
             }
         }
         let dir = tempfile::tempdir().unwrap();
