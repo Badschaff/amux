@@ -9455,28 +9455,10 @@ fn criterion_wants_peer_verification(c: &str) -> bool {
     l.contains("verified it themselves") || l.contains("rather than taking the author's word")
 }
 
-/// The exit for a card whose WORK belongs to another lane (AF-506).
-///
-/// Reported by `backend`, hit live on MI-4155 during autonomous backlog triage.
-/// A lane holding a card that is not its work has no honest state to move it to:
-/// `backlog` re-feeds that same lane's auto-pickup, `todo` re-queues after a
-/// cooldown, `needsyou` reads as blocked on Ethan rather than on a peer, and
-/// `review` — which the DISPATCHER's own card text recommends — gates on acking
-/// "Implemented and self-tested" / "Diff / PR is up", which a card you are
-/// ROUTING AWAY cannot truthfully claim. Every move is a lie or a loop, which is
-/// ethos rule 3: a legitimate state with no truthful path forward.
-///
-/// The gate is RIGHT to refuse; what was missing is that the refusal knew only
-/// one way out. Reassignment is not a bypass and is deliberately kept out of the
-/// `or_force` family: it does not skip the gate, it moves the card to whoever
-/// the gate is asking about, and that lane satisfies it honestly.
-///
-/// Two wordings because two different things are true. When the caller is not
-/// the owner, the owner can be NAMED. When the caller IS the owner — backend's
-/// case, since the pickup had already assigned it to them — nothing here can
-/// tell whether the work belongs elsewhere, so it is stated as a conditional
-/// and the loop is spelled out. Neither wording asserts the card is misassigned
-/// (AF-169: a hint that cannot apply must not print as though it does).
+/// Ownership-aware recovery beside gate refusals (AF-506, CLA-3).
+/// A peer's existing card remains theirs. An owned or unassigned card gets a
+/// local completion path; a missing gate must not manufacture a peer wait.
+/// The legacy response key is retained for client compatibility.
 fn reassign_exit(card: &str, owner: Option<&str>, caller: &str) -> Value {
     let owner = owner.map(str::trim).filter(|o| !o.is_empty());
     let mine = owner.is_none_or(|o| o == caller);
@@ -9500,17 +9482,14 @@ fn reassign_exit(card: &str, owner: Option<&str>, caller: &str) -> Value {
             "not_a_bypass": "this does not skip the gate; it puts the card back in front of the lane the gate is asking about, and they satisfy it honestly",
         });
     }
-    // Same false promise as the auto-pickup nudge carried, fixed for the same
-    // reason (AMUX-4678): a worker running `amux board assign <ID> <other-lane>`
-    // gets 403 cross_board_reassignment_forbidden from this very file. A gate
-    // refusal that offers an escape the same server refuses is ethos rule 3 —
-    // a constraint with no truthful path — and this is the moment a lane is
-    // most likely to try it.
+    // The owner must satisfy its own outcome. Suggesting a peer reviewer or
+    // textual wait here recreates the outside dependency refused by storage.
+    // Keep the response key for clients, but teach local completion, not handoff.
     json!({
-        "when": "If this card's WORK belongs to another lane, hand it over instead of acking a criterion you cannot truthfully claim. You own it right now, so nothing here can tell whether that is the case — only you can.",
-        "how": format!("amux board reviewer {card} <owning-lane> (or shepherd, or a depends_on edge)"),
-        "effect": "the card STAYS on your board — a worker cannot assign one to another lane, and trying it is refused 403 cross_board_reassignment_forbidden. Linking names who the gate is really asking about without claiming the work moved. Moving it to `backlog` or `todo` while you still own it re-feeds your own auto-pickup and it returns.",
-        "not_a_bypass": "this does not skip the gate; it records that the criterion belongs to another lane, and the card is still yours until they act",
+        "when": "When a gate remains unsatisfied on your card, own the missing implementation, review or verification on this board.",
+        "how": format!("GET /api/board/contract?card={card}; inspect the resolved criteria, reuse available artifacts, and complete the missing work locally before acknowledging it."),
+        "effect": "The card stays on this board. Do not create a cross-worker dependency or move the wait into reviewer, shepherd, source_ref, blocked_on, next_action or gate prose. A peer's paused state or card status is not a prerequisite. Preserve actual access restrictions and required spend/customer-outbound approvals.",
+        "not_a_bypass": "this does not skip the gate; satisfy it with actual local work and evidence. Record any genuine missing permission precisely while completing independent work",
     })
 }
 
@@ -9559,21 +9538,19 @@ mod reassign_exit_tests {
         }
     }
 
-    /// THE REPORTED CASE. The pickup had already assigned MI-4155 to backend, so
-    /// they OWNED the card they needed to hand away. Nothing here can tell
-    /// whether the work belongs elsewhere, so it must be a conditional the
-    /// reader resolves — and it must name the loop, which is the part that cost
-    /// them two round trips.
+    /// Gate refusal must not teach the owner to recreate a rejected outside
+    /// dependency as a reviewer, shepherd or prose wait.
     #[test]
-    fn a_card_you_already_own_states_the_condition_and_names_the_loop() {
+    fn a_card_you_already_own_teaches_local_completion() {
         let v = reassign_exit("MI-4155", Some("backend"), "backend");
-        assert!(v["when"].as_str().unwrap().starts_with("If this card's WORK belongs"), "{v:#}");
-        assert!(v["when"].as_str().unwrap().contains("only you can"), "{v:#}");
+        assert!(v["how"].as_str().unwrap().contains("/api/board/contract?card=MI-4155"), "{v:#}");
+        assert!(v["how"].as_str().unwrap().contains("complete the missing work locally"), "{v:#}");
         assert!(
-            v["effect"].as_str().unwrap().contains("re-feeds your own auto-pickup"),
-            "the loop that sent the card back twice is not named: {v:#}"
+            v["effect"].as_str().unwrap().contains("Do not create a cross-worker dependency"),
+            "gate refusal must reinforce the same-board policy: {v:#}"
         );
-        assert!(v["how"].as_str().unwrap().contains("<owning-lane>"), "{v:#}");
+        assert!(!v.to_string().contains("<owning-lane>"), "{v:#}");
+        assert!(!v.to_string().contains("until they act"), "{v:#}");
     }
 
     /// An unowned card behaves like one you own: amux cannot name a peer, so it
@@ -9584,7 +9561,7 @@ mod reassign_exit_tests {
         for owner in [None, Some(""), Some("   ")] {
             let v = reassign_exit("AF-1", owner, "amux-frustrations");
             assert!(
-                v["how"].as_str().unwrap().contains("<owning-lane>"),
+                v["how"].as_str().unwrap().contains("complete the missing work locally"),
                 "owner {owner:?} produced a named command: {v:#}"
             );
         }

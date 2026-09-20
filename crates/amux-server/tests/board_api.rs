@@ -6550,6 +6550,17 @@ async fn a_gate_refusal_offers_the_reassignment_exit_and_says_it_is_not_a_bypass
     // The gate itself is untouched: this is offered BESIDE the refusal.
     assert_eq!(v["kind"], json!("gate_blocked"), "{v}");
     assert!(v["how_to_ack"]["gate_ack"] == json!(true), "{v}");
+
+    // The owner must get a local completion path, not advice to recreate an
+    // outside dependency as reviewer/shepherd prose after storage rejects it.
+    let (st, _, owned) = send_with(
+        &app, "PATCH", &format!("/api/board/{id}"),
+        Some(json!({ "status": "done", "evidence": EV })),
+        &[("X-Amux-Session", "mvs-infra")],
+    ).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert!(owned["or_reassign"]["how"].as_str().unwrap().contains("complete the missing work locally"), "{owned}");
+    assert!(!owned["or_reassign"].to_string().contains("<owning-lane>"), "{owned}");
 }
 
 /// AF-506, second pass — EVERY refusal that blocks closing or reviewing a card

@@ -3411,4 +3411,4 @@ SESSION: codex-lifecycle-adherence
 CARD: CLA-3
 SYMPTOM: Active-board audit found seven cross-worker dependency edges on six cards. Delegation opt-in bypassed dependency validation, missing/unassigned references escaped it, and fan-out moved a prerequisite while leaving its dependent on the parent board. The existing fan-out retry test asserted that split ownership as success.
 COST: Repeated owner intervention to remove peer waits; six live cards required explicit ownership/next-action correction and a new regression covering the incoming side of reassignment.
-FIX: Enforce same-board graph writes in storage and API, retain connected work on its owner board during fan-out, and preserve prerequisite evidence when repairing legacy edges. No model calls are needed for enforcement.
+FIX: Enforce same-board graph writes in storage and API, retain connected work on its owner board during fan-out, and preserve prerequisite evidence when repairing legacy edges. Live verification also found gate refusals recommending peer reviewer/dependency waits; those now teach local completion. No model calls are needed for enforcement.
