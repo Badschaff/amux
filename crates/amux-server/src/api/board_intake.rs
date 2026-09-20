@@ -102,12 +102,22 @@ pub struct Plan {
     /// 2026-09-15: creates that skip it return in ~0 s, creates that make it
     /// take ~20 s at p50), so a slow create has to be able to say so.
     pub model_ms: Option<u64>,
+    /// AMUX-4880: cards that recently CLOSED and resemble this request.
+    ///
+    /// Advisory and read-only. The merge predicate still excludes terminal
+    /// rows, because appending into a closed card is the failure that
+    /// exclusion prevents; this only lets a capture SAY that the thing being
+    /// asked for looks like something that already shipped. Empty is the
+    /// common case and means "nothing recent resembles this", which is a real
+    /// answer rather than a missing one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completed_hints: Vec<CompletedHint>,
     #[serde(skip)] candidates: Vec<Candidate>,
 }
 impl Plan {
     fn create(reason: &str, candidates: Vec<Candidate>, available: usize, measured: bool) -> Self {
         Self { decision: Decision { action:"create".into(), task_id:None, reason:reason.into(), title:None, confidence:1.0 }, measured,
-            n_considered:candidates.len(), n_available:available, candidates, model:None, model_ms:None }
+            n_considered:candidates.len(), n_available:available, candidates, model:None, model_ms:None, completed_hints:Vec::new() }
     }
     pub fn preserve_structured_request(&mut self) {
         self.decision.action = "create".into();
@@ -294,18 +304,33 @@ pub async fn plan(store: &Store, session: &str, owner: &str, title: &str, descri
         }))?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok((candidates,available))
     })();
+    // AMUX-4880. Read-only, and computed on the SAME connection the candidate
+    // read already opened, so it costs one extra query rather than a second
+    // connection. Failure is silent by construction: an advisory hint that
+    // cannot be produced must not take the create down with it.
+    let completed_hints = (|| -> anyhow::Result<Vec<CompletedHint>> {
+        let conn = store.read()?;
+        Ok(recently_completed_matches(&conn, title, chrono::Utc::now().timestamp()))
+    })()
+    .unwrap_or_default();
+    // AMUX-4880. EVERY early return below carries the hints too. The
+    // "no open work in this ownership scope" path is the one that matters
+    // most: nothing open to compare against is exactly when a reader has no
+    // other way to learn the thing already shipped, and it was the shape of
+    // the incident that produced this feature.
+    let with_hints = |mut plan: Plan| -> Plan { plan.completed_hints = completed_hints.clone(); plan };
     let (candidates, available) = match loaded {
-        Ok(v) => v, Err(e) => { tracing::warn!(target:"amux::board_intake", error=%e, "semantic intake candidate read failed"); return Plan::create("candidate read failed; request preserved",vec![],0,false); }
+        Ok(v) => v, Err(e) => { tracing::warn!(target:"amux::board_intake", error=%e, "semantic intake candidate read failed"); return with_hints(Plan::create("candidate read failed; request preserved",vec![],0,false)); }
     };
-    if candidates.is_empty() { return Plan::create("no open work in this ownership scope", candidates,available,true); }
-    let Some(client) = MODEL.get().cloned() else { return Plan::create("semantic provider unavailable or explicitly disabled; request preserved",candidates,available,false) };
+    if candidates.is_empty() { return with_hints(Plan::create("no open work in this ownership scope", candidates,available,true)); }
+    let Some(client) = MODEL.get().cloned() else { return with_hints(Plan::create("semantic provider unavailable or explicitly disabled; request preserved",candidates,available,false)) };
     let model = super::mdai::resolve_model(None);
     let (t,d,rows) = (title.to_string(), description.to_string(), candidates.clone());
     let started = std::time::Instant::now();
     let result = classify_within_deadline(client, model.clone(), t, d, rows).await;
     let model_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let mut plan = match result {
-        Ok(Ok(decision)) => Plan {decision, measured:true, n_considered:candidates.len(), n_available:available, model:Some(model), model_ms:Some(model_ms), candidates},
+        Ok(Ok(decision)) => Plan {decision, measured:true, n_considered:candidates.len(), n_available:available, model:Some(model), model_ms:Some(model_ms), candidates, completed_hints:Vec::new()},
         result => {
             tracing::warn!(target:"amux::board_intake", error=?result, model_ms, "semantic comparison unavailable; incoming request preserved");
             let mut failed = Plan::create("semantic comparison failed; request preserved separately",candidates,available,false);
@@ -322,8 +347,142 @@ pub async fn plan(store: &Store, session: &str, owner: &str, title: &str, descri
     }
     // A matching title alone never makes an unavailable model count as measured.
     if plan.decision.action == "create" { plan.decision.task_id = None; }
+    // AMUX-4880: attach on EVERY path, including the ones that skipped the
+    // model. A create that never reached the classifier is exactly the case
+    // where a reader has least other information about duplication.
+    if !completed_hints.is_empty() {
+        tracing::info!(target:"amux::board_intake", session,
+            hints = completed_hints.len(),
+            first = %completed_hints[0].id,
+            verdict = "board_intake_resembles_completed_work",
+            "captured request resembles recently completed work");
+    }
+    plan.completed_hints = completed_hints;
     tracing::info!(target:"amux::board_intake", session, decision=%plan.log_line(), "board intake compared");
     plan
+}
+
+/// A card that recently CLOSED and resembles the incoming request (AMUX-4880).
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct CompletedHint {
+    pub id: String,
+    pub title: String,
+    pub session: String,
+    pub status: String,
+    /// Unix seconds of the close, so a reader can say "yesterday" without
+    /// re-querying.
+    pub updated: i64,
+}
+
+/// Tokens too common to carry any signal about what a request is ABOUT.
+/// `amux` is in here on purpose: on this board it appears in a large share of
+/// titles and would make unrelated requests look alike.
+const HINT_STOPWORDS: &[&str] = &[
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "that", "this",
+    "it", "is", "be", "was", "are", "as", "at", "by", "from", "into", "our", "we", "i",
+    "can", "you", "your", "my", "me", "so", "if", "not", "no", "do", "does", "did",
+    "amux", "card", "cards", "task", "tasks", "board", "worker", "workers", "lane",
+];
+
+fn hint_tokens(text: &str) -> std::collections::BTreeSet<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| w.len() >= 3 && !HINT_STOPWORDS.contains(w))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether an incoming title resembles a closed card's title (AMUX-4880).
+///
+/// PURE, so the motivating pair can be replayed in a test without a database.
+///
+/// Requires both an absolute overlap (three distinctive words agreeing is not
+/// a coincidence at title length) and a proportional one, so a long title
+/// cannot swallow a short unrelated one.
+///
+/// THE RATIO IS CALIBRATED ON THE REAL PAIR, not on taste. My first version
+/// used 0.5 and its own replay test rejected it: the motivating titles share
+/// {create, scheduler, weekly, simplification} = 4 tokens against a 10-token
+/// title, which is 0.40. I had calibrated against the TRUNCATED title as shown
+/// on the board ("...goes thru the…"), where the denominator is smaller and
+/// the ratio flattered the threshold. Calibrating a matcher on an abbreviated
+/// specimen is how it comes to miss the full-length case it exists for.
+///
+/// 0.35 sits below the measured 0.40 with margin rather than on the boundary.
+/// The absolute floor does the real work: the negative tests include a pair
+/// that shares nothing BUT scaffolding words, which a matcher without its
+/// stopword list would score as perfect.
+const HINT_MIN_OVERLAP: usize = 3;
+const HINT_MIN_RATIO: f64 = 0.35;
+
+fn title_resembles(incoming: &str, closed: &str) -> bool {
+    let (a, b) = (hint_tokens(incoming), hint_tokens(closed));
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    let overlap = a.intersection(&b).count();
+    let smaller = a.len().min(b.len());
+    overlap >= HINT_MIN_OVERLAP && (overlap as f64 / smaller as f64) >= HINT_MIN_RATIO
+}
+
+/// How far back a close still counts as "recent" for the hint.
+fn completed_hint_window_days() -> i64 {
+    std::env::var("AMUX_INTAKE_COMPLETED_HINT_DAYS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|d| *d > 0)
+        .unwrap_or(14)
+}
+
+/// Recently-closed cards resembling this request, ACROSS ALL SESSIONS.
+///
+/// CROSS-SESSION ON PURPOSE, and the card asked for that decision explicitly.
+/// The motivating case is exactly the cross-lane one: Ethan asked for a weekly
+/// simplification scan on the `amux` lane 17 hours after `amux-frustrations`
+/// had built it and its scheduler had already fired once. A same-session-only
+/// hint would have stayed silent on the incident that produced this feature.
+///
+/// A read-only LOOKUP is not the thing `cross_board_create_forbidden` governs.
+/// That rule stops one lane WRITING to another's board; this writes nothing,
+/// assigns nothing, and cannot move a card. It only lets a capture say "this
+/// looks like something that shipped".
+///
+/// THE MERGE PREDICATE IS UNTOUCHED. Terminal cards remain ineligible as merge
+/// targets, because appending new text into a closed card is the failure that
+/// exclusion exists to prevent. This is a separate, additive read.
+fn recently_completed_matches(conn: &rusqlite::Connection, title: &str, now_s: i64) -> Vec<CompletedHint> {
+    if hint_tokens(title).is_empty() {
+        return Vec::new();
+    }
+    let cutoff = now_s - completed_hint_window_days() * 86_400;
+    let mut out = Vec::new();
+    let q = conn.prepare(
+        "SELECT id, title, COALESCE(session,''), status, COALESCE(updated,0) FROM issues \
+         WHERE status IN ('done','verified') AND archived=0 AND deleted IS NULL \
+           AND COALESCE(updated,0) >= ?1 \
+         ORDER BY updated DESC LIMIT 400",
+    );
+    let Ok(mut stmt) = q else { return out };
+    let Ok(rows) = stmt.query_map(rusqlite::params![cutoff], |r| {
+        Ok(CompletedHint {
+            id: r.get(0)?,
+            title: r.get(1)?,
+            session: r.get(2)?,
+            status: r.get(3)?,
+            updated: r.get(4)?,
+        })
+    }) else {
+        return out;
+    };
+    for hint in rows.flatten() {
+        if title_resembles(title, &hint.title) {
+            out.push(hint);
+            if out.len() >= 3 {
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// The size past which a semantic append is refused and the request becomes its
@@ -684,6 +843,58 @@ mod structured_skip_tests {
 #[cfg(test)]
 mod intake_deadline_tests {
     use super::*;
+
+    /// AMUX-4880. THE INCIDENT, REPLAYED WITH THE REAL TITLES.
+    ///
+    /// 2026-09-17 17:32 AF-916 closed, having built the weekly scan and its
+    /// scheduler. 2026-09-18 10:39 Ethan asked for exactly that, and it was
+    /// captured as AMUX-4799 with nothing saying it already existed. The
+    /// capture could not have been flagged for two independent reasons: AF-916
+    /// was `done` (excluded by status) and sat on another lane (excluded by
+    /// session). This pins that the hint fires on that pair.
+    #[test]
+    fn the_amux_4799_request_resembles_the_af_916_work_that_shipped() {
+        let asked = "Create an amux scheduler that runs weekly which goes thru the entire amux server/ui to find simplification opportunities";
+        let shipped = "Design and test a weekly amux simplification-scan prompt; create the scheduler with the winning version";
+        assert!(
+            title_resembles(asked, shipped),
+            "the request that produced this card must resemble the work that shipped"
+        );
+    }
+
+    /// The other arm. Without it, `fn title_resembles(_,_) -> true` passes the
+    /// test above and marks every capture as a duplicate, which destroys the
+    /// signal more thoroughly than not having it.
+    #[test]
+    fn unrelated_titles_do_not_resemble_each_other() {
+        let cases = [
+            ("Create an amux scheduler that runs weekly", "Fix the iOS Safari composer attachment race"),
+            ("Peek latency: the transcript render is uncached", "Board payload ships 25% nulls"),
+            // Shares only the stopword-ish scaffolding, which must not count.
+            ("The amux board card for this task", "This amux worker card board task"),
+        ];
+        for (a, b) in cases {
+            // The third case is the interesting one: it is nothing BUT common
+            // tokens, so a matcher that forgot its stopword list would score it
+            // as a perfect match.
+            assert!(
+                !title_resembles(a, b),
+                "{a:?} must not resemble {b:?}; a false positive costs trust in every later hint"
+            );
+        }
+    }
+
+    /// An empty or punctuation-only title has no tokens, and must not match
+    /// everything by vacuous intersection.
+    #[test]
+    fn a_title_with_no_distinctive_tokens_matches_nothing() {
+        for empty in ["", "   ", "-- ...", "a the of"] {
+            assert!(
+                !title_resembles(empty, "Create an amux scheduler that runs weekly"),
+                "{empty:?} has no distinctive tokens and must match nothing"
+            );
+        }
+    }
 
     /// AMUX-4847. THE CHECK THIS FILE ALREADY SHIPPED COULD NOT FIRE.
     /// `SLOW_MODEL_MS` was a 60_000 literal while the call it measures is
