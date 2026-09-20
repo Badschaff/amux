@@ -505,6 +505,55 @@ struct WindowScan {
     covered: bool,
     /// How many matches were dropped by the cap.
     dropped: u64,
+    /// AMUX-4857. How often each pattern fires across the WHOLE generation,
+    /// not just inside the window — the denominator that turns a line from a
+    /// fact into evidence.
+    ///
+    /// Accumulated in the SAME pass that finds the hits. The card proposed a
+    /// second pass; the scan already touches every line, so a second read of
+    /// the same bytes would cost twice for nothing.
+    base_counts: std::collections::BTreeMap<String, u64>,
+    /// First and last timestamp seen anywhere in the generation, which is the
+    /// period the counts above are OVER. Published rather than assumed: a
+    /// pattern looks rare when the log is young, and "occurrences in the
+    /// generation" and "occurrences in 24h" are different populations.
+    span: Option<(f64, f64)>,
+}
+
+/// Collapse a log line to a pattern key for base-rate counting (AMUX-4857).
+///
+/// Drops the leading timestamp and then every digit run, so
+/// `subagent lifecycle event did not change the live set (n=3)` and the same
+/// line with `n=17` count as one pattern. Truncated, because the tail of a
+/// long line is usually the variable part and two lines agreeing for 80
+/// characters are the same warn for this purpose.
+///
+/// Deliberately crude. A normaliser that is too clever merges two DIFFERENT
+/// warns and reports a base rate that belongs to neither, which is worse than
+/// the missing denominator this exists to supply.
+fn log_pattern_key(line: &str) -> String {
+    let body = line.split_once(" INFO ")
+        .or_else(|| line.split_once(" WARN "))
+        .or_else(|| line.split_once(" ERROR "))
+        .map(|(_, rest)| rest)
+        .unwrap_or(line);
+    let mut out = String::with_capacity(80);
+    let mut last_was_digit = false;
+    for ch in body.chars() {
+        if out.len() >= 80 {
+            break;
+        }
+        if ch.is_ascii_digit() {
+            if !last_was_digit {
+                out.push('#');
+            }
+            last_was_digit = true;
+        } else {
+            out.push(ch);
+            last_was_digit = false;
+        }
+    }
+    out.trim().to_string()
 }
 
 /// At most this many lines reach a card, and at most this many bytes each.
@@ -554,9 +603,25 @@ where
     let mut dropped = 0u64;
     let mut saw_at_or_before_start = false;
     let mut saw_at_or_after_end = false;
+    let mut base_counts: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut span: Option<(f64, f64)> = None;
     for line in lines {
         let line = line.as_ref();
         let Some(ts) = log_line_ts(line) else { continue };
+        // AMUX-4857: the denominator, gathered in this same pass. The span is
+        // taken over EVERY timestamped line, not just actionable ones, because
+        // it measures how long the generation covers — which is the period the
+        // counts below are over.
+        span = Some(match span {
+            None => (ts, ts),
+            Some((lo, hi)) => (lo.min(ts), hi.max(ts)),
+        });
+        if is_actionable_log_line(line) {
+            let key = log_pattern_key(&String::from_utf8_lossy(line));
+            if !key.is_empty() {
+                *base_counts.entry(key).or_insert(0) += 1;
+            }
+        }
         if ts <= start {
             saw_at_or_before_start = true;
         }
@@ -573,7 +638,56 @@ where
             }
         }
     }
-    WindowScan { hits, covered: saw_at_or_before_start && saw_at_or_after_end, dropped }
+    WindowScan {
+        hits,
+        covered: saw_at_or_before_start && saw_at_or_after_end,
+        dropped,
+        base_counts,
+        span,
+    }
+}
+
+/// How a single window line compares to its own background rate (AMUX-4857).
+///
+/// `None` when the generation is too short to give a rate at all, which is a
+/// real state and not a quiet zero: a young log makes every pattern look rare.
+fn base_rate_verdict(scan: &WindowScan, line: &str, window_s: f64) -> Option<String> {
+    let (lo, hi) = scan.span?;
+    let span_s = hi - lo;
+    if span_s <= 0.0 || window_s <= 0.0 {
+        return None;
+    }
+    let key = log_pattern_key(line);
+    let total = *scan.base_counts.get(&key)?;
+    let per_min = total as f64 * 60.0 / span_s;
+    let observed = scan.hits.iter().filter(|h| log_pattern_key(h) == key).count() as f64;
+    let expected = total as f64 * window_s / span_s;
+    // The comparison is the point, and the verdict is BINARY on purpose.
+    //
+    // A three-way split with a "slightly above" middle was the first version
+    // and its own test rejected it: a line sitting exactly at background
+    // reported "slightly above" because the generation span is never exactly
+    // the round number the fixture implies (3630s, not 3600s), so
+    // observed=1 > expected=0.9917. That middle category is the defect this
+    // field exists to remove — it makes noise read as a mild finding, which is
+    // how eight background warns looked like eight leads on AMUX-4852.
+    //
+    // So: either a line clears its own background by a margin, or it is noise
+    // and says so. `LEAD_FACTOR` is the margin, and it is deliberately loose
+    // because a bursty log at its own rate must not trip it.
+    const LEAD_FACTOR: f64 = 1.5;
+    let verdict = if expected > 0.0 && observed > expected * LEAD_FACTOR {
+        format!(
+            "{:.1}x ABOVE background — this is the lead",
+            observed / expected.max(0.0001)
+        )
+    } else {
+        "at or below background — noise, not a finding".to_string()
+    };
+    Some(format!(
+        "[{observed:.0} here vs {expected:.1} expected; {per_min:.1}/min over {:.1}h of log; {verdict}]",
+        span_s / 3600.0
+    ))
 }
 
 /// Read the server log generations and scan them for `[start, end]`.
@@ -590,13 +704,30 @@ where
 fn warns_during_request(start: f64, end: f64) -> WindowScan {
     use std::io::BufRead;
     let dir = crate::config::amux_home().join("logs");
-    let mut out = WindowScan { hits: Vec::new(), covered: false, dropped: 0 };
+    let mut out = WindowScan {
+        hits: Vec::new(),
+        covered: false,
+        dropped: 0,
+        base_counts: Default::default(),
+        span: None,
+    };
     for name in ["server-rs.log.1", "server-rs.log"] {
         let Ok(f) = std::fs::File::open(dir.join(name)) else { continue };
         let lines = std::io::BufReader::new(f).split(b'\n').filter_map(Result::ok);
         let scan = scan_lines_for_window(lines, start, end);
         out.covered |= scan.covered;
         out.dropped += scan.dropped;
+        // AMUX-4857. BOTH generations are the corpus, so counts sum and the
+        // span is their union. Using one file's span against both files' counts
+        // would inflate every rate by roughly the rotation factor, which is the
+        // denominator error this field exists to prevent.
+        for (k, n) in scan.base_counts {
+            *out.base_counts.entry(k).or_insert(0) += n;
+        }
+        out.span = match (out.span, scan.span) {
+            (None, s) | (s, None) => s,
+            (Some((a_lo, a_hi)), Some((b_lo, b_hi))) => Some((a_lo.min(b_lo), a_hi.max(b_hi))),
+        };
         for h in scan.hits {
             if out.hits.len() < WINDOW_SCAN_CAP {
                 out.hits.push(h);
@@ -637,12 +768,36 @@ fn logged_during_worst_request(scan: &WindowScan, start: f64, end: f64) -> Strin
     } else {
         String::new()
     };
+    // AMUX-4857. THE HEDGE WAS NOT ENOUGH. "This is correlation, not cause" is
+    // true and does not help: a reader still cannot tell a warn that fires 40
+    // times a minute anyway from one that fired only here. The first is
+    // background, the second is a lead, and without a denominator they print
+    // identically. Measured on AMUX-4852: 8 lines in a 14.4s window looked like
+    // eight findings, while the background rate predicted 9.3 — the window was
+    // QUIETER than usual and the lines said nothing about that request.
+    //
+    // So each line now carries its own base rate, and the corpus is named:
+    // an absent line is not evidence of silence, because the scan is
+    // WARN/ERROR only (AMUX-4848) and an INFO line explaining the latency
+    // would never appear here.
+    let window_s = (end - start).max(0.0);
+    let lines = scan
+        .hits
+        .iter()
+        .map(|h| match base_rate_verdict(scan, h, window_s) {
+            Some(rate) => format!("  {h}\n      {rate}"),
+            None => format!("  {h}\n      [no base rate: the log generation is too short to give one]"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
         "{} line(s) logged DURING this request{more}, window {window}. This is \
          correlation, not cause: these lines were emitted while the request was open, \
-         which is evidence a reader can act on and not a verdict.\n{}",
+         which is evidence a reader can act on and not a verdict. Each line carries how \
+         often that same pattern fires across the whole retained generation, so a common \
+         warn cannot read as a finding. CORPUS IS WARN/ERROR ONLY: a quiet base-rate \
+         verdict means those levels were quiet, not that nothing was logged.\n{lines}",
         scan.hits.len(),
-        scan.hits.iter().map(|h| format!("  {h}")).collect::<Vec<_>>().join("\n")
     )
 }
 
@@ -16536,8 +16691,8 @@ mod window_scan_tests {
     fn covered_and_empty_reads_differently_from_uncovered() {
         let start = at("2026-09-18T04:37:33Z");
         let end = at("2026-09-18T04:38:33Z");
-        let quiet = WindowScan { hits: vec![], covered: true, dropped: 0 };
-        let blind = WindowScan { hits: vec![], covered: false, dropped: 0 };
+        let quiet = WindowScan { hits: vec![], covered: true, dropped: 0, base_counts: Default::default(), span: None };
+        let blind = WindowScan { hits: vec![], covered: false, dropped: 0, base_counts: Default::default(), span: None };
         let quiet_s = logged_during_worst_request(&quiet, start, end);
         let blind_s = logged_during_worst_request(&blind, start, end);
         assert!(quiet_s.starts_with("none."), "{quiet_s}");
@@ -16606,6 +16761,80 @@ mod window_scan_tests {
         assert!(
             !block.contains("last_ts"),
             "last_ts is the NEWEST offending row, usually a different request: {block}"
+        );
+    }
+
+    /// AMUX-4857. A line at its background rate and a line far above it must
+    /// NOT read the same. On AMUX-4852 eight identical warns inside a 14.4s
+    /// window looked like eight findings; the background rate predicted 9.3,
+    /// so the window was QUIETER than usual and the lines said nothing.
+    ///
+    /// Both arms in one cell on purpose. A test that only checks a rate is
+    /// PRINTED is exactly as green when the rate is computed over the wrong
+    /// window, which is the failure the card names.
+    #[test]
+    fn a_warn_above_its_background_reads_differently_from_one_at_it() {
+        // One hour of log. "chatty" fires every minute (60 total), "rare"
+        // fires 3 times in the hour. The window is the last 60s and holds
+        // one of each — so chatty is AT background and rare is ~20x above it.
+        let mut lines: Vec<Vec<u8>> = Vec::new();
+        for m in 0..60 {
+            lines.push(
+                format!("2026-09-18T04:{m:02}:05.000000Z  WARN noisy: chatty thing happened")
+                    .into_bytes(),
+            );
+        }
+        for m in [7u32, 23, 59] {
+            lines.push(
+                format!("2026-09-18T04:{m:02}:30.000000Z  WARN rareish: rare thing happened")
+                    .into_bytes(),
+            );
+        }
+        let start = at("2026-09-18T04:59:00Z");
+        let end = at("2026-09-18T05:00:00Z");
+        lines.push("2026-09-18T04:00:00.000000Z  INFO gen start".as_bytes().to_vec());
+        lines.push("2026-09-18T05:00:30.000000Z  INFO gen end".as_bytes().to_vec());
+
+        let scan = scan_lines_for_window(lines, start, end);
+        let out = logged_during_worst_request(&scan, start, end);
+
+        assert!(
+            out.contains("rare thing happened"),
+            "the rare line must appear at all: {out}"
+        );
+        // The discrimination itself.
+        let rare_line = out
+            .lines()
+            .skip_while(|l| !l.contains("rare thing happened"))
+            .nth(1)
+            .unwrap_or("");
+        let chatty_line = out
+            .lines()
+            .skip_while(|l| !l.contains("chatty thing happened"))
+            .nth(1)
+            .unwrap_or("");
+        assert!(
+            rare_line.contains("ABOVE background"),
+            "a warn ~20x its base rate must be called out as the lead, got {rare_line:?}\n{out}"
+        );
+        assert!(
+            chatty_line.contains("at or below background"),
+            "a warn AT its base rate must be named as noise, or it reads as a finding \
+             exactly like the AMUX-4852 case, got {chatty_line:?}\n{out}"
+        );
+        assert_ne!(
+            rare_line, chatty_line,
+            "the two must not print identically; that identity IS the defect"
+        );
+        // The denominator travels with the number (the card's second rule).
+        assert!(
+            out.contains("of log"),
+            "the period the rate is OVER must be stated: {out}"
+        );
+        // And the corpus caveat, so a quiet verdict is not read as silence.
+        assert!(
+            out.contains("WARN/ERROR ONLY"),
+            "the payload must say what corpus it scanned: {out}"
         );
     }
 
