@@ -3693,3 +3693,14 @@ COST: real alarm and ~20 minutes of investigation (a scratch card created and
 FIX: not found. Parked on AF-942 with a concrete trigger (a clean reproduction with a
  verified immediately-before state, or a recurrence caught during a future
  verification pass) rather than continuing to chase an unreproduced anomaly.
+
+## A fan-out validates a stale candidate and parks its own merge as an external blocker
+AREA: board
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-20
+SESSION: codex-lifecycle-adherence
+CARD: CLA-10
+SYMPTOM: Live MF-1238 integration repeatedly passed candidate validation, then received Mixpeek's pre-push no-ref/non-fast-forward refusal because remote main advanced during the checks. A subsequent attempt was killed at the harness's 120-second Git deadline even though repository pre-push gates take longer. TP-1 repeatedly returned to Backlog waiting for its own unmerged commit, leaving no integration candidate. The generic failure sent ordinary Git contention back to the model.
+COST: Multiple successful check runs and model turns without a landed candidate; two separate fleet audits found the same self-trigger on TP-1.
+FIX: CLA-10 rebuilds and revalidates up to three candidates when an observed remote ref changes, then retains an automatic retry state without another model reminder. Real unchanged-ref hook failures still require repair; hooks retain a bounded 30-minute budget and immediate lifecycle cancellation. Configuration changes invalidate in-flight checks. Real bare-remote regression tests pass and fail when candidate retry is removed; full-suite results and live adoption are tracked on CLA-10.

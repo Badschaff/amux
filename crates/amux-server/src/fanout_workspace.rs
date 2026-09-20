@@ -253,7 +253,15 @@ async fn integration_git<F: Fn() -> Result<(), String>>(
         "AMUX_SESSION",
         workspace.branch.trim_start_matches("amux/fanout/"),
     );
-    let (status, output) = checked_command(cmd, permit, Duration::from_secs(120)).await?;
+    // Repository pre-push hooks run the actual content gates. They routinely
+    // take longer than a network-only Git operation, but remain cancellable
+    // as soon as lifecycle/admission changes.
+    let timeout = if args.first() == Some(&"push") {
+        Duration::from_secs(1800)
+    } else {
+        Duration::from_secs(120)
+    };
+    let (status, output) = checked_command(cmd, permit, timeout).await?;
     if !status.success() {
         return Err(output);
     }
@@ -262,14 +270,37 @@ async fn integration_git<F: Fn() -> Result<(), String>>(
 
 /// Integrate an immutable worker head in a separate checkout. The shared main
 /// checkout is never switched, reset or merged into. A competing remote push
-/// simply refuses our ordinary fast-forward push and causes a later retry.
+/// rebuilds a fresh candidate and reruns validation without asking the model
+/// to resolve ordinary Git contention.
+const MAIN_ADVANCED_RETRY: &str = "Remote main advanced through three integration attempts; the harness will retry automatically with a fresh candidate";
+
 pub async fn integrate<F: Fn() -> Result<(), String>>(
     workspace: &Workspace,
     verification: &str,
     permit: F,
 ) -> Result<String, String> {
-    permit()?;
     let head = git(&workspace.path, &["rev-parse", "HEAD"]).await?;
+    for attempt in 1..=3 {
+        permit()?;
+        if git(&workspace.path, &["rev-parse", "HEAD"]).await? != head {
+            return Err("Worker workspace changed during integration; integration deferred".into());
+        }
+        if let Some(merged) = integrate_attempt(workspace, verification, &head, &permit).await? {
+            return Ok(merged);
+        }
+        tracing::info!(session=%workspace.branch.trim_start_matches("amux/fanout/"), attempt,
+            verdict="fanout_main_advanced_retry", "remote main advanced; rebuilding and revalidating the candidate");
+    }
+    Err(MAIN_ADVANCED_RETRY.into())
+}
+
+async fn integrate_attempt<F: Fn() -> Result<(), String>>(
+    workspace: &Workspace,
+    verification: &str,
+    head: &str,
+    permit: &F,
+) -> Result<Option<String>, String> {
+    permit()?;
     if !git(&workspace.path, &["status", "--porcelain"])
         .await?
         .is_empty()
@@ -280,19 +311,19 @@ pub async fn integrate<F: Fn() -> Result<(), String>>(
     let main = git(&workspace.repo, &["rev-parse", "origin/main"]).await?;
     if git(
         &workspace.repo,
-        &["merge-base", "--is-ancestor", &head, &main],
+        &["merge-base", "--is-ancestor", head, &main],
     )
     .await
     .is_ok()
     {
-        return Ok(main);
+        return Ok(Some(main));
     }
     if workspace.base.is_empty() {
         return Err("Legacy workspace has no recorded creation base; reconcile its own commits against origin/main before automatic integration".into());
     }
     git(
         &workspace.repo,
-        &["merge-base", "--is-ancestor", &workspace.base, &head],
+        &["merge-base", "--is-ancestor", &workspace.base, head],
     )
     .await
     .map_err(|_| {
@@ -313,7 +344,7 @@ pub async fn integrate<F: Fn() -> Result<(), String>>(
     )
     .await?;
     let result=async {
-        integration_git(workspace,&candidate,&["merge","--no-ff","--no-edit",&head],&permit).await
+        integration_git(workspace,&candidate,&["merge","--no-ff","--no-edit",head],permit).await
             .map_err(|e|format!("Integration conflict: rebase the worker branch on origin/main and resolve it there. {e}"))?;
         let merged=git(&candidate,&["rev-parse","HEAD"]).await?;
         // The configured command is run from the merged checkout. Existing git
@@ -321,7 +352,7 @@ pub async fn integrate<F: Fn() -> Result<(), String>>(
         let mut cmd=tokio::process::Command::new("sh");
         cmd.arg("-c").arg(verification).current_dir(&candidate)
             .env("AMUX_SESSION",workspace.branch.trim_start_matches("amux/fanout/"));
-        let (status,output)=checked_command(cmd,&permit,Duration::from_secs(600)).await?;
+        let (status,output)=checked_command(cmd,permit,Duration::from_secs(600)).await?;
         if !status.success() { return Err(format!("Candidate validation exited {}; fix and recommit locally. {}",status.code().unwrap_or(-1),output)); }
         if git(&candidate,&["rev-parse","HEAD"]).await?!=merged
             || !git(&candidate,&["status","--porcelain"]).await?.is_empty() {
@@ -332,11 +363,25 @@ pub async fn integrate<F: Fn() -> Result<(), String>>(
             || !git(&workspace.path,&["status","--porcelain"]).await?.is_empty() {
             return Err("Worker workspace changed during validation; integration deferred".into());
         }
-        integration_git(workspace,&candidate,&["push","origin",&format!("{merged}:refs/heads/main")],&permit).await?;
+        // Detect a stale parent BEFORE an expensive pre-push hook. A remote
+        // race after this check is handled the same way, using observed refs
+        // rather than parsing a hook's possibly misleading error text.
+        git(&workspace.repo,&["fetch","origin","main"]).await?;
+        if git(&workspace.repo,&["rev-parse","origin/main"]).await? != main {
+            return Ok(None);
+        }
+        if let Err(error) = integration_git(workspace,&candidate,&["push","origin",&format!("{merged}:refs/heads/main")],permit).await {
+            permit()?;
+            git(&workspace.repo,&["fetch","origin","main"]).await?;
+            if git(&workspace.repo,&["rev-parse","origin/main"]).await? != main {
+                return Ok(None);
+            }
+            return Err(error);
+        }
         // Exact remote read-back; another successful merge may already follow us.
         git(&workspace.repo,&["fetch","origin","main"]).await?;
         git(&workspace.repo,&["merge-base","--is-ancestor",&merged,"origin/main"]).await?;
-        Ok(merged)
+        Ok(Some(merged))
     }.await;
     // Only this temporary candidate is disposable. Worker files and branches
     // survive failed tests, conflicts, rejected pushes and process restarts.
@@ -570,17 +615,27 @@ pub async fn queue_integration(state: &crate::api::AppState, name: &str) -> bool
             if current.0 != board {
                 return Err("Board changed during integration; work the new state first".into());
             }
+            if crate::api::session_verbs::parse_env(&name)
+                .get_or("CC_WORKTREE_VERIFY", "") != verify
+                || load(&home, &name).is_none_or(|current| {
+                    current.base != workspace.base
+                        || current.path != workspace.path
+                        || current.repo != workspace.repo
+                })
+            {
+                return Err("Integration configuration changed; validate the new contract first".into());
+            }
             Ok(())
         };
         let result = integrate(&workspace, &verify, same_board).await;
-        let (status,detail)=match result { Ok(sha)=>("integrated",format!("Remote main contains {sha}; integration checks passed or the exact head was already present")),Err(e)=>("requires_work",crate::api::session_verbs::redact_secrets(&e).chars().take(4000).collect()) };
+        let (status,detail)=match result { Ok(sha)=>("integrated",format!("Remote main contains {sha}; integration checks passed or the exact head was already present")),Err(e) if e==MAIN_ADVANCED_RETRY=>("retrying",e),Err(e)=>("requires_work",crate::api::session_verbs::redact_secrets(&e).chars().take(4000).collect()) };
         let record = json!({"status":status,"detail":detail,"head":head,"at":crate::config::now_f64(),"fingerprint":fingerprint,"worktree":workspace.path,"branch":workspace.branch});
         write_integration_status(&home, &name, &record);
         if status == "integrated" {
             record_integrated_head(&state.store, &name, &head).await;
         }
         tracing::info!(session=%name,verdict="fanout_integration",%status,%detail,"fan-out integration outcome");
-        if previous["detail"] != detail && ready_board(&state, &name).is_ok() {
+        if status != "retrying" && previous["detail"] != detail && ready_board(&state, &name).is_ok() {
             let text=format!("[amux fan-out integration] {detail}. Continue on your own board and durable worktree {}. Configure the relevant repository test/lint command with PATCH /api/sessions/{name}/config {{\"worktree_verify\":\"<command>\"}}; the harness runs it on the exact merged candidate. For a legacy workspace, first inspect your unmerged history and then set worktree_base to the exact reviewed common ancestor of HEAD and origin/main through the same configuration endpoint. Resolve conflicts and test failures locally, commit the fix, and continue every remaining outcome through its gates. Do not create cross-worker dependencies or ordinary Needs You asks. Integration is evidence, not permission to acknowledge unverified criteria.",workspace.path);
             let key = format!("fanout-integration:{name}:{head}:{status}:{detail}");
             let _ = crate::api::session_verbs::enqueue_state_reminder(
@@ -804,6 +859,82 @@ mod tests {
             main
         );
         assert!(Path::new(&w.path).join("child.txt").exists());
+    }
+    async fn peer_checkout(d: &Path, w: &Workspace) -> String {
+        let peer = d.join("peer").to_string_lossy().into_owned();
+        let remote = git(&w.repo, &["remote", "get-url", "origin"]).await.unwrap();
+        git(&w.repo, &["clone", &remote, &peer]).await.unwrap();
+        git(&peer, &["config", "user.email", "peer@example.invalid"]).await.unwrap();
+        git(&peer, &["config", "user.name", "Peer"]).await.unwrap();
+        peer
+    }
+
+    /// The peer really pushes to a local bare remote; no mocked Git error text.
+    fn peer_push_script(peer: &str) -> String {
+        // Git exports repository-local variables to hooks. The other checkout
+        // must not inherit them or its push recursively invokes this hook.
+        format!("unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_PREFIX\nprintf 'peer\\n' >> '{peer}/peer.txt'\ngit -C '{peer}' add peer.txt\ngit -C '{peer}' commit -m peer\ngit -C '{peer}' push origin main\n")
+    }
+
+    #[tokio::test]
+    async fn main_advance_during_validation_rebuilds_and_revalidates_without_moving_workers() {
+        let (d, w) = fixture().await;
+        commit(&w, "child.txt", "child\n").await;
+        let peer = peer_checkout(d.path(), &w).await;
+        let marker = d.path().join("validated").to_string_lossy().into_owned();
+        let local = git(&w.repo, &["rev-parse", "HEAD"]).await.unwrap();
+        let child = git(&w.path, &["rev-parse", "HEAD"]).await.unwrap();
+        let verify = format!("set -eu\ntest -f child.txt\nif test -f '{marker}'; then test -f peer.txt; else\n{}fi\nprintf 'checked\\n' >> '{marker}'\n", peer_push_script(&peer));
+        let merged = integrate(&w, &verify, || Ok(())).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "checked\nchecked\n");
+        assert_eq!(git(&w.repo, &["show", &format!("{merged}:peer.txt")]).await.unwrap(), "peer");
+        assert_eq!(git(&w.repo, &["show", &format!("{merged}:child.txt")]).await.unwrap(), "child");
+        assert_eq!(git(&w.repo, &["rev-parse", "HEAD"]).await.unwrap(), local);
+        assert_eq!(git(&w.path, &["rev-parse", "HEAD"]).await.unwrap(), child);
+    }
+
+    #[tokio::test]
+    async fn main_advance_in_pre_push_retries_but_unchanged_remote_gate_failure_does_not() {
+        use std::os::unix::fs::PermissionsExt;
+        let (d, w) = fixture().await;
+        commit(&w, "child.txt", "child\n").await;
+        let peer = peer_checkout(d.path(), &w).await;
+        let hooks = d.path().join("hook-calls").to_string_lossy().into_owned();
+        let checks = d.path().join("checks").to_string_lossy().into_owned();
+        let hook = Path::new(&w.repo).join(".git/hooks/pre-push");
+        std::fs::write(&hook, format!("#!/bin/sh\nset -eu\nif ! test -f '{hooks}'; then\n{}fi\nprintf 'hook\\n' >> '{hooks}'\n", peer_push_script(&peer))).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let verify = format!("test -f child.txt && printf 'checked\\n' >> '{checks}'");
+        let merged = integrate(&w, &verify, || Ok(())).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&hooks).unwrap(), "hook\nhook\n");
+        assert_eq!(std::fs::read_to_string(&checks).unwrap(), "checked\nchecked\n");
+        assert_eq!(git(&w.repo, &["show", &format!("{merged}:peer.txt")]).await.unwrap(), "peer");
+
+        commit(&w, "later.txt", "unmerged\n").await;
+        std::fs::write(&hook, format!("#!/bin/sh\nprintf 'refused\\n' >> '{hooks}'\necho real-content-gate-refusal >&2\nexit 1\n")).unwrap();
+        let error = integrate(&w, &verify, || Ok(())).await.unwrap_err();
+        assert!(error.contains("real-content-gate-refusal"), "{error}");
+        assert_eq!(std::fs::read_to_string(&hooks).unwrap(), "hook\nhook\nrefused\n");
+        assert_eq!(git(&w.repo, &["rev-parse", "origin/main"]).await.unwrap(), merged);
+        assert!(Path::new(&w.path).join("later.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn main_advance_retry_is_bounded_and_revalidation_failure_never_pushes() {
+        let (d, w) = fixture().await;
+        commit(&w, "child.txt", "child\n").await;
+        let peer = peer_checkout(d.path(), &w).await;
+        let checks = d.path().join("checks").to_string_lossy().into_owned();
+        let verify = format!("set -eu\n{}printf 'checked\\n' >> '{checks}'\n", peer_push_script(&peer));
+        assert_eq!(integrate(&w, &verify, || Ok(())).await.unwrap_err(), MAIN_ADVANCED_RETRY);
+        assert_eq!(std::fs::read_to_string(&checks).unwrap(), "checked\nchecked\nchecked\n");
+        assert!(git(&w.repo, &["show", "origin/main:child.txt"]).await.is_err());
+
+        let once = d.path().join("once").to_string_lossy().into_owned();
+        let fail = format!("set -eu\nif test -f '{once}'; then echo combined-regression >&2; exit 9; fi\ntouch '{once}'\n{}", peer_push_script(&peer));
+        let error = integrate(&w, &fail, || Ok(())).await.unwrap_err();
+        assert!(error.contains("combined-regression"), "{error}");
+        assert!(git(&w.repo, &["show", "origin/main:child.txt"]).await.is_err());
     }
     #[test]
     fn integration_admits_completed_prerequisites_before_their_successors() {
