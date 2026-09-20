@@ -60,16 +60,6 @@ fn rig() -> Rig {
     std::env::set_var("AMUX_NEEDSYOU_ASK_REQUIRED", "0");
     std::env::set_var("AMUX_TODO_WIP_LIMIT", "0");
     std::env::set_var("AMUX_CONTINUATION_REQUIRED", "0");
-    // AF-921: golden_dependency_chain deliberately builds a cross-worker
-    // dependency chain (a parent owned by one session depending on children
-    // owned by three others) to exercise the orchestrator's own resolution
-    // logic -- the parent must stay Waiting(Dependency) until all three
-    // cross-owner leases complete. board.rs::foreign_dependencies refuses
-    // that at create time by default (cross_board_dependency_forbidden,
-    // b18789f9); its own refusal has separate coverage in
-    // tests/board_ownership.rs. Same escape hatch tests/board_request.rs
-    // already uses to opt a rig out of the create-time policy.
-    std::env::set_var("AMUX_BOARD_DELEGATION", "1");
     let dir = tempfile::tempdir().unwrap();
     let store: SharedStore = Arc::new(Store::open(&dir.path().join("golden.db")).unwrap());
     let state = AppState {
@@ -648,13 +638,16 @@ async fn golden_dependency_chain() {
     for child in [&c1, &c2, &c3] {
         store_command_criterion(app, child, "true").await;
     }
-    let parent = create_task(
-        app,
-        "parent integration",
-        Some("parent-owner"),
-        &[c1.clone(), c2.clone(), c3.clone()],
-    )
-    .await;
+    let parent = create_task(app, "parent integration", Some("parent-owner"), &[]).await;
+    // Historical boards can still contain foreign edges. Seed that legacy
+    // specimen directly: production writes must refuse it, while the runtime
+    // must continue to read existing graphs honestly until they are repaired.
+    let legacy_deps = json!([c1, c2, c3]).to_string();
+    let legacy_parent = parent.clone();
+    rig.store.write(move |conn| {
+        conn.execute("UPDATE issues SET depends_on=?1 WHERE id=?2", params![legacy_deps, legacy_parent])?;
+        Ok(WriteOutcome { applied: true, events: vec![] })
+    }).unwrap();
     let ptid = board_store::internal_id(&parent);
 
     let rt = runtime(&rig, false);

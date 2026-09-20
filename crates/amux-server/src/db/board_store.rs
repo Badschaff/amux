@@ -441,19 +441,59 @@ pub fn board_delegation_allowed(session: Option<&str>) -> bool {
 }
 
 /// References to other boards are evidence, not scheduler dependencies.
-/// Validate in the writer so reassignment cannot race creation or a PATCH.
+/// This invariant is unconditional: delegation may authorize assignment, never
+/// an execution edge across owners. Unassigned cards form their own board.
 pub fn foreign_dependencies(conn: &Connection, session: Option<&str>, deps: &[String]) -> rusqlite::Result<Vec<(String, String)>> {
-    let Some(session) = session.filter(|s| !s.is_empty()) else { return Ok(vec![]) };
-    if board_delegation_allowed(Some(session)) { return Ok(vec![]) }
+    let session = session.filter(|s| !s.is_empty());
     let mut foreign = Vec::new();
     for id in deps {
         let owner = conn.query_row("SELECT session FROM issues WHERE id=?1 AND deleted IS NULL", [id],
-            |r| r.get::<_, Option<String>>(0)).optional()?.flatten();
-        if let Some(owner) = owner.filter(|s| !s.is_empty() && s != session) {
-            foreign.push((id.clone(), owner));
+            |r| r.get::<_, Option<String>>(0)).optional()?;
+        match owner {
+            Some(owner) if owner.as_deref().filter(|s| !s.is_empty()) == session => {},
+            Some(owner) => foreign.push((id.clone(), owner.filter(|s| !s.is_empty()).unwrap_or_else(|| "unassigned".into()))),
+            None => foreign.push((id.clone(), "missing".into())),
         }
     }
     Ok(foreign)
+}
+
+/// Reassignment must also preserve the board of every task that waits on this
+/// card. Keep connected work together; silently dropping these edges would
+/// turn an unfinished prerequisite into runnable work.
+pub fn foreign_dependents(conn: &Connection, id: &str, session: Option<&str>) -> rusqlite::Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT i.id, COALESCE(NULLIF(i.session,''),'unassigned') FROM issues i, \
+         json_each(CASE WHEN json_valid(i.depends_on) THEN i.depends_on ELSE '[]' END) d \
+         WHERE i.deleted IS NULL AND d.value=?1 AND COALESCE(i.session,'') != ?2 ORDER BY i.id")?;
+    let rows = stmt.query_map(params![id, session.unwrap_or("")], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    rows.collect()
+}
+
+fn refuse_dependency_write(card: &str, edges: &[(String, String)]) -> rusqlite::Result<()> {
+    if edges.is_empty() { return Ok(()) }
+    tracing::warn!(marker="cross_board_dependency_refused", card, dependencies=?edges,
+        measured=true, n_considered=edges.len(), "storage refused a dependency graph crossing worker boards");
+    Err(rusqlite::Error::InvalidParameterName(format!("cross_board_dependency_forbidden: {card}: {edges:?}")))
+}
+
+/// Guard the shared write path, including board-drive and internal assignments.
+/// Legacy bad edges may still receive evidence and be removed incrementally;
+/// new edges, ownership changes and reopening a terminal card are checked.
+fn validate_dependency_update(conn: &Connection, row: &IssueRow) -> rusqlite::Result<()> {
+    let previous: Option<(Option<String>, Option<String>, String, String)> = conn.query_row(
+        "SELECT session, depends_on, status, type FROM issues WHERE id=?1", [&row.id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?;
+    let Some((owner, deps, status, item_type)) = previous else { return Ok(()) };
+    let owner_changed = owner.as_deref().filter(|s| !s.is_empty()) != row.session.as_deref().filter(|s| !s.is_empty());
+    let old_deps: Vec<String> = serde_json::from_str(deps.as_deref().unwrap_or("[]")).unwrap_or_default();
+    let reopened = execution_is_terminal(&status, &item_type) && !execution_is_terminal(&row.status, &row.item_type);
+    let added: Vec<String> = row.depends_on.iter().filter(|d| owner_changed || reopened || !old_deps.contains(d)).cloned().collect();
+    refuse_dependency_write(&row.id, &foreign_dependencies(conn, row.session.as_deref(), &added)?)?;
+    if owner_changed {
+        refuse_dependency_write(&row.id, &foreign_dependents(conn, &row.id, row.session.as_deref())?)?;
+    }
+    Ok(())
 }
 
 /// Why a typed ask was refused, or that it was accepted.
@@ -3254,6 +3294,7 @@ pub fn open_capture_with_desc(
 /// card at the top of its lane), int timestamps, `notified` 0. Returns the
 /// row as stored.
 pub fn create_issue(conn: &Connection, new: &NewIssue, now: i64) -> rusqlite::Result<IssueRow> {
+    refuse_dependency_write("new card", &foreign_dependencies(conn, new.session.as_deref(), &new.depends_on)?)?;
     let prefix = prefix_from_session(new.session.as_deref().unwrap_or(""));
     let id = next_issue_id(conn, &prefix)?;
     let min_pos: f64 = conn.query_row(
@@ -4000,6 +4041,7 @@ fn entered_state_at_for_write(conn: &Connection, row: &IssueRow) -> Option<i64> 
 }
 
 pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<usize> {
+    validate_dependency_update(conn, row)?;
     // This marker records delivery, not an outside dependency. Once the owner
     // structures the captured request it must become eligible without a second
     // manual PATCH deleting harness-generated text. Preserve all real holds.
@@ -5170,7 +5212,9 @@ mod tests {
         // A missing or discarded required artifact is not successful delivery.
         // The owner can explicitly remove a no-longer-required relationship.
         dependent.depends_on = vec!["AMUX-DOES-NOT-EXIST".into()];
-        save_patched(&conn, &mut dependent).unwrap();
+        assert!(save_patched(&conn, &mut dependent).is_err(), "new missing dependencies are rejected");
+        // A historical dangling row still reads as blocked, never successful.
+        conn.execute("UPDATE issues SET depends_on='[\"AMUX-DOES-NOT-EXIST\"]' WHERE id=?1", [&dependent.id]).unwrap();
         assert_eq!(crate::runtime_jobs::board_drive::deps_blocking(&conn, &dependent), dependent.depends_on);
         blocker.status = "discarded".into();
         save_patched(&conn, &mut blocker).unwrap();

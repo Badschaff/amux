@@ -3401,3 +3401,14 @@ CARD: CLA-2
 SYMPTOM: Ephemeral starts recreated detached worktrees; stop forcibly disposed worktrees. Existing fan-outs had no recorded creation base or automatic checked integration. Two legacy worktrees had empty indexes over populated commits, and two running children had no worktree directory.
 COST: Completed child work had no deterministic route to main; stopping or restarting could lose uncommitted work, and malformed workspaces obstructed the board drain.
 FIX: Durable per-child branches, preserve workspaces on stop/restart, whole-board integration admission, separately tested merge candidate and ordinary push, pause cancellation, explicit preserved legacy recovery. Pending originating-user validation.
+
+## Self-contained boards could still acquire outside execution dependencies
+AREA: board
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-19
+SESSION: codex-lifecycle-adherence
+CARD: CLA-3
+SYMPTOM: Active-board audit found seven cross-worker dependency edges on six cards. Delegation opt-in bypassed dependency validation, missing/unassigned references escaped it, and fan-out moved a prerequisite while leaving its dependent on the parent board. The existing fan-out retry test asserted that split ownership as success.
+COST: Repeated owner intervention to remove peer waits; six live cards required explicit ownership/next-action correction and a new regression covering the incoming side of reassignment.
+FIX: Enforce same-board graph writes in storage and API, retain connected work on its owner board during fan-out, and preserve prerequisite evidence when repairing legacy edges. No model calls are needed for enforcement.

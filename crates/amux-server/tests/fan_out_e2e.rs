@@ -707,7 +707,7 @@ async fn launch_retry_reuses_graph_and_preserves_paused_child_configuration() {
 }
 
 #[tokio::test]
-async fn fan_out_retry_keeps_assignment_after_retitle_and_does_not_start_dependents() {
+async fn fan_out_keeps_dependency_chain_local_and_retries_independent_assignment() {
     let r = rig().await;
     write_parent_env(&r.home,"retry-fanout");
     let epic = create(&r.app,json!({"title":"Parser rollout", "type":"epic", "session":"retry-fanout"})).await;
@@ -720,10 +720,21 @@ async fn fan_out_retry_keeps_assignment_after_retitle_and_does_not_start_depende
         let (status,_,body)=send(&r.app,"PATCH",&format!("/api/board/{card}"),Some(patch),&[("x-amux-session","retry-fanout")]).await;
         assert!(status.is_success(),"{body}");
     }
+    let (status, _, body) = send(&r.app, "POST", &format!("/api/board/{eid}/fan-out"), Some(json!({})), &[("x-amux-session","retry-fanout")]).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "fan_out_no_independent_work");
+    assert_eq!(get_card(&r.app,id).await["session"], "retry-fanout");
+    let independent = create(&r.app, json!({"title":"Independent documentation fix", "status":"todo", "session":"retry-fanout"})).await;
+    let independent_id = independent["id"].as_str().unwrap();
+    let (status, _, body) = send(&r.app, "PATCH", &format!("/api/board/{independent_id}"), Some(json!({"epic":eid})), &[("x-amux-session","retry-fanout")]).await;
+    assert!(status.is_success(), "{body}");
     let path = format!("/api/board/{eid}/fan-out");
     let (status,_,result)=send(&r.app,"POST",&path,Some(json!({})),&[("x-amux-session","retry-fanout")]).await;
     assert_eq!(status,StatusCode::CREATED,"{result}");
     assert_eq!(result["n_considered"],1);
+    assert_eq!(get_card(&r.app,id).await["session"], "retry-fanout");
+    assert_eq!(get_card(&r.app,blocked_id).await["depends_on"], json!([id]));
+    let id = independent_id;
     let assigned = get_card(&r.app,id).await;
     let worker = assigned["session"].as_str().unwrap();
     let env_path=r.home.join("sessions").join(format!("{worker}.env"));

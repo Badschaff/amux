@@ -1373,7 +1373,7 @@ async fn get_contract(
         },
         "worker_board_ownership": {
             "rule": "workers create and drain their own board; verified caller identity determines ownership",
-            "dependencies": "depends_on is limited to the same worker board; foreign artifacts belong in description/evidence, and the owner implements missing components",
+            "dependencies": "depends_on must reference existing cards on the same worker board, including during reassignment and fan-out; delegation cannot override this. Foreign artifacts belong in description/evidence, and the owner implements missing components",
             "peer_messages": "coordination remains in Messages without automatically minting recipient tasks or callbacks",
             "delegation": "request_to is refused by default (cross_board_delegation_forbidden); AMUX_BOARD_DELEGATION=1 is an explicit legacy cooperative-mode opt-in resolved by worker/group/global settings, not permission a worker should grant itself",
             "security": "worker create and reassignment cannot place cards on peers; administrative callers retain placement, while dependency validation remains atomic"
@@ -4193,7 +4193,7 @@ fn foreign_dependency_refusal(deps: &[(String, String)]) -> Value {
         measured=true, n_considered=deps.len(), "foreign task cannot gate a self-contained board");
     json!({"code":"cross_board_dependency_forbidden", "error":"dependencies must belong to the same worker board",
         "dependencies":deps.iter().map(|(id,session)|json!({"id":id,"session":session})).collect::<Vec<_>>(),
-        "how_to_fix":"keep the required outcome on your own board and own its missing components; reference existing peer artifacts in the description or evidence instead of depends_on. Preserve real access, spend and customer-outbound restrictions."})
+        "how_to_fix":"keep the required outcome on your own board and own its missing components; reference existing peer artifacts in the description or evidence instead of depends_on. Do not relocate a peer wait into source_ref, blocked_on, next_action or gate text: keep the actual prerequisite on this board and implement it here. Preserve real access, spend and customer-outbound restrictions."})
 }
 
 fn unknown_type_response(t: &str) -> Response {
@@ -6575,6 +6575,7 @@ async fn fan_out_item(
         Missing,
         NotEpic,
         NoChildren,
+        NoIndependentWork,
         WrongOwner(String),
         Fanned {
             epic: Box<IssueRow>,
@@ -6654,6 +6655,13 @@ async fn fan_out_item(
                     continue;
                 }
                 let eph_name = format!("{}-eph-{}", slugify_name(&actor_w, 30), cid);
+                let dependents = bs::foreign_dependents(conn, cid, Some(&eph_name))?;
+                if !dependents.is_empty() {
+                    tracing::info!(card = %child.id, dependents = ?dependents, measured = true,
+                        n_considered = dependents.len(), verdict = "fan_out_connected_work_retained",
+                        "prerequisite retained with its dependent tasks on the owner board");
+                    continue;
+                }
                 if !child.depends_on.is_empty() {
                     // Ready dependencies are completed inputs now. Retain their
                     // provenance without creating cross-worker execution edges.
@@ -6684,7 +6692,7 @@ async fn fan_out_item(
             }
 
             if children.is_empty() {
-                return finish(&slot_w, Out::NoChildren, no_write());
+                return finish(&slot_w, Out::NoIndependentWork, no_write());
             }
 
             // Log on the epic itself
@@ -6733,6 +6741,10 @@ async fn fan_out_item(
         Some(Out::NoChildren) => err(
             StatusCode::CONFLICT,
             json!({"error": "epic has no non-terminal children to fan out", "item": id}),
+        ),
+        Some(Out::NoIndependentWork) => err(
+            StatusCode::CONFLICT,
+            json!({"code":"fan_out_no_independent_work", "error":"no independent ready outcomes to fan out; connected or gated tasks remain on their owner board", "item":id}),
         ),
         Some(Out::WrongOwner(owner)) => err(
             StatusCode::FORBIDDEN,
@@ -10048,7 +10060,7 @@ pub async fn patch_item(
             // onto a peer's board through PATCH. Administrative callers remain
             // able to reassign, while a verified worker may only name itself as
             // the destination. Peer collaboration belongs in reviewer,
-            // shepherd, and depends_on links instead of the ownership field.
+            // shepherd, and evidence references instead of cross-board ownership or dependency edges.
             if !caller_lane.is_empty() && map.contains_key("session") {
                 let requested_owner = body_opt_str(&map, "session")
                     .flatten()
@@ -11008,11 +11020,25 @@ pub async fn patch_item(
                     changed.push("depends_on".into());
                 }
             }
-            if map.contains_key("depends_on") || map.contains_key("session") {
+            let requested = body_str(&map, "status").unwrap_or_else(|| next.status.clone());
+            let requested = bs::parse_status(&requested)
+                .map(|status| bs::status_to_db(status, &next.status)).unwrap_or(requested);
+            let reopened = bs::execution_is_terminal(&row.status, &row.item_type)
+                && !bs::execution_is_terminal(&requested, &next.item_type);
+            if map.contains_key("depends_on") || map.contains_key("session") || reopened {
                 let foreign = bs::foreign_dependencies(conn, next.session.as_deref(), &next.depends_on)?;
                 if !foreign.is_empty() {
                     return finish(&slot_w, PatchOut::Refused(StatusCode::CONFLICT,
                         foreign_dependency_refusal(&foreign)), no_write());
+                }
+            }
+            if next.session != row.session {
+                let dependents = bs::foreign_dependents(conn, &row.id, next.session.as_deref())?;
+                if !dependents.is_empty() {
+                    let mut refusal = foreign_dependency_refusal(&dependents);
+                    refusal["relation"] = json!("incoming_dependents");
+                    refusal["how_to_fix"] = json!("Keep this prerequisite and its dependent tasks on the same board. Fan out independent outcomes; consume verified inputs with evidence before moving work.");
+                    return finish(&slot_w, PatchOut::Refused(StatusCode::CONFLICT, refusal), no_write());
                 }
             }
             if let Some(v) = map.get("tags") {

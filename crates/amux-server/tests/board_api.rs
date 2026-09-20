@@ -2054,7 +2054,7 @@ async fn blocked_refuses_a_card_that_names_no_watch() {
     assert!(fix["on_a_person"].as_str().unwrap().contains("needsyou"), "{v}");
 
     // A dependency satisfies it.
-    let other = create(&app, json!({"title": "the thing that must land first"})).await;
+    let other = create(&app, json!({"title": "the thing that must land first", "session": "w2"})).await;
     let (st, _, v) = send(
         &app,
         "PATCH",
@@ -4792,7 +4792,8 @@ async fn terminal_transition_records_summary_and_preserves_provenance_for_provid
                 "session": lane,
                 "source_ref": "message:ATE-75",
                 "epic": "ATE-75",
-                "depends_on": ["AMUX-4018"],
+                // Historical dangling provenance is seeded through the writer
+                // below; new API writes correctly reject missing dependencies.
             }),
         )
         .await;
@@ -7029,7 +7030,7 @@ async fn a_dependency_refusal_names_the_dependencys_own_type() {
 #[tokio::test]
 async fn doing_ack_cannot_bypass_readiness_and_repairs_are_atomic() {
     let (app, store, _dir) = app_with_store();
-    let dep = create(&app, json!({"title":"Import census", "type":"code", "status":"backlog"})).await;
+    let dep = create(&app, json!({"title":"Import census", "session":"parity", "type":"code", "status":"backlog"})).await;
     let dep_id = dep["id"].as_str().unwrap();
     let dep_w = dep_id.to_string();
     store.write(move |conn| {
@@ -7056,8 +7057,21 @@ async fn doing_ack_cannot_bypass_readiness_and_repairs_are_atomic() {
 
     // A missing input and a stored blocker also obey the parker's predicate.
     for fields in [json!({"depends_on":["MISSING-999"]}), json!({"depends_on":[],"blocked_on":"required access absent"})] {
+        let missing = fields["depends_on"][0] == "MISSING-999";
         let (status,_,body) = send(&app,"PATCH",&path,Some(fields)).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
+        if missing {
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(body["code"], "cross_board_dependency_forbidden");
+            // New writes are refused; seed historical corruption separately
+            // to preserve the read-side rule that a missing input blocks work.
+            let legacy_id = id.to_string();
+            store.write(move |conn| {
+                conn.execute("UPDATE issues SET depends_on='[\"MISSING-999\"]' WHERE id=?1", [legacy_id])?;
+                Ok(amux_server::db::WriteOutcome { applied:true, events:vec![] })
+            }).unwrap();
+        } else {
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
         let (status,_,body) = send(&app,"PATCH",&path,Some(json!({"status":"doing","gate_checked":["Input census is available"]}))).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert_eq!(body["code"], "acceptance_checks_failed");

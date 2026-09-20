@@ -23,7 +23,9 @@ visible for intake.
    per-card reminder falls through to guarded pickup. Captured backlog requests
    can receive the same once-per-card intake action as Doing receipts.
 4. **Parallel execution:** fan-out assigns independent ready outcomes to stable
-   child identities. It uses the same dependency completion predicate as normal
+   child identities. Connected prerequisite chains remain together on the owner
+   board; moving one prerequisite cannot strand its dependents on another board.
+   It uses the same dependency completion predicate as normal
    dispatch. Both `/launch` and `/{id}/fan-out` use one ephemeral provisioner with
    worktrees and backlog draining enabled. It preserves existing configuration,
    pause/archive state, and assignments on retry. An identical open launch graph

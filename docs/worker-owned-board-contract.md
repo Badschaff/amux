@@ -2,7 +2,7 @@
 
 The default is one worker owning the complete outcome on its own board. A directory or component owned by another worker is not a reason to delegate the task or wait. Use an isolated checkout and reuse existing artifacts where appropriate.
 
-- New `depends_on` edges must stay on the same worker's board. Cross-board evidence belongs in the description or evidence field. POST and PATCH validate ownership inside the serialized writer and reject the entire mutation with `cross_board_dependency_forbidden`.
+- New `depends_on` edges must reference existing cards on the same worker's board, with no delegation opt-out. Cross-board evidence belongs in the description or evidence field. Relocating a peer wait into `source_ref`, `blocked_on`, `next_action` or gate prose is not a valid workaround; retain the actual artifact requirement on this board and implement the missing component here. Creation and updates validate both outgoing edges and incoming dependents on ownership changes inside the serialized writer and reject the entire mutation with `cross_board_dependency_forbidden`.
 - Workers cannot create assignments on another board using `request_to`. The refusal is `cross_board_delegation_forbidden`. Ordinary cross-board creation and reassignment remain forbidden.
 - Peer messages remain in Messages as coordination. Direct, queued and recovered deliveries do not automatically create recipient work or completion callbacks, and do not invoke semantic intake. Owner commands still receive board capture.
 - `Doing` must agree with pickup about unresolved dependencies and `blocked_on`. A gate acknowledgment cannot return success for a claim that the next board-drive tick would park. Missing prerequisites also block claims. Starting a parent does not require completed children; closing it does.
@@ -11,6 +11,8 @@ The default is one worker owning the complete outcome on its own board. A direct
 
 The existing worker/group/global setting `AMUX_APPROVAL_TYPES=budget,customer_outbound` confines Needs You to increased spend/budget and customer outbound without existing permission. A real credential or permission denial is still a real execution restriction; removing a worker dependency does not grant access. Complete independent preparation and record the exact remaining condition.
 
-`AMUX_BOARD_DELEGATION=1` explicitly opts a legacy cooperative workspace into routed tasks, peer capture and cross-board edges. It is off by default. Workers must not grant themselves this exception to evade the owner-selected policy. It does not bypass lifecycle, isolation, authentication or cross-group restrictions.
+`AMUX_BOARD_DELEGATION=1` retains legacy routed-task and peer-capture behavior; it never permits cross-board dependency edges. It is off by default. Workers must not grant themselves this exception to evade the owner-selected policy. It does not bypass lifecycle, isolation, authentication or cross-group restrictions.
 
 TubeScience's September 17 repair keeps its import census as an evidence-only investigation and preserves its existing Done evidence. Validation cards retain outcome requirements as acceptance criteria and use the existing per-column/type gates; a final result is not falsely acknowledged merely to start work. No repair claims unperformed parity or production verification.
+
+Fan-out keeps a prerequisite with its dependent tasks on the original board and assigns only independent ready outcomes. Completed inputs are consumed with an audit record before moving a card. Internal storage writes enforce the same rule as HTTP writes. Existing foreign edges can receive evidence and be removed without falsifying completion or removing actual artifact requirements; no new cross-worker edge is permitted.
