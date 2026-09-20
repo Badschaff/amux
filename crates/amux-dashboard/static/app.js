@@ -2019,6 +2019,15 @@ function _uiComponentCheck(root = document) {
     if (!strip || strip.hidden || !strip.getClientRects().length)
       issues.push('board-columns:active-work-missing');
   }
+  root.querySelectorAll('.board-activity-task').forEach(task => {
+    if (!task.getClientRects().length) return;
+    considered++;
+    const style = getComputedStyle(task);
+    const line = parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.35;
+    const padding = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
+    if (task.getBoundingClientRect().height > line * 3 + padding + 2)
+      issues.push((task.closest('.board-activity-item')?.dataset.cardId || 'board-activity') + ':activity-summary-too-tall');
+  });
   return {measured:true,n_considered:considered,issues};
 }
 
@@ -11534,7 +11543,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.996';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.997';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.

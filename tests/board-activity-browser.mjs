@@ -22,7 +22,7 @@ function card(id,session,status,title) {
     depends_on:[],archived:false,created:1,updated:1,pos:0};
 }
 const board=[card('SP-787','studio-plg','backlog','OpenAPI submission parameters'),
-  card('FX-1','linked-worker','doing','First outcome'),card('FX-2','linked-worker','doing','Second outcome'),
+  card('FX-1','linked-worker','doing','First outcome: '+ 'A legacy task title contains a whole request and must not hide the board. '.repeat(20)),card('FX-2','linked-worker','doing','Second outcome'),
   ...Array.from({length:18},(_,i)=>card('WRAP-'+i,'studio-plg','backlog',
     'A long board title must wrap inside its own row when a worker has more tasks than fit on a phone screen'))];
 let payload=[worker('studio-plg',null),worker('linked-worker','FX-1'),
@@ -61,6 +61,13 @@ try {
     assert.equal(await page.locator('.board-card-live[data-id="FX-1"]').count(),1);
     assert.equal(await page.locator('.board-card-live[data-id="FX-2"]').count(),0);
     assert.equal(await page.locator('.board-card-observed[data-id="SP-787"]').count(),1);
+    const summary=page.locator('#board-columns-activity [data-card-id="FX-1"] .board-activity-task');
+    assert.ok((await summary.textContent()).length>1000,'full task text remains accessible');
+    assert.equal(await page.evaluate(()=>_uiComponentCheck().issues.filter(i=>i.endsWith(':activity-summary-too-tall')).length),0);
+    assert.ok((await page.locator('#board-columns-activity').boundingBox()).height<190,'long task summaries keep the board visible');
+    const tall=await page.addStyleTag({content:'.board-activity-task {-webkit-line-clamp:unset !important;}'});
+    assert.ok(await page.evaluate(()=>_uiComponentCheck().issues.some(i=>i.endsWith(':activity-summary-too-tall'))),'diagnostic detects an unbounded legacy title');
+    await tall.evaluate(el=>el.remove());
     for (const mode of ['list','worker','status']) {
       await page.evaluate(mode=>{boardViewMode=mode;renderBoard();},mode);
       assert.equal(await page.locator('#board-columns-activity [data-worker="linked-worker"]').count(),1);

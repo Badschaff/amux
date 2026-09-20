@@ -3479,3 +3479,14 @@ CARD: CLA-4
 SYMPTOM: The public board API accepts text or a string array for acceptance_criteria, but has_execution_details and its SQL mirror only accepted arrays. Two active-board cards with next actions and nonempty textual criteria were consequently counted as raw captures.
 COST: AMUX-4508 and MHC-808 could be sent back to intake despite already carrying the execution fields the public API accepts.
 FIX: Use the same accepted text/array shapes in the shared Rust and SQL predicates, with empty/malformed/object controls. The text_criteria_recognized log names recovered captured work once per card/hour. Preserve the criteria verbatim and retain actual approval/event holds.
+
+## A paragraph-length activity title displaces the board
+AREA: ui
+SEVERITY: friction
+STATUS: open
+DATE: 2026-09-19
+SESSION: codex-lifecycle-adherence
+CARD: CLA-4
+SYMPTOM: Live screenshot inspection found a legacy task with its whole request as its title. The activity strip rendered every line and stretched all neighboring cards to the same height, displacing the board on a phone despite passing presence checks.
+COST: Current-work visibility consumed the space needed to see and operate the board.
+FIX: Limit the activity summary to three lines, preserve the complete accessible button text and full task destination, and align cards independently. The existing UI diagnostic reports activity-summary-too-tall; the browser fixture covers a paragraph-length title and detects removal of the clamp.
