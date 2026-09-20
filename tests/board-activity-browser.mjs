@@ -61,6 +61,17 @@ try {
     assert.equal(await page.locator('.board-card-live[data-id="FX-1"]').count(),1);
     assert.equal(await page.locator('.board-card-live[data-id="FX-2"]').count(),0);
     assert.equal(await page.locator('.board-card-observed[data-id="SP-787"]').count(),1);
+    for (const mode of ['list','worker','status']) {
+      await page.evaluate(mode=>{boardViewMode=mode;renderBoard();},mode);
+      assert.equal(await page.locator('#board-columns-activity [data-worker="linked-worker"]').count(),1);
+      assert.equal(await page.locator('#board-columns > #board-columns-activity').count(),0,
+        'activity sits above horizontal columns, not in an offscreen column');
+    }
+    await page.evaluate(()=>document.getElementById('board-columns-activity').remove());
+    assert.ok(await page.evaluate(()=>_uiComponentCheck().issues.includes('board-columns:active-work-missing')),
+      'diagnostic detects erased activity, not just card highlights');
+    await page.evaluate(()=>renderBoard());
+    assert.ok(await page.evaluate(()=>!_uiComponentCheck().issues.includes('board-columns:active-work-missing')));
     // Keep runtime active while moving to another exact card: the old active-set
     // signature missed this, and the SSE handler never repainted either board.
     payload=[worker('studio-plg',null),worker('linked-worker','FX-2'),payload[2]];
@@ -78,9 +89,9 @@ try {
     await page.waitForFunction(()=>getComputedStyle(document.getElementById('peek-overlay')).opacity==='1');
     assert.equal(await page.evaluate(()=>_uiComponentCheck().issues.filter(i=>i.endsWith(':board-row-content-overflow')).length),0);
     if(width===390) {
-      const broken=await page.addStyleTag({content:'.peek-issue-item {flex-shrink:1 !important;}'});
+      const broken=await page.addStyleTag({content:'.peek-issue-item {height:8px !important;max-height:8px !important;min-height:0 !important;flex:0 0 8px !important;}'});
       assert.ok(await page.evaluate(()=>_uiComponentCheck().issues.some(i=>i.endsWith(':board-row-content-overflow'))),
-        'diagnostic must detect the original compressed-row failure');
+        'diagnostic must detect an injected compressed-row failure');
       await broken.evaluate(el=>el.remove());
     }
     payload=[worker('studio-plg',null,{lifecycle:'paused',running:false}),payload[1],payload[2]];

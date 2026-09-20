@@ -2012,6 +2012,13 @@ function _uiComponentCheck(root = document) {
     if (title.getBoundingClientRect().bottom > box.bottom + 1)
       issues.push((row.dataset.id || 'board-row') + ':board-row-content-overflow');
   });
+  const boardHost = root.querySelector('#board-columns');
+  if (boardHost && boardHost.getClientRects().length && _boardActivityEntries().length) {
+    considered++;
+    const strip = root.querySelector('#board-columns-activity');
+    if (!strip || strip.hidden || !strip.getClientRects().length)
+      issues.push('board-columns:active-work-missing');
+  }
   return {measured:true,n_considered:considered,issues};
 }
 
@@ -5224,7 +5231,7 @@ function _boardActivityForCard(item) {
   return _boardActivityEntries(item.session).find(a => (a.cardId || a.observedId) === item.id) || null;
 }
 
-function _renderBoardActivity(host, workerName) {
+function _renderBoardActivity(host, workerName, insideHost = true) {
   if (!host || !host.parentNode) return;
   const id = host.id + '-activity';
   let strip = document.getElementById(id);
@@ -5233,7 +5240,8 @@ function _renderBoardActivity(host, workerName) {
     strip.id = id;
     strip.className = 'board-activity';
     strip.setAttribute('aria-label', 'Current worker activity');
-    host.insertBefore(strip, host.firstChild);
+    if (insideHost) host.insertBefore(strip, host.firstChild);
+    else host.parentNode.insertBefore(strip, host);
   }
   const entries = _boardActivityEntries(workerName);
   strip.hidden = !entries.length;
@@ -11526,7 +11534,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.995';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.996';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -30728,7 +30736,10 @@ function renderBoard() {
   if (document.body.classList.contains('board-dragging')) { _boardRenderPending = true; return; }
   renderBoardFilters();
   const container = document.getElementById('board-columns');
-  _renderBoardActivity(container, '');
+  // Global columns scroll horizontally. Keep activity above them, outside the
+  // host whose contents every board view replaces. Worker detail instead keeps
+  // its strip inside its vertical scrolling list and mounts it after rendering.
+  _renderBoardActivity(container, '', false);
   // Update view toggle buttons
   var bvS = document.getElementById('bv-session');
   var bvC = document.getElementById('bv-status');

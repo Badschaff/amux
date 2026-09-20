@@ -3457,3 +3457,14 @@ CARD: CLA-4
 SYMPTOM: Six shell commands on two active fan-out workers had waited 5–6 hours on fleet-wide pgrep -f "git commit". Their own shell command lines contain that expression, so each wait keeps itself blocked.
 COST: full-e2e-test-coverage and mixpeek-fanout-eph-MF-1239 retained live shell work with no task progress despite separate durable workspaces.
 FIX: Record exact PID/parent/worker evidence, terminate only confirmed self-matching wait shells after rechecking active lifecycle and child processes, and record the repair on their current boards. Document checkout-local bounded Git recovery; never delete another worker’s lock or treat process existence as progress.
+
+## Global board render erases its current-work strip
+AREA: ui
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-19
+SESSION: codex-lifecycle-adherence
+CARD: CLA-4
+SYMPTOM: The real browser regression timed out finding global current activity even with two running fixture workers. Moving the shared strip inside its host for worker-detail scrolling also put the global strip inside the horizontal columns; every global render replaced that host and erased it.
+COST: Running workers disappeared from board activity across filters and view changes, making real task execution look like non-adherence.
+FIX: Mount global activity above the replaceable horizontal columns while retaining the worker-detail scrolling mount. Report active-work-missing through the existing measured UI diagnostics. Browser coverage exercises list/worker/status views, same-status task switching, filters, pause and both desktop/phone widths, with missing-strip and compressed-row negative controls.
