@@ -6459,6 +6459,7 @@ async fn fan_out_item(
                 // Ephemeral workers have exactly their own cards; they must
                 // drain backlog when idle or a self-parked card sits forever.
                 env.set("AMUX_DISPATCH_BACKLOG_WHEN_IDLE", "1");
+                env.set("CC_VERIFICATION_POLICY", "production");
 
                 let model_flag = format!("--model {} --dangerously-skip-permissions", model);
                 let flags = if extra_flags.is_empty() {
@@ -6768,10 +6769,17 @@ async fn launch_priorities(
                     depends_on: Vec::new(),
                     tags: vec![format!("p{}", idx)],
                     ask_type: None,
-                    next_action: Some(format!("Investigate and implement: {trimmed}")),
+                    next_action: Some(format!(
+                        "Implement, merge to main, and verify in production: {trimmed}"
+                    )),
                     acceptance_criteria: Some(
-                        serde_json::to_string(&[format!("{trimmed}: implemented and verified")])
-                            .expect("single-element array always serializes"),
+                        serde_json::to_string(&[format!(
+                            "{trimmed}: implemented, merged to main, deployed, and verified working in production \
+                             (not just CI/tests). Evidence must include production verification \
+                             (API call, kubectl check, Studio screenshot, or live exercise). \
+                             Do not stop at done; drive to verified."
+                        )])
+                        .expect("single-element array always serializes"),
                     ),
                     ask_question: None,
                     ask_unblocks: None,
@@ -6838,6 +6846,7 @@ async fn launch_priorities(
         env.set("CC_CREATOR", &format!("launch:{actor}"));
         env.set("AMUX_DISPATCH_BACKLOG_WHEN_IDLE", "0");
         env.set("AMUX_BOARD_DELEGATION", "0");
+        env.set("CC_VERIFICATION_POLICY", "production");
 
         let model_flag = format!("--model {} --dangerously-skip-permissions", model);
         let flags = if extra_flags.is_empty() {
