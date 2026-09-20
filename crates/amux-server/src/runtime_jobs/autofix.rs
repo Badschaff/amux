@@ -1110,7 +1110,7 @@ pub fn detect_5xx(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>
     let mut suppressed = Vec::new();
     let q = conn.prepare(
         "SELECT ts, method, path, family, status, latency_ms, client_ip, amux_session, \
-                worker, error_body \
+                worker, error_body, boot_at \
          FROM _amux_request_log WHERE status >= 500 AND ts >= ?1 ORDER BY ts ASC LIMIT 200000",
     );
     let mut stmt = match q {
@@ -1134,6 +1134,7 @@ pub fn detect_5xx(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>
             r.get::<_, Option<String>>(7)?.unwrap_or_default(),
             r.get::<_, Option<String>>(8)?.unwrap_or_default(),
             r.get::<_, Option<String>>(9)?.unwrap_or_default(),
+            r.get::<_, Option<f64>>(10)?,
         ))
     });
     let rows = match rows {
@@ -1146,7 +1147,7 @@ pub fn detect_5xx(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>
         }
     };
     for row in rows.flatten() {
-        let (ts, method, path, family, status, latency, ip, session, worker, body) = row;
+        let (ts, method, path, family, status, latency, ip, session, worker, body, boot_at) = row;
         // The honest-degradation gate, applied BEFORE grouping so a suppressed
         // code cannot dilute a real group's sample.
         if status == 501 || status == 503 {
@@ -1184,8 +1185,16 @@ pub fn detect_5xx(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>
             sample_body: String::new(),
             max_latency: 0.0,
             targets: Default::default(),
+            boots: Default::default(),
         });
         g.targets.insert(target.clone());
+        // AMUX-4851. A NULL predates migration 0030 and cannot name a process,
+        // so it is skipped rather than folded in as a distinct one.
+        if let Some(b) = boot_at {
+            if b.is_finite() && b > 0.0 {
+                g.boots.insert(b as i64);
+            }
+        }
         g.count += 1;
         g.last_ts = ts;
         g.max_latency = g.max_latency.max(latency);
@@ -1290,6 +1299,34 @@ pub fn detect_5xx(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>
             ("first_seen".into(), rl::local_when(g.first_ts)),
             ("last_seen".into(), rl::local_when(g.last_ts)),
             ("count".into(), g.count.to_string()),
+            // AMUX-4851. THE FIELD THAT SAYS WHETHER THE SERVER WAS DYING.
+            // This grouping is per-endpoint with no process dimension, so
+            // without this a crash loop and a single sick handler produce
+            // identical-looking cards: every boot re-files the same endpoint,
+            // and the restart count is the thing that separates them. Measured
+            // 2026-09-19 over 3,568 5xx in 7 days, the largest incident carried
+            // 42 distinct boot_at across 1,900 responses.
+            //
+            // The count is stated even when it is 1, because "confined to one
+            // process" is a real finding and an absent field reads as unchecked
+            // rather than as checked-and-single.
+            (
+                "distinct_processes".into(),
+                if g.boots.is_empty() {
+                    "unknown: these rows predate the boot_at column (migration 0030)".into()
+                } else if g.boots.len() == 1 {
+                    "1 — confined to a single server process, so this is the handler, not a restart loop".into()
+                } else {
+                    format!(
+                        "{} — these responses span {} SERVER RESTARTS, so read this as a process \
+                         that kept dying rather than one endpoint misbehaving; the endpoint named \
+                         above may be a victim. Look at what restarted the server before looking \
+                         at the handler.",
+                        g.boots.len(),
+                        g.boots.len()
+                    )
+                },
+            ),
             (
                 "distinct_clients".into(),
                 format!(
@@ -1351,6 +1388,20 @@ struct Group {
     /// (AMUX-3840): the card has to name who was hit without being one card
     /// per victim.
     targets: std::collections::BTreeSet<String>,
+    /// Distinct `boot_at` values seen in this group (AMUX-4851).
+    ///
+    /// THE FIELD THAT SEPARATES A SICK ENDPOINT FROM A DYING SERVER. A group
+    /// confined to one process is a handler fault; a group spanning many is a
+    /// crash loop, and the per-endpoint card cannot say which because every
+    /// boot re-files the same endpoint and the RESTART COUNT is what a reader
+    /// needs. Measured 2026-09-19 over 3,568 5xx in 7 days: the largest
+    /// incident carried 42 distinct boot_at across 1,900 responses, and
+    /// 09-17 13:56 carried 23 across 206.
+    ///
+    /// A NULL `boot_at` is a legacy row predating migration 0030, so it is
+    /// skipped rather than counted as a distinct process; counting it would
+    /// inflate the restart count with rows that simply cannot answer.
+    boots: std::collections::BTreeSet<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -11529,6 +11580,54 @@ mod tests {
     /// that files per-row would put 14 cards on the board for one bug, which
     /// is how a board stops being read (ethos rule 5 — at 100x volume, does
     /// this stay coherent?).
+    /// AMUX-4851. A crash loop and one sick handler produce the SAME
+    /// per-endpoint group, because this detector has no process dimension and
+    /// every boot re-files the same endpoint. The restart count is the only
+    /// thing that separates them, so the card has to carry it.
+    ///
+    /// Inserts directly rather than through `log_row`, because `Row` has 73
+    /// literal constructions in this file and widening it to carry a boot_at
+    /// would touch every one of them for a field only this cell needs.
+    #[tokio::test]
+    async fn a_group_spanning_restarts_says_so_and_one_confined_to_a_process_says_that() {
+        for (boots, expect, forbid) in [
+            (vec![111.0_f64, 222.0, 333.0], "3", "confined to a single server process"),
+            (vec![111.0_f64, 111.0, 111.0], "confined to a single server process", "SERVER RESTARTS"),
+        ] {
+            let (st, _d) = state();
+            let now = unix_now();
+            for (i, boot) in boots.iter().enumerate() {
+                let (ts, b) = (now - 60.0 - i as f64, *boot);
+                st.store
+                    .write(move |conn| {
+                        conn.execute(
+                            "INSERT INTO _amux_request_log (ts, method, path, family, status, \
+                             latency_ms, client_ip, user_agent, amux_session, worker, \
+                             answered_by, error_body, boot_at) \
+                             VALUES (?1,'GET','/api/health','/api/health',500,7.0,\
+                             '127.0.0.1','curl/8','','lane','native','{\"message\":\"boom\"}',?2)",
+                            rusqlite::params![ts, b],
+                        )?;
+                        Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                    })
+                    .unwrap();
+            }
+            let _ = autofix_tick(&st, std::path::Path::new("/nonexistent")).await;
+            let c = cards(&st);
+            assert_eq!(c.len(), 1, "three rows on one route are one card, got {c:#?}");
+            let body = format!("{:?}", c[0]);
+            assert!(
+                body.contains(expect),
+                "a group over boots {boots:?} must report {expect:?} in distinct_processes; \
+                 without it a crash loop is indistinguishable from a sick handler.\nbody: {body}"
+            );
+            assert!(
+                !body.contains(forbid),
+                "a group over boots {boots:?} must NOT claim {forbid:?}.\nbody: {body}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn n_identical_5xx_produce_one_card() {
         let (st, _d) = state();
