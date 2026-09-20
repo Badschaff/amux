@@ -139,6 +139,44 @@ fn email_err_with(e: &str, extra: Value) -> Response {
             );
         }
     }
+    // A QUOTA REFUSAL IS UPSTREAM DECLINING, NOT AMUX FAILING (AMUX-4833).
+    // Exactly the AMUX-3809 reasoning one step over: that card changed a dead
+    // credential from 502 to 403 because "nothing in amux is broken". Nothing
+    // is broken here either — Gmail applied a per-minute quota and said so.
+    //
+    // The 502 was not only wrong to the caller, it was wrong to the 5xx
+    // detector, which is how this arrived as an automated fault card at all.
+    // 429 is the status that says "come back", and Retry-After says when: the
+    // exceeded quota is per MINUTE (quota_limit defaultPerMinutePerUser,
+    // window_start_time in the body), so the window turns over within 60s.
+    //
+    // REUSES integrations::email's predicate rather than restating it. This
+    // file's own OAuth comment says two spellings of "which codes are refusals"
+    // would drift, and that warning applies to quota codes identically.
+    if let Some(start) = e.find('{') {
+        if let Ok(body) = serde_json::from_str::<Value>(&e[start..]) {
+            let status = if e.contains("gmail api 429") { 429 } else { 403 };
+            if crate::integrations::email::GmailClient::gmail_rate_limited(status, &body) {
+                let mut r = err(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    merge(json!({
+                        "error": e,
+                        "rate_limited": true,
+                        "fix": "Gmail applied a per-minute quota to this project, so the call \
+                                was declined rather than failing. Retry after the window turns \
+                                over. If it is sustained, the caller is issuing too many \
+                                Gmail requests per minute: check for a batch fallback expanding \
+                                one call into many single fetches (AMUX-4780).",
+                    })),
+                );
+                r.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    axum::http::HeaderValue::from_static("60"),
+                );
+                return r;
+            }
+        }
+    }
     err(StatusCode::BAD_GATEWAY, merge(json!({ "error": e })))
 }
 
@@ -2761,5 +2799,72 @@ mod tests {
             http.calls.lock().unwrap().iter().all(|(m, u, _)| !(m == "POST" && u.contains("/send"))),
             "the reply must be held, not sent"
         );
+    }
+}
+
+/// AMUX-4833: a Gmail quota refusal is 429, not 502.
+#[cfg(test)]
+mod rate_limit_status_tests {
+    use super::*;
+
+    /// The VERBATIM body from the filed card, trimmed only of the parts the
+    /// detector truncated. Using the real shape is the point: a fixture I
+    /// invented would have agreed with whatever predicate I wrote.
+    fn real_429_body() -> String {
+        r#"gmail api 403: {"error":{"code":403,"details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","domain":"googleapis.com","metadata":{"consumer":"projects/492989726165","quota_limit":"defaultPerMinutePerUser","quota_limit_value":"15000","quota_metric":"gmail.googleapis.com/default"},"reason":"RATE_LIMIT_EXCEEDED"}],"errors":[{"domain":"usageLimits","message":"Quota exceeded for quota metric 'Queries'"}]}}"#.to_string()
+    }
+
+    #[tokio::test]
+    async fn a_quota_refusal_answers_429_with_retry_after() {
+        let r = email_err(&real_429_body());
+        assert_eq!(
+            r.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a per-minute quota is upstream DECLINING; 502 says amux is broken and tells the \
+             5xx detector the same thing"
+        );
+        assert_eq!(
+            r.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("60"),
+            "the exceeded quota is per MINUTE, so the window turns over within 60s"
+        );
+        let body = axum::body::to_bytes(r.into_body(), 8192).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["rate_limited"], true);
+    }
+
+    /// The control that keeps this from swallowing real faults. An ordinary
+    /// upstream failure must STAY a 502, including one whose text merely
+    /// mentions a quota — which is why the predicate reads structure rather
+    /// than searching for a substring.
+    #[tokio::test]
+    async fn ordinary_upstream_faults_stay_502() {
+        for e in [
+            "gmail api 500: {\"error\":{\"code\":500,\"message\":\"Backend Error\"}}",
+            "gmail api 404: {\"error\":{\"code\":404,\"message\":\"Not Found\"}}",
+            // Mentions the words, carries none of the structure.
+            "gmail api 500: {\"error\":{\"code\":500,\"message\":\"usageLimits RATE_LIMIT_EXCEEDED happened downstream\"}}",
+            "gmail batch transport error - falling back to single fetches",
+        ] {
+            assert_eq!(
+                email_err(e).status(),
+                StatusCode::BAD_GATEWAY,
+                "this is amux failing, not declining: {e}"
+            );
+        }
+    }
+
+    /// A dead credential must keep its own 403 + needs_auth answer (AMUX-3809).
+    /// The new arm runs in the same function and must not shadow it.
+    #[tokio::test]
+    async fn a_revoked_token_still_answers_403_needs_auth() {
+        let e = "token refresh failed (400): {\"error\":\"invalid_grant\",\"error_description\":\"Token has been expired or revoked\"}";
+        let r = email_err(e);
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(r.into_body(), 8192).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["needs_auth"], true, "re-consent, not a retry");
     }
 }

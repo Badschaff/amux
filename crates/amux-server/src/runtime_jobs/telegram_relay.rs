@@ -24,9 +24,11 @@ const JOB: &str = super::registry::ids::TELEGRAM_RELAY;
 
 pub async fn run(state: AppState) {
     loop {
-        registry::tick(JOB);
-        if let Err(e) = relay_cycle(&state).await {
-            tracing::warn!("telegram_relay: scan error: {e}");
+        // AMUX-4828: bracket the cycle; the one-shot records no duration.
+        registry::tick_start(JOB);
+        match relay_cycle(&state).await {
+            Ok(()) => registry::tick_end(JOB),
+            Err(e) => tracing::warn!("telegram_relay: scan error: {e}"),
         }
         tokio::time::sleep(Duration::from_secs(30)).await;
     }

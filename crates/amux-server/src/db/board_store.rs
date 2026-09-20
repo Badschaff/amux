@@ -441,19 +441,59 @@ pub fn board_delegation_allowed(session: Option<&str>) -> bool {
 }
 
 /// References to other boards are evidence, not scheduler dependencies.
-/// Validate in the writer so reassignment cannot race creation or a PATCH.
+/// This invariant is unconditional: delegation may authorize assignment, never
+/// an execution edge across owners. Unassigned cards form their own board.
 pub fn foreign_dependencies(conn: &Connection, session: Option<&str>, deps: &[String]) -> rusqlite::Result<Vec<(String, String)>> {
-    let Some(session) = session.filter(|s| !s.is_empty()) else { return Ok(vec![]) };
-    if board_delegation_allowed(Some(session)) { return Ok(vec![]) }
+    let session = session.filter(|s| !s.is_empty());
     let mut foreign = Vec::new();
     for id in deps {
         let owner = conn.query_row("SELECT session FROM issues WHERE id=?1 AND deleted IS NULL", [id],
-            |r| r.get::<_, Option<String>>(0)).optional()?.flatten();
-        if let Some(owner) = owner.filter(|s| !s.is_empty() && s != session) {
-            foreign.push((id.clone(), owner));
+            |r| r.get::<_, Option<String>>(0)).optional()?;
+        match owner {
+            Some(owner) if owner.as_deref().filter(|s| !s.is_empty()) == session => {},
+            Some(owner) => foreign.push((id.clone(), owner.filter(|s| !s.is_empty()).unwrap_or_else(|| "unassigned".into()))),
+            None => foreign.push((id.clone(), "missing".into())),
         }
     }
     Ok(foreign)
+}
+
+/// Reassignment must also preserve the board of every task that waits on this
+/// card. Keep connected work together; silently dropping these edges would
+/// turn an unfinished prerequisite into runnable work.
+pub fn foreign_dependents(conn: &Connection, id: &str, session: Option<&str>) -> rusqlite::Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT i.id, COALESCE(NULLIF(i.session,''),'unassigned') FROM issues i, \
+         json_each(CASE WHEN json_valid(i.depends_on) THEN i.depends_on ELSE '[]' END) d \
+         WHERE i.deleted IS NULL AND d.value=?1 AND COALESCE(i.session,'') != ?2 ORDER BY i.id")?;
+    let rows = stmt.query_map(params![id, session.unwrap_or("")], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    rows.collect()
+}
+
+fn refuse_dependency_write(card: &str, edges: &[(String, String)]) -> rusqlite::Result<()> {
+    if edges.is_empty() { return Ok(()) }
+    tracing::warn!(marker="cross_board_dependency_refused", card, dependencies=?edges,
+        measured=true, n_considered=edges.len(), "storage refused a dependency graph crossing worker boards");
+    Err(rusqlite::Error::InvalidParameterName(format!("cross_board_dependency_forbidden: {card}: {edges:?}")))
+}
+
+/// Guard the shared write path, including board-drive and internal assignments.
+/// Legacy bad edges may still receive evidence and be removed incrementally;
+/// new edges, ownership changes and reopening a terminal card are checked.
+fn validate_dependency_update(conn: &Connection, row: &IssueRow) -> rusqlite::Result<()> {
+    let previous: Option<(Option<String>, Option<String>, String, String)> = conn.query_row(
+        "SELECT session, depends_on, status, type FROM issues WHERE id=?1", [&row.id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?;
+    let Some((owner, deps, status, item_type)) = previous else { return Ok(()) };
+    let owner_changed = owner.as_deref().filter(|s| !s.is_empty()) != row.session.as_deref().filter(|s| !s.is_empty());
+    let old_deps: Vec<String> = serde_json::from_str(deps.as_deref().unwrap_or("[]")).unwrap_or_default();
+    let reopened = execution_is_terminal(&status, &item_type) && !execution_is_terminal(&row.status, &row.item_type);
+    let added: Vec<String> = row.depends_on.iter().filter(|d| owner_changed || reopened || !old_deps.contains(d)).cloned().collect();
+    refuse_dependency_write(&row.id, &foreign_dependencies(conn, row.session.as_deref(), &added)?)?;
+    if owner_changed {
+        refuse_dependency_write(&row.id, &foreign_dependents(conn, &row.id, row.session.as_deref())?)?;
+    }
+    Ok(())
 }
 
 /// Why a typed ask was refused, or that it was accepted.
@@ -1699,12 +1739,121 @@ pub fn core_gates(criteria: &[String], target: TaskStatus) -> Vec<Gate> {
 // Log convention
 // ---------------------------------------------------------------------------
 
+/// A `` `YYYY-MM-DD` `` line on its own, distinct from an ordinary
+/// `` `HH:MM` message `` entry by length and shape alone. Returns the date
+/// text when `line` is exactly that.
+fn date_separator(line: &str) -> Option<&str> {
+    let inner = line.trim().strip_prefix('`')?.strip_suffix('`')?;
+    let b = inner.as_bytes();
+    (b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && inner[..4].bytes().all(|c| c.is_ascii_digit())
+        && inner[5..7].bytes().all(|c| c.is_ascii_digit())
+        && inner[8..10].bytes().all(|c| c.is_ascii_digit()))
+    .then_some(inner)
+}
+
 /// Append one history line exactly the way Python's `_append_board_log`
-/// does: `` (log.rstrip() + "\n`HH:MM` " + line).strip() `` — so logs written
+/// did: `` (log.rstrip() + "\n`HH:MM` " + line).strip() `` — so logs written
 /// by either server interleave without corrupting each other's lines.
+///
+/// AF-470: `HH:MM` alone lost the date, so a multi-day log's time axis had
+/// to be INFERRED from where the clock visibly wraps backwards (measured on
+/// TG-3239's 74 entries) rather than read. Every option that stamped every
+/// line paid a per-line width cost this view's own mobile rules (375px)
+/// don't have room for; Ethan's call (2026-09-18) was a date only where the
+/// day actually changes: `` `YYYY-MM-DD` `` as its own line, inserted the
+/// first time an entry lands on a day the log hasn't seen a separator for
+/// yet. A log with no separator at all (every entry written before this
+/// existed) gets one on its very next append — that is the honest
+/// boundary: existing HH:MM-only entries are baked in and stay ambiguous
+/// forever, which is the same limit the card's own options all shared.
 pub fn append_log(existing: Option<&str>, hhmm: &str, line: &str) -> String {
     let base = existing.unwrap_or("").trim_end();
-    format!("{base}\n`{hhmm}` {line}").trim().to_string()
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let last_separator = base.lines().rev().find_map(date_separator);
+    let mut out = base.to_string();
+    if last_separator != Some(today.as_str()) {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push('`');
+        out.push_str(&today);
+        out.push('`');
+    }
+    format!("{out}\n`{hhmm}` {line}").trim().to_string()
+}
+
+// ---------------------------------------------------------------------------
+// AF-510: fleet-wide needs:you digest producer
+// ---------------------------------------------------------------------------
+
+/// One row of the fleet-wide needs:you digest -- what would be shown to the
+/// owner, regardless of which channel eventually carries it there.
+pub struct NeedsYouDigestCard {
+    pub id: String,
+    pub session: String,
+    pub title: String,
+    pub ask_question: Option<String>,
+    pub ask_actor: Option<String>,
+    pub archived: bool,
+    pub asked_at: f64,
+    pub age_days: f64,
+}
+
+/// AF-510. Fleet-wide needs:you digest: every non-terminal card that is
+/// waiting on a human, aged by the SAME clock `board_drive.rs`'s per-lane
+/// renag uses -- `MIN(issue_tags.added_at)` for a tagged ask, falling back to
+/// `i.updated` only when no tag row exists (AC-178: `updated` alone is
+/// last-touch, so the most-commented asks would look youngest) -- so a
+/// fleet-wide view and the per-lane renag never disagree about how old the
+/// same ask is.
+///
+/// Returns the OLDEST `cap` cards fleet-wide, plus the TRUE total before
+/// capping. Age is the ordering signal on purpose (AF-510's own
+/// recommendation: a week-old queue is what costs the owner, not today's
+/// newest asks), and the true total travels separately so a digest can never
+/// repeat the 92-cards-in-one-SMS mistake (autofix.rs's own comment on why
+/// broadcasts get capped) while still saying what it could not show (ethos
+/// rule 4 -- a capped list that does not report its own population reads as
+/// complete).
+///
+/// Caller decides delivery; this function decides nothing about a channel.
+pub fn needsyou_digest(
+    conn: &Connection,
+    now: f64,
+    cap: usize,
+) -> rusqlite::Result<(Vec<NeedsYouDigestCard>, usize)> {
+    let mut all: Vec<NeedsYouDigestCard> = conn
+        .prepare(
+            "SELECT i.id, i.session, i.title, i.ask_question, i.ask_actor, \
+                    COALESCE(i.archived,0), COALESCE(MIN(t.added_at), i.updated) AS asked_at \
+             FROM issues i LEFT JOIN issue_tags t \
+                  ON t.issue_id = i.id AND lower(t.tag) LIKE 'needs:you%' \
+             WHERE i.deleted IS NULL AND i.owner_type='agent' \
+             AND (t.tag IS NOT NULL OR i.status='needsyou') \
+             AND i.status NOT IN ('done','verified','discarded') \
+             GROUP BY i.id HAVING asked_at IS NOT NULL \
+             ORDER BY asked_at ASC",
+        )?
+        .query_map([], |r| {
+            let asked_at: f64 = r.get(6)?;
+            Ok(NeedsYouDigestCard {
+                id: r.get(0)?,
+                session: r.get(1)?,
+                title: r.get(2)?,
+                ask_question: r.get(3)?,
+                ask_actor: r.get(4)?,
+                archived: r.get::<_, i64>(5)? != 0,
+                asked_at,
+                age_days: (now - asked_at) / 86400.0,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let total = all.len();
+    all.truncate(cap);
+    Ok((all, total))
 }
 
 // ---------------------------------------------------------------------------
@@ -2034,8 +2183,14 @@ impl IssueRow {
             "decision_question": self.decision_question,
             "decision_rationale": self.decision_rationale,
             "decision_supersedes": self.decision_supersedes,
-            "waiting_on": self.waiting_on.as_deref()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
+            // AF-930: was `.and_then(|s| serde_json::from_str(s).ok())`, which
+            // reports the same `null` for "empty" and "holds real content
+            // that failed to parse" -- same defect `parse_json_or_raw_string`
+            // exists to fix for `acceptance_criteria` (AF-711), unfixed here.
+            // A pre-fix plain-string value (or one written by a client that
+            // never JSON-encoded it) rendered as `null` with no sign anything
+            // was wrong.
+            "waiting_on": parse_json_or_raw_string(self.waiting_on.as_deref()),
             "requested_by": self.requested_by,
             "callback": self.callback_session.as_ref().map(|session| serde_json::json!({
                 "session": session,
@@ -3139,6 +3294,7 @@ pub fn open_capture_with_desc(
 /// card at the top of its lane), int timestamps, `notified` 0. Returns the
 /// row as stored.
 pub fn create_issue(conn: &Connection, new: &NewIssue, now: i64) -> rusqlite::Result<IssueRow> {
+    refuse_dependency_write("new card", &foreign_dependencies(conn, new.session.as_deref(), &new.depends_on)?)?;
     let prefix = prefix_from_session(new.session.as_deref().unwrap_or(""));
     let id = next_issue_id(conn, &prefix)?;
     let min_pos: f64 = conn.query_row(
@@ -3233,6 +3389,37 @@ pub fn soft_delete(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
         params![id, now],
     )?;
     Ok(n > 0)
+}
+
+/// The inverse of `soft_delete` (AF-922). Before this existed, a mistaken
+/// DELETE on any card had no sanctioned recovery path at all -- `deleted` is
+/// the one column `save_patched` deliberately never touches (see its own
+/// note), and no other write in this module clears it, so the only way back
+/// was a raw SQL UPDATE against the live database. Same shape as
+/// `unarchive` clearing `archived`.
+///
+/// Returns false when the id does not resolve to a currently-deleted row
+/// (already live, or never existed -- the caller distinguishes those with
+/// [`issue_exists_including_deleted`] before calling this).
+pub fn undelete(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
+    let now = Utc::now().timestamp();
+    let n = conn.execute(
+        "UPDATE issues SET deleted = NULL, updated = ?2 WHERE id = ?1 AND deleted IS NOT NULL",
+        params![id, now],
+    )?;
+    Ok(n > 0)
+}
+
+/// Whether `id` exists at all, deleted or not. The ONE sanctioned exception
+/// to this module's own invariant ("`deleted IS NULL` is filtered in every
+/// query") -- undelete needs to tell "never existed" apart from "exists but
+/// was never deleted", which every other query in this file answers
+/// identically (not found) because they were never asked to distinguish them.
+pub fn issue_exists_including_deleted(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
+    Ok(conn
+        .query_row("SELECT 1 FROM issues WHERE id = ?1", params![id], |_| Ok(()))
+        .optional()?
+        .is_some())
 }
 
 /// Write back a patched row. Only columns this API models are touched —
@@ -3346,6 +3533,13 @@ pub fn dependency_is_resolved(status: &str, item_type: &str) -> bool {
             && !amux_core::board::verified_is_meaningful(core_item_type(item_type)))
 }
 
+/// Whether an execution lane can retire this assignment. Failed terminal
+/// outcomes stop execution but must never satisfy a dependent task's gate.
+pub fn execution_is_terminal(status: &str, item_type: &str) -> bool {
+    parse_status(status).is_some_and(|s| s.is_terminal())
+        || dependency_is_resolved(status, item_type)
+}
+
 pub fn dependency_resolved(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
     let state = conn.query_row(
         "SELECT status, type FROM issues WHERE id=?1 AND deleted IS NULL",
@@ -3443,6 +3637,45 @@ pub fn is_capture_shell(row: &IssueRow) -> bool {
     row.creator == "amux"
         && row.desc.trim_start().starts_with("**Prompt:**")
         && !capture_is_delegated_ask(&row.desc)
+        && !has_execution_details(row)
+}
+
+/// Raw provenance can remain in the description after intake. Execution is
+/// structured when both the next action and at least one textual gate exist.
+pub fn has_execution_details(row: &IssueRow) -> bool {
+    row.next_action.as_deref().is_some_and(|s| !s.trim().is_empty())
+        && row.acceptance_criteria.as_deref()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .is_some_and(|value| match value {
+                // The public board API accepts both text and string arrays.
+                // Recognizing only arrays sent legitimate structured work back
+                // to intake while the board correctly displayed its criteria.
+                serde_json::Value::String(text) => {
+                    let present = !text.trim().is_empty();
+                    if present && row.creator == "amux" && row.desc.trim_start().starts_with("**Prompt:**")
+                        && crate::log_dedupe::first_this_bucket(
+                            &format!("text-criteria:{}", row.id),
+                            crate::log_dedupe::hour_bucket(chrono::Utc::now().timestamp() as f64)) {
+                        tracing::info!(card = %row.id, measured=true, n_considered=1,
+                            verdict="text_criteria_recognized", "structured captured work uses supported textual acceptance criteria");
+                    }
+                    present
+                },
+                serde_json::Value::Array(items) => items.iter().any(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())),
+                _ => false,
+            })
+}
+
+fn execution_details_sql() -> String {
+    // CASE prevents json_each from evaluating corrupt legacy JSON.
+    let whitespace = "char(9)||char(10)||char(11)||char(12)||char(13)||' '||char(133)||char(160)||char(5760)||char(8192)||char(8193)||char(8194)||char(8195)||char(8196)||char(8197)||char(8198)||char(8199)||char(8200)||char(8201)||char(8202)||char(8232)||char(8233)||char(8239)||char(8287)||char(12288)";
+    format!("(length(trim(COALESCE(i.next_action,''), {whitespace})) > 0 AND \
+        CASE WHEN json_valid(i.acceptance_criteria) THEN \
+          CASE json_type(i.acceptance_criteria) \
+          WHEN 'text' THEN length(trim(json_extract(i.acceptance_criteria,'$'), {whitespace})) > 0 \
+          WHEN 'array' THEN EXISTS(\
+            SELECT 1 FROM json_each(i.acceptance_criteria) c WHERE c.type='text' \
+            AND length(trim(c.value, {whitespace})) > 0) ELSE 0 END ELSE 0 END)")
 }
 
 /// A captured message whose FIRST LINE opens with `ASK` and names a board id is
@@ -3518,7 +3751,7 @@ fn capture_prompt_first_line(desc: &str) -> Option<&str> {
 /// would match "ask me later" and part company with `strip_prefix("ASK")` on the
 /// very first message anyone writes in lower case.
 pub fn capture_shell_sql() -> String {
-    format!("({} AND NOT {})", capture_envelope_sql(), capture_delegation_sql())
+    format!("({} AND NOT {} AND NOT {})", capture_envelope_sql(), capture_delegation_sql(), execution_details_sql())
 }
 
 /// `creator='amux'` plus the `**Prompt:**` marker: amux minted this row from an
@@ -3826,6 +4059,16 @@ fn entered_state_at_for_write(conn: &Connection, row: &IssueRow) -> Option<i64> 
 }
 
 pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<usize> {
+    validate_dependency_update(conn, row)?;
+    // This marker records delivery, not an outside dependency. Once the owner
+    // structures the captured request it must become eligible without a second
+    // manual PATCH deleting harness-generated text. Preserve all real holds.
+    if row.source_ref.as_deref() == Some("Already delivered owner follow-up; claim explicitly when switching work")
+        && row.creator == "amux" && has_execution_details(row) {
+        row.source_ref = None;
+        tracing::info!(card = %row.id, verdict = "capture_intake_completed",
+            "structured captured request released its delivery-only hold");
+    }
     let dep_json = if row.depends_on.is_empty() {
         None
     } else {
@@ -4987,7 +5230,9 @@ mod tests {
         // A missing or discarded required artifact is not successful delivery.
         // The owner can explicitly remove a no-longer-required relationship.
         dependent.depends_on = vec!["AMUX-DOES-NOT-EXIST".into()];
-        save_patched(&conn, &mut dependent).unwrap();
+        assert!(save_patched(&conn, &mut dependent).is_err(), "new missing dependencies are rejected");
+        // A historical dangling row still reads as blocked, never successful.
+        conn.execute("UPDATE issues SET depends_on='[\"AMUX-DOES-NOT-EXIST\"]' WHERE id=?1", [&dependent.id]).unwrap();
         assert_eq!(crate::runtime_jobs::board_drive::deps_blocking(&conn, &dependent), dependent.depends_on);
         blocker.status = "discarded".into();
         save_patched(&conn, &mut blocker).unwrap();
@@ -5949,13 +6194,83 @@ mod tests {
         assert_eq!(prefix_from_session("general-canvas-apps"), "GCA");
     }
 
+    /// AF-470: `append_log`'s line SHAPE for an entry (backtick-time, space,
+    /// message) is unchanged from Python's; both cases here now also carry a
+    /// leading date separator because neither `existing` argument has one
+    /// yet. `today()` mirrors `append_log`'s own `chrono::Local::now()` call
+    /// rather than hardcoding a date, so this test does not go stale.
     #[test]
     fn append_log_matches_python_format() {
-        assert_eq!(append_log(None, "12:01", "x -> y"), "`12:01` x -> y");
+        let today = format!("`{}`", chrono::Local::now().format("%Y-%m-%d"));
+        assert_eq!(append_log(None, "12:01", "x -> y"), format!("{today}\n`12:01` x -> y"));
+        // The separator lands right before the NEW entry, not retroactively
+        // before the pre-existing one: `existing` has no separator at all,
+        // so its own date is genuinely untracked, and the marker means "from
+        // here, dates are tracked" -- it cannot honestly claim the old line
+        // shared today's date too.
         assert_eq!(
             append_log(Some("`09:00` created\n"), "12:01", "a: todo -> doing"),
-            "`09:00` created\n`12:01` a: todo -> doing"
+            format!("`09:00` created\n{today}\n`12:01` a: todo -> doing")
         );
+    }
+
+    /// AF-470. The property the card asked for: width is paid ONLY at a real
+    /// day boundary. Once a separator for today already exists, a second
+    /// same-day append must not add another one.
+    #[test]
+    fn append_log_adds_no_second_separator_on_the_same_day() {
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let after_first = append_log(None, "09:00", "created");
+        assert_eq!(after_first, format!("`{today}`\n`09:00` created"));
+        let after_second = append_log(Some(&after_first), "09:15", "a: todo -> doing");
+        assert_eq!(
+            after_second,
+            format!("`{today}`\n`09:00` created\n`09:15` a: todo -> doing"),
+            "a second entry on the SAME day must not repeat the separator: {after_second}"
+        );
+    }
+
+    /// AF-470. A log that already tracks dates, appended to on a NEW day,
+    /// gets exactly one fresh separator -- not a re-statement of the old
+    /// one, not silence.
+    #[test]
+    fn append_log_adds_a_fresh_separator_when_the_day_changes() {
+        let existing = "`2020-01-01`\n`21:20` yesterday's last entry";
+        let got = append_log(Some(existing), "08:25", "today's first entry");
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        assert_eq!(
+            got,
+            format!("{existing}\n`{today}`\n`08:25` today's first entry"),
+            "a real day change must get its own separator: {got}"
+        );
+    }
+
+    /// AF-470. Every entry written before this feature existed has no
+    /// separator at all -- TG-3239's own 74-entry log, exactly. The very
+    /// next append must add one (marking "dates are tracked from here"), not
+    /// retroactively guess at the untracked history above it.
+    #[test]
+    fn append_log_on_a_legacy_log_with_no_separator_convention_adds_one() {
+        let legacy = "`21:20` old entry one\n`08:25` old entry two (next calendar day, unmarked)";
+        let got = append_log(Some(legacy), "14:00", "first entry since the fix shipped");
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        assert_eq!(
+            got,
+            format!("{legacy}\n`{today}`\n`14:00` first entry since the fix shipped")
+        );
+    }
+
+    /// AF-470. The separator's own shape must never be mistaken for an
+    /// ordinary entry needing a separator search to skip a false match --
+    /// `date_separator` returns None for anything that is not EXACTLY
+    /// `` `YYYY-MM-DD` `` alone on the line.
+    #[test]
+    fn date_separator_recognizes_only_the_exact_shape() {
+        assert_eq!(date_separator("`2026-09-18`"), Some("2026-09-18"));
+        assert_eq!(date_separator("`09:15` message"), None, "an ordinary entry is not a separator");
+        assert_eq!(date_separator("`2026-09-18` message"), None, "trailing text disqualifies it");
+        assert_eq!(date_separator("2026-09-18"), None, "must be backtick-wrapped");
+        assert_eq!(date_separator("`26-09-18`"), None, "must be 4-digit year");
     }
 
     #[test]
@@ -5993,6 +6308,109 @@ mod tests {
         );
         // Ungated statuses stay ungated.
         assert!(default_gates_for("code", TaskStatus::Todo).is_empty());
+    }
+
+    /// AF-510. The whole point of the digest: oldest asks first, fleet-wide,
+    /// regardless of which lane holds them -- the queue that actually costs
+    /// the owner is the week-old backlog, not today's newest card.
+    #[test]
+    fn needsyou_digest_orders_oldest_first_fleet_wide() {
+        let conn = crate::db::migrate::test_memdb();
+        for (id, session, updated) in [
+            ("NY-NEW", "lane-a", 1_900_000_000i64),
+            ("NY-OLD", "lane-b", 1_000_000_000i64),
+            ("NY-MID", "lane-a", 1_500_000_000i64),
+        ] {
+            conn.execute(
+                "INSERT INTO issues (id,title,status,session,owner_type,created,updated) \
+                 VALUES (?1,?1,'needsyou',?2,'agent',?3,?3)",
+                params![id, session, updated],
+            )
+            .unwrap();
+        }
+        let (rows, total) = needsyou_digest(&conn, 2_000_000_000.0, 10).unwrap();
+        assert_eq!(total, 3);
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["NY-OLD", "NY-MID", "NY-NEW"], "must be oldest-asked-first, not insertion or session order");
+        assert!(rows[0].age_days > rows[1].age_days && rows[1].age_days > rows[2].age_days);
+    }
+
+    /// AF-510. autofix.rs's own lesson: "the owner digest emitted 92 cards in
+    /// one SMS" is what makes a cap mandatory. This pins BOTH halves — the cap
+    /// actually truncates, AND the true population survives the cap instead of
+    /// disappearing with it (ethos rule 4: a capped list that does not report
+    /// its own size reads as complete).
+    #[test]
+    fn needsyou_digest_caps_but_reports_the_true_total() {
+        let conn = crate::db::migrate::test_memdb();
+        for i in 0..5i64 {
+            conn.execute(
+                "INSERT INTO issues (id,title,status,session,owner_type,created,updated) \
+                 VALUES (?1,?1,'needsyou','lane',   'agent',?2,?2)",
+                params![format!("NY-{i}"), 1_000_000_000i64 + i],
+            )
+            .unwrap();
+        }
+        let (rows, total) = needsyou_digest(&conn, 2_000_000_000.0, 2).unwrap();
+        assert_eq!(total, 5, "the true population must survive the cap");
+        assert_eq!(rows.len(), 2, "the returned list must actually be capped");
+        // And it must be the OLDEST two that survive the cut, not an arbitrary two.
+        assert_eq!(rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), vec!["NY-0", "NY-1"]);
+    }
+
+    /// AF-510. Mirrors the per-lane renag's own predicate exactly: a
+    /// human-owned card is never renagged to a lane (there is no lane to
+    /// renag), and a terminal card is not a live ask regardless of how it got
+    /// tagged. Both must stay invisible to the digest for the same reason.
+    #[test]
+    fn needsyou_digest_excludes_human_owned_and_terminal_cards() {
+        let conn = crate::db::migrate::test_memdb();
+        conn.execute(
+            "INSERT INTO issues (id,title,status,session,owner_type,created,updated) \
+             VALUES ('NY-HUMAN','t','needsyou','lane','human',1000000000,1000000000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO issues (id,title,status,session,owner_type,created,updated) \
+             VALUES ('NY-DONE','t','done','lane','agent',1000000000,1000000000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO issue_tags (issue_id,tag,added_at) VALUES ('NY-DONE','needs:you',1000000000)",
+            [],
+        )
+        .unwrap();
+        let (rows, total) = needsyou_digest(&conn, 2_000_000_000.0, 10).unwrap();
+        let leaked_ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(total, 0, "neither a human-owned nor a terminal card is a live agent ask: {leaked_ids:?}");
+    }
+
+    /// AF-510 / AC-178. The ask clock is the TAG's `added_at` when a tag
+    /// exists, never `updated` — `updated` is last-touch, so a heavily
+    /// commented-on ask would otherwise look newest right when it is most
+    /// overdue. Matches board_drive.rs's own renag query byte for byte in
+    /// intent: MIN(tag.added_at), falling back to `i.updated` only when no
+    /// tag row exists at all.
+    #[test]
+    fn needsyou_digest_ages_by_the_tag_not_the_last_touch() {
+        let conn = crate::db::migrate::test_memdb();
+        // Asked long ago (tag), but touched (commented on) recently.
+        conn.execute(
+            "INSERT INTO issues (id,title,status,session,owner_type,created,updated) \
+             VALUES ('NY-TAGGED','t','doing','lane','agent',1000000000,1_950_000_000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO issue_tags (issue_id,tag,added_at) VALUES ('NY-TAGGED','needs:you-review',1_000_000_000)",
+            [],
+        )
+        .unwrap();
+        let (rows, _) = needsyou_digest(&conn, 2_000_000_000.0, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].asked_at, 1_000_000_000.0, "asked_at must be the TAG's added_at, not the recent `updated` touch");
     }
 }
 
@@ -6493,6 +6911,57 @@ everything to a clean machine.";
     /// Runs BOTH over the same fixtures rather than asserting each separately,
     /// which is the only arrangement that can catch a drift: two independent
     /// assertions both stay green while the predicates diverge.
+    #[test]
+    fn execution_retirement_keeps_runtime_verification_and_dependency_failure_distinct() {
+        assert!(!execution_is_terminal("done", "code"));
+        assert!(execution_is_terminal("done", "chore"));
+        assert!(execution_is_terminal("verified", "code"));
+        for status in ["discarded", "quarantined"] {
+            assert!(execution_is_terminal(status, "code"));
+            assert!(!dependency_is_resolved(status, "code"));
+        }
+        for status in ["backlog", "todo", "review", "doing", "unknown"] {
+            assert!(!execution_is_terminal(status,"code"));
+        }
+    }
+
+    #[test]
+    fn structured_capture_releases_only_the_delivery_marker() {
+        let conn = crate::db::migrate::test_memdb();
+        for (i, hold) in ["Already delivered owner follow-up; claim explicitly when switching work", "budget approval pending"].into_iter().enumerate() {
+            let id = format!("HOLD-{i}");
+            conn.execute("INSERT INTO issues(id,title,desc,status,creator,created,updated,next_action,acceptance_criteria,source_ref) VALUES (?1,'Reproduce bug','**Prompt:** fix this','backlog','amux',1,1,'Run regression','[\"Regression passes\"]',?2)", rusqlite::params![id, hold]).unwrap();
+            let mut row = get_issue(&conn,&id).unwrap().unwrap();
+            save_patched(&conn,&mut row).unwrap();
+            assert_eq!(row.source_ref.as_deref(), if i==0 {None} else {Some(hold)});
+            assert_eq!(get_issue(&conn,&id).unwrap().unwrap().source_ref, row.source_ref);
+        }
+    }
+
+    #[test]
+    fn retained_prompt_provenance_does_not_make_structured_work_a_shell() {
+        let conn = crate::db::migrate::test_memdb();
+        for (i, (action, criteria, expected)) in [
+            ("Run the reproduction", r#"["Regression no longer reproduces"]"#, false),
+            ("Run the reproduction", r#""Regression no longer reproduces""#, false),
+            ("Run the reproduction", r#"" \t\n\u2003""#, true),
+            ("", r#""Regression no longer reproduces""#, true),
+            ("", r#"["Regression no longer reproduces"]"#, true),
+            ("Run the reproduction", "[]", true),
+            ("Run the reproduction", r#"[" ", null, 1]"#, true),
+            ("Run the reproduction", "broken json", true),
+            ("Run the reproduction", r#"{"gate":"done"}"#, true),
+            ("\u{2003}", r#"["done"]"#, true),
+        ].into_iter().enumerate() {
+            let id = format!("INTAKE-{i}");
+            conn.execute("INSERT INTO issues(id,title,desc,status,creator,created,updated,next_action,acceptance_criteria) VALUES (?1,'Reproduce bug','**Prompt:** fix this','backlog','amux',1,1,?2,?3)", rusqlite::params![id, action, criteria]).unwrap();
+            let row = get_issue(&conn, &id).unwrap().unwrap();
+            let sql: bool = conn.query_row(&format!("SELECT {} FROM issues i WHERE id=?1", capture_shell_sql()), [&id], |r| r.get(0)).unwrap();
+            assert_eq!(is_capture_shell(&row), expected, "Rust: {id}");
+            assert_eq!(sql, expected, "SQL: {id}");
+        }
+    }
+
     #[test]
     fn the_sql_predicate_and_the_rust_one_select_the_same_rows() {
         // The REAL schema via the migration chain, not a hand-rolled four-column

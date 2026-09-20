@@ -3292,44 +3292,404 @@ FIX: Assert the SHAPE either way, and admit exactly one host excuse. The
   tick — so the test was not merely flaky, it was the only thing reporting a
   production job that has silently not run.
 
-  ## A create can silently fold into an active card, with no visible signal, and a routine cleanup then lands on the wrong card
-  AREA: board
-  SEVERITY: blocks
+## `waiting_on` PATCHed with its own documented JSON-object shape silently cleared it instead
+AREA: board
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-18
+SESSION: amux-frustrations
+CARD: AF-930
+SYMPTOM: PATCHed `waiting_on` on a real needsyou card (AF-546) with the exact
+ object shape migrations/0048 documents ({"actor":...,"type":...,"question":...,
+ "unblocks":...}) and the shape `advance()`'s own Gap-4 logic writes on NeedsYou
+ entry. Response was 200, `applied: true`, `waiting_on` echoed back correctly in
+ that one response -- but a subsequent GET, and the card's own `log`, showed
+ `waiting_on: null`, with the log line reading plainly "amux-frustrations:
+ waiting_on" as if the write had landed. `set_opt`'s `body_opt_str` treats any
+ non-string JSON value the same as an explicit null: `Some(v) =>
+ Some(v.as_str().map(str::to_string))` returns `Some(None)` for an object,
+ which is indistinguishable from a caller clearing the field on purpose. Same
+ defect shape AF-711 already fixed for `acceptance_criteria` four lines above
+ the unfixed `waiting_on` call site in the same file.
+COST: two extra round-trips fixing the same card's `waiting_on` field before
+ realizing the object shape itself was the problem, one of which briefly left
+ AF-546 -- a card actually waiting on Ethan -- carrying a stale, wrong question
+ because the correction attempt used the same broken shape.
+FIX: 831cc0cb + a35d850f. Added `encode_waiting_on` mirroring
+ `encode_acceptance_criteria`: object or non-empty string -> JSON-encoded and
+ stored; null/empty -> clears; any other shape -> rejected with a 400 instead
+ of silently coerced into a clear. Also fixed a second, related read-side gap:
+ `snapshot_fields` decoded `waiting_on` via `serde_json::from_str(s).ok()`,
+ which reports the same null for "empty" and "holds real content that failed
+ to parse" -- switched to the existing `parse_json_or_raw_string` helper
+ (already used for `acceptance_criteria`), so legacy non-JSON content also
+ stops rendering as null. 6 new tests, mutation-verified: reverting the object
+ arm to `Ok(None)` reddened exactly the 2 tests exercising that shape.
+
+  ## A second amux-server-rs opened the shared production DB for 13h with zero warning
+  AREA: instruments
+  SEVERITY: slows
   STATUS: open
-  DATE: 2026-09-18
+  DATE: 2026-09-19
   SESSION: amux-frustrations
-  CARD: AF-922
-  SYMPTOM: sent a plain `POST /api/board` to create a throwaway verification card
-   (title "af460 verify probe") while my own AF-460 was `doing`. The response was an
-   ordinary-looking 2xx with an `id` field — no error, nothing that read as a
-   refusal — except the `id` it returned was `AF-460` itself: a model-judged
-   "semantic intake" classifier (92% confidence, ~4.7s) had decided the new title
-   was "the same work" and folded it (`intake.action: "append"`) instead of
-   creating anything new. The fold signal was real and present in the response
-   body (`intake.comparison.decision.reason`), just buried where nobody creating
-   a routine test card would think to check it. Treating the returned id as a
-   disposable probe, I archived it, force-PATCHed its status (correctly refused,
-   `archived_task_immutable`), restored it, then DELETEd it — every one of those
-   calls actually landed on my real, in-progress AF-460 work card. Caught only
-   because the DELETE produced a 404 on a card I knew should still exist.
-  COST: a live work card carrying ~50 log lines of investigation, decisions and a
-   shipped fix came within one missed double-check of being permanently gone from
-   every normal read path. Recovery required leaving the sanctioned API entirely —
-   a direct `sqlite3` UPDATE clearing `issues.deleted` on the live production DB —
-   because no undelete endpoint or CLI verb exists for a soft-deleted card
-   (confirmed: `board.rs::delete_item` calls `bs::soft_delete`, which only sets a
-   timestamp; nothing clears it back). Ten minutes, plus the risk of a manual raw
-   SQL write against the fleet's shared database, for what should have been a
-   disposable throwaway create.
-  FIX: not chosen. Two independent fixes, and they are not the same one: (1) a
-   fold this consequential should not resolve to a bare 2xx — the response should
-   make it unmistakable that no new resource was created (a distinct status code,
-   or `applied: false`-shaped body, the way other non-mutations in this API
-   already signal a no-op rather than dressing it as success). (2) `soft_delete`
-   has no inverse anywhere in the API or CLI — a mistaken delete on ANY card, fold
-   or not, currently has no sanctioned recovery path at all; a plain `amux board
-   undelete <ID>` (clearing `deleted` the same way `unarchive` clears `archived`)
-   would have made this a 5-second fix instead of a raw DB write. Neither is mine
-   to ship unilaterally — (1) changes the create contract every caller reads, (2)
-   is a new recovery primitive — but leaving (2) missing means the NEXT accidental
-   delete on this fleet has the same only-option: raw SQL against production.
+  CARD: AF-937
+  SYMPTOM: found a live, healthy-looking `amux-server-rs` process (pid 21435, port
+   8823) that had been running since the prior afternoon, started manually from a
+   bare Terminal.app shell with no AMUX_RS_PORT set, so it fell onto the compiled-in
+   `DEFAULT_PORT` (8823, config.rs) and the default `AMUX_HOME` -- landing on the
+   *exact same* `~/.amux/amux.db` the real, launchd-managed server (8824) already
+   held open. `lsof` showed identical .db/.wal/.shm inodes on both pids. Both
+   `/health` endpoints reported success the entire time; nothing anywhere logged,
+   counted, or surfaced that two writers existed. This is the same underlying shape
+   AEAB-11 reported a month earlier (2026-08-17) and it recurred with zero
+   detection in between.
+  COST: unmeasured but real -- the original AEAB-11 instance of this exact pattern
+   dropped a batch of request-log rows to lock contention and doubled that day's log
+   volume. This time nobody was watching for it; it was found by accident while
+   resolving an unrelated stale board card, not by any instrument. 13 hours is a
+   lower bound on how long it could silently run, since only self-adoption (an
+   unrelated mechanism) kept it alive that long by re-exec'ing it onto every new
+   build.
+  FIX: not applied here (killed the orphan process, which fixes this ONE instance,
+   not the class). Filed AF-937: Store::open (or a lib.rs startup check) should
+   probe for an existing writer on the same db_path and log a loud WARN naming it,
+   per ethos rule 4 -- both servers here reported "healthy" the whole time, so
+   nothing about the failure was wrong-looking from either process's own vantage
+   point.
+
+## Numbered request captured as an active task named 1
+AREA: board
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-19
+SESSION: codex-lifecycle-adherence
+CARD: CLA-1
+SYMPTOM: MFEM1-53 was Doing with title `1` derived from `1. lets ensure ...`; separate capture producers and delivery-only holds left raw requests looking like executable work. An already-delivered advance reminder also returned before independent pickup.
+COST: User could not identify active work from the board; audit required all 31 active workers and 1,298 open cards to distinguish execution from intake and stale reminders.
+FIX: Consolidate capture and structured-intake predicates, strip list syntax before sentence extraction, and yield suppressed reminders to guarded pickup. Cross-board create correctly refused filing this on amux-frustrations; track on the originating board under the user's worker-ownership rule. Originator acceptance remains pending.
+
+## Launch retries duplicate cards and disable backlog draining
+AREA: board
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-19
+SESSION: codex-lifecycle-adherence
+CARD: CLA-1
+SYMPTOM: Launch-created workers had three identical priority cards and AMUX_DISPATCH_BACKLOG_WHEN_IDLE=0; fan-out enabled the flag. Repeating either endpoint rewrote child env files, and title-derived identities could collide or change on retitle.
+COST: Three workers each held three copies of the same priority, while the harness could not drain their backlogs after completing the current task.
+FIX: Share ephemeral provisioning, reuse an identical open launch graph, retain assigned identity across retries, preserve pause/configuration, and fan out only ready independent tasks. Originator acceptance remains pending.
+
+
+## Orchestrations stays blank while full board history loads and misses child follow-ups
+AREA: board
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-19
+SESSION: codex-lifecycle-adherence
+CARD: CLA-2
+SYMPTOM: The Orchestrations view fetched all 20,888 issues with full descriptions before rendering; existing fan-out follow-ups without epic links were absent, and To Do epics were labelled paused regardless of worker lifecycle.
+COST: The owner could not see running fan-outs or assess their complete queues from Orchestrations.
+FIX: Compact measured projection of existing boards, whole child queues and orphan fan-outs, actual worker pause state, explicit loading/error/retry, shared terminal predicate and current-task highlighting. Pending originating-user validation.
+
+## Fan-out restart can discard the workspace and has no durable main integration stage
+AREA: scheduler
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-19
+SESSION: codex-lifecycle-adherence
+CARD: CLA-2
+SYMPTOM: Ephemeral starts recreated detached worktrees; stop forcibly disposed worktrees. Existing fan-outs had no recorded creation base or automatic checked integration. Two legacy worktrees had empty indexes over populated commits, and two running children had no worktree directory.
+COST: Completed child work had no deterministic route to main; stopping or restarting could lose uncommitted work, and malformed workspaces obstructed the board drain.
+FIX: Durable per-child branches, preserve workspaces on stop/restart, whole-board integration admission, separately tested merge candidate and ordinary push, pause cancellation, explicit preserved legacy recovery. Pending originating-user validation.
+
+## Self-contained boards could still acquire outside execution dependencies
+AREA: board
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-19
+SESSION: codex-lifecycle-adherence
+CARD: CLA-3
+SYMPTOM: Active-board audit found seven cross-worker dependency edges on six cards. Delegation opt-in bypassed dependency validation, missing/unassigned references escaped it, and fan-out moved a prerequisite while leaving its dependent on the parent board. The existing fan-out retry test asserted that split ownership as success.
+COST: Repeated owner intervention to remove peer waits; six live cards required explicit ownership/next-action correction and a new regression covering the incoming side of reassignment.
+FIX: Enforce same-board graph writes in storage and API, retain connected work on its owner board during fan-out, and preserve prerequisite evidence when repairing legacy edges. Live verification also found gate refusals recommending peer reviewer/dependency waits; those now teach local completion. No model calls are needed for enforcement.
+
+
+## Idle board workers lose fallback observation after their hook expires
+AREA: scheduler
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-19
+SESSION: codex-lifecycle-adherence
+CARD: CLA-4
+SYMPTOM: In the 28-active-board audit, mvs-infra and amux displayed idle while board-drive refused their expired Active reports and did not admit a current pane probe. The fallback measurement was disabled by the same hook whose evidence had expired.
+COST: Two active workers with a combined 1,173 non-terminal outcomes could not cross the dispatch boundary at the measured snapshot.
+FIX: Admit bounded current pane measurement when a running worker's structured report expires; require a recognized idle boundary and log measured fallback recovery. Regression includes empty, unknown and busy controls.
+
+## Held reminders and epic containers suppress unrelated board completion
+AREA: board
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-19
+SESSION: codex-lifecycle-adherence
+CARD: CLA-4
+SYMPTOM: Already-delivered blocker recovery returned before verification; advancement queried 40 candidates but selected only the first; epics and raw captures blocked verification despite being exempt from pickup WIP. One unresolved verification batch member held all unoffered work for 24h. Global and amux-group Verified gates still required a different worker despite the owner's no-outside-dependency policy.
+COST: Audit found 1,689 runtime Done outcomes awaiting verification, including 44 homepage, 81 gtm-engine and 328 amux-frustrations outcomes behind unchanged blocker recovery. These are measured queued populations, not all attributed solely to this bug.
+FIX: Share execution-slot and reminder predicates; scan candidates past refusals; let independent verification pass held reminders; fingerprint batch output/contracts and release unoffered work on partial progress. Replace the live foreign-signoff criteria with owner reproduction and recorded evidence while retaining test/deployment/regression gates.
+
+## Failed command interpretation leaves a request pending without an execution owner
+AREA: board
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-19
+SESSION: codex-lifecycle-adherence
+CARD: CLA-4
+SYMPTOM: Structured intake remained opt-in, while an exhausted two-attempt receipt stayed pending indefinitely. Active-board audit found 120 raw-capture candidates; repeated legacy launches also left three byte-equivalent full-e2e assignments.
+COST: A request could consume its interpretation budget without becoming owned work, and identical fan-out copies occupied two additional Todo slots.
+FIX: Default to bounded durable intake; exhausted interpretation creates one structured intake investigation on the same board using the existing dispatcher, with original errors and usage preserved. Archive only the two proven FETC duplicates against canonical FETC-3; preserve differing same-title outcomes for semantic reconciliation.
+
+## Worker shell waits count themselves as another Git commit
+AREA: workflow
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-19
+SESSION: codex-lifecycle-adherence
+CARD: CLA-4
+SYMPTOM: Six shell commands on two active fan-out workers had waited 5–6 hours on fleet-wide pgrep -f "git commit". Their own shell command lines contain that expression, so each wait keeps itself blocked.
+COST: full-e2e-test-coverage and mixpeek-fanout-eph-MF-1239 retained live shell work with no task progress despite separate durable workspaces.
+FIX: Record exact PID/parent/worker evidence, terminate only confirmed self-matching wait shells after rechecking active lifecycle and child processes, and record the repair on their current boards. Document checkout-local bounded Git recovery; never delete another worker’s lock or treat process existence as progress.
+
+## Global board render erases its current-work strip
+AREA: ui
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-19
+SESSION: codex-lifecycle-adherence
+CARD: CLA-4
+SYMPTOM: The real browser regression timed out finding global current activity even with two running fixture workers. Moving the shared strip inside its host for worker-detail scrolling also put the global strip inside the horizontal columns; every global render replaced that host and erased it.
+COST: Running workers disappeared from board activity across filters and view changes, making real task execution look like non-adherence.
+FIX: Mount global activity above the replaceable horizontal columns while retaining the worker-detail scrolling mount. Report active-work-missing through the existing measured UI diagnostics. Browser coverage exercises list/worker/status views, same-status task switching, filters, pause and both desktop/phone widths, with missing-strip and compressed-row negative controls.
+
+## Supported textual criteria are misclassified as an unstructured capture
+AREA: board
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-19
+SESSION: codex-lifecycle-adherence
+CARD: CLA-4
+SYMPTOM: The public board API accepts text or a string array for acceptance_criteria, but has_execution_details and its SQL mirror only accepted arrays. Two active-board cards with next actions and nonempty textual criteria were consequently counted as raw captures.
+COST: AMUX-4508 and MHC-808 could be sent back to intake despite already carrying the execution fields the public API accepts.
+FIX: Use the same accepted text/array shapes in the shared Rust and SQL predicates, with empty/malformed/object controls. The text_criteria_recognized log names recovered captured work once per card/hour. Preserve the criteria verbatim and retain actual approval/event holds.
+
+## A paragraph-length activity title displaces the board
+AREA: ui
+SEVERITY: friction
+STATUS: open
+DATE: 2026-09-19
+SESSION: codex-lifecycle-adherence
+CARD: CLA-4
+SYMPTOM: Live screenshot inspection found a legacy task with its whole request as its title. The activity strip rendered every line and stretched all neighboring cards to the same height, displacing the board on a phone despite passing presence checks.
+COST: Current-work visibility consumed the space needed to see and operate the board.
+FIX: Limit the activity summary to three lines, preserve the complete accessible button text and full task destination, and align cards independently. The existing UI diagnostic reports activity-summary-too-tall; the browser fixture covers a paragraph-length title and detects removal of the clamp.
+
+## Fan-out verification accepts an unintegrated worktree
+AREA: gates
+SEVERITY: wrong-state
+STATUS: open
+DATE: 2026-09-19
+SESSION: codex-lifecycle-adherence
+CARD: CLA-4
+SYMPTOM: test-priority acknowledged Verified while its evidence still said push/CI pending. Its feature commit was not an ancestor of origin/main and the workspace had no creation base or integration receipt. The board accepted a textual assertion that contradicted the known artifact state.
+COST: A live terminal count overstated actual completion; dependent work could consume an unintegrated outcome. Requiring the whole board before integration would also deadlock a successor waiting for a verified prerequisite.
+FIX: Share a current-head/clean-worktree/integration-receipt check across Verified creation and transition, bind the async observation to the card revision/owner, and log fanout_verification_requires_integration. Integrate evidenced prerequisites before queued successors using the shared WIP predicate; active implementation and unevidenced review still refuse. Exercise real disposable Git integration and stale/dirty/missing-receipt controls through the API.
+
+## Orchestration launch has no coordinating worker or independent fan-out model profiles
+AREA: board
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-19
+SESSION: codex-lifecycle-adherence
+CARD: CLA-5
+SYMPTOM: The launch form offered one shared provider/model pair and an Orchestrator (self) workspace selector. A launch created child workers without a dedicated coordinator profile; the user could not select distinct coordinator and fan-out models or see those roles in Orchestrations.
+COST: One user-reported orchestration workflow blocked; coordinator ownership and model choices required manual worker setup.
+FIX: CLA-5 creates a coordinating worker using the existing worker/epic primitives, separates role profiles and per-child overrides, preserves exact retry intent, and records coordinator provision/start verdicts. Browser/API validation and live deployment tracked on the card.
+
+## Global Orchestrations lists ordinary epics and repeats fan-out workers per task
+AREA: board
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-20
+SESSION: codex-lifecycle-adherence
+CARD: CLA-6
+SYMPTOM: The global tab promoted ordinary epics into orchestration roots and rendered full fan-out boards as repeated worker rows. The live snapshot contained 13 fan-out workers under three parents, but 199 epics in the projection and nearly 200 displayed entries.
+COST: User could not find the actual coordinator/fan-out structure in the global tab after the role/model launcher change.
+FIX: Project actual tracked worker boards and linked ancestors, then group by recorded coordinator ownership. Show each worker once with expandable board tasks, active work, model and workspace state. Report included/excluded populations through orchestration_projection and API fields; preserve scoped and retired inventory.
+
+
+## Verifying an unassigned card reports a false ownership race
+AREA: gates
+SEVERITY: wrong-state
+STATUS: open
+DATE: 2026-09-20
+SESSION: codex-lifecycle-adherence
+CARD: CLA-7
+SYMPTOM: The board details form submitted session:"" while moving a chore to Verified. The workspace preflight treated the owner as Some("") but the write normalized it to None, returning verification_observation_stale even though no concurrent edit occurred.
+COST: Gate-revision acceptance failed on desktop, mobile and iOS, and legitimate unassigned tasks could not reach Verified through the UI.
+FIX: Apply the transaction's nullable-owner normalization before measuring workspace readiness. Preserve the revision/owner race check, add its observed/current values to logs, and cover empty, whitespace, null and retained owners through the public API.
+
+## An older board poll clears a newer read failure
+AREA: ui
+SEVERITY: wrong-state
+STATUS: open
+DATE: 2026-09-20
+SESSION: codex-lifecycle-adherence
+CARD: CLA-7
+SYMPTOM: Overlapping board reads published in response order. An older successful response could clear a newer board/status read failure and show Live while the board was unavailable; an old failure could likewise overwrite a recovery.
+COST: The iOS outage acceptance test intermittently displayed Live instead of Sync error, hiding actionable failure state from the user.
+FIX: Validate each response batch before publishing and order publication by read generation. Older reads may finish while a newer read is pending, but cannot replace a newer completed result. Emit board_read_superseded and test both failure and recovery with deliberately reversed responses.
+
+## Lifecycle fixtures confuse host scheduling with product failure
+AREA: tests
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-20
+SESSION: codex-lifecycle-adherence
+CARD: CLA-7
+SYMPTOM: Full server runs failed before exercising Stop or Pause because fake tools were assumed ready after 150ms or one second. The sticky board-status fixture likewise exhausted five discovery attempts during process-wide epoch churn.
+COST: Broad validation could not distinguish lifecycle failures from setup that had never reached the required state.
+FIX: Wait on bounded readiness conditions, publish the fake provider PID atomically and clean up its process before reporting failure. Use the existing deadline-based real-handler discovery helper while retaining its error/refusal controls. Stop must still interrupt actual busy work within the original five-second deadline; readiness failures name the unmet condition.
+
+## Orchestrations labels retained task links as live work
+AREA: ui
+SEVERITY: wrong-state
+STATUS: open
+DATE: 2026-09-20
+SESSION: codex-lifecycle-adherence
+CARD: CLA-7
+SYMPTOM: The deployed Orchestrations view showed Working now on audit-and-disable-unused and full-e2e-test-coverage while their measured runtime states were waiting and idle. It used task_board_id without the runtime activity verdict.
+COST: The new orchestration view contradicted its own worker status and made retained board claims look like execution.
+FIX: Share the board's runtime activity predicate, require a measured linked current task for live highlighting, and retain navigation under Current task when execution is not confirmed. Report changed activity projection counts and exercise active, idle, waiting, paused, stopped, expired, unlinked and unmeasured states in the browser.
+
+
+## Layout acceptance reads different accordion renders as one frame
+AREA: tests
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-20
+SESSION: codex-lifecycle-adherence
+CARD: CLA-7
+SYMPTOM: The iPhone Paused/Archived order test queried bounding boxes in separate browser calls. Normal worker refresh replaced an accordion between element resolution and measurement, returning null while its replacement was visibly ordered correctly.
+COST: The otherwise passing final Rust/browser CI run was red. A WebKit refresh diagnostic reproduced detached geometry in 38 of 60 samples.
+FIX: Measure visibility, geometry and sibling order atomically in the page; check the initial frame and five actual worker refreshes. Emit measured frame counts and all rectangles in the test log, retain positive size checks, and require the entire live worker card to end above Paused.
+
+## Successful fan-out merge leaves verification on the previous daily cooldown
+AREA: board
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-20
+SESSION: codex-lifecycle-adherence
+CARD: CLA-8
+SYMPTOM: An idle fan-out had three Done code outcomes and a successful current-head integration receipt, but board-drive still reported previous verification batch pending (24h retry). Verification identity covered the card and gate but omitted integrated output, so satisfying the merge prerequisite did not resume verification.
+COST: The completed implementation remained unverified until an explicit continuation message; a normal board tick could not distinguish that new evidence from an unchanged wait.
+FIX: Persist the successful integrated head as a durable session event and include it in verification identity. Backfill existing successful receipts at the next boundary, ignore unchanged-head retries and other workers' merges, and re-enter the existing verification/wake selector without advancing any card automatically. The regression fails on the old identity, exercises a stopped worker, and asserts repeated receipts consume no additional turns.
+
+## A confirmed continuation remains in the coordinator input
+AREA: messaging
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-20
+SESSION: codex-lifecycle-adherence
+CARD: CLA-9
+SYMPTOM: A coordinator continuation returned confirmed after an Escape+Enter retry, but the exact instruction remained in its native composer. A later bare Enter resumed the coordinator. The retry still pressed Escape after picker-safe paste, and its final confirmation accepted a single cleared frame; a missing-UI frame also failed to reset the earlier clear observation.
+COST: The orchestrator did not act on an accepted continuation until the terminal was independently inspected and the pending input submitted.
+FIX: Retry Enter without Escape because picker-shaped input already uses bracketed paste. Require consecutive clear frames, including the final read, or durable provider acceptance. Emit submission_enter_retry with its actual key mode. A model-free real-tmux replay fails on the old retry bytes [Escape, Enter] and verifies the new path submits without interrupting; frame-sequence controls cover repaint, missing UI, active input and collapsed paste. Fixture cleanup uses the standard named exact tmux target so the source audit also verifies its cross-session isolation.
+
+
+## Concurrent test subscribers hide board diagnostic warnings
+AREA: tests
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-20
+SESSION: codex-lifecycle-adherence
+CARD: CLA-8
+SYMPTOM: CI's parallel server tests returned the expected unreadable-WIP error but captured only the success-side INFO event; the WARN assertion failed. The board's two log-contract tests installed thread-local subscribers while sharing process-wide callsite interest with other tests.
+COST: A valid release could not complete verification because the diagnostic test observed a different logging environment than production.
+FIX: Execute each board diagnostic contract in its own exact-test subprocess, following the existing storage-probe contract pattern. Preserve every real production call and required diagnostic field; fail if the child exits unsuccessfully or runs zero tests. The child output is included on failure instead of retrying or ignoring a missing warning.
+
+
+## Board recovery fixture mistakes a concurrent policy change for repeated work
+AREA: tests
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-20
+SESSION: codex-lifecycle-adherence
+CARD: CLA-8
+SYMPTOM: The parallel board suite queued another blocker-recovery turn after a progress-only edit. Its fixture left scoped settings unguarded while other tests changed AMUX_HOME; recovery identity correctly includes the approval policy, which differed between the real workspace and those temporary homes.
+COST: The unchanged-state assertion failed for a changed-policy scenario it had accidentally constructed.
+FIX: Hold the existing shared temporary-home guard in both recovery-identity tests. The policy remains fixed across progress-only edits, while real blocker/output changes must still rearm and explicit holds remain intact. Keep failed-test output as evidence rather than explaining it away as build contention.
+
+
+## Worker status UI update leaves generated interaction inventory stale
+AREA: tests
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-20
+SESSION: codex-lifecycle-adherence
+CARD: CLA-8
+SYMPTOM: The combined main revision failed every browser shard before execution because the new status helpers changed the SPA function count from 2066 to 2069 but the generated interaction registry and its embedded state bundle still reported 2066.
+COST: Browser verification could not run for the integration and delivery fixes after incorporating the concurrent main update.
+FIX: Regenerate both artifacts using npm run build:state and verify them with lint:spa. The bundle difference is exactly the inventory count; no handlers changed. Bump the dashboard and service-worker cache versions together so deployed clients receive the matching bundle.
+
+
+## Host contrast test reads a replaced node after refresh
+AREA: tests
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-20
+SESSION: codex-lifecycle-adherence
+CARD: CLA-8
+SYMPTOM: The iOS host-metrics acceptance scenario failed while parsing an empty computed color after refresh. It resolved chip handles before evaluateAll, while the completed host request replaced those elements with the next render.
+COST: One browser scenario failed after the rest of its shard passed; a detached test element was mistaken for the current UI's contrast.
+FIX: Resolve the current semantic chip elements and all computed colors in one browser task. Require exactly three chips, six samples, the requested theme, valid measured colors, and the unchanged 4.5 contrast threshold. Attach raw colors and frame counts, and keep the independent production contrast beacon assertion.
+
+
+## Upload acceptance waits on unrelated page resources before testing uploads
+AREA: tests
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-20
+SESSION: codex-lifecycle-adherence
+CARD: CLA-8
+SYMPTOM: The upload restart scenario exhausted its 30-second test budget in page.goto waiting for load, before selecting a file. The failure snapshot already showed the rendered upload workers. Waiting for every page resource made unrelated resource completion part of the upload acceptance contract.
+COST: A complete browser shard failed before reaching the upload assertions; its other 273 scenarios passed.
+FIX: Wait for DOM content and the actual worker-terminal controls. Hold an unrelated image request open in the restart scenario and assert the page is still interactive while uploads recover. The old setup fails this controlled case; all 21 upload checks pass with the new readiness condition across desktop, mobile and Safari. Log upload-readiness when the pending-resource control is observed; retain every upload byte, count, timeout and cancellation assertion.
+
+## A refused `verified` PATCH (blocked:true) read back as a demoted, wiped card moments later
+AREA: gates
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-20
+SESSION: amux-frustrations
+CARD: AF-942
+SYMPTOM: sent `PATCH /api/board/AF-940 {"status":"verified","gate_ack":true}` against
+ a card confirmed `verified` (reviewer set, evidence recorded). Response was a clean
+ refusal: HTTP 409, `blocked:true`, `code:"verified_requires_gate_checked"`,
+ `discarded:[]`. A GET moments later showed `status:"done"`, `reviewer:null`, and the
+ entire `verification` object wiped (`state:"not_verified"`, all fields null).
+ Restored the card from its own prior evidence. Could NOT reproduce on a fresh
+ scratch card driven through the identical sequence (create->done->verified->same
+ PATCH): that one returned HTTP 200 `applied:false` with no change, before or after.
+ Reading board.rs's refusal branch, it explicitly calls `no_write()` — and AF-940's
+ own durable `log` field, checked after restoring, shows NO `verified -> done`
+ transition ever recorded, though every other real transition on that card is
+ logged. That absence makes a genuine write-path bug the less likely of two
+ explanations; a stale or racy read immediately following a refused PATCH is the
+ more likely one. Neither confirmed. Spot-checked 7 other cards verified this same
+ session — all clean, so this did not recur elsewhere.
+COST: real alarm and ~20 minutes of investigation (a scratch card created and
+ discarded, a source read, a 7-card spot-check) over what a board's own audit log
+ says never happened as a write. Whether or not this is a genuine bug, a refusal
+ response and a subsequent read disagreeing about a card's state — even briefly — is
+ exactly the shape this repo's own instruments are supposed to make impossible.
+FIX: not found. Parked on AF-942 with a concrete trigger (a clean reproduction with a
+ verified immediately-before state, or a recurrence caught during a future
+ verification pass) rather than continuing to chase an unreproduced anomaly.

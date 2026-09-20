@@ -119,6 +119,24 @@ classify_owner() { # <user> <command>
     */private/tmp/claude-501/*)
       p=${2#*/private/tmp/claude-501/}; p=${p%%/*}
       echo "lane scratch (${p})" ;;
+    *Virtualization.VirtualMachine.xpc*)
+      # BEFORE the /System/* arm on purpose, because it lives there and is not
+      # what that arm describes. Apple's VM helper is
+      # /System/Library/Frameworks/Virtualization.framework/.../XPCServices/
+      # com.apple.Virtualization.VirtualMachine.xpc, so the fallback below calls
+      # it SIP-protected and reboot-only. It is neither: it runs as the invoking
+      # user and is a guest VM that some userspace tool started, so it stops
+      # from userspace. Measured 2026-09-19: pid 9701, user ethan, 31 GB
+      # resident, reported as "reboot only" while `colima stop` would have
+      # freed it. Telling the owner to reboot a 24/7 box for something a
+      # command can stop is the expensive half of this mistake.
+      #
+      # The owning tool is deliberately NOT named here, because it is not
+      # derivable at this point: the argv is the framework helper's own path
+      # and carries no VM or lane name, and the process is reparented to
+      # launchd (ppid 1), so neither the command nor the process tree says who
+      # started it. Naming a guess would send the owner to the wrong lane.
+      echo "user-owned guest VM (stop from userspace, no reboot: colima stop / limactl stop / quit Docker Desktop)" ;;
     /System/*|/usr/libexec/*|/usr/sbin/*)
       echo "macOS daemon (SIP-protected, reboot only)" ;;
     *)

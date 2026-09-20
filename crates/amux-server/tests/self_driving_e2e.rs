@@ -509,13 +509,20 @@ async fn recursive_planning_feedback_replans_and_history_is_immutable() {
 #[tokio::test]
 async fn workers_create_only_on_their_own_board_and_link_peers_explicitly() {
     let rig = rig();
+    // AF-922: `depends_on` across boards is now refused at create time
+    // (cross_board_dependency_forbidden, b18789f9) -- exactly the shape this
+    // test's own name argues for ("link peers explicitly" via reviewer/
+    // shepherd below, not via depends_on). The prerequisite this test's
+    // depends_on edge points at is now owned by the SAME worker as the card
+    // that depends on it, so that edge stays legal; the peer relationship the
+    // test demonstrates is carried by reviewer/shepherd instead.
     let (status, _, dependency) = send(
         &rig.app,
         "POST",
         "/api/board",
         Some(json!({
-            "title": "Peer-owned prerequisite",
-            "session": "worker-b",
+            "title": "Own-board prerequisite",
+            "session": "worker-a",
             "status": "backlog",
             "type": "chore"
         })),

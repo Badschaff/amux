@@ -249,11 +249,28 @@ impl Runtime {
         let mut tick_n: u64 = 0;
         loop {
             interval.tick().await;
-            crate::runtime_jobs::registry::tick(crate::runtime_jobs::registry::ids::ORCH_RUNTIME);
             tick_n += 1;
             let heartbeat = tick_n.is_multiple_of(self.heartbeat_every.max(1));
-            if let Err(e) = self.tick_once(heartbeat).await {
-                tracing::warn!(error = %e, "orchestrator tick failed");
+            // AMUX-4828: BRACKET the pass, do not stamp a one-shot before it.
+            //
+            // `registry::tick` sets last_start and last_end to the same instant,
+            // so `last_ms` is never written, and `classify_observed` uses that
+            // field for exactly one thing: upgrading `ok` to `slow`. With it
+            // permanently None this job could only ever read `ok` or `stalled`,
+            // and `stalled` is the word a reader acts on. Measured at median
+            // 402ms and worst 49336ms over 17,199 blocking-poll samples, this is
+            // precisely a job whose slowness was indistinguishable from death.
+            //
+            // tick_end sits in the Ok arm only: a failing pass that still
+            // stamped would make a dead orchestrator read as a working one.
+            crate::runtime_jobs::registry::tick_start(
+                crate::runtime_jobs::registry::ids::ORCH_RUNTIME,
+            );
+            match self.tick_once(heartbeat).await {
+                Ok(()) => crate::runtime_jobs::registry::tick_end(
+                    crate::runtime_jobs::registry::ids::ORCH_RUNTIME,
+                ),
+                Err(e) => tracing::warn!(error = %e, "orchestrator tick failed"),
             }
         }
     }
@@ -1749,152 +1766,40 @@ impl Runtime {
         body: &str,
         now: DateTime<Utc>,
     ) -> anyhow::Result<()> {
-        // Redact secret shapes before the prompt reaches the fleet-readable board
-        // — title AND desc both derive from `body` (AMUX-3384). Same helper the
-        // send-path capture uses, so the two sites cannot drift on what leaks.
-        let redacted = crate::api::session_verbs::redact_prompt_secrets(body);
-        let body = redacted.as_str();
-        let Some(title) = amux_core::board::title_from_prompt(body) else {
-            return Ok(()); // steering, not a task
-        };
-        if amux_core::board::is_informational_query(body) {
-            tracing::info!(
-                worker = %worker,
-                "ledger: informational prompt not carded by orchestrator (message retained)"
-            );
-            return Ok(());
-        }
-        // AMUX-2604: a prompt is spoken INTO a context capture cannot see, so
-        // "This should be one row" mints a card no one can dispatch later. The
-        // check is COMPUTED here (never a model call — ethos rule 2) and the
-        // REWRITE is asked of the worker at its next turn boundary, because
-        // the worker is the only party that ever held the missing referent.
-        let needs_self_desc = amux_core::board::title_needs_self_description(&title);
+        // All transports use the same receipt policy: redact, classify, deduplicate,
+        // and retain the current work claim when a distinct follow-up arrives.
         let wid = worker.to_string();
         let body = body.to_string();
-        let captured_desc = crate::api::session_verbs::format_captured_desc(&body);
-        // Carries (card id, session name) out of the writer so the nudge can
-        // be addressed AFTER the card exists — the consequence hangs off the
-        // write that already happens, with a named consumer and a durable
-        // dedupe key, rather than a new bus (CLAUDE.md's recorded decision).
-        let minted: std::sync::Arc<std::sync::Mutex<Option<(String, String)>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let minted = std::sync::Arc::new(std::sync::Mutex::new(None));
         let minted_w = minted.clone();
-        self.store
-            .write_async(move |conn| {
-                let Some(wrow) = crate::db::queries::get_worker(conn, &wid)? else {
-                    // A card must be attributable; a worker the store cannot
-                    // name gets no invented attribution (Invariant 20).
-                    tracing::warn!(worker = %wid,
-                        "prompt delivered to a worker with no store row; no ledger card minted");
-                    return Ok(WriteOutcome { applied: false, events: vec![] });
-                };
-                let name = wrow.display_name;
-                if name.trim().is_empty() {
-                    tracing::warn!(worker = %wid,
-                        "worker has no display name; no ledger card minted");
-                    return Ok(WriteOutcome { applied: false, events: vec![] });
-                }
-                let mut row = crate::db::board_store::create_issue(
-                    conn,
-                    &crate::db::board_store::NewIssue {
-                        acceptance_criteria: None,
-                        next_action: None,
-                        title,
-                        desc: captured_desc,
-                        // In flight, not queued: see the doc comment — a
-                        // `todo` mint was re-dispatched by the planner,
-                        // double-running every direct prompt.
-                        status: "doing".into(),
-                        session: Some(name.clone()),
-                        // AF-699: a peer-relay REPLY carrying no ask is not
-                        // code work and cannot close on "implemented and
-                        // merged" -- reported by mixpeek-orchestrator, 11
-                        // accumulated un-closeable on one lane's board alone.
-                        item_type: amux_core::board::item_type_for_capture(&body).into(),
-                        creator: "amux".into(),
-                        owner_type: "agent".into(),
-                        due: None,
-                        due_time: None,
-                        reviewer: None,
-                        shepherd: None,
-                        gate: vec![],
-                        depends_on: vec![],
-                        // The tag is the durable half of the flag: the steer
-                        // below is delivered once and consumed, but a card
-                        // whose title was never repaired stays findable by
-                        // anyone querying the board (`needs-self-description`)
-                        // — a nudge with no residue is a nudge that silently
-                        // did not happen (ethos rule 4).
-                        tags: if needs_self_desc.is_some() {
-                            vec!["needs-self-description".to_string()]
-                        } else {
-                            vec![]
-                        },
-                        // Not an ask: this producer files ordinary cards, and a card
-                        // filed into needsyou without one is what AMUX-3929 is about.
-                        ask_type: None,
-                        ask_question: None,
-                        ask_unblocks: None,
-                        ask_actor: None,
-                        // AF-367: minted by the orchestrator runtime.
-                        source: Some("orchestrator".into()),
-                        requested_by: None,
-                        callback_session: None,
-                        callback_prompt: None,
-                    },
-                    now.timestamp(),
-                )?;
-                let stamp = chrono::Local::now().format("%H:%M").to_string();
-                row.log = Some(crate::db::board_store::append_log(
-                    row.log.as_deref(),
-                    &stamp,
-                    "capture: session prompt",
-                ));
-                if let Some(reason) = needs_self_desc {
-                    row.log = Some(crate::db::board_store::append_log(
-                        row.log.as_deref(),
-                        &stamp,
-                        &format!("capture: title needs self-description — {reason}"),
-                    ));
-                    *minted_w.lock().unwrap() = Some((row.id.clone(), name));
-                }
-                crate::db::board_store::save_patched(conn, &mut row)?;
-                // notified is deliberately outside save_patched's SET list
-                // (a Python-owned column); set it here so the assignment
-                // notifier never re-announces a prompt the worker already
-                // has in hand.
-                conn.execute(
-                    "UPDATE issues SET notified = 1 WHERE id = ?1",
-                    params![row.id],
-                )?;
-                Ok(WriteOutcome {
-                    applied: true,
-                    events: vec![PendingEvent {
-                        entity_type: EntityType::Task,
-                        entity_id: row.id.clone(),
-                        mutation: MutationKind::Created,
-                        payload: Some(row.snapshot()),
-                    }],
-                })
+        self.store.write_async(move |conn| {
+            let Some(worker) = crate::db::queries::get_worker(conn, &wid)? else {
+                tracing::warn!(worker = %wid, "capture: worker missing; receipt not minted");
+                return Ok(WriteOutcome { applied: false, events: vec![] });
+            };
+            let name = worker.display_name;
+            let Some(row) = crate::api::session_verbs::mint_capture_card(
+                conn, &name, &body, now.timestamp_millis(), false,
+            )? else {
+                return Ok(WriteOutcome { applied: false, events: vec![] });
+            };
+            if let Some(reason) = amux_core::board::title_needs_self_description(&row.title) {
+                *minted_w.lock().unwrap() = Some((row.id.clone(), name, reason));
+            }
+            tracing::info!(card = %row.id, verdict = "canonical_capture", "orchestrator used shared prompt capture");
+            Ok(WriteOutcome {
+                applied: true,
+                events: vec![PendingEvent {
+                    entity_type: EntityType::Task,
+                    entity_id: row.id.clone(),
+                    mutation: MutationKind::Created,
+                    payload: Some(row.snapshot()),
+                }],
             })
-            .await?;
+        }).await?;
 
-        // The consequence, hung off the write that already happened and
-        // addressed to a NAMED consumer: the worker that received the prompt.
-        //
-        // Delivery is `steer_enqueue`, the existing path, never a direct send
-        // — the steering loop applies the turn-boundary gate, so this cannot
-        // land mid-turn, and it arrives exactly when the worker has finished
-        // the prompt and therefore HOLDS the context the capture lacked.
-        //
-        // Asked once, not every turn: the enqueue is fired from the MINT, which
-        // happens once per card, and the guard key is the card id — so even a
-        // duplicate mint replaces the queued row instead of stacking a second
-        // copy (steer_enqueue dedupes on `guard`).
         let minted = minted.lock().unwrap().take();
-        if let Some((card_id, session)) = minted {
-            let reason = needs_self_desc.unwrap_or("it has no referent outside this conversation");
+        if let Some((card_id, session, reason)) = minted {
             let msg = format!(
                 "Board card {card_id} was captured from your last prompt, and its title \
                  cannot be dispatched by anyone who was not in this conversation: {reason}.\n\n\
@@ -2718,6 +2623,26 @@ mod adherence_tests {
     }
 
     #[tokio::test]
+    async fn every_transport_reuses_capture_and_preserves_active_work() {
+        let store = store();
+        let worker = seed_worker(&store, 34, "capture-retry");
+        let rt = runtime(store.clone(), None, false);
+        let now = Utc::now();
+        let body = "1. Fix the flaky parser\n2. Verify the regression";
+        rt.capture_prompt_card(&worker, body, now).await.unwrap();
+        rt.capture_prompt_card(&worker, body, now + chrono::Duration::minutes(20)).await.unwrap();
+        rt.capture_prompt_card(&worker, "Add a route for the archive endpoint", now).await.unwrap();
+        rt.capture_prompt_card(&worker, "Thanks, looks good", now).await.unwrap();
+        let conn = store.read().unwrap();
+        assert_eq!(conn.query_row("SELECT count(*) FROM issues", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+        let rows = conn.prepare("SELECT title,status,source FROM issues ORDER BY created,id").unwrap()
+            .query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,String>(2)?))).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert!(rows.contains(&("Fix the flaky parser".into(), "doing".into(), "capture".into())));
+        assert!(rows.contains(&("Add a route for the archive endpoint".into(), "backlog".into(), "capture".into())));
+    }
+
+    #[tokio::test]
     async fn delivered_informational_question_stays_message_only() {
         let store = store();
         let worker = seed_worker(&store, 4, "alpha");
@@ -2901,14 +2826,16 @@ mod adherence_tests {
         );
     }
 
-    /// M5 guards: steering words mint nothing, but every durable command cards
-    /// even while other work is open. Command/message idempotency owns transport
-    /// retries; text equality is not enough to erase an intentional repeat.
+    /// Commands remain deliverable even when their board receipt is reused.
+    /// Distinct work gets its own receipt; identical open work must not inflate
+    /// the backlog or replace the current execution claim.
     #[tokio::test]
-    async fn steering_skips_but_open_work_and_repeated_commands_still_card() {
+    async fn steering_skips_and_repeated_commands_reuse_open_board_receipts() {
         let store = store();
         let w = seed_worker(&store, 4, "alpha");
-        let rt = runtime(store.clone(), None, false);
+        let protocol = Arc::new(MockProtocol::new());
+        protocol.register(w.clone(), AgentState::Idle);
+        let rt = runtime(store.clone(), Some(protocol.clone()), false);
 
         // Control word: retained as a message by the caller, but not a task.
         let now = Utc::now();
@@ -2930,21 +2857,34 @@ mod adherence_tests {
             "an open card must not absorb a different command before the model can classify it"
         );
 
-        // A second durable message with identical text may be intentional. The
-        // transport layer dedupes retries by message id, so capture must not add
-        // a second, capability-reducing text heuristic.
-        rt.capture_prompt_card(
-            &w,
-            "also handle the retry path in the same module please",
-            now + chrono::Duration::seconds(1),
-        )
-        .await
-        .unwrap();
+        // Two intentional repeats still reach the model and remain durable
+        // messages. Only the redundant board receipts are consolidated.
+        for key in ["repeat-one", "repeat-two"] {
+            let message = MessageId::from_ulid(ulid::Ulid::new());
+            seed_message(&store, &message, "also handle the retry path in the same module please");
+            enqueue_deliver(&store, &w, &message, key);
+            rt.pump_commands(Utc::now(), &BTreeMap::new()).await.unwrap();
+            // The mock does not emit provider acknowledgements. Confirm this
+            // delivery through the command state machine before the next one.
+            store.write(move |conn| {
+                let id: String = conn.query_row(
+                    "SELECT id FROM _amux_commands WHERE idempotency_key=?1", [key], |r| r.get(0),
+                )?;
+                crate::db::commands::transition(conn, &CommandId::parse(&id).unwrap(),
+                    amux_core::protocol::CommandTransition::Confirm, 3)?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            }).unwrap();
+        }
+        assert_eq!(protocol.calls().iter().filter(|call|
+            matches!(call, RecordedCall::DeliverMessage { .. })).count(), 2);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM _amux_messages"), 2);
         assert_eq!(
             count(&store, "SELECT COUNT(*) FROM issues"),
-            3,
-            "a separate durable command must remain visible to the model"
+            2,
+            "repeated delivery must not duplicate the same unfinished board outcome"
         );
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM issues WHERE status='doing'"), 1);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM issues WHERE status='backlog'"), 1);
     }
 
     fn seed_message(store: &SharedStore, id: &MessageId, body: &str) {
@@ -3253,5 +3193,54 @@ mod rate_limit_recovery_tests {
             }
         }
         assert_eq!(second, 0, "one announcement per exhaustion episode");
+    }
+}
+
+#[cfg(test)]
+mod tick_bracket_guard {
+    /// AMUX-4828: `run` must report a pass that FINISHED, with its duration.
+    ///
+    /// `registry::tick` sets last_start and last_end to the same instant, so it
+    /// writes no duration and marks a pass that had only STARTED.
+    /// `classify_observed` reads `last_tick_ms` for exactly one purpose,
+    /// upgrading `ok` to `slow`, so with the one-shot that branch is dead and a
+    /// job that merely runs LONG can only present as `ok` or `stalled`.
+    ///
+    /// Source-reading is the weaker instrument and the one that fits: driving
+    /// `run` means an interval loop that never returns.
+    #[test]
+    fn the_orchestrator_brackets_its_tick_and_only_stamps_a_completed_one() {
+        let src = include_str!("runtime.rs");
+        // BOUND THE SLICE TO THE FUNCTION. A fixed window sweeps into this test,
+        // whose assertions contain the literal being searched for, and the guard
+        // then matches its own source. That trap has fired repeatedly here.
+        let start = src.find("pub async fn run(self: Arc<Self>)").expect("run exists");
+        let rest = &src[start..];
+        let body = &rest[..rest.find("\n    }\n").map(|i| i + 6).expect("run is closed")];
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let start_at = code.find("tick_start(").expect("the pass is bracketed with tick_start");
+        let work_at = code.find("self.tick_once(").expect("the loop runs the pass");
+        let end_at = code.find("tick_end(").expect("the loop records a tick_end");
+        let ok_at = code.find("Ok(()) =>").expect("the completed arm is matched explicitly");
+        assert!(start_at < work_at, "tick_start must precede the pass");
+        assert!(
+            work_at < end_at,
+            "tick_end must come AFTER the pass: a tick stamped first reports one that STARTED"
+        );
+        assert!(
+            ok_at < end_at,
+            "tick_end must sit in the Ok arm: a failing pass that still stamps makes a dead \
+             orchestrator read as a working one"
+        );
+        assert!(
+            !code.contains("registry::tick("),
+            "the one-shot cannot express a duration, which is what made this job's slowness \
+             indistinguishable from death"
+        );
     }
 }

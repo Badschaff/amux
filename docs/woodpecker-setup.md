@@ -35,9 +35,9 @@ docker --context <name> build -t amux-rust-base -f Dockerfile.rust-base .
 See `Dockerfile.rust-base`'s own header for the full reasoning. Rebuild it
 whenever `Cargo.lock` changes enough that the cached deps go meaningfully
 stale — still a manually-triggered, occasional step, but as of 2026-09-05
-this is amux's own job across all three real build hosts (build-02.baar,
-build.home, build.northstage — the last a rename of what was build.virt04),
-not infra's: `scripts/rebuild-rust-base.sh` fans the same `docker build`
+this is amux's own job across all three real build hosts (see
+CLAUDE.local.md for their real names and the 2026-09-04 rename of one of
+them; this repo is public and hostnames don't belong in it), not infra's: `scripts/rebuild-rust-base.sh` fans the same `docker build`
 out to every host at once (via pre-created `docker context`s, one per
 host — see that script's own header for the env var it reads). Note the
 transport is TCP + mutual TLS on port 2376 now (infra's `tofu/docker-mtls/`

@@ -50,7 +50,20 @@ import json, os, shlex, ssl, subprocess, sys, time, urllib.error, urllib.request
 # `^`-anchored, because an unanchored match now finds the comment line first
 # (checked: it returned empty, which would have made `grep -L` match nothing and
 # report a clean fleet).
-GUARD_VERSION = 17
+GUARD_VERSION = 18
+
+# AF-929: the AC-297 severity upgrade below is structurally blind to
+# `git commit <pathspec>` (confirmed empirically, scratch repo, 2026-09-18) --
+# that form stages the pathspec's own current working-tree bytes into git's
+# throwaway commit-time index before this hook ever runs, so `git diff`
+# (unstaged) for that exact path is empty by construction, every time, with
+# nothing left to detect. STAGED_LARGE_LINES is the fallback signal that IS
+# reachable in that shape: the staged numstat itself. 200 is p75 of this
+# repo's own last 500 commits' total changed-line count (216, measured
+# 2026-09-18 via `git log --numstat`, rounded down) -- a commit this size is
+# already atypically large for ONE file when the repo's own norm is a whole
+# commit at ~100 lines across every file it touches.
+STAGED_LARGE_LINES = 200
 
 
 def amux_base_url():
@@ -883,11 +896,13 @@ def main():
     for f in (d.get("shared") or []):
         mins = int((f.get("age_secs") or 0) / 60)
         _n = ""
+        _staged_total = 0
         try:
             _ns = subprocess.run(
                 ["git", "diff", "--cached", "--numstat", "--", f.get("path") or ""],
                 capture_output=True, text=True, timeout=5).stdout.split()
             if len(_ns) >= 2 and _ns[0].isdigit():
+                _staged_total = int(_ns[0]) + (int(_ns[1]) if _ns[1].isdigit() else 0)
                 _n = " This commit stages %s insertions / %s deletions there — if that is " \
                      "MORE than you wrote, their work is in it." % (_ns[0], _ns[1])
         except Exception:
@@ -895,7 +910,14 @@ def main():
         # AC-297: upgrade from NOTE to WARNING when the file has unstaged changes
         # right now. That is the FACT — someone has uncommitted work in a file
         # you are about to commit whole.
-        _level = "WARNING" if f.get("has_unstaged_changes") else "NOTE"
+        # AF-929: OR when the staged diff itself is already large. A pathspec
+        # commit (`git commit <path>`) never has unstaged changes to find for
+        # that exact path by the time this hook runs, so `has_unstaged_changes`
+        # alone silently downgrades exactly the sweep this NOTE/WARNING split
+        # exists to catch. The staged size is reachable in both commit shapes,
+        # so it never goes blind the way the first check does.
+        _level = "WARNING" if (f.get("has_unstaged_changes")
+                                or _staged_total >= STAGED_LARGE_LINES) else "NOTE"
         # An own-shell fallback permits the workflow without identifying its
         # writer. A dirty file adds no authorship evidence, and there is no
         # peer whose recorded write the legacy provenance prose can describe.

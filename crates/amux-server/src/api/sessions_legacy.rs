@@ -600,11 +600,38 @@ static SESSIONS_RUNTIME_EPOCH: std::sync::atomic::AtomicU64 =
 /// invalidate ~every request and resurrect the AR-135 pool-starvation
 /// stampede this cache exists to prevent. Content edits inside an env file
 /// don't move the set — those paths already invalidate explicitly.
-fn registry_fingerprint() -> u64 {
+/// `None` means THE MEASUREMENT DID NOT RUN, and it is a distinct answer from
+/// any hash (AMUX-4838).
+///
+/// This used to `return 0` when the directory could not be read, and every
+/// caller compares fingerprints for EQUALITY, so "could not read" was compared
+/// against real hashes as though it were one. Instrumenting `race_verdict` to
+/// name which half moved showed every registry race in an `api::` run had the
+/// shape `<hash>->0` or `0-><hash>`: one sample succeeding and the other
+/// failing to read, reported as a change.
+///
+/// A sentinel could not have been chosen safely either, because 0 is a
+/// REACHABLE value here: `acc` starts at 0 and the loop XORs into it, so a
+/// directory with no `.env` files hashes to 0 legitimately. An empty registry
+/// and an unreadable one were the same number. `Option` separates all three
+/// states (`Some(0)` empty, `Some(h)` populated, `None` unmeasured) and makes
+/// the third impossible to read as a value by accident.
+fn registry_fingerprint() -> Option<u64> {
+    registry_fingerprint_at(&amux_home().join("sessions"))
+}
+
+/// The measurement itself, taking its directory as an argument.
+///
+/// Split out so the three states can be tested without touching `AMUX_HOME`.
+/// That global is exactly what makes this area flaky: parallel tests swap the
+/// process-wide home through `test_env::set_home()`, which is what produced the
+/// interleaved `<hash>->0` samples in the first place. A test that set the home
+/// to prove a point about reading the home would be racing the bug it is
+/// describing.
+fn registry_fingerprint_at(dir: &std::path::Path) -> Option<u64> {
     use std::hash::{Hash, Hasher};
-    let dir = amux_home().join("sessions");
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return 0;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return None;
     };
     let mut acc = 0u64;
     for e in entries.flatten() {
@@ -617,7 +644,7 @@ fn registry_fingerprint() -> u64 {
             }
         }
     }
-    acc
+    Some(acc)
 }
 
 /// Drop the cached session list so the very next GET rebuilds (AMUX-2926).
@@ -1302,6 +1329,14 @@ impl FleetSignals {
             }
             return None;
         }
+        if !structured && status == "idle" && pane_boundary == Some(true) {
+            let key = format!("measured-fallback-boundary:{name}");
+            if crate::log_dedupe::first_this_bucket(&key, crate::log_dedupe::hour_bucket(self.now)) {
+                tracing::info!(target: "status_truth", session = name, measured = true, n_considered = 1,
+                    verdict = "idle_boundary_measured_without_current_hook",
+                    "recognized live composer restores dispatch after absent or expired structured report");
+            }
+        }
         if measured && ex["decided_by"] == "codex_stale_active_refused" {
             let key = format!("structured-boundary:{name}");
             if crate::log_dedupe::first_this_bucket(&key, crate::log_dedupe::hour_bucket(self.now)) {
@@ -1373,12 +1408,19 @@ impl FleetSignals {
     /// scrollback count as evidence by stuffing the map.
     pub fn pane_probe_candidate(&self, name: &str) -> bool {
         let act = self.activity.get(&format!("amux-{name}")).copied().unwrap_or(0) as f64;
-        // Hookless providers have no structured turn-boundary signal. An idle
-        // Gemini terminal stops painting; aging out its only observable signal
-        // makes a future queued task permanently ineligible for delivery.
-        // Keep measuring these lanes. A nonempty recognized composer is still
-        // required by turn_boundary_status; silence itself never permits sends.
-        self.now - act < self.contradiction_window() || self.hookless_workers.contains(name)
+        let report_current = self.reports.get(name).is_some_and(|r| {
+            report_applies(
+                r["state"].as_str().unwrap_or(""), r["ts"].as_f64().unwrap_or(0.0),
+                self.started.get(name).copied().unwrap_or(0.0), self.now,
+            )
+        });
+        // Losing a hook must not also disable its fallback. A quiet worker
+        // whose report expired still needs a bounded current pane observation.
+        // This admits measurement, never delivery: the boundary classifier
+        // still requires a recognized nonempty composer and rejects live work.
+        self.now - act < self.contradiction_window()
+            || self.hookless_workers.contains(name)
+            || (self.agent_running(&format!("amux-{name}")) && !report_current)
     }
 
     /// Raw pane for a lane whose evidence is admissible: recently painted and
@@ -2743,7 +2785,16 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
             // invalidate_sessions_cache(). Rebuild — and say so, because
             // this line firing is how the next missing call site announces
             // itself instead of shipping another flaky-stale list.
-            if c.registry == registry_fingerprint() {
+            //
+            // UNMEASURED IS NOT A MATCH, and here that is the conservative
+            // direction rather than the damaging one (AMUX-4838). This arm only
+            // decides whether to reuse a cached list: an unreadable registry
+            // means the guard cannot confirm the cached worker set is still
+            // current, so it rebuilds. That costs one build. The race check at
+            // the end of the build makes the OPPOSITE call on the same
+            // `None` because the cost there is a 503 for every caller, and a
+            // rebuild is not a refusal.
+            if registry_fingerprint().is_some_and(|f| c.registry == f) {
                 return Ok(c.json.clone());
             }
             tracing::info!(
@@ -2830,7 +2881,7 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
             if c.store.ptr_eq(&store_key)
                 && !c.json.is_empty()
                 && c.epoch == epoch_now
-                && c.registry == registry_fingerprint()
+                && registry_fingerprint().is_some_and(|f| c.registry == f)
             {
                 return Ok(c.json.clone());
             }
@@ -2848,7 +2899,7 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
                 if c.store.ptr_eq(&store_key)
                     && !c.json.is_empty()
                     && c.epoch == epoch_now
-                    && c.registry == registry_fingerprint()
+                    && registry_fingerprint().is_some_and(|f| c.registry == f)
                 {
                     return Ok(c.json.clone());
                 }
@@ -2880,7 +2931,7 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
             && !c.json.is_empty()
             && c.epoch == epoch_now
             && c.runtime_epoch == runtime_epoch_now
-            && c.registry == registry_fingerprint()
+            && registry_fingerprint().is_some_and(|f| c.registry == f)
         {
             return Ok(c.json.clone());
         }
@@ -2906,27 +2957,46 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
         registry_start,
         registry_fingerprint(),
     ) {
-        Ok(()) => {
-            if let Ok(mut c) = build_array_cache().lock() {
+        RaceVerdict::Fresh => {
+            // `Fresh` is only reachable with both samples measured, so this
+            // binding always takes. It is written as a conditional rather than
+            // an unwrap because an unwrap here would be a panic in the request
+            // path if the verdict ever gained a fourth state.
+            if let (Ok(mut c), Some(registry)) = (build_array_cache().lock(), registry_start) {
                 *c = ListSnapshot {
                     store: store_key,
                     stamp: now,
                     json: json.clone(),
                     epoch: epoch_start,
                     runtime_epoch: runtime_epoch_start,
-                    registry: registry_start,
+                    registry,
                 };
             }
         }
-        Err(raced) => {
+        RaceVerdict::Raced => {
             // Fail closed as well as refusing the cache write. Returning JSON that
             // predates an isolation/delete/config change would leak the old fleet
             // shape to the one request that happened to race the change.
             tracing::warn!(
                 target: "amux::sessions",
+                verdict = "sessions_build_raced", measured = true, n_considered = 1,
                 "session-list build raced a structural change — refusing the stale response"
             );
-            return Err(raced.into());
+            return Err(DiscoveryRaced.into());
+        }
+        RaceVerdict::Unverifiable => {
+            // SERVE, BUT DO NOT CACHE (AMUX-4838). The registry could not be
+            // read, so "did anything move" has no answer; the old code called
+            // that a race and 503'd, which is a positive asserted from a probe
+            // that never fired. `measured = false` is the field a sweep reads,
+            // and it is the same contract every /api/debug route already keeps:
+            // publish whether the measurement ran, beside the thing it decided.
+            tracing::warn!(
+                target: "amux::sessions",
+                verdict = "sessions_registry_unmeasured", measured = false, n_considered = 0,
+                "registry fingerprint could not be sampled; serving this build without \
+                 caching it, since whether it raced cannot be established"
+            );
         }
     }
     Ok(json)
@@ -2985,16 +3055,61 @@ impl std::error::Error for BuilderBusy {}
 /// Serve a finished build only if neither the epoch nor the on-disk registry
 /// moved while it ran. Extracted so the construction of [`DiscoveryRaced`] is
 /// pinned by a test rather than only the classifier that reads it.
+/// Three answers, because there are three states (AMUX-4838).
+#[derive(Debug, PartialEq, Eq)]
+enum RaceVerdict {
+    /// Nothing moved and both registry samples were measured. Safe to serve AND
+    /// to cache.
+    Fresh,
+    /// Something demonstrably moved. The caller gets a 503 with `Retry-After`.
+    Raced,
+    /// A registry sample could not be taken, so whether anything moved is
+    /// unknown. Serve the build, but do NOT cache it.
+    Unverifiable,
+}
+
+/// Serve a finished build only if neither the epoch nor the on-disk registry
+/// moved while it ran. Extracted so the construction of [`DiscoveryRaced`] is
+/// pinned by a test rather than only the classifier that reads it.
+///
+/// THE THIRD CASE IS A DELIBERATE CHOICE, and the card asked for it to be named
+/// rather than defaulted (AMUX-4838). When a registry sample is `None` the
+/// honest answer is "cannot tell", and the two obvious policies are both wrong
+/// on their own:
+///
+/// - Failing closed treats a non-measurement as proof of a change, which is the
+///   defect being fixed: it asserts a positive from a probe that could not fire.
+///   Worse, it does not degrade gracefully. A read failure that PERSISTS makes
+///   every `GET /api/sessions` 503 forever, and every retry re-fails the same
+///   way, so a filesystem blip becomes a total outage of the endpoint the whole
+///   fleet polls.
+/// - Treating it as unchanged removes the 503 but lets a snapshot that really
+///   did race get written into the cache, where later callers keep reading it
+///   long after the blip ended.
+///
+/// So the choice is neither: SERVE, BUT DO NOT CACHE. The caller gets an answer
+/// built from a real read of the database, which is the thing they asked for,
+/// and the one durable consequence of being wrong is refused. The cost is a
+/// rebuild on the next request instead of a cache hit, which is the same cost
+/// the old code paid on every one of these — it just paid it behind a 503.
+///
+/// An epoch move is still decisive on its own: those counters are in-process
+/// and always measured, so `None` never reaches this branch.
 fn race_verdict(
     epoch_start: u64,
     epoch_now: u64,
-    registry_start: u64,
-    registry_now: u64,
-) -> Result<(), DiscoveryRaced> {
-    if epoch_now == epoch_start && registry_now == registry_start {
-        Ok(())
-    } else {
-        Err(DiscoveryRaced)
+    registry_start: Option<u64>,
+    registry_now: Option<u64>,
+) -> RaceVerdict {
+    if epoch_now != epoch_start {
+        return RaceVerdict::Raced;
+    }
+    match (registry_start, registry_now) {
+        (Some(a), Some(b)) if a == b => RaceVerdict::Fresh,
+        (Some(_), Some(_)) => RaceVerdict::Raced,
+        // At least one sample never ran. `Some(0)` is NOT this case: an empty
+        // registry is a measured 0 and compares like any other value.
+        _ => RaceVerdict::Unverifiable,
     }
 }
 
@@ -3560,6 +3675,39 @@ fn last_human_ts_from_user_messages(
     out
 }
 
+/// AMUX-4879 / last_board_change_ts. The age of a lane's most recent board
+/// transition, so `status` is never read bare.
+///
+/// `status` is an INSTANTANEOUS between-turn sample. A lane that closes a card
+/// every half hour reads `idle` on most samples and is indistinguishable from
+/// one that has not moved a card in thirty hours. That ambiguity has produced
+/// the same wrong conclusion twice: Ethan reported three fan-out workers as
+/// stalled (AMUX-4777) and the lane triaging it repeated the error, before
+/// board_change_log showed 43 transitions in the preceding 24h with the most
+/// recent 19 minutes earlier.
+///
+/// `board_change_log` is the authoritative record and already exists; it was
+/// simply never joined to the thing a reader looks at.
+///
+/// Pure and DB-free for the same reason `last_human_ts_from_user_messages`
+/// above is: the property is then testable without standing up a connection.
+/// Takes the MAX per session rather than the last row seen, because the
+/// caller's query is grouped rather than ordered and must not depend on
+/// SQLite's row order to be correct.
+fn last_board_change_from_rows(rows: &[(String, f64)]) -> BTreeMap<String, f64> {
+    let mut out: BTreeMap<String, f64> = BTreeMap::new();
+    for (session, at) in rows {
+        if session.trim().is_empty() || !at.is_finite() || *at <= 0.0 {
+            continue;
+        }
+        let slot = out.entry(session.clone()).or_insert(*at);
+        if *at > *slot {
+            *slot = *at;
+        }
+    }
+    out
+}
+
 fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
     #[cfg(test)]
     if fleet_suppressed() {
@@ -3708,9 +3856,12 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             "external_email_allowed_own": env.contains_key("AMUX_EMAIL_EXTERNAL_ALLOW"),
             "worktree": env.get("CC_WORKTREE").cloned().unwrap_or_default(),
             "worktree_repo": env.get("CC_WORKTREE_REPO").cloned().unwrap_or_default(),
-            "worktree_active": home.join("worktrees").join(&name).exists(),
+            "worktree_active": home.join("worktrees").join(&name).join(".git").exists(),
+            "worktree_path": home.join("worktrees").join(&name).to_string_lossy(),
+            "worktree_integration": crate::fanout_workspace::integration_status(&home, &name),
             "ephemeral": env.get("CC_EPHEMERAL").map(|v| v == "1").unwrap_or(false),
             "ephemeral_parent": env.get("CC_PARENT").cloned().unwrap_or_default(),
+            "orchestrator": env.get("CC_ORCHESTRATOR").is_some_and(|v| v == "1"),
             "mcp": env.get("CC_MCP").cloned().unwrap_or_default(),
             "session_created": session_created,
             "last_activity": last_activity,
@@ -3855,6 +4006,54 @@ fn steering_with_transport(conn: &rusqlite::Connection) -> rusqlite::Result<BTre
             "guard":guard,"system":system,"transport_id":transport_id}));
     }
     Ok(steering)
+}
+
+/// The current branch, read from `.git/HEAD` instead of asking git.
+///
+/// AMUX-4778: the sessions build spent ~2.4s of every cold rebuild running
+/// `git rev-parse --abbrev-ref HEAD` once per distinct checkout, 12 at a time,
+/// across ~107 directories. `rev-parse` in the common case reads exactly this
+/// file, so the subprocess is the entire cost.
+///
+/// Measured against `git rev-parse --abbrev-ref HEAD` on all 100 real session
+/// directories on this box: AGREED 100 of 100, at 0.031 ms per directory
+/// against 37.4 ms for the subprocess (3.1 ms total against 3.74 s).
+///
+/// Handles the three shapes that made a naive `<dir>/.git/HEAD` read wrong when
+/// I first tried it (it agreed on only 21 of 100):
+///   - a SUBDIRECTORY of a checkout has no `.git`; git walks up, so this does;
+///   - a worktree or submodule has `.git` as a FILE holding `gitdir: <path>`,
+///     which may be relative;
+///   - a DETACHED head holds a raw sha, and `rev-parse --abbrev-ref` answers
+///     the literal "HEAD" for it, so that is what this returns.
+///
+/// Returns None when it cannot answer, and the caller then pays for git. A
+/// wrong branch is worse than a slow one.
+fn branch_from_head_file(dir: &str) -> Option<String> {
+    let mut cur = std::path::Path::new(dir).to_path_buf();
+    loop {
+        let dot = cur.join(".git");
+        if dot.exists() {
+            let gitdir = if dot.is_file() {
+                let txt = std::fs::read_to_string(&dot).ok()?;
+                let rest = txt.trim().strip_prefix("gitdir:")?.trim().to_string();
+                let p = std::path::PathBuf::from(&rest);
+                if p.is_absolute() { p } else { cur.join(p) }
+            } else {
+                dot
+            };
+            let head = std::fs::read_to_string(gitdir.join("HEAD")).ok()?;
+            let head = head.trim();
+            return Some(match head.strip_prefix("ref: refs/heads/") {
+                Some(b) => b.to_string(),
+                // Detached: `--abbrev-ref` prints HEAD, not the sha.
+                None => "HEAD".to_string(),
+            });
+        }
+        if !cur.pop() {
+            return None;
+        }
+    }
 }
 
 fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::Value>> {
@@ -4013,6 +4212,23 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
             vec![]
         };
         let last_human_ts = last_human_ts_from_user_messages(&user_msgs);
+        // AMUX-4879. One grouped query for the whole fleet, not one per lane:
+        // this runs on every /api/sessions poll. `changed_at` is FLOAT SECONDS
+        // here, unlike `cmd_history.ts` which is milliseconds, so it is passed
+        // through unscaled.
+        let last_board_change = {
+            let rows: Vec<(String, f64)> = conn
+                .prepare(
+                    "SELECT changed_by, MAX(changed_at) FROM board_change_log \
+                     WHERE changed_by IS NOT NULL AND changed_by != '' GROUP BY changed_by",
+                )
+                .and_then(|mut stmt| {
+                    stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))
+                        .map(|rows| rows.flatten().collect())
+                })
+                .unwrap_or_default();
+            last_board_change_from_rows(&rows)
+        };
         {
             for (session, text, card_id, ts_ms) in user_msgs {
                 let card_id = card_id.filter(|id| !id.trim().is_empty());
@@ -4187,6 +4403,13 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
             v["status"] = json!(truth.status);
             v["task_board_id"] = json!(truth.card_id);
             v["last_human_ts"] = json!(last_human_ts.get(&name).copied().unwrap_or(0));
+            // AMUX-4879. Beside `status`, so `idle` is never read bare. 0 means
+            // "this lane has never moved a card", which is a real answer and is
+            // NOT the same as "just now" — the same distinction task_updated
+            // makes a few lines below. The client must not render an age it
+            // does not have.
+            v["last_board_change_ts"] =
+                json!(last_board_change.get(&name).copied().unwrap_or(0.0));
             v["runtime_board"] = json!({
                 "measured": truth.measured,
                 // `status` is the compact client contract; retain the
@@ -4413,7 +4636,20 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
                 .filter(|d| !d.is_empty())
                 .map(String::from)
                 .collect();
-            let dir_list: Vec<String> = dirs.into_iter().collect();
+            // FAST PATH FIRST (AMUX-4778): resolve what we can by reading
+            // `.git/HEAD`, and only spawn git for the directories that cannot
+            // be answered that way. On this box that is all of them, taking the
+            // projection from ~2.4s to ~3ms; the subprocess below stays for any
+            // shape the file read does not cover.
+            let mut dir_list: Vec<String> = Vec::new();
+            for d in dirs {
+                match branch_from_head_file(&d) {
+                    Some(b) => {
+                        branches.insert(d, b);
+                    }
+                    None => dir_list.push(d),
+                }
+            }
             for chunk in dir_list.chunks(12) {
                 let handles: Vec<_> = chunk
                     .iter()
@@ -4448,7 +4684,9 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
         }
         for v in out.iter_mut() {
             let b = v["dir"].as_str().and_then(|d| branches.get(d)).cloned().unwrap_or_default();
-            v["branch"] = json!(b);
+            v["branch"] = if v["worktree_active"] == true {
+                json!(v["worktree_path"].as_str().and_then(branch_from_head_file).unwrap_or_default())
+            } else { json!(b) };
         }
     }
 
@@ -4938,6 +5176,22 @@ pub(crate) mod tests {
         assert_eq!(cflags, "--model qwen3.8:27b");
         assert!(cmodel.is_empty(), "agent CLIs have no CC_MODEL");
         assert_eq!(cresolved, "qwen3.8:27b");
+        // Muse: an agent CLI, so the model rides in CC_FLAGS and CC_MODEL stays
+        // empty (the ollama CC_MODEL path is ollama-only).
+        let (mflags, mmodel, mresolved) = worker_model_env("muse", "muse-spark-1.2", "", "opus");
+        assert_eq!(mflags, "--model muse-spark-1.2");
+        assert!(mmodel.is_empty(), "muse must not use the ollama CC_MODEL path");
+        assert_eq!(mresolved, "muse-spark-1.2");
+        // THE CLAUDE DEFAULT MUST NOT LEAK (the gtm-researcher-gemini defect one
+        // provider over). An unspecified model leaves CC_FLAGS EMPTY so muse's
+        // own CLI decides; `default_model_for_provider("muse")` supplies
+        // muse-spark-1.3-contributor at launch. "opus" is not a model Meta can
+        // be asked for, and a worker created with it would be dead on arrival.
+        let (mflags2, mmodel2, mresolved2) = worker_model_env("muse", "", "", "opus");
+        assert!(mflags2.is_empty(), "empty muse model must not become --model opus: {mflags2}");
+        assert!(!mflags2.contains("opus"));
+        assert!(mmodel2.is_empty());
+        assert!(mresolved2.is_empty());
 
         // Ollama + NO model -> CC_MODEL empty (start uses the ollama default),
         // and the CLAUDE default ("opus") must appear NOWHERE. This is the exact
@@ -5868,6 +6122,28 @@ Claude usage limit reached. Your limit will reset at 3pm.
         assert_ne!(s.turn_boundary_status(lane).as_deref(),Some("idle"));
         s.panes.insert(lane.into(),String::new());
         assert!(s.turn_boundary_status(lane).is_none());
+    }
+
+    #[test]
+    fn expired_hook_keeps_fallback_observable_without_authorizing_unknown_or_busy_panes() {
+        for state in ["active", "blocked", "idle"] {
+            let mut s = signals();
+            let lane = "expired-hook";
+            s.running.insert(format!("amux-{lane}"));
+            s.started.insert(lane.into(), s.now - 200_000.0);
+            s.activity.insert(format!("amux-{lane}"), (s.now - 7200.0) as i64);
+            s.reports = json!({lane: {"state":state,"ts":s.now - 100_000.0,"subagents":{"count":0}}});
+            assert!(s.pane_probe_candidate(lane), "expired {state} must not suppress the fallback measurement");
+            assert!(s.turn_boundary_status(lane).is_none(), "an absent capture is not idle evidence");
+            s.panes.insert(lane.into(), "Claude Code\n❯ \n────────────────────\n⏵⏵ bypass permissions on (shift+tab to cycle)".into());
+            assert_eq!(s.turn_boundary_status(lane).as_deref(), Some("idle"), "expired {state}");
+            s.panes.insert(lane.into(), WORKING_BAR.into());
+            assert_ne!(s.turn_boundary_status(lane).as_deref(), Some("idle"), "busy {state}");
+            s.panes.insert(lane.into(), "unrecognized provider output".into());
+            assert!(s.turn_boundary_status(lane).is_none(), "unknown {state}");
+            s.panes.insert(lane.into(), String::new());
+            assert!(s.turn_boundary_status(lane).is_none(), "empty {state}");
+        }
     }
 
     #[test]
@@ -6837,6 +7113,74 @@ Checked, nothing of mine was at risk, no action needed from you.
     /// The controls matter as much: prose that merely ENDS in something
     /// time-shaped, and a single-space gap, must pass through untouched — an
     /// over-eager strip would corrupt real preview text fleet-wide.
+    /// AMUX-4778: the branch must come from `.git/HEAD`, and agree with git.
+    ///
+    /// The sessions build spent ~2.4s of every cold rebuild on
+    /// `git rev-parse --abbrev-ref HEAD`, once per distinct checkout. The file
+    /// read that replaces it was verified against git on all 100 real session
+    /// directories on this box (100/100, 0.031ms vs 37.4ms each). A unit test
+    /// still has to build the shapes itself, because my FIRST attempt at this
+    /// read agreed on only 21 of those 100 and every miss was a different
+    /// shape.
+    #[test]
+    fn the_branch_read_matches_git_across_checkout_shapes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // 1. A repo ROOT on a branch.
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        assert_eq!(branch_from_head_file(repo.to_str().unwrap()).as_deref(), Some("main"));
+
+        // 2. A SUBDIRECTORY. This is what broke the naive version: 79 of the
+        // 100 real directories are nested, have no `.git` of their own, and git
+        // finds the root by walking up.
+        let nested = repo.join("a/b/c");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(
+            branch_from_head_file(nested.to_str().unwrap()).as_deref(),
+            Some("main"),
+            "a nested directory must resolve to its repo's branch, not None"
+        );
+
+        // 3. A WORKTREE: `.git` is a FILE holding `gitdir: <path>`.
+        let wt = root.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let wtgit = repo.join(".git/worktrees/wt");
+        std::fs::create_dir_all(&wtgit).unwrap();
+        std::fs::write(wtgit.join("HEAD"), "ref: refs/heads/feature/x\n").unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", wtgit.display())).unwrap();
+        assert_eq!(
+            branch_from_head_file(wt.to_str().unwrap()).as_deref(),
+            Some("feature/x"),
+            "a slash in the branch must survive: refs/heads/feature/x is ONE branch name"
+        );
+
+        // 4. DETACHED head. `rev-parse --abbrev-ref HEAD` prints the literal
+        // "HEAD", not the sha, so returning the sha would silently disagree
+        // with the command this replaces.
+        let det = root.join("det");
+        std::fs::create_dir_all(det.join(".git")).unwrap();
+        std::fs::write(det.join(".git/HEAD"), "9fceb02a1b0e4e1f0000000000000000deadbeef\n").unwrap();
+        assert_eq!(
+            branch_from_head_file(det.to_str().unwrap()).as_deref(),
+            Some("HEAD"),
+            "detached must report HEAD, matching --abbrev-ref, never the sha"
+        );
+
+        // 5. A `.git` FILE with junk in it must not be read as a branch: answer
+        // None so the caller pays for git rather than inventing one.
+        let junk = root.join("junk");
+        std::fs::create_dir_all(&junk).unwrap();
+        std::fs::write(junk.join(".git"), "this is not a gitdir pointer\n").unwrap();
+        assert_eq!(
+            branch_from_head_file(junk.to_str().unwrap()),
+            None,
+            "unparseable .git must fall back to git, not guess"
+        );
+    }
+
     #[test]
     fn elapsed_suffix_strips_the_ticker_and_only_the_ticker() {
         // The live specimens (column-padded status lines).
@@ -6874,6 +7218,66 @@ Checked, nothing of mine was at risk, no action needed from you.
         assert_eq!(out.get("a"), Some(&2_000), "the LATER row for session a must win, not the first");
         assert_eq!(out.get("b"), Some(&5_000));
         assert_eq!(out.get("c"), None, "a session with no rows must be absent, not zero");
+    }
+
+    // AMUX-4879. A lane that has moved a card recently and one that has not
+    // must be DISTINGUISHABLE, because `status` alone cannot tell them apart:
+    // it is an instantaneous between-turn sample, so a working lane reads
+    // `idle` on most samples exactly like a stalled one. That ambiguity
+    // produced the same wrong conclusion twice, from two different readers.
+    //
+    // The ordering case is the one that can actually fail. The sibling above
+    // takes the LAST row seen because its caller orders by ts ASC; this
+    // caller GROUPs instead, so row order is not guaranteed and taking the
+    // last row would silently return an older timestamp. Feeding the newest
+    // row first is what separates a real MAX from a copied idiom.
+    #[test]
+    fn last_board_change_takes_the_max_per_session_regardless_of_row_order() {
+        let rows = vec![
+            ("busy".to_string(), 3_000.5_f64),
+            ("quiet".to_string(), 10.0_f64),
+            // Deliberately OUT OF ORDER: an older row after a newer one.
+            ("busy".to_string(), 1_000.0_f64),
+        ];
+        let out = last_board_change_from_rows(&rows);
+        assert_eq!(
+            out.get("busy").copied(),
+            Some(3_000.5),
+            "the MAX must win even when the older row arrives last; a last-row-wins \
+             implementation returns 1000.0 here"
+        );
+        assert_eq!(out.get("quiet").copied(), Some(10.0));
+        assert_eq!(
+            out.get("never").copied(),
+            None,
+            "a lane that has never moved a card must be ABSENT, so the caller's \
+             unwrap_or(0.0) means 'never' rather than 'just now'"
+        );
+        assert_ne!(
+            out.get("busy").copied(),
+            out.get("quiet").copied(),
+            "a recently-active lane and a long-quiet one must not read identically; \
+             that indistinguishability is the whole defect this field exists to fix"
+        );
+    }
+
+    // Junk must not become a timestamp. A 0.0 or a NaN reaching the payload
+    // would render as an age, and the caller cannot tell a parsed-but-invalid
+    // value from an absent one once it is a number.
+    #[test]
+    fn last_board_change_drops_unusable_rows_rather_than_publishing_them() {
+        let rows = vec![
+            ("".to_string(), 500.0_f64),
+            ("zero".to_string(), 0.0_f64),
+            ("negative".to_string(), -5.0_f64),
+            ("nan".to_string(), f64::NAN),
+            ("good".to_string(), 42.0_f64),
+        ];
+        let out = last_board_change_from_rows(&rows);
+        assert_eq!(out.get("good").copied(), Some(42.0));
+        for bad in ["", "zero", "negative", "nan"] {
+            assert_eq!(out.get(bad).copied(), None, "{bad} must not reach the payload");
+        }
     }
 
     #[test]
@@ -6942,9 +7346,15 @@ mod discovery_race_tests {
     #[tokio::test]
     async fn a_discovery_race_is_503_with_retry_after_and_other_failures_stay_500() {
         // The construction site: a moved epoch or a moved registry is the race.
-        assert!(race_verdict(1, 1, 7, 7).is_ok());
-        assert!(race_verdict(1, 1, 7, 8).is_err(), "a registry change alone is a race");
-        let raced: anyhow::Error = race_verdict(1, 2, 7, 7).unwrap_err().into();
+        // AMUX-4838 made the samples Option; measured values behave as before.
+        assert_eq!(race_verdict(1, 1, Some(7), Some(7)), RaceVerdict::Fresh);
+        assert_eq!(
+            race_verdict(1, 1, Some(7), Some(8)),
+            RaceVerdict::Raced,
+            "a registry change alone is a race"
+        );
+        assert_eq!(race_verdict(1, 2, Some(7), Some(7)), RaceVerdict::Raced);
+        let raced: anyhow::Error = DiscoveryRaced.into();
 
         let r = discovery_failure(&raced, raced.to_string());
         assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -6969,6 +7379,115 @@ mod discovery_race_tests {
         assert!(r.headers().get(axum::http::header::RETRY_AFTER).is_none());
         let db = anyhow::anyhow!("database query failed");
         assert_eq!(discovery_failure(&db, db.to_string()).status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// AMUX-4838: an unreadable registry is NOT a changed registry.
+    ///
+    /// These are the exact shapes the live instrumentation caught. Annotating
+    /// `race_verdict` to name which half moved (with `eprintln!`, because
+    /// `tracing` emits nothing in tests) showed all 18 races in one `api::` run
+    /// were `<hash>->0` or `0-><hash>`: one sample read the directory and the
+    /// other failed to, reported as a change and served as a 503 on a build
+    /// that raced with nothing.
+    #[test]
+    fn an_unreadable_registry_is_not_a_changed_registry() {
+        assert_eq!(
+            race_verdict(1, 1, Some(11720959678383719654), None),
+            RaceVerdict::Unverifiable,
+            "the end sample failing to read is not evidence the registry moved"
+        );
+        assert_eq!(
+            race_verdict(1, 1, None, Some(4361722783805985690)),
+            RaceVerdict::Unverifiable,
+            "the start sample failing to read is not evidence either"
+        );
+        assert_eq!(race_verdict(1, 1, None, None), RaceVerdict::Unverifiable);
+    }
+
+    /// The sentinel that could not have worked: 0 is a REACHABLE fingerprint.
+    ///
+    /// `registry_fingerprint` seeds its accumulator at 0 and XORs into it, so a
+    /// directory containing no `.env` files hashes to 0 legitimately. Under the
+    /// old `return 0` an empty registry and an unreadable one were one value,
+    /// which is why this had to become `Option` rather than a reserved number.
+    #[test]
+    fn an_empty_registry_is_a_measured_zero_and_compares_like_any_other_value() {
+        assert_eq!(
+            race_verdict(1, 1, Some(0), Some(0)),
+            RaceVerdict::Fresh,
+            "an empty registry that stayed empty did not race"
+        );
+        assert_eq!(
+            race_verdict(1, 1, Some(0), Some(99)),
+            RaceVerdict::Raced,
+            "a registry that went from empty to populated really did change"
+        );
+        // And the pair the old code could not tell apart at all.
+        assert_ne!(
+            race_verdict(1, 1, Some(0), Some(0)),
+            race_verdict(1, 1, None, None),
+            "empty and unreadable must not be the same verdict"
+        );
+    }
+
+    /// An epoch move decides on its own, whatever the registry did. Those
+    /// counters are in-process and always measured, so a `None` registry must
+    /// never soften a real epoch race into `Unverifiable`.
+    #[test]
+    fn a_moved_epoch_is_a_race_even_when_the_registry_is_unmeasured() {
+        assert_eq!(race_verdict(1, 2, None, None), RaceVerdict::Raced);
+        assert_eq!(race_verdict(1, 2, Some(7), None), RaceVerdict::Raced);
+    }
+
+    /// The three states AT THE SOURCE, which is where the sentinel used to
+    /// collapse two of them into one number.
+    ///
+    /// Deliberately NOT via `AMUX_HOME`: swapping that global is the mechanism
+    /// behind the flake this card came from, so a test that set it to make a
+    /// point about reading it would be racing the very bug it describes.
+    #[test]
+    fn the_fingerprint_tells_unreadable_from_empty_from_populated() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let missing = dir.path().join("no-such-sessions-dir");
+        assert_eq!(
+            registry_fingerprint_at(&missing),
+            None,
+            "an unreadable directory is a NON-MEASUREMENT, not a fingerprint"
+        );
+
+        let empty = dir.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        assert_eq!(
+            registry_fingerprint_at(&empty),
+            Some(0),
+            "a readable directory with no .env files is a measured 0"
+        );
+
+        let populated = dir.path().join("populated");
+        std::fs::create_dir(&populated).unwrap();
+        std::fs::write(populated.join("alpha.env"), "X=1").unwrap();
+        let one = registry_fingerprint_at(&populated).expect("readable");
+        assert_ne!(one, 0, "a populated registry must not hash to the empty value");
+
+        // The pair the old `return 0` could not tell apart, stated as the
+        // inequality that used to be an equality.
+        assert_ne!(
+            registry_fingerprint_at(&missing),
+            registry_fingerprint_at(&empty),
+            "unreadable and empty must not be the same answer"
+        );
+
+        // And the set really is a set: adding a name moves it, order does not.
+        std::fs::write(populated.join("beta.env"), "X=2").unwrap();
+        let two = registry_fingerprint_at(&populated).expect("readable");
+        assert_ne!(one, two, "a new .env must move the fingerprint");
+        std::fs::write(populated.join("gamma.meta.json"), "{}").unwrap();
+        assert_eq!(
+            registry_fingerprint_at(&populated),
+            Some(two),
+            "a non-.env file must not move it; .meta.json churn is why this hashes the name set"
+        );
     }
 
     /// AMUX-4764: the SECOND refusal in the same function. AMUX-4637 typed the

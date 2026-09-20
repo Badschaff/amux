@@ -1282,14 +1282,55 @@ fn last_advance(conn: &Connection, session: &str) -> Option<(f64, Option<String>
 /// below; a container is never dispatchable, drainable, or a WIP slot.
 ///
 /// Params: ?1 = session, ?2 = fresh_cut (epoch s), ?3 = reclaim_cut (epoch s).
-const DISPATCHABLE_WHERE: &str = "i.session=?1 AND i.status='todo' \
-     AND i.owner_type='agent' AND i.deleted IS NULL AND COALESCE(i.archived,0)=0 \
-     AND COALESCE(i.type,'') NOT IN ('tripwire','watch','epic') \
-     AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=i.id \
-                     AND lower(t.tag) LIKE 'needs:you%') \
-     AND i.updated >= ?2 \
-     AND NOT EXISTS (SELECT 1 FROM session_events e WHERE e.type IN ('task.claimed','pickup.reclaimed_stale') \
-                     AND e.ts > ?3 AND e.data LIKE '%\"' || i.id || '\"%')";
+/// Issue ids claimed (or stale-reclaimed) since a cutoff, as a NON-CORRELATED
+/// subquery. `?N` is the cutoff timestamp.
+///
+/// AMUX-4782: this replaced `e.data LIKE '%"' || i.id || '"%'`, which is a
+/// CORRELATED leading-wildcard LIKE. SQLite cannot index a leading wildcard, so
+/// it re-walked every claim-type event for EVERY candidate row, and board-drive
+/// runs this per lane. Measured on the live board (117 candidate rows):
+///
+/// ```text
+/// correlated LIKE      116 rows   3073 ms
+/// this form            116 rows    227 ms   (218 ms of which is transport)
+/// ```
+///
+/// so the query itself went from ~2.9s to ~9ms. Equivalence was checked ROW BY
+/// ROW, not by comparing counts: a query selecting the two predicates
+/// side-by-side and keeping only the rows where they disagree returned ZERO.
+///
+/// BOTH GUARDS ARE LOAD-BEARING, and the second one I only found by testing.
+///
+/// `x NOT IN (set)` is NULL, not TRUE, when the set contains a NULL, so one
+/// claim event whose data lacked `.issue` would make this predicate reject
+/// EVERY card on EVERY lane and board-drive would go quietly idle on a full
+/// queue. `IS NOT NULL` removes those from the set.
+///
+/// `json_valid` is the one that is easy to miss: `json_extract` on malformed
+/// data RAISES rather than returning NULL, and the caller's `unwrap_or(0)` then
+/// turns that error into a count of zero, which is the same silent stall by a
+/// different route. A test inserting `'not json at all'` caught it; the
+/// NULL-only version passed the first two cells and failed the third.
+fn claimed_since_sql(param: u8) -> String {
+    format!(
+        "SELECT json_extract(e.data,'$.issue') FROM session_events e \
+         WHERE e.type IN ('task.claimed','pickup.reclaimed_stale') AND e.ts > ?{param} \
+         AND json_valid(e.data) AND json_extract(e.data,'$.issue') IS NOT NULL"
+    )
+}
+
+fn dispatchable_where() -> String {
+    format!(
+        "i.session=?1 AND i.status='todo' \
+         AND i.owner_type='agent' AND i.deleted IS NULL AND COALESCE(i.archived,0)=0 \
+         AND COALESCE(i.type,'') NOT IN ('tripwire','watch','epic') \
+         AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=i.id \
+                         AND lower(t.tag) LIKE 'needs:you%') \
+         AND i.updated >= ?2 \
+         AND i.id NOT IN ({claimed})",
+        claimed = claimed_since_sql(3)
+    )
+}
 
 /// py:14403 — the count over EXACTLY the rows pickup selects from, via
 /// [`DISPATCHABLE_WHERE`]. Per-card refusals (junk shells, structured deps) still
@@ -1299,7 +1340,7 @@ fn eligible_todo_count(conn: &Connection, session: &str, now: f64) -> i64 {
     let fresh_cut = pickup_fresh_cut(now);
     let reclaim_cut = now - reclaim_cooldown_s();
     conn.query_row(
-        &format!("SELECT COUNT(*) FROM issues i WHERE {DISPATCHABLE_WHERE}"),
+        &format!("SELECT COUNT(*) FROM issues i WHERE {dw}", dw = dispatchable_where()),
         rusqlite::params![session, fresh_cut, reclaim_cut],
         |r| r.get(0),
     )
@@ -1435,6 +1476,28 @@ pub(crate) fn doing_is_unblocked(conn: &Connection, row: &bs::IssueRow) -> bool 
         && deps_blocking(conn, row).is_empty()
 }
 
+/// Containers, captures and held work do not consume an execution slot.
+/// Status is supplied by the caller: this also applies to verification readiness.
+fn holds_execution_slot(conn: &Connection, row: &bs::IssueRow) -> bool {
+    !bs::is_capture_shell(row)
+        && !matches!(row.item_type.as_str(), "tripwire" | "watch" | "epic")
+        && !row.tags.iter().any(|t| t.to_ascii_lowercase().starts_with("needs:you"))
+        && doing_is_unblocked(conn, row)
+}
+
+fn open_execution_count(conn: &Connection, session: &str) -> rusqlite::Result<usize> {
+    let mut stmt = conn.prepare("SELECT id FROM issues WHERE session=?1 AND deleted IS NULL \
+        AND COALESCE(archived,0)=0 AND status IN ('doing','review') AND owner_type='agent'")?;
+    let ids = stmt.query_map([session], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut count = 0;
+    for id in ids {
+        if let Some(row) = bs::get_issue(conn, &id)? {
+            count += usize::from(holds_execution_slot(conn, &row));
+        }
+    }
+    Ok(count)
+}
+
 /// AMUX-3757: manual claims, status claims, frontier capacity and pickup must
 /// agree about which Doing rows hold a slot. Read the real capture predicate,
 /// including its whitespace handling, instead of maintaining SQL lookalikes.
@@ -1460,10 +1523,7 @@ pub(crate) fn wip_holding_ids(
                 capture_shells += 1;
                 continue;
             }
-            if matches!(row.item_type.as_str(), "tripwire" | "watch" | "epic")
-                || row.tags.iter().any(|t| t.to_ascii_lowercase().starts_with("needs:you"))
-                || !doing_is_unblocked(conn, &row)
-            {
+            if !holds_execution_slot(conn, &row) {
                 continue;
             }
             holding.push(id);
@@ -1649,13 +1709,15 @@ fn drainable_backlog_rows(conn: &Connection, session: &str, now: f64) -> rusqlit
            AND NOT {CAPTURE} \
            AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=i.id \
                            AND lower(t.tag) LIKE 'needs:you%') \
-           AND NOT EXISTS (SELECT 1 FROM session_events e WHERE e.type='task.claimed' \
-                           AND e.ts > ?2 AND e.data LIKE '%\"' || i.id || '\"%') \
+           AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=i.id \
+                           AND lower(t.tag) = 'defer:focused') \
+           AND i.id NOT IN ({CLAIMED}) \
            AND NOT (COALESCE(i.source_ref,'') <> '' AND COALESCE(i.last_verified_at,0) > ?3) \
            AND COALESCE(i.blocked_on,'') = '' \
            AND NOT (COALESCE(i.source,'')='capture' AND COALESCE(i.source_ref,'') <> '') \
          ORDER BY COALESCE(i.pinned,0) DESC, COALESCE(i.created,0) ASC, i.id ASC",
-                CAPTURE = bs::capture_shell_sql()),
+                CAPTURE = bs::capture_shell_sql(),
+                CLAIMED = claimed_since_sql(2)),
         )
         .and_then(|mut st| {
             st.query_map(rusqlite::params![session, reclaim_cut, verified_cut], |r| {
@@ -1721,6 +1783,21 @@ fn drainable_backlog_count(conn: &Connection, session: &str, now: f64) -> usize 
 /// CANNOT serve this purpose — `source_ref` is on 93% of backlog cards and a
 /// future `due` on 65%, because both are auto-populated, so excluding on either
 /// would silence ~65% of the drain (AF-514).
+///
+/// A `defer:focused` TAG is excluded for the same reason (AF-514, decided:
+/// option 1, "a tag... excluded by drainable_backlog_ids the way `needs:you`
+/// already is"). mixpeek-studio's MS-1331/MS-1314/MS-1275 each auto-drained
+/// 3+ times a day and re-parked each time: their real deferral horizon is
+/// weeks, but the only existing lever with any teeth (`source_ref` +
+/// `last_verified_at` within `SOURCE_REF_STALE_S`, 24h) caps the honest
+/// horizon at a day, so they had to re-affirm daily and each affirmation cost
+/// a drain-and-re-park cycle. A tag is rare by construction the same way
+/// `blocked_on` is: nothing sets it by default, a lane sets it deliberately
+/// per card, and setting it costs nothing but is never automatic — unlike
+/// `source_ref`/`due`, which amux itself populates on most backlog cards
+/// regardless of intent. `PATCH /api/board/<ID>` with `{"tags":[...,
+/// "defer:focused"]}` (or without it, to clear) is the whole interface; no
+/// new column, no new verb, no CLI shorthand yet.
 fn oldest_drainable_backlog(conn: &Connection, session: &str, now: f64, continuation_gate: bool) -> Option<String> {
     drainable_backlog_ids(conn, session, now).into_iter().find(|id| {
         !continuation_gate || bs::get_issue(conn, id).ok().flatten().is_some_and(|row|
@@ -1782,7 +1859,8 @@ fn promote_blocked_self_owned_deps(conn: &Connection, session: &str, now: f64) -
     let reclaim_cut = now - reclaim_cooldown_s();
     let ids: Vec<String> = conn
         .prepare(&format!(
-            "SELECT i.id FROM issues i WHERE {DISPATCHABLE_WHERE} ORDER BY COALESCE(i.pinned,0) DESC, COALESCE(i.created,0) ASC"
+            "SELECT i.id FROM issues i WHERE {dw} ORDER BY COALESCE(i.pinned,0) DESC, COALESCE(i.created,0) ASC",
+            dw = dispatchable_where()
         ))
         .and_then(|mut st| {
             st.query_map(rusqlite::params![session, fresh_cut, reclaim_cut], |r| {
@@ -2222,6 +2300,10 @@ fn child_terminal_for_epic(conn: &Connection, id: &str) -> bool {
 }
 
 fn epic_completion_candidates(conn: &Connection) -> Vec<(String, Vec<(String, String)>)> {
+    epic_completion_candidates_at(conn, &crate::config::amux_home())
+}
+
+fn epic_completion_candidates_at(conn: &Connection, home: &std::path::Path) -> Vec<(String, Vec<(String, String)>)> {
     let epic_ids = conn
         .prepare(
             "SELECT id FROM issues WHERE type='epic' AND deleted IS NULL \
@@ -2248,20 +2330,47 @@ fn epic_completion_candidates(conn: &Connection) -> Vec<(String, Vec<(String, St
                     .map(|rows| rows.flatten().collect::<Vec<_>>())
                 })
                 .unwrap_or_default();
-            if let Ok(Some(root))=bs::get_issue(conn,&epic) {
-                for id in root.depends_on {
-                    if !children.iter().any(|(child,_)|child==&id) {
-                        let status=bs::get_issue(conn,&id).ok().flatten().map(|c|c.status).unwrap_or_else(||"missing".into());
-                        children.push((id,status));
+            let root = bs::get_issue(conn, &epic).ok().flatten()?;
+            for id in &root.depends_on {
+                if !children.iter().any(|(child,_)|child==id) {
+                    let status=bs::get_issue(conn,id).ok().flatten().map(|c|c.status).unwrap_or_else(||"missing".into());
+                    children.push((id.clone(),status));
+                }
+            }
+            if children.is_empty() || !children.iter().all(|(id, _)| child_terminal_for_epic(conn, id))
+                || !deps_blocking(conn, &root).is_empty() { return None; }
+
+            // Progress and completion cover the same owned boards. Follow-up
+            // work need not be manually linked to the original assignment.
+            // Ordinary parent workers may own unrelated work; only dedicated
+            // coordinators contribute their entire board to this orchestration.
+            let read_role = |name: &str| {
+                let path = home.join("sessions").join(format!("{name}.env"));
+                crate::config::parse_env_file(&if path.exists() { path } else { path.with_extension("env.reaped") })
+            };
+            let mut owners = std::collections::BTreeSet::new();
+            if let Some(owner) = root.session.as_deref() {
+                if read_role(owner).get("CC_ORCHESTRATOR").is_some_and(|v| v == "1") {
+                    owners.insert(owner.to_string());
+                }
+                let mut stmt = conn.prepare("SELECT DISTINCT session FROM issues WHERE epic=?1 AND deleted IS NULL AND COALESCE(archived,0)=0 AND session IS NOT NULL").ok()?;
+                let assigned = stmt.query_map([&epic], |r| r.get::<_,String>(0)).ok()?.collect::<rusqlite::Result<Vec<_>>>().ok()?;
+                for name in assigned {
+                    let env = read_role(&name);
+                    if env.get("CC_EPHEMERAL").is_some_and(|v| v == "1") && env.get("CC_PARENT").is_some_and(|v| v == owner) {
+                        owners.insert(name);
                     }
                 }
             }
-            (!children.is_empty()
-                && children
-                    .iter()
-                    .all(|(id, _)| child_terminal_for_epic(conn, id))
-                && bs::get_issue(conn, &epic).ok().flatten().is_some_and(|root| deps_blocking(conn, &root).is_empty()))
-            .then_some((epic, children))
+            for owner in owners {
+                let mut stmt = conn.prepare("SELECT id,status,COALESCE(type,'code') FROM issues WHERE session=?1 AND deleted IS NULL AND COALESCE(archived,0)=0 AND COALESCE(type,'code')!='epic' ORDER BY created,id").ok()?;
+                let work = stmt.query_map([&owner], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).ok()?.collect::<rusqlite::Result<Vec<_>>>().ok()?;
+                for (id, status, kind) in work {
+                    if !bs::execution_is_terminal(&status, &kind) { return None; }
+                    if !children.iter().any(|(child,_)| child == &id) { children.push((id,status)); }
+                }
+            }
+            Some((epic, children))
         })
         .collect()
 }
@@ -2354,7 +2463,7 @@ pub(crate) async fn complete_finished_epics(state: &AppState) -> usize {
                 target: "amux::board_drive",
                 %epic,
                 %children,
-                "board_drive: completed epic — every linked child is terminal"
+                "board_drive: completed epic — required outcomes and owned execution tasks are terminal"
             );
         }
     }
@@ -2364,6 +2473,34 @@ pub(crate) async fn complete_finished_epics(state: &AppState) -> usize {
 #[cfg(test)]
 mod epic_completion_unit_tests {
     use super::*;
+
+    #[test]
+    fn orchestration_waits_for_unlinked_coordinator_and_child_work() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("coordinator.env"), "CC_ORCHESTRATOR=1\n").unwrap();
+        std::fs::write(sessions.join("child.env.reaped"), "CC_EPHEMERAL=1\nCC_PARENT=coordinator\n").unwrap();
+        let conn = crate::db::migrate::test_memdb();
+        conn.execute_batch("INSERT INTO issues(id,title,status,type,session,epic,created,updated) VALUES
+            ('E','Outcome','doing','epic','coordinator',NULL,1,1),
+            ('A','Assignment','verified','code','child','E',1,1),
+            ('B','Child follow-up','backlog','code','child',NULL,1,1),
+            ('C','Combined verification','todo','research','coordinator',NULL,1,1),
+            ('D','Unrelated work','doing','code','unrelated',NULL,1,1);").unwrap();
+        assert!(epic_completion_candidates_at(&conn,home.path()).is_empty());
+        conn.execute("UPDATE issues SET status='verified' WHERE id='B'",[]).unwrap();
+        assert!(epic_completion_candidates_at(&conn,home.path()).is_empty(), "coordinator still owns work");
+        conn.execute("UPDATE issues SET status='done' WHERE id='C'",[]).unwrap();
+        let candidates = epic_completion_candidates_at(&conn,home.path());
+        assert_eq!(candidates.len(),1);
+        assert_eq!(candidates[0].1.len(),3);
+        // An existing parent with its own independent backlog is not a dedicated
+        // coordinator. Its unrelated work does not become a new execution gate.
+        std::fs::write(sessions.join("coordinator.env"), "CC_PROVIDER=claude\n").unwrap();
+        conn.execute("UPDATE issues SET status='todo' WHERE id='C'",[]).unwrap();
+        assert_eq!(epic_completion_candidates_at(&conn,home.path()).len(),1);
+    }
 
     #[test]
     fn epic_completes_only_after_every_child_is_terminal() {
@@ -2393,20 +2530,9 @@ mod epic_completion_unit_tests {
 
 // ── Ephemeral worker reaper ──────────────────────────────────────────────
 //
-// Ephemeral workers (CC_EPHEMERAL=1) exist for exactly one fan-out card.
-// Once the work is done or parked, the worker has no purpose. This reaper
-// runs every drive_tick and handles three cases:
-//
-// 1. ALL cards terminal -> stop worker, archive env file, clean worktree
-// 2. Worker idle, only card in backlog/todo, no doing cards -> stop worker
-//    (the card stays on the board for the parent to handle)
-// 3. Worker idle with a doing card that hasn't progressed -> re-drive it
-//    (AMUX-4900: the three anti-repetition mechanisms in drive_lane all
-//    correctly suppress re-nudging for long-lived lanes, but an ephemeral
-//    worker that goes idle on its only card is stuck forever. 5min cooldown.)
-
-/// Cooldown for re-driving a stalled ephemeral worker (case 3).
-const EPHEMERAL_REDRIVE_COOLDOWN_S: f64 = 300.0;
+// Ephemeral workers retain their entire assigned board. Retirement requires
+// every type-specific terminal gate, a recorded integration of the unchanged
+// clean head, and a stopped provider. Workspaces survive retirement.
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct EphemeralReaperReport {
@@ -2414,7 +2540,6 @@ pub struct EphemeralReaperReport {
     pub n_considered: usize,
     pub reaped_done: usize,
     pub reaped_parked: usize,
-    pub redriven: usize,
     pub errors: usize,
 }
 
@@ -2428,9 +2553,6 @@ pub(crate) async fn reap_ephemeral_workers(state: &AppState) -> EphemeralReaperR
         Err(_) => return report,
     };
 
-    let terminal: std::collections::HashSet<&str> =
-        ["done", "verified", "discarded", "cancelled"].iter().copied().collect();
-
     let mut ephemeral_sessions: Vec<(String, String)> = Vec::new(); // (name, parent)
     for entry in entries.flatten() {
         let fname = entry.file_name();
@@ -2438,7 +2560,9 @@ pub(crate) async fn reap_ephemeral_workers(state: &AppState) -> EphemeralReaperR
         if !fname_s.ends_with(".env") { continue; }
         let name = fname_s.trim_end_matches(".env").to_string();
         let env = crate::config::parse_env_file(&entry.path());
-        if env.get("CC_EPHEMERAL").map(|v| v == "1").unwrap_or(false) {
+        if env.get("CC_EPHEMERAL").map(|v| v == "1").unwrap_or(false)
+            && env.get("CC_PAUSED").is_none_or(|v| v != "1")
+            && env.get("CC_ARCHIVED").is_none_or(|v| v != "1") {
             let parent = env.get("CC_PARENT").cloned().unwrap_or_default();
             ephemeral_sessions.push((name, parent));
         }
@@ -2447,32 +2571,18 @@ pub(crate) async fn reap_ephemeral_workers(state: &AppState) -> EphemeralReaperR
     report.n_considered = ephemeral_sessions.len();
     if ephemeral_sessions.is_empty() { return report; }
 
-    let eph_names: Vec<String> = ephemeral_sessions.iter().map(|(n, _)| n.clone()).collect();
-    let cards_by_session: HashMap<String, Vec<(String, String)>> = match state.store.read() {
+    let cards_by_session: HashMap<String, Vec<(String, String, String)>> = match state.store.read() {
         Ok(conn) => {
-            let mut map: HashMap<String, Vec<(String, String)>> = HashMap::new();
-            // Query cards for every session name the env-file scan found, not a
-            // name pattern. The launch endpoint names workers from the card title
-            // (e.g. "audit-and-disable-unused"), not with an "-eph-" infix, so the
-            // old LIKE '%-eph-%' missed every launch-created worker (AMUX-5001).
-            for chunk in eph_names.chunks(50) {
-                let placeholders: String = chunk.iter().enumerate()
-                    .map(|(i, _)| format!("?{}", i + 1))
-                    .collect::<Vec<_>>().join(",");
-                let sql = format!(
-                    "SELECT id, session, status FROM issues WHERE session IN ({placeholders})"
-                );
-                if let Ok(mut stmt) = conn.prepare(&sql) {
-                    let params: Vec<&dyn rusqlite::types::ToSql> =
-                        chunk.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
-                    let rows = stmt.query_map(params.as_slice(), |r| {
-                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
-                    });
-                    if let Ok(rows) = rows {
-                        for row in rows.flatten() {
-                            map.entry(row.1).or_default().push((row.0, row.2));
-                        }
-                    }
+            let mut map = HashMap::new();
+            let Ok(mut stmt) = conn.prepare("SELECT id,status,COALESCE(type,'code') FROM issues WHERE session=?1 AND deleted IS NULL AND COALESCE(archived,0)=0") else {
+                report.errors += 1;
+                return report;
+            };
+            for (name, _) in &ephemeral_sessions {
+                match stmt.query_map([name], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+                    .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>()) {
+                    Ok(rows) => { map.insert(name.clone(), rows); }
+                    Err(_) => { report.errors += 1; }
                 }
             }
             map
@@ -2487,100 +2597,29 @@ pub(crate) async fn reap_ephemeral_workers(state: &AppState) -> EphemeralReaperR
             _ => continue,
         };
 
-        let all_terminal = card_list.iter().all(|(_, st)| terminal.contains(st.as_str()));
-        let has_doing = card_list.iter().any(|(_, st)| st == "doing");
-        let all_parked = card_list.iter().all(|(_, st)| st == "backlog" || st == "todo");
+        // An idle worker with queued work still owns that work. Reaping it and
+        // returning cards to the parent made an ordinary pause look like a handoff.
+        if !card_list.iter().all(|(_, status, kind)| bs::execution_is_terminal(status, kind)) { continue; }
+        // Completion cannot retire a branch before its integration is recorded.
+        if crate::fanout_workspace::integration_status(&home, name)["status"] != "integrated" {
+            crate::fanout_workspace::queue_integration(state, name).await;
+            continue;
+        }
+        let Some(workspace)=crate::fanout_workspace::load(&home,name) else { continue; };
+        let integration=crate::fanout_workspace::integration_status(&home,name);
+        if crate::fanout_workspace::git(&workspace.path,&["rev-parse","HEAD"]).await.ok().as_deref()!=integration["head"].as_str()
+            || crate::fanout_workspace::git(&workspace.path,&["status","--porcelain"]).await.map(|s|!s.is_empty()).unwrap_or(true) { continue; }
+        let action = "done";
 
-        // Use pane-based detection, not is_running. is_running returns true
-        // for workers at the Claude ❯ prompt (tmux alive + process alive),
-        // so idle ephemeral workers look "running" forever.
-        let pane_output = crate::api::session_verbs::tmux_capture(name, 30).await;
-        let pane_status = crate::api::session_verbs::detect_claude_status(&pane_output);
-        let is_idle = pane_status == "idle" || pane_status.is_empty();
+        let is_idle = !crate::api::session_verbs::is_running(name).await;
         if !is_idle {
+            // Worker is actively processing (someone sent it a message).
+            // Let it finish before reaping, regardless of card state.
             continue;
         }
 
-        // Case 3: idle with a doing card. Re-drive it instead of reaping.
-        // The three anti-repetition mechanisms in drive_lane (active-claim-current,
-        // unchanged-reminder, continue-nudge termination) all correctly prevent
-        // re-nudging long-lived lanes. But an ephemeral worker exists for exactly
-        // one card, so when it goes idle without finishing, it is stuck forever.
-        if has_doing && !all_terminal && !all_parked {
-            let doing_card_id = card_list.iter()
-                .find(|(_, st)| st == "doing")
-                .map(|(id, _)| id.clone());
-            if let Some(card_id) = doing_card_id {
-                let now = crate::config::now_f64();
-                let recent_redrive = match state.store.read() {
-                    Ok(conn) => conn
-                        .query_row(
-                            "SELECT 1 FROM session_events WHERE session=?1 \
-                             AND type='ephemeral.redrive' AND ts > ?2 LIMIT 1",
-                            rusqlite::params![name, now - EPHEMERAL_REDRIVE_COOLDOWN_S],
-                            |_| Ok(true),
-                        )
-                        .optional()
-                        .ok()
-                        .flatten()
-                        .unwrap_or(false),
-                    Err(_) => false,
-                };
-                if !recent_redrive {
-                    let prompt = match state.store.read() {
-                        Ok(conn) => bs::get_issue(&conn, &card_id).ok().flatten().map(|row| {
-                            format!(
-                                "You went idle while card {} was still in doing. \
-                                 Continue driving it to completion.\n\n\
-                                 Card: {}\n{}",
-                                card_id,
-                                row.title,
-                                row.desc.chars().take(2000).collect::<String>(),
-                            )
-                        }),
-                        Err(_) => None,
-                    };
-                    if let Some(prompt) = prompt {
-                        let delivered = crate::api::session_verbs::steer_enqueue(
-                            state, name, &prompt, GUARD, "ephemeral-redrive",
-                        ).await;
-                        if delivered.is_ok() {
-                            crate::api::session_verbs::emit_event(
-                                state,
-                                name,
-                                "ephemeral.redrive",
-                                Some(serde_json::json!({ "card": card_id })),
-                                None,
-                                "ephemeral-reaper",
-                            ).await;
-                            tracing::info!(
-                                target: "amux::board",
-                                session = %name,
-                                card = %card_id,
-                                verdict = "ephemeral_redrive",
-                                measured = true,
-                                n_considered = 1,
-                                "ephemeral reaper: re-drove idle worker on stalled doing card"
-                            );
-                            report.redriven += 1;
-                        }
-                    }
-                }
-            }
-            continue;
-        }
-
-        let action = if all_terminal {
-            "done"
-        } else if !has_doing && all_parked {
-            "parked"
-        } else {
-            continue;
-        };
-
-        let card_ids: Vec<String> = card_list.iter().map(|(id, _)| id.clone()).collect();
         let card_summary = card_list.iter()
-            .map(|(id, st)| format!("{id}={st}"))
+            .map(|(id, st, _)| format!("{id}={st}"))
             .collect::<Vec<_>>().join(", ");
 
         tracing::info!(
@@ -2595,90 +2634,33 @@ pub(crate) async fn reap_ephemeral_workers(state: &AppState) -> EphemeralReaperR
             "reaping ephemeral worker"
         );
 
-        // Full decommission: stop, clean worktree, remove all registration
-        // files so the worker disappears from the dashboard (not just STOPPED).
-        // Matches delete_post in session_verbs.rs.
-
-        // 1. Kill tmux
+        // Stop the tmux session
         let stq = format!("={name}");
         let _ = tokio::process::Command::new("tmux")
             .args(["kill-session", "-t", &stq])
             .output()
             .await;
 
-        // 2. Clean up worktree if present. Discover parent repo from .git file
-        //    since the worktree may belong to any repo (e.g. mixpeek, not amux).
-        let wt_path = home.join("worktrees").join(name);
-        if wt_path.exists() {
-            let parent_repo = std::fs::read_to_string(wt_path.join(".git"))
-                .ok()
-                .and_then(|content| {
-                    content.strip_prefix("gitdir: ").and_then(|g| {
-                        let gitdir = g.trim();
-                        gitdir.find("/.git/worktrees/").map(|pos| {
-                            std::path::PathBuf::from(&gitdir[..pos])
-                        })
-                    })
-                });
-            let mut cmd = tokio::process::Command::new("git");
-            if let Some(ref repo) = parent_repo {
-                cmd.arg("-C").arg(repo);
-            }
-            cmd.args(["worktree", "remove", "--force"]).arg(&wt_path);
-            let out = cmd.output().await;
-            if out.as_ref().map(|o| !o.status.success()).unwrap_or(true) {
-                let mut cmd2 = tokio::process::Command::new("git");
-                if let Some(ref repo) = parent_repo {
-                    cmd2.arg("-C").arg(repo);
-                }
-                cmd2.args(["worktree", "remove", "--force", "--force"]).arg(&wt_path);
-                let _ = cmd2.output().await;
-            }
-        }
-
-        // 3. Remove registration files (env, mem, meta, log) so the session
-        //    disappears from the fleet, not just shows as STOPPED.
+        // Full decommission: remove all registration files so the worker
+        // disappears from the dashboard, not just shows as STOPPED. Archiving
+        // the env file alone left ghost entries in the fleet list (AMUX-5001).
         let env_path = sessions_dir.join(format!("{name}.env"));
         let _ = std::fs::remove_file(&env_path);
-        let _ = std::fs::remove_file(home.join("sessions").join(format!("{name}.mem")));
-        let _ = std::fs::remove_file(home.join("sessions").join(format!("{name}.meta")));
-        let _ = std::fs::remove_file(home.join("sessions").join(format!("{name}.log")));
-
-        // 4. Invalidate session cache so the dashboard picks up the removal
+        let _ = std::fs::remove_file(sessions_dir.join(format!("{name}.mem")));
+        let _ = std::fs::remove_file(sessions_dir.join(format!("{name}.meta")));
+        let _ = std::fs::remove_file(sessions_dir.join(format!("{name}.log")));
         crate::api::sessions_legacy::invalidate_sessions_cache();
 
-        // 5. Clean up steering queue
+        // Clean steering queue so no stale prompts accumulate
         let n = name.to_string();
         let _ = state.store.write_async(move |conn| {
             let _ = conn.execute("DELETE FROM steering_queue WHERE session=?", [&n]);
             Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
         }).await;
 
-        // Log the card back to the parent if parked
-        if action == "parked" && !parent.is_empty() {
-            let stamp = chrono::Local::now().format("%H:%M").to_string();
-            for card_id in &card_ids {
-                let cid = card_id.clone();
-                let par = parent.clone();
-                let stamp_w = stamp.clone();
-                let _ = state.store.write_async(move |conn| {
-                    if let Some(mut card) = bs::get_issue(conn, &cid)? {
-                        card.session = Some(par);
-                        card.log = Some(bs::append_log(
-                            card.log.as_deref(), &stamp_w,
-                            "ephemeral worker reaped (card parked); returned to parent session",
-                        ));
-                        card.updated = chrono::Utc::now().timestamp();
-                        card.rev += 1;
-                        bs::save_patched(conn, &mut card)?;
-                    }
-                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
-                }).await;
-            }
-            report.reaped_parked += 1;
-        } else {
-            report.reaped_done += 1;
-        }
+        // Worktree disposal is owned by the worktree lifecycle. A terminal card
+        // is not proof that every untracked file is disposable.
+        report.reaped_done += 1;
     }
 
     report
@@ -3486,8 +3468,9 @@ pub fn select_pickup_with(
                 // the 256-card scoring window before its pin boost applies; then
                 // oldest-first so a deep queue never drops the oldest before it
                 // can score.
-                "SELECT i.id FROM issues i WHERE {DISPATCHABLE_WHERE} \
-                 ORDER BY COALESCE(i.pinned,0) DESC, i.created ASC LIMIT 256"
+                "SELECT i.id FROM issues i WHERE {dw} \
+                 ORDER BY COALESCE(i.pinned,0) DESC, i.created ASC LIMIT 256",
+                dw = dispatchable_where()
             ))
             .and_then(|mut st| {
                 st.query_map(rusqlite::params![session, fresh_cut, reclaim_cut], |r| {
@@ -3528,8 +3511,9 @@ pub fn select_pickup_with(
         scored.into_iter().map(|(_, _, id)| id).collect()
     } else {
         conn.prepare(&format!(
-            "SELECT i.id FROM issues i WHERE {DISPATCHABLE_WHERE} \
-             ORDER BY COALESCE(i.pinned,0) DESC, COALESCE(i.pos, 0) ASC, i.created ASC LIMIT 16"
+            "SELECT i.id FROM issues i WHERE {dw} \
+             ORDER BY COALESCE(i.pinned,0) DESC, COALESCE(i.pos, 0) ASC, i.created ASC LIMIT 16",
+            dw = dispatchable_where()
         ))
         .and_then(|mut st| {
             st.query_map(rusqlite::params![session, fresh_cut, reclaim_cut], |r| {
@@ -3770,9 +3754,28 @@ fn needs_human_sql() -> &'static str {
      AND lower(t.tag) LIKE 'needs:you%')"
 }
 
+/// Verification reacts to output/contract changes, never heartbeat revisions.
+fn verification_contract(conn: &Connection, id: &str) -> rusqlite::Result<Option<String>> {
+    use sha2::{Digest, Sha256};
+    let Some(row) = bs::get_issue(conn, id)? else { return Ok(None) };
+    let gate = bs::effective_gate_configured(conn, &row, TaskStatus::Verified);
+    let human_hold = row.tags.iter().any(|t| t.to_ascii_lowercase().starts_with("needs:you"));
+    let mut state = json!([row.id, row.session, row.status, row.item_type, row.archived,
+        row.owner_type, human_hold, row.acceptance_criteria, row.evidence, gate]);
+    // A merge can satisfy the final prerequisite without editing the card.
+    // Keep ordinary-worker signatures unchanged and ignore integration retry
+    // timestamps, so deploying/retrying this fix cannot wake the whole fleet.
+    if let Some(head) = row.session.as_deref()
+        .map(|worker| crate::fanout_workspace::integrated_head(conn, worker)).transpose()?.flatten() {
+        state.as_array_mut().unwrap().push(json!({"integrated_head":head}));
+    }
+    Ok(Some(format!("{:x}", Sha256::digest(state.to_string().as_bytes()))))
+}
+
 /// Hold an unchanged verification batch, but immediately offer the next batch
-/// after the worker resolves the previous one. A lane-wide 24h timer used to
-/// throttle a successful worker to eight cards per day regardless of progress.
+/// after the worker makes terminal progress in the previous one. Previously
+/// one unresolved card starved every unoffered card for a day. Selection excludes
+/// recently offered cards, so partial progress cannot repeat the same held work.
 fn verify_batch_pending(conn: &Connection, session: &str, now: f64) -> bool {
     let previous: Option<String> = conn.query_row(
         "SELECT data FROM session_events WHERE session=?1 AND type='verify.nudge' AND ts>?2 ORDER BY ts DESC,id DESC LIMIT 1",
@@ -3783,34 +3786,58 @@ fn verify_batch_pending(conn: &Connection, session: &str, now: f64) -> bool {
     let Some(cards) = data.get("cards").and_then(Value::as_array).filter(|ids| !ids.is_empty()) else {
         return true; // Legacy event has no identity; retain its bounded cooldown.
     };
-    cards.iter().any(|id| {
+    cards.iter().all(|id| {
         let Some(id) = id.as_str() else { return true };
-        conn.query_row(&format!(
-            "SELECT EXISTS(SELECT 1 FROM issues WHERE id=?1 AND session=?2 AND status='done' \
-             AND deleted IS NULL AND COALESCE(archived,0)=0 AND owner_type='agent' {} {})",
-            unverifiable_types_sql(), needs_human_sql()),
-            rusqlite::params![id, session], |r| r.get::<_, bool>(0)).unwrap_or(true)
+        let Some(previous) = data.get("contracts").and_then(|v| v.get(id)).and_then(Value::as_str) else {
+            // Legacy batches did not record the gate they asked for. Re-measure
+            // once; subsequent batches retain a fingerprint and stay bounded.
+            return false;
+        };
+        match verification_contract(conn, id) {
+            Ok(Some(current)) => current == previous,
+            Ok(None) => false,
+            Err(_) => true, // Unreadable is not permission to spend a turn.
+        }
     })
 }
 
 /// Cards in `done` that this session could verify. Returns (id, title, type)
 /// tuples, capped at 8 for prompt brevity.
 fn done_verify_candidates(conn: &Connection, session: &str) -> Vec<(String, String, String)> {
-    conn.prepare(&format!(
-        "SELECT id, title, COALESCE(type,'code') FROM issues \
-         WHERE session=?1 AND status='done' AND deleted IS NULL \
-         AND COALESCE(archived,0)=0 AND owner_type='agent' {} {} \
-         ORDER BY updated DESC LIMIT 8",
-        unverifiable_types_sql(),
-        needs_human_sql()
-    ))
-    .and_then(|mut st| {
-        st.query_map(rusqlite::params![session], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
-        })
-        .map(|rows| rows.flatten().collect())
+    let measured = (|| -> rusqlite::Result<Vec<(String, String, String)>> {
+        let mut recent = conn.prepare("SELECT data FROM session_events WHERE session=?1 AND type='verify.nudge' AND ts>?2")?;
+        let history = recent.query_map(rusqlite::params![session, now_f64() - VERIFY_NUDGE_COOLDOWN_S], |r|r.get::<_,String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut offered = std::collections::HashSet::new();
+        for raw in history {
+            if let Ok(Value::Object(data)) = serde_json::from_str::<Value>(&raw) {
+                if let Some(contracts) = data.get("contracts").and_then(Value::as_object) {
+                    for (id, signature) in contracts {
+                        if let Some(signature) = signature.as_str() { offered.insert((id.clone(), signature.to_string())); }
+                    }
+                }
+            }
+        }
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id,title,COALESCE(type,'code') FROM issues WHERE session=?1 AND status='done' \
+             AND deleted IS NULL AND COALESCE(archived,0)=0 AND owner_type='agent' {} {} ORDER BY updated ASC,id ASC",
+            unverifiable_types_sql(), needs_human_sql()))?;
+        let rows = stmt.query_map([session], |r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?;
+        let mut selected = Vec::new();
+        for row in rows {
+            let row = row?;
+            if verification_contract(conn, &row.0)?.is_some_and(|signature| !offered.contains(&(row.0.clone(), signature))) {
+                selected.push(row);
+                if selected.len() == 8 { break; }
+            }
+        }
+        Ok(selected)
+    })();
+    measured.unwrap_or_else(|error| {
+        tracing::warn!(session,measured=false,n_considered=0,%error,verdict="verification_selection_unmeasured",
+            "verification selection failed; no worker turn queued");
+        Vec::new()
     })
-    .unwrap_or_default()
 }
 
 /// Total count of done cards for this session (for the "and N more" line).
@@ -3845,31 +3872,18 @@ fn verify_nudge_text(cards: &[(String, String, String)], total: i64) -> String {
     }
     let list = lines.join("\n");
     format!(
-        "[amux] You have no queued work (no todo/doing/review cards), but {total} of your \
-         cards sit in `done` awaiting verification.\n\n\
+        "[amux verification] No executable work is currently queued; {total} runtime-changing \
+         outcomes still need verification. This batch contains up to eight oldest unoffered cards:\n\n\
          {list}\n\n\
-         For each card, read its RESOLVED gate first — GET /api/board/contract?card=<id> — \
-         and move to `verified` only when EVERY criterion there holds, with evidence of \
-         what you checked. The gate resolves card -> worker -> group -> global -> type \
-         default, so it varies by card; this nudge deliberately does not restate it \
-         (AMUX-3477: a previous version hardcoded four criteria the board does not use, \
-         and following the instruction literally moved cards on the wrong basis — the \
-         AF-112 family, one layer up). If you cannot satisfy the resolved gate honestly, \
-         leave the card in `done`. If the work is stale or was superseded, archive it \
-         with a note explaining why.\n\n\
-         To see ALL of them (this list is the 8 most recent): \
-         GET /api/board?status=done&done_limit=0 scoped to you. NOTE: the UNSCOPED \
-         /api/board caps terminal (done/verified/discarded) cards at 100, so a done card \
-         of yours can look ABSENT there while it is very much on the board — check by id \
-         (GET /api/board/<id>) or with the scoped query above, not the capped default \
-         (this is the exact trap that read as 'these cards do not exist', 2026-08-13).\n\n\
-         Cards that genuinely cannot be verified by you (e.g., they require a human \
-         decision or access you lack) should be tagged `needs:you` — with the ask and \
-         what unblocks it — to mark them human-blocked. Be honest about what that does \
-         today: it moves the card into the dashboard needs:you view, and NOTHING pushes \
-         it to the owner (there is no digest/alert/email path for needs:you as of \
-         2026-09-03, AC-413). So tag it only when a human genuinely owes the next step; \
-         it is not an escape hatch that makes the card someone else's problem."
+         Read GET /api/board/contract?card=<id> for each current gate. Reproduce the result from \
+         actual output assets, record the checks and results, and advance to verified only when \
+         every criterion holds. Own the remaining implementation, integration and verification \
+         on this board. If a card was superseded, record the canonical survivor and evidence \
+         before retiring it. Do not fabricate completion or another worker's sign-off.\n\n\
+         Use Needs You only for the configured authorization categories. Preserve actual access \
+         restrictions and explicit owner holds, record the precise blocker, and continue \
+         independent work. Record a disposition for each offered card so one unresolved outcome \
+         does not strand the rest. Full inventory: GET /api/board?session=<your-worker>&status=done&done_limit=0."
     )
 }
 
@@ -4179,91 +4193,20 @@ fn outstanding_work(
 mod continue_nudge_ask_tests {
     use super::continue_nudge_text;
 
-    /// AMUX-3561. The nudge must ask for what its RECIPIENT can do.
-    ///
-    /// It said "verify each in prod or archive if superseded" to a lane that
-    /// cannot verify: the resolved `verified` gate in a reviewing group requires
-    /// a DIFFERENT worker who checked it themselves. Measured 2026-08-23 —
-    /// 3,383 unarchived `done` cards fleet-wide, 141 naming a reviewer, so 96%
-    /// of what this listed could not be advanced by the lane reading it, 25-50
-    /// times a day.
-    ///
-    /// AMUX-2903 narrowed the TRIGGER for exactly this reason and left the
-    /// sentence doing the thing the narrowing was for.
     #[test]
-    fn the_done_section_asks_for_a_reviewer_when_none_is_named() {
-        let blocked = vec![("B-1".to_string(), "a blocker".to_string())];
-        let done = vec![
-            ("D-1".to_string(), "shipped a thing".to_string(), String::new()),
-            ("D-2".to_string(), "shipped another".to_string(), String::new()),
-        ];
-        let t = continue_nudge_text(1, 2, &blocked, &done, &[]);
-
-        assert!(
-            t.contains("amux board reviewer"),
-            "the ONE step the lane can take must be named: {t}"
-        );
-        assert!(t.contains("(no reviewer)"), "each card must say whether it has one: {t}");
-        assert!(
-            !t.contains("verify each in prod"),
-            "it must NOT instruct a verification the recipient cannot perform — that \
-             sentence is the defect: {t}"
-        );
-
-        // AND THE OTHER BRANCH, which is the control: when a reviewer IS named
-        // the ask changes, so this is not just a blanket removal of the verify
-        // instruction. A fix that deleted the sentence unconditionally would
-        // pass the assertions above and fail here.
-        let reviewed = vec![(
-            "D-3".to_string(),
-            "shipped".to_string(),
-            "amux-frustrations".to_string(),
-        )];
-        let t2 = continue_nudge_text(1, 1, &blocked, &reviewed, &[]);
-        assert!(t2.contains("reviewer: amux-frustrations"), "name the peer: {t2}");
-        assert!(
-            t2.contains("amux board ask") && !t2.contains("amux board reviewer"),
-            "with a reviewer named, the ask becomes chasing THEM, not naming one: {t2}"
-        );
+    fn continuation_reads_current_contract_instead_of_inventing_foreign_review_debt() {
+        for reviewer in ["", "peer-lane"] {
+            let done=vec![("D-1".into(),"shipped outcome".into(),reviewer.into())];
+            let text=continue_nudge_text(0,1,&[],&done,&[]);
+            assert!(text.contains("/api/board/contract?card=<id>"));
+            assert!(text.contains("Done is terminal for non-runtime outcomes"));
+            assert!(text.contains("code, ops, blocker and tripwire outcomes still require verified"));
+            assert!(!text.contains("amux board reviewer") && !text.contains("blocked on someone else"));
+            assert!(text.contains("actual results") && text.contains("explicit authorization holds"));
+            assert!(text.contains("D-1"));
+        }
     }
 
-    /// AMUX-3819: `done` is a resting place, and the drive must not say
-    /// otherwise.
-    ///
-    /// The closing sentence read "keep going until everything is verified,
-    /// archived, or genuinely blocked", which is STRICTER THAN THE RULE IT
-    /// ENFORCES — the owner's wording is "you MAY move an issue to `verified`
-    /// only after ALL of these hold". Permission with a bar, not an obligation.
-    /// Enforcing the stricter reading converts an opt-in ladder into a standing
-    /// debt: amux-frustrations reported 143 done cards of which ~112 name no
-    /// reviewer and therefore cannot advance at all, and asked what routes them
-    /// to a peer. Nothing should. Nobody decided those 112 warranted a peer's
-    /// time; this sentence decided it for them.
-    #[test]
-    fn the_drive_does_not_demand_verification_of_every_done_card() {
-        let done: Vec<(String, String, String)> =
-            (0..3).map(|i| (format!("D-{i}"), "shipped".into(), String::new())).collect();
-        let t = continue_nudge_text(0, 3, &[], &done, &[]);
-
-        assert!(t.contains("done, verified, archived"), "`done` must be a listed terminal: {t}");
-        assert!(
-            t.contains("legitimate resting place") && t.contains("not a backlog"),
-            "and the done section must say so, or the closing line is the only signal: {t}"
-        );
-        // THE CONTROL, and the reason this is not just deleting the ask: the
-        // step a lane CAN take is still named, and still framed as a judgement
-        // about which cards warrant a peer rather than as coverage of all of
-        // them. A version that dropped the reviewer mechanics entirely would
-        // pass both assertions above and remove the only path to `verified`.
-        assert!(t.contains("amux board reviewer"), "the mechanics stay available: {t}");
-        assert!(
-            t.contains("worth a peer's time"),
-            "framed as judgement, not as a quota to clear: {t}"
-        );
-        // And the count is still REPORTED. Hiding the number would be the
-        // opposite failure to demanding it be zero.
-        assert!(t.contains("3 of the 3") || t.contains("name no reviewer"), "{t}");
-    }
 }
 
 fn last_continue_nudge_counts(conn: &Connection, lane: &str) -> Option<(i64, i64)> {
@@ -4357,102 +4300,24 @@ fn continue_nudge_text(
         if done_count > done.len() as i64 {
             lines.push(format!("  ... and {} more", done_count - done.len() as i64));
         }
-        // ASK FOR WHAT THE RECIPIENT CAN ACTUALLY DO (AMUX-3561).
-        //
-        // This said "verify each in prod or archive if superseded" — an
-        // instruction the lane cannot follow for almost any card it names. The
-        // resolved `verified` gate in a reviewing group requires "Peer-reviewed
-        // by a DIFFERENT worker (name them)" and "That peer verified it
-        // themselves": unsatisfiable by the author BY CONSTRUCTION. Measured
-        // 2026-08-23: 3,383 unarchived `done` cards fleet-wide, 141 naming a
-        // reviewer — 4.2%. So 96% of what this section listed could not be
-        // advanced by the lane reading it, ~25-50 times a day.
-        //
-        // AMUX-2903 already fixed the TRIGGER for this reason and its comment
-        // says the done count "still rides along in the message as context".
-        // It did not ride as context; it rode as an imperative. The trigger was
-        // narrowed and the sentence was left doing the thing the narrowing was
-        // for. Ethos rule 3 survives a fix aimed at its cause if the wording is
-        // not fixed too.
-        //
-        // What a lane CAN do is name the peer, and that is now the ask — which
-        // also produces the exact input the gate requires (12af7ab refuses a
-        // `verified` transition with no reviewer), so the nudge starts feeding
-        // the gate instead of demanding an output the recipient cannot make.
-        // `done` IS A RESTING PLACE (AMUX-3819). The owner's own rule reads
-        // "You MAY move an issue to `verified` only after ALL of these hold" —
-        // a permission with a bar on it, not an obligation. This nudge used to
-        // tell every lane to name a reviewer for every done card, which turns
-        // an opt-in ladder into a standing debt: amux-frustrations reported 143
-        // done cards of which ~112 name no reviewer, and asked, correctly, what
-        // routes them. Nothing should. Nobody decided those 112 warranted a
-        // peer's time; the nudge decided it for them.
-        //
-        // So the ask is now about JUDGEMENT rather than coverage: which of
-        // these is worth a peer, and the mechanics for that one. A count of
-        // unreviewed cards is still reported, because the number is real and
-        // hiding it would be the opposite failure.
-        let unreviewed = done.iter().filter(|(_, _, rv)| rv.is_empty()).count();
-        let ask = if unreviewed > 0 {
-            format!(
-                "{done_count} done card(s); {unreviewed} of the {} listed name no reviewer. \
-                 `done` is a legitimate resting place and most cards belong there — \
-                 `verified` is for work whose correctness is worth a peer's time, and it \
-                 needs a DIFFERENT worker who checked it themselves, which you cannot \
-                 supply on your own. If any of these IS worth that, name the peer: \
-                 `amux board reviewer <id> <peer-session>`. Archive the ones that were \
-                 superseded. Leaving the rest in `done` is not a backlog.",
-                done.len()
-            )
-        } else {
-            // AF-695: this used to point at `amux board ask <id>`, which does
-            // not do what this sentence claims. `ask`/`status_request` pings
-            // the card's OWNER for a status report and ignores `reviewer`
-            // entirely, and it refuses outright on ANY terminal status
-            // (TERMINAL_STATUSES includes `done`) regardless of who it would
-            // have pinged. Measured by mixpeek-funnel: 8 of 8 done+reviewer
-            // cards refused. The verb that actually notifies the named
-            // reviewer is a transition INTO `review` (reviewer_notify fires
-            // there, board.rs AMUX-3771), which is not terminal and keeps the
-            // already-named reviewer if none is passed.
-            //
-            // NOT UNIVERSAL (mixpeek-funnel, ran this against a real batch):
-            // `review`'s gate is TYPE-SCOPED, and for `code` it asks for
-            // "Implemented and self-tested" + "Diff / PR is up" -- both false
-            // for a card whose work has not actually shipped (blocked on
-            // something else, superseded mid-flight). Moving THAT card to
-            // review would force the same false attestation the sibling nudge
-            // arm above already warns about. 6 of 8 in the real batch moved
-            // cleanly; the other 2 were exactly this case.
-            format!(
-                "{done_count} done card(s), each with a reviewer named — put them back in \
-                 review so the reviewer is actually notified (`amux board review <id>`, the \
-                 named reviewer is preserved), or verify the ones where YOU are the named \
-                 reviewer. Archive instead if the work was superseded. If the card is `code` \
-                 typed and the work genuinely has not shipped, `review`'s gate cannot be \
-                 attested honestly either -- leave it in `done` rather than attest either \
-                 gate falsely. `amux board ask <id>` does NOT reach a reviewer here: it pings \
-                 the card's OWNER for a status report, and it refuses outright on any \
-                 terminal status including `done` (measured by mixpeek-funnel, 2026-09-10: \
-                 8 of 8 refused). AF-695 has detail."
-            )
-        };
+        let ask = format!(
+            "{done_count} done card(s) remain. Read GET /api/board/contract?card=<id> for each \
+             current gate and type. Done is terminal for non-runtime outcomes; \
+             code, ops, blocker and tripwire outcomes still require verified. Own that verification: reproduce current output, record checks \
+             and actual results, and advance only when every resolved criterion holds. A named \
+             reviewer is context, not a reason to wait on another worker. Do not re-open work just \
+             to notify a reviewer or fabricate a peer sign-off. If code has not shipped, satisfy \
+             its actual merge/deployment gates first. Preserve explicit authorization holds."
+        );
         sections.push(format!("{ask}\n{}", lines.join("\n")));
     }
 
     format!(
-        // `done` IS IN THE LIST NOW (AMUX-3819). This sentence made `verified`
-        // the only non-archive terminal state, which is stricter than the rule
-        // it is enforcing: the owner's own wording is "you MAY move an issue to
-        // `verified` only after ALL of these hold". Permission with a bar, not
-        // an obligation — and a drive that says "keep going until everything is
-        // verified" converts an opt-in ladder into a standing debt for every
-        // lane, which is what produced a 143-card pile with ~112 unreviewable
-        // by construction.
         "[amux auto-continue] Your todo queue is empty but you still have \
          outstanding work:\n\n{}\n\n\
-         Keep going until everything is done, verified, archived, or genuinely \
-         blocked on someone else. Don't stop between cards.",
+         Complete each outcome through its type's terminal state. Own prerequisites on this board; \
+         another worker's availability is not a dependency. Preserve actual access and authorization \
+         restrictions, record a precise blocker when necessary, and continue independent work.",
         sections.join("\n\n")
     )
 }
@@ -4583,8 +4448,8 @@ fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String
          Reuse existing artifacts and tasks; implement missing ordinary prerequisites yourself, \
          using an isolated checkout when necessary. Peer review may run in parallel. \
          Only an actually unavailable required artifact justifies a depends_on edge; \
-         if only a peer can produce it, use `amux board request <lane> <title>` with an exact \
-         deliverable and callback, and continue independent work. Do not invent peer signoff gates. \
+         own the missing deliverable on this same board and continue independent work. \
+         Do not create cross-worker dependencies or invent peer signoff gates. \
          Preserve explicit owner holds and access restrictions. \
          Needs You must satisfy the scoped approval policy below. \
          Do NOT move unfinished work to review to park it.{}\n{}{}",
@@ -4601,6 +4466,13 @@ fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String
         row.id, row.id
     ));
     prompt.push_str(&format!("\n\n[approval policy] Allowed Needs You categories: {}. Make ordinary implementation choices. Resolve operational prerequisites yourself within existing authority.", bs::approval_types(Some(session)).join(", ")));
+    let role_env = crate::api::session_verbs::parse_env(session);
+    if role_env.get("CC_EPHEMERAL") == Some("1") {
+        if let Some(parent) = role_env.get("CC_PARENT") {
+            prompt.push_str(&format!("\n\n[orchestration] Your orchestrator is {parent}. For conflicting requirements or direction, send one concise question with this card ID and your attempted remedies using `amux send {parent} --no-board --stdin`; continue independent work. This is guidance, not an outside dependency or mandatory sign-off."));
+        }
+        prompt.push_str("\n\n[fan-out workspace] Own the entire board in your dedicated amux/fanout branch. Preserve the worktree across pauses. Resolve implementation dependencies locally and never create a task on another worker board. Commit your changes and record test evidence; configure CC_WORKTREE_VERIFY with the appropriate repository verification command. When completed outcomes have evidence and no implementation is active, the harness merges an isolated candidate, runs those checks, and pushes main without changing the shared checkout. Resolve returned conflicts/check failures yourself; keep driving to the resolved terminal gates. Only actual spend/customer-outbound authorization remains an approval.");
+    }
     if let Some(next) = row.next_action.as_deref().filter(|v| !v.is_empty()) {
         prompt.push_str(&format!("\nNext action: {}", quoted_card_text(next, &row.id)));
     }
@@ -4741,28 +4613,23 @@ fn capture_cleanup_reason(row: &bs::IssueRow) -> String {
 /// Select the owning model's once-per-card disposition request. Neither a
 /// progress append nor generic advance nudges can spend this distinct action.
 fn unnudged_capture_cleanup(conn: &Connection, session: &str) -> Option<String> {
-    let candidates: Vec<String> = conn
-        .prepare(
-            "SELECT id FROM issues \
-             WHERE session=?1 AND status='doing' AND source='capture' \
-             AND deleted IS NULL AND COALESCE(archived,0)=0 AND owner_type='agent' AND COALESCE(type,'') != 'epic' \
-             ORDER BY updated DESC LIMIT 40",
-        )
-        .and_then(|mut st| {
-            st.query_map([session], |r| r.get(0))
-                .map(|rows| rows.flatten().collect())
-        })
-        .unwrap_or_default();
-
-    candidates.into_iter().find_map(|id| {
-        let row = bs::get_issue(conn, &id).ok().flatten()?;
-        if capture_cleanup_reason(&row).is_empty() { return None; }
-        let idem = format!("decompose:{id}");
-        let already = conn
-            .query_row("SELECT 1 FROM session_events WHERE idem=?1 LIMIT 1", [idem], |_| Ok(()))
-            .optional().ok().flatten().is_some();
-        (!already).then_some(id)
-    })
+    // Filter disposed/structured receipts before LIMIT. Looking at only the
+    // newest 40 first let already-asked receipts hide all older pending intake.
+    let sql = format!(
+        "SELECT i.id FROM issues i WHERE i.session=?1 \
+         AND i.status IN ('doing','todo','backlog') AND i.source IN ('capture','orchestrator') \
+         AND i.deleted IS NULL AND COALESCE(i.archived,0)=0 AND i.owner_type='agent' \
+         AND COALESCE(i.type,'') != 'epic' AND {} \
+         AND NOT EXISTS (SELECT 1 FROM session_events e WHERE e.idem='decompose:'||i.id) \
+         ORDER BY i.created,i.id LIMIT 1", bs::capture_shell_sql());
+    match conn.query_row(&sql, [session], |r| r.get(0)).optional() {
+        Ok(card) => card,
+        Err(error) => {
+            tracing::warn!(session, %error, verdict = "capture_intake_selection_failed",
+                "could not inspect pending command intake");
+            None
+        }
+    }
 }
 
 /// [`select_advance`] over an INJECTED "is this name a registered worker"
@@ -4888,53 +4755,15 @@ pub fn select_advance_with(
         }
     }
 
-    // NO `done` TIER (py:13460, Ethan 2026-08-08: "we shouldnt be sending
-    // commands to idle workers that genuinely have no more work"). `done` was
-    // briefly selected here so something drove done->verified. Removing it was
-    // right on its own terms: this loop re-woke lanes per card, per cooldown —
-    // 294 advance nudges/day against 25 human prompts, 46% repeats, each wake
-    // replaying a 400-600k context. A lane whose only remaining cards are `done`
-    // has nothing IN FLIGHT.
-    //
-    // THE HANDOFF NAMED HERE DOES NOT EXIST (AMUX-2782). This comment used to
-    // say "the daily verification sweep took that job and does it better — one
-    // batched message once a day". There is no such sweep. Searched: every
-    // `jobs::spawn_loop` registration in lib.rs (board-drive, autofix,
-    // commit-nudge, ghost-rescue, pipe-reconcile, invariants-monitor,
-    // event-processors, orchestrator-runtime, scan, bootstrap, self-adopt,
-    // legacy-port); all 114 schedules, where the only ENABLED sweeps are LOG
-    // sweeps (SCHED-329, SCHED-331 — docs/rust-migration/log-sweep.md, a
-    // different contract that the name collides with) and the amux lane's own
-    // SCHED-276 board-triage entry is enabled=0; and the whole repo, where the
-    // sole hit for "verification sweep" was THIS COMMENT citing itself.
-    //
-    // The claim is deleted rather than kept, per ethos rule 6: implement the
-    // promise or delete it — an unimplemented handoff that reads as implemented
-    // is what stopped anyone checking for three days.
-    //
-    // MEASURED CONSEQUENCE, cards reaching `verified` per day:
-    //     08-07: 256   08-08: 121 (tier removed)   08-09: 38   08-10: 2
-    // against 1,153 unarchived `done` cards, 876 of them older than a day. The
-    // count is a last-touch proxy (`updated`; only 29 rows carry
-    // `last_verified_at`), which INFLATES recent days rather than deflating
-    // them, so the collapse is a floor, not an artefact.
-    //
-    // DO NOT FIX THIS BY RE-ADDING THE TIER — that was removed with a
-    // measurement and the owner's words behind it. What replaces it is an open
-    // design question that pairs with AMUX-2466's NEEDS-YOU on whether
-    // fleet-wide `verified` is the right gate at all.
-    //
-    // CANDIDATES, not LIMIT 1 (py:13439, AMUX-2498). Taking the single
-    // highest-priority card meant an exhausted per-card budget silenced every
-    // OTHER card the lane held — and because the ordering puts `doing` first, a
-    // lane that peer-reviews continuously always has a populated review tier, so
-    // the lanes using reviewers most were starved hardest.
+    // Done runtime outcomes use the separate batched verifier. Scan the complete
+    // Doing/Review frontier so a held or suppressed candidate cannot starve its
+    // siblings. At most one delivery is accepted per lane/tick.
     let mut cands: Vec<(String, String)> = conn
         .prepare(
             "SELECT id, status FROM issues WHERE session=?1 AND deleted IS NULL \
              AND COALESCE(archived,0)=0 AND status IN ('doing','review') AND owner_type='agent' \
              AND NOT (COALESCE(type,'')='epic' AND status='doing') \
-             ORDER BY CASE status WHEN 'doing' THEN 0 ELSE 1 END, updated DESC LIMIT 40",
+             ORDER BY CASE status WHEN 'doing' THEN 0 ELSE 1 END, updated DESC, id ASC",
         )
         .and_then(|mut st| {
             st.query_map(rusqlite::params![session], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -4942,6 +4771,11 @@ pub fn select_advance_with(
         })
         .unwrap_or_default();
     if let Some(capture_id) = capture_cleanup.as_deref() {
+        if !cands.iter().any(|(id, _)| id == capture_id) {
+            if let Ok(Some(row)) = bs::get_issue(conn, capture_id) {
+                cands.insert(0, (row.id, row.status));
+            }
+        }
         cands.sort_by_key(|(id, _)| if id == capture_id { 0 } else { 1 });
     }
     if cands.is_empty() {
@@ -4957,12 +4791,40 @@ pub fn select_advance_with(
             cands.insert(0, c);
         }
     }
-    let Some((card_id, status)) = cands.into_iter().next() else {
-        return Advance::None {
-            reason: "no-open-card",
-            detail: "no agent-owned doing/review card to drive".into(),
-        };
-    };
+    let mut refusal = Advance::None { reason: "no-open-card", detail: "no agent-owned doing/review card to drive".into() };
+    for (card_id, status) in cands {
+        let next = advance_card(conn, session, tags, now, reviewer_unreachable, card_id, status);
+        if let Advance::Nudge { target, card, text, .. } = &next {
+            let measured = (|| -> rusqlite::Result<bool> {
+                let Some(row) = bs::get_issue(conn, card)? else { return Ok(false) };
+                let started: f64 = conn.query_row(
+                    "SELECT coalesce(max(ts),0) FROM session_events WHERE session=?1 AND type='session.started'",
+                    [target], |r| r.get(0))?;
+                let identity = reminder_identity(target, text, &row, started);
+                let (sent, queued) = crate::api::session_verbs::state_reminder_status(conn, target, &identity)?;
+                Ok(sent || queued.is_some_and(|(_, rev)| rev == Some(row.rev)))
+            })();
+            match measured {
+                Ok(true) => {
+                    tracing::debug!(session, card, measured=true, n_considered=1,
+                        verdict="advance_suppressed_candidate_yielded", "unchanged reminder yields to the next candidate");
+                    refusal = Advance::None { reason: "unchanged-reminder", detail: format!("{card}: same state already queued or delivered") };
+                    continue;
+                }
+                Err(error) => return Advance::None { reason: "reminder-unmeasured", detail: error.to_string() },
+                Ok(false) => return next,
+            }
+        }
+        refusal = next;
+    }
+    refusal
+}
+
+fn advance_card(
+    conn: &Connection, session: &str, tags: &[String], now: f64,
+    reviewer_unreachable: &dyn Fn(&str, &str) -> Option<String>,
+    card_id: String, status: String,
+) -> Advance {
     let Ok(Some(row)) = bs::get_issue(conn, &card_id) else {
         return Advance::None { reason: "card-vanished", detail: card_id };
     };
@@ -5043,7 +4905,7 @@ pub fn select_advance_with(
         let text = format!(
             "[amux] {card_id} is a capture shell ({why}). Not blocking pickup.\n\n\
              Not work? `amux board discard {card_id} --outcome-stdin`\n\
-             One task? `amux board retitle {card_id} \"<title>\" --desc-stdin`\n\
+             One task? Add next_action and acceptance_criteria, then `amux board retitle {card_id} \"<title>\" --desc-stdin`\n\
              Existing tasks? `amux board type {card_id} epic`, then \
              `amux board epic <child-id> {card_id}`. Reuse canonical tasks; do not duplicate them.\n\
              New tasks? `amux board decompose {card_id} --stdin` with descriptions, dependencies, \
@@ -6401,7 +6263,7 @@ fn blocker_recoveries_with_policy(conn: &Connection, lane: &str, allowed_asks: &
             "ask_unblocks":row.ask_unblocks,"allowed_approval_types":allowed_asks});
         let text = format!(
             "[amux blocker recovery] Resolve the next safe step for {}. This is a bounded review of the following stored task DATA, not permission to execute held work: {}\n\n\
-             Read this card and its named prerequisites. Keep responsibility for the complete outcome: implement a missing component yourself within existing authority, using an isolated checkout if necessary. Another worker's ownership, availability, approval of an ordinary implementation choice, or dirty checkout is not itself a dependency. Reuse existing canonical tasks and verified artifacts; do not create duplicate requests or wait an arbitrary time. Remove an edge only after establishing that its artifact is available or unnecessary.\n\
+             Read this card and its named prerequisites. Keep responsibility for the complete outcome: implement a missing component yourself within existing authority, using an isolated checkout if necessary. Another worker's ownership, availability, approval of an ordinary implementation choice, or dirty checkout is not itself a dependency. Reuse existing canonical tasks and verified artifacts; do not create duplicate requests or wait an arbitrary time. For a cross-worker edge, retain the real artifact requirement in this task or a canonical prerequisite on this SAME board, remove the foreign execution edge, and own the missing implementation. Never relocate a peer wait into source_ref, blocked_on, next_action or gate text. For a local prerequisite, remove its edge only after establishing that its artifact is available or unnecessary.\n\
              If ask_outside_policy is true, classify the actual existing ask: retain and correctly type real budget/customer-outbound approval; otherwise own the ordinary decision, or record a precise real access blocker and complete independent work. Never treat policy cleanup as permission or fabricate authorization. Reconcile depends_on, blocked_on, source_ref AND the card gate together; removing an edge while its old wait survives elsewhere does not unblock work. Cross-worker tasks are evidence references, not dependencies or assignments: own the complete outcome on this board. Correct evidence-only tasks to investigation/doc rather than requiring a nonexistent deployment. Put completion requirements in acceptance_criteria and use the predefined column gates; never acknowledge completed results just to start. Preserve actual access restrictions, explicit owner holds, new-spend approval and customer-outbound approval. If one still blocks execution, record the exact observable condition and evidence, and perform any independent preparation that is allowed. Do not claim held work is running or fabricate completion. Supply next_action and acceptance_criteria on the existing card; track any actual execution as Doing and finish through the predefined gates. Resolve the same prerequisite for other affected cards in this lane in this turn when possible. No repeated whole-board audit. An unchanged blocker will not receive another recovery prompt.",
             row.id, context);
         result.push(BlockerRecovery {card:row.id,rev:row.rev,identity,text});
@@ -6459,6 +6321,10 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
     // mutation. An exact surviving claim comes first: resuming its own Doing
     // work is not a second WIP claim and must not be hidden by the WIP cap.
     let woke_for_dispatch = if !fleet.is_running(lane).await {
+        crate::fanout_workspace::adopt_at_boundary(state,lane).await;
+        if crate::fanout_workspace::queue_integration(state,lane).await {
+            return LaneTrace::skip(lane,"integrating","validating completed worker changes before resuming terminal gates").with_counts(eligible,open);
+        }
         let should_wake = match state.store.read() {
             Ok(conn) => match select_resume(&conn, lane, now_f64(), true) {
                 Resume::Claim { .. } => true,
@@ -6467,15 +6333,19 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 // post-start selector sends the complete candidate set.
                 Resume::Conflicting { .. } => true,
                 Resume::Current { .. } => true,
-                Resume::None => matches!(
-                    select_pickup(&conn, lane, now_f64()),
-                    Pickup::Claim { .. } | Pickup::DrainBacklog { .. }
-                ),
+                Resume::None => {
+                    matches!(select_pickup(&conn, lane, now_f64()), Pickup::Claim { .. } | Pickup::DrainBacklog { .. })
+                        || matches!(select_advance(&conn, lane, &fleet.tags(lane), now_f64()),
+                            Advance::Nudge { kind: "advance-nudged" | "decompose-asked", .. })
+                        || (eligible == 0 && open_execution_count(&conn,lane).ok() == Some(0)
+                            && !verify_batch_pending(&conn,lane,now_f64())
+                            && !done_verify_candidates(&conn,lane).is_empty())
+                },
             },
             Err(_) => return LaneTrace::skip(lane, "store-unavailable", "could not preflight stopped worker")
                 .with_counts(eligible, open),
         };
-        if !should_wake {
+        if !should_wake && !crate::fanout_workspace::integration_followup_needed(state,lane) {
             return LaneTrace::skip(
                 lane,
                 "not-running-no-dispatchable-work",
@@ -6563,6 +6433,10 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
         return LaneTrace::skip(lane, "mid-turn", detail).with_counts(eligible, open);
     }
 
+    crate::fanout_workspace::adopt_at_boundary(state, lane).await;
+    if crate::fanout_workspace::queue_integration(state, lane).await {
+        return LaneTrace::skip(lane, "integrating", "repository validation and main integration are running").with_counts(eligible, open);
+    }
     let now = now_f64();
     let tags = fleet.tags(lane);
     let Ok(conn) = state.store.read() else {
@@ -6748,93 +6622,96 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
             .with_counts(eligible, open);
     };
     let advance = select_advance(&conn, lane, &tags, now);
-    let pickup = match &advance {
-        Advance::Nudge { .. } => None,
-        Advance::None { .. } => Some(select_pickup(&conn, lane, now)),
-    };
+    let pickup = select_pickup(&conn, lane, now);
     drop(conn);
-
-    if let Advance::Nudge { target, card, status, text, kind } = advance {
-        // A NUDGE IS ABOUT A CARD, so it carries that card's revision and the
-        // delivery loop drops it if the card moves first (AMUX-3659). Read
-        // here, at compute time, because that is the state the text describes.
-        // A card whose rev cannot be read delivers unconditionally — the same
-        // behaviour as before, since refusing to nudge because a read failed
-        // would be a worse trade than an occasionally-stale nudge.
-        let rev: Option<i64> = state
-            .store
-            .read()
-            .ok()
-            .and_then(|c| {
-                c.query_row("SELECT rev FROM issues WHERE id=?1", rusqlite::params![&card], |r| r.get(0))
-                    .ok()
-            });
-        let delivery = match rev {
-            Some(r) => fleet.deliver_about(&target, &text, &card, r).await,
-            None => fleet.deliver_work(&target, &text).await.map(|_|true),
-        };
-        match delivery {
-            Err(error)=>return nudge_delivery_failed(lane,&target,&card,&error).with_counts(eligible,open),
-            Ok(false)=>return LaneTrace::skip(lane,"unchanged-reminder","same card state already queued or delivered; no new worker turn").with_counts(eligible,open),
-            Ok(true)=>{},
-        }
-        // THE COOLDOWN IS PER LANE, AND A REVIEW ROUTE INVOLVES TWO OF THEM.
-        // `advance.nudged` is recorded under the REVIEWER (python:13817 — it
-        // once stamped the card owner's cooldown while the message went to the
-        // reviewer, so the reviewer's own cooldown was never touched). But then
-        // NOTHING stamps the OWNER's lane, and the owner's lane is what
-        // re-selects the same review card on the next tick. Measured live at
-        // 22:07/22:08/22:09: amux-agent was nudged about AC-233 on three
-        // consecutive ticks, 60s apart, stopping only when the per-CARD budget
-        // hit 3 — a bound meant to span 24h, spent in three minutes.
-        //
-        // So the route writes a second, cheap marker under the OWNER. It is a
-        // DIFFERENT type on purpose: `last_advance` counts it (the owner's lane
-        // goes quiet for 15 minutes) while the per-card budget counts only
-        // `advance.nudged`, so recording it cannot burn the reviewer's three
-        // nudges at twice the rate.
-        if kind == "review-routed" && target != lane {
-            crate::api::session_verbs::emit_event(
-                state,
-                lane,
-                "advance.routed",
-                Some(json!({"issue": card, "status": status, "reviewer": target})),
-                None,
-                "board-drive",
-            )
-            .await;
-        }
-        // BOTH renag arms write the same event TYPE — the type is the fault
-        // class and it should stay one thing. The arm is carried in `kind`
-        // inside the data, which is where a per-branch counter can read it
-        // without splitting the class (AMUX-3777).
-        let etype =
-            if kind.starts_with("renag") { "needsyou.renag" } else { "advance.nudged" };
-        let idem = if kind == "decompose-asked" {
-            Some(format!("decompose:{card}"))
-        } else {
-            None
-        };
-        // The event carries the card's STATUS, which Python kept only in memory.
-        // That is what makes "did the lane make progress since we spoke?"
-        // survive the restart this process takes on every deploy.
-        crate::api::session_verbs::emit_event(
-            state,
-            &target,
-            etype,
-            Some(json!({"issue": card, "status": status, "kind": kind})),
-            idem,
-            "board-drive",
-        )
-        .await;
-        return LaneTrace::acted(lane, kind, &card, format!("delivered to {target}"))
-            .with_counts(eligible, open);
-    }
 
     let advance_reason = match &advance {
         Advance::None { reason, detail } => (*reason, detail.clone()),
-        Advance::Nudge { .. } => unreachable!("handled above"),
+        Advance::Nudge { .. } => ("unchanged-reminder", "same card state already queued or delivered".into()),
     };
+    'reminder: {
+        if let Advance::Nudge { target, card, status, text, kind } = advance {
+            // A NUDGE IS ABOUT A CARD, so it carries that card's revision and the
+            // delivery loop drops it if the card moves first (AMUX-3659). Read
+            // here, at compute time, because that is the state the text describes.
+            // A card whose rev cannot be read delivers unconditionally — the same
+            // behaviour as before, since refusing to nudge because a read failed
+            // would be a worse trade than an occasionally-stale nudge.
+            let rev: Option<i64> = state
+                .store
+                .read()
+                .ok()
+                .and_then(|c| {
+                    c.query_row("SELECT rev FROM issues WHERE id=?1", rusqlite::params![&card], |r| r.get(0))
+                        .ok()
+                });
+            let delivery = match rev {
+                Some(r) => fleet.deliver_about(&target, &text, &card, r).await,
+                None => fleet.deliver_work(&target, &text).await.map(|_|true),
+            };
+            match delivery {
+                Err(error)=>return nudge_delivery_failed(lane,&target,&card,&error).with_counts(eligible,open),
+                Ok(false) => {
+                    tracing::info!(session = lane, card, verdict = "duplicate_reminder_yields_to_pickup",
+                        "board_drive: suppressed reminder does not suppress independent work");
+                    break 'reminder;
+                },
+                Ok(true)=>{},
+            }
+            // THE COOLDOWN IS PER LANE, AND A REVIEW ROUTE INVOLVES TWO OF THEM.
+            // `advance.nudged` is recorded under the REVIEWER (python:13817 — it
+            // once stamped the card owner's cooldown while the message went to the
+            // reviewer, so the reviewer's own cooldown was never touched). But then
+            // NOTHING stamps the OWNER's lane, and the owner's lane is what
+            // re-selects the same review card on the next tick. Measured live at
+            // 22:07/22:08/22:09: amux-agent was nudged about AC-233 on three
+            // consecutive ticks, 60s apart, stopping only when the per-CARD budget
+            // hit 3 — a bound meant to span 24h, spent in three minutes.
+            //
+            // So the route writes a second, cheap marker under the OWNER. It is a
+            // DIFFERENT type on purpose: `last_advance` counts it (the owner's lane
+            // goes quiet for 15 minutes) while the per-card budget counts only
+            // `advance.nudged`, so recording it cannot burn the reviewer's three
+            // nudges at twice the rate.
+            if kind == "review-routed" && target != lane {
+                crate::api::session_verbs::emit_event(
+                    state,
+                    lane,
+                    "advance.routed",
+                    Some(json!({"issue": card, "status": status, "reviewer": target})),
+                    None,
+                    "board-drive",
+                )
+                .await;
+            }
+            // BOTH renag arms write the same event TYPE — the type is the fault
+            // class and it should stay one thing. The arm is carried in `kind`
+            // inside the data, which is where a per-branch counter can read it
+            // without splitting the class (AMUX-3777).
+            let etype =
+                if kind.starts_with("renag") { "needsyou.renag" } else { "advance.nudged" };
+            let idem = if kind == "decompose-asked" {
+                Some(format!("decompose:{card}"))
+            } else {
+                None
+            };
+            // The event carries the card's STATUS, which Python kept only in memory.
+            // That is what makes "did the lane make progress since we spoke?"
+            // survive the restart this process takes on every deploy.
+            crate::api::session_verbs::emit_event(
+                state,
+                &target,
+                etype,
+                Some(json!({"issue": card, "status": status, "kind": kind})),
+                idem,
+                "board-drive",
+            )
+            .await;
+            return LaneTrace::acted(lane, kind, &card, format!("delivered to {target}"))
+                .with_counts(eligible, open);
+        }
+
+    }
 
     if let Some((card, cause)) = current_claim {
         // An exact runtime identity prevents a second claim, but cannot veto
@@ -6843,10 +6720,9 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
         // already sent about a raw prompt is not an executable task claim.
         let capture_exempt = state.store.read().ok()
             .and_then(|conn| bs::get_issue(&conn, &card).ok().flatten())
-            .is_some_and(|row| row.creator == "amux" && row.desc.starts_with("**Prompt:**"));
-        let recovery = matches!(&pickup, Some(Pickup::ReclaimStale { card: stale, .. }) if stale == &card)
-            || (capture_exempt
-                && matches!(&pickup, Some(Pickup::Claim { .. } | Pickup::DrainBacklog { .. })));
+            .is_some_and(|row| bs::is_capture_shell(&row) || row.item_type == "epic");
+        let recovery = matches!(&pickup, Pickup::ReclaimStale { card: stale, .. } if stale == &card)
+            || capture_exempt;
         if !recovery || fleet.active_child_work(lane) {
             return LaneTrace::skip(lane, "active-claim-current",
                 format!("{card} remains the exact runtime card ({cause}); canonical advancement: {} — {}",
@@ -6857,7 +6733,7 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
             "board_drive: idle runtime claim no longer vetoes guarded stale recovery or capture-shell WIP exemption");
     }
 
-    match pickup.expect("pickup computed whenever advance declined") {
+    match pickup {
         Pickup::Claim { card, prompt } => {
             // Only dispatch "work it now" if the atomic claim actually took —
             // the card could have been closed between select_pickup and here
@@ -7102,6 +6978,7 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
         Pickup::None { reason, detail } => {
             // Before generic verification/triage: missing continuations and
             // parked Backlog were invisible to the old blocked-only nudge.
+            let mut unchanged_recoveries = 0;
             if fleet.auto_continue_enabled(lane) && dispatch_backlog_when_idle(lane) {
                 let recovery_lane = lane.to_string();
                 let recoveries = state.store.read_async(move |conn| {
@@ -7132,13 +7009,7 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                         }
                     }
                 }
-                if considered > 0 {
-                    // Do not spend a generic triage/continue turn on the same
-                    // work that already has a durable specific recovery.
-                    return LaneTrace::skip(lane, "blocker-recovery-unchanged",
-                        format!("{considered} parked/incomplete cards already reviewed or queued; waiting for a substantive change"))
-                        .with_counts(eligible, open);
-                }
+                unchanged_recoveries = considered;
             }
             // VERIFY NUDGE — options A+B. When a session has no todo/doing/
             // review work but holds `done` cards, nudge it to verify them.
@@ -7148,12 +7019,13 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
             //   - 24h cooldown (the old tier nudged per card per cooldown)
             //   - the session decides what to verify, not the loop
             let verify_trace = 'verify: {
-                if eligible > 0 || open > 0 {
-                    break 'verify None;
+                if eligible > 0 { break 'verify None; }
+                let Ok(conn) = state.store.read() else { break 'verify None; };
+                match open_execution_count(&conn, lane) {
+                    Ok(0) => {},
+                    Ok(_) => break 'verify None,
+                    Err(error) => break 'verify Some(format!("execution population unmeasured: {error}")),
                 }
-                let Ok(conn) = state.store.read() else {
-                    break 'verify None;
-                };
                 let total = done_card_count(&conn, lane);
                 if total == 0 {
                     break 'verify None;
@@ -7168,6 +7040,10 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 if cards.is_empty() {
                     break 'verify None;
                 }
+                let contracts: serde_json::Map<String, Value> = cards.iter().filter_map(|(id,_,_)|
+                    verification_contract(&conn,id).ok().flatten().map(|signature|(id.clone(),json!(signature)))
+                ).collect();
+                if contracts.len() != cards.len() { break 'verify Some("verification contracts unmeasured".into()); }
                 drop(conn);
                 let text = verify_nudge_text(&cards, total);
                 if let Err(error) = fleet.deliver_work(lane, &text).await {
@@ -7177,13 +7053,13 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                     state,
                     lane,
                     "verify.nudge",
-                    Some(json!({"done_count": total, "cards": cards.iter().map(|(id,_,_)| id.as_str()).collect::<Vec<_>>()})),
+                    Some(json!({"done_count": total, "cards": cards.iter().map(|(id,_,_)| id.as_str()).collect::<Vec<_>>(), "contracts":contracts})),
                     None,
                     "board-drive",
                 )
                 .await;
-                tracing::info!(session = lane, total, batch_size = cards.len(),
-                    verdict = "verify_batch_queued",
+                tracing::info!(session = lane, total, batch_size = cards.len(), unchanged_recoveries,
+                    measured=true, n_considered=total, verdict = "verify_batch_queued",
                     "board_drive: verification batch accepted; next batch becomes eligible when these cards are resolved");
                 return LaneTrace::acted(
                     lane,
@@ -7193,6 +7069,15 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 )
                 .with_counts(eligible, open);
             };
+
+            if unchanged_recoveries > 0 {
+                // Suppress generic repetition of the held work, not unrelated
+                // verification. Preserve the real holds and their diagnostics.
+                let verify = verify_trace.map(|v| format!(" | verify: {v}")).unwrap_or_default();
+                return LaneTrace::skip(lane, "blocker-recovery-unchanged",
+                    format!("{unchanged_recoveries} parked/incomplete cards already reviewed; independent verification considered{verify}"))
+                    .with_counts(eligible, open);
+            }
 
             // BACKLOG TRIAGE NUDGE. Sessions accumulate backlog cards
             // (findings, investigations, decomposed work) that nobody ever
@@ -8902,12 +8787,12 @@ mod tests {
     /// reviewer (`amux board review`, which fires `reviewer_notify` on entry
     /// into `review`) and must not recommend `ask` for this population.
     #[test]
-    fn the_reviewer_named_nudge_recommends_review_not_ask() {
+    fn the_reviewer_named_nudge_keeps_verification_on_the_owners_board() {
         let done = vec![("D-1".to_string(), "a done card".to_string(), "peer-lane".to_string())];
         let text = continue_nudge_text(0, 1, &[], &done, &[]);
         assert!(
-            text.contains("amux board review"),
-            "must recommend the verb that notifies the named reviewer: {text}"
+            text.contains("Own that verification") && text.contains("/api/board/contract"),
+            "must resolve the actual gate locally instead of adding a peer wait: {text}"
         );
         assert!(
             !text.contains("ask them to verify"),
@@ -9287,7 +9172,7 @@ mod tests {
 
         let text = verify_nudge_text(&cards, total);
         assert!(text.contains("... and 3 more"), "11 - 8 = 3; got: {text}");
-        assert!(text.contains("11 of your"), "the headline must state the true total");
+        assert!(text.contains("11 runtime-changing"), "the headline must state the true total");
         // Every listed card must actually appear, or the list and the count
         // describe different sets.
         for (id, _, _) in &cards {
@@ -9337,6 +9222,7 @@ mod tests {
         starts: std::sync::atomic::AtomicUsize,
         start_error: std::sync::Mutex<Option<String>>,
         delivery_error: std::sync::Mutex<Option<String>>,
+        suppress_about: std::sync::atomic::AtomicBool,
     }
     impl Default for BoundaryFleet {
         fn default() -> Self {
@@ -9349,7 +9235,8 @@ mod tests {
                 enabled: std::sync::atomic::AtomicBool::new(true),
                 isolated: std::sync::atomic::AtomicBool::new(false),
                 starts: std::sync::atomic::AtomicUsize::new(0),
-                start_error: std::sync::Mutex::new(None), delivery_error: std::sync::Mutex::new(None) }
+                start_error: std::sync::Mutex::new(None), delivery_error: std::sync::Mutex::new(None),
+                suppress_about: std::sync::atomic::AtomicBool::new(false) }
         }
     }
     impl Fleet for BoundaryFleet {
@@ -9376,6 +9263,10 @@ mod tests {
             if let Some(error) = self.delivery_error.lock().unwrap().clone() { return Err(error); }
             self.deliver(lane, text).await;
             Ok(())
+        }
+        async fn deliver_about(&self, lane: &str, text: &str, _: &str, _: i64) -> Result<bool, String> {
+            if self.suppress_about.load(std::sync::atomic::Ordering::SeqCst) { return Ok(false); }
+            self.deliver_work(lane, text).await.map(|_| true)
         }
         async fn deliver_blocker_recovery(&self, lane: &str, text: &str, _card: &str, _rev: i64, identity: &str) -> Result<bool, String> {
             self.deliver_resume(lane, text, identity).await.map(|d| d == ResumeDelivery::Queued)
@@ -9440,6 +9331,10 @@ mod tests {
 
     #[tokio::test]
     async fn idle_parked_backlog_gets_one_specific_recovery_without_clearing_holds() {
+        // Recovery identity includes the scoped approval policy. Keep that
+        // scope fixed while parallel tests install and remove fixture homes.
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
         let (_dir, state, store) = drive_state();
         drive_card(&store, "PARKED", "backlog", "agent", "code");
         drive_card(&store, "EXTERNAL", "todo", "agent", "code");
@@ -9541,6 +9436,10 @@ mod tests {
 
     #[test]
     fn blocker_progress_notes_do_not_buy_another_model_turn() {
+        // Recovery identity includes the scoped approval policy. Keep that
+        // scope fixed while parallel tests install and remove fixture homes.
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
         let (_dir, _state, store) = drive_state();
         drive_card(&store, "WAIT", "backlog", "agent", "code");
         store.write(|conn| {
@@ -9739,6 +9638,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn suppressed_review_reminder_does_not_starve_ready_work() {
+        let (_dir, state, store) = drive_state();
+        drive_card(&store, "REVIEW-1", "review", "agent", "code");
+        drive_card(&store, "READY-1", "todo", "agent", "code");
+        let fleet = BoundaryFleet::default();
+        fleet.suppress_about.store(true, std::sync::atomic::Ordering::SeqCst);
+        let trace = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(trace.outcome, "assigned", "{trace:?}");
+        assert_eq!(drive_status(&store, "READY-1"), "doing");
+        assert_eq!(drive_status(&store, "REVIEW-1"), "review");
+        assert_eq!(fleet.delivered.lock().unwrap().len(), 1, "only new work consumes a turn");
+    }
+
+    #[test]
+    fn already_asked_receipts_cannot_hide_older_pending_intake() {
+        let conn = board_db();
+        for n in 0..45 {
+            let id = format!("RAW-{n:02}");
+            add_card(&conn,&id,"lane","backlog","Fix parser","**Prompt:** Fix the parser regression");
+            conn.execute("UPDATE issues SET creator='amux',source='capture',created=?2,updated=?2 WHERE id=?1",rusqlite::params![id,n+1]).unwrap();
+            if n>0 {
+                conn.execute("INSERT INTO session_events(ts,session,type,data,idem,source) VALUES (1,'lane','advance.nudged','{}',?1,'test')",[format!("decompose:{id}")]).unwrap();
+            }
+        }
+        assert_eq!(unnudged_capture_cleanup(&conn,"lane"),Some("RAW-00".into()));
+    }
+
+    #[test]
+    fn queued_capture_gets_intake_even_with_an_existing_review_card() {
+        let conn = board_db();
+        add_card(&conn, "REVIEW-1", "lane", "review", "Review parser fix", "SCOPE: tests");
+        add_card(&conn, "RAW-1", "lane", "backlog", "1", "**Prompt:** 1. Fix parser\n2. Add regression");
+        conn.execute("UPDATE issues SET creator='amux',source='capture' WHERE id='RAW-1'", []).unwrap();
+        assert!(matches!(select_advance(&conn,"lane",&[],now_f64()), Advance::Nudge { card, kind: "decompose-asked", .. } if card=="RAW-1"));
+    }
+
+    #[tokio::test]
     async fn exact_stale_claim_does_not_disable_recovery_and_next_todo_pickup() {
         let (_dir, state, store) = drive_state();
         drive_card(&store, "ABANDONED", "doing", "agent", "code");
@@ -9778,6 +9714,169 @@ mod tests {
         assert_eq!(drive_status(&store, "REAL"), "doing");
         assert_eq!(drive_status(&store, "SHELL"), "doing", "never silently discard the user's captured request");
         assert_eq!(fleet.delivered.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reviewed_blocker_yields_to_independent_verification_and_preserves_hold() {
+        let (_dir, state, store) = drive_state();
+        drive_card(&store, "HELD", "backlog", "agent", "code");
+        drive_card(&store, "READY", "done", "agent", "code");
+        store.write(|conn| {
+            conn.execute("UPDATE issues SET blocked_on='explicit owner deployment hold' WHERE id='HELD'", [])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let fleet = BoundaryFleet::default();
+        assert_eq!(drive_lane(&state, &fleet, "lane").await.outcome, "blocker-recovery");
+        let second = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(second.outcome, "verify-nudge", "{second:?}");
+        assert_eq!(second.card.as_deref(), Some("READY"));
+        assert_eq!(drive_status(&store, "HELD"), "backlog");
+        assert_eq!(drive_events(&store, "task.blocker_recovery"), 1);
+        assert_eq!(drive_lane(&state, &fleet, "lane").await.reason, "blocker-recovery-unchanged");
+        assert_eq!(fleet.delivered.lock().unwrap().len(), 2, "neither held work nor unchanged verification repeats");
+    }
+
+    #[tokio::test]
+    async fn container_and_already_asked_capture_do_not_hide_child_verification() {
+        for capture in [false, true] {
+            let (_dir, state, store) = drive_state();
+            drive_card(&store, "CONTAINER", "doing", "agent", if capture { "code" } else { "epic" });
+            drive_card(&store, "CHILD", "done", "agent", "code");
+            drive_claim(&store, "CONTAINER");
+            if capture {
+                store.write(|conn| {
+                    conn.execute("UPDATE issues SET creator='amux',source='capture',desc='**Prompt:** continue please' WHERE id='CONTAINER'", [])?;
+                    conn.execute("INSERT INTO session_events(ts,session,type,data,idem) VALUES(1,'lane','advance.nudged','{}','decompose:CONTAINER')", [])?;
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                }).unwrap();
+            }
+            let fleet = BoundaryFleet::default();
+            let result = drive_lane(&state, &fleet, "lane").await;
+            assert_eq!(result.outcome, "verify-nudge", "capture={capture}: {result:?}");
+            assert_eq!(drive_status(&store, "CONTAINER"), "doing", "selection never fabricates completion");
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_verification_progress_offers_other_cards_without_repeating_unresolved_ones() {
+        let (_dir, state, store) = drive_state();
+        for n in 0..10 { drive_card(&store, &format!("VERIFY-{n}"), "done", "agent", "code"); }
+        let fleet = BoundaryFleet::default();
+        assert_eq!(drive_lane(&state, &fleet, "lane").await.outcome, "verify-nudge");
+        assert_eq!(drive_events(&store, "verify.nudge"), 1);
+        drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(drive_events(&store, "verify.nudge"), 1, "no progress means no extra paid turn");
+        store.write(|conn| {
+            conn.execute("UPDATE issues SET status='verified' WHERE id='VERIFY-0'", [])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let second = drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(second.outcome, "verify-nudge", "{second:?}");
+        let messages = fleet.delivered.lock().unwrap();
+        assert!(messages[1].1.contains("VERIFY-8") && messages[1].1.contains("VERIFY-9"));
+        assert!(!messages[1].1.contains("VERIFY-1"), "unresolved member of previous batch stays quiet");
+        assert_eq!(drive_status(&store, "VERIFY-1"), "done");
+    }
+
+    #[tokio::test]
+    async fn stopped_worker_with_only_verification_work_wakes_once() {
+        let (_dir,state,store)=drive_state();
+        drive_card(&store,"DONE","done","agent","code");
+        let fleet=BoundaryFleet::default();
+        fleet.running.store(false,std::sync::atomic::Ordering::SeqCst);
+        let result=drive_lane(&state,&fleet,"lane").await;
+        assert_eq!(result.outcome,"verify-nudge","{result:?}");
+        assert_eq!(fleet.starts.load(std::sync::atomic::Ordering::SeqCst),1);
+        fleet.running.store(false,std::sync::atomic::Ordering::SeqCst);
+        drive_lane(&state,&fleet,"lane").await;
+        assert_eq!(fleet.starts.load(std::sync::atomic::Ordering::SeqCst),1,"unchanged batch cannot repeatedly restart a worker");
+    }
+
+    #[tokio::test]
+    async fn integrated_head_rearms_verification_once_without_daily_delay() {
+        let (_dir, state, store) = drive_state();
+        drive_card(&store, "DONE", "done", "agent", "code");
+        let fleet = BoundaryFleet::default();
+        assert_eq!(drive_lane(&state, &fleet, "lane").await.outcome, "verify-nudge");
+        let original = verification_contract(&store.read().unwrap(), "DONE").unwrap();
+        crate::fanout_workspace::record_integrated_head(&store, "other-lane", "other").await;
+        drive_lane(&state, &fleet, "lane").await;
+        assert_eq!(drive_events(&store, "verify.nudge"), 1, "another worker's merge cannot consume a turn");
+
+        crate::fanout_workspace::record_integrated_head(&store, "lane", "first").await;
+        assert_ne!(verification_contract(&store.read().unwrap(), "DONE").unwrap(), original);
+        // A stopped provider must also wake for the newly integrated output.
+        fleet.running.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(drive_lane(&state, &fleet, "lane").await.outcome, "verify-nudge");
+        assert_eq!(fleet.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        for _ in 0..3 {
+            crate::fanout_workspace::record_integrated_head(&store, "lane", "first").await;
+            drive_lane(&state, &fleet, "lane").await;
+        }
+        assert_eq!(drive_events(&store, "fanout.integrated"), 2, "one receipt per changed worker output");
+        assert_eq!(drive_events(&store, "verify.nudge"), 2, "receipt retries cannot spend more turns");
+        crate::fanout_workspace::record_integrated_head(&store, "lane", "second").await;
+        assert_eq!(drive_lane(&state, &fleet, "lane").await.outcome, "verify-nudge");
+        assert_eq!(drive_events(&store, "verify.nudge"), 3);
+        assert_eq!(drive_status(&store, "DONE"), "done", "integration never fabricates verification");
+    }
+
+    #[tokio::test]
+    async fn changed_verification_gate_rearms_once_but_log_churn_does_not() {
+        let (_dir, state, store) = drive_state();
+        drive_card(&store,"DONE","done","agent","code");
+        let fleet=BoundaryFleet::default();
+        assert_eq!(drive_lane(&state,&fleet,"lane").await.outcome,"verify-nudge");
+        store.write(|c| {
+            c.execute("UPDATE issues SET rev=rev+1,log='checked again' WHERE id='DONE'",[])?;
+            Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
+        }).unwrap();
+        drive_lane(&state,&fleet,"lane").await;
+        assert_eq!(drive_events(&store,"verify.nudge"),1);
+        store.write(|c| {
+            c.execute("INSERT INTO session_gates(session,status,gate) VALUES('lane','verified',?1)", [json!(["Reproduce the current output with recorded evidence"]).to_string()])?;
+            Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
+        }).unwrap();
+        assert_eq!(drive_lane(&state,&fleet,"lane").await.outcome,"verify-nudge");
+        drive_lane(&state,&fleet,"lane").await;
+        assert_eq!(drive_events(&store,"verify.nudge"),2);
+        assert_eq!(drive_status(&store,"DONE"),"done");
+    }
+
+    #[test]
+    fn asked_capture_prefix_cannot_hide_review_work_beyond_the_old_scan_limit() {
+        let conn = board_db();
+        for n in 0..45 {
+            let id=format!("RAW-{n}");
+            add_card(&conn,&id,"lane","doing","1","**Prompt:** 1. Fix parser");
+            conn.execute("UPDATE issues SET creator='amux',source='capture' WHERE id=?1",[&id]).unwrap();
+            conn.execute("INSERT INTO session_events(ts,session,type,data,idem) VALUES(1,'lane','advance.nudged','{}',?1)",
+                [format!("decompose:{id}")]).unwrap();
+        }
+        add_card(&conn,"REVIEW","lane","review","Verify the parser bounds","SCOPE: parser regression");
+        assert!(matches!(select_advance(&conn,"lane",&[],now_f64()), Advance::Nudge { card, .. } if card == "REVIEW"));
+    }
+
+    #[test]
+    fn advance_scans_past_asked_captures_and_confirmed_reminders() {
+        let conn = board_db();
+        add_card(&conn, "RAW", "lane", "doing", "1", "**Prompt:** 1. Fix parser");
+        add_card(&conn, "REVIEW", "lane", "review", "Verify parser bounds", "SCOPE: parser regression");
+        conn.execute("UPDATE issues SET creator='amux',source='capture' WHERE id='RAW'", []).unwrap();
+        conn.execute("INSERT INTO session_events(ts,session,type,data,idem) VALUES(1,'lane','advance.nudged','{}','decompose:RAW')", []).unwrap();
+        let next = select_advance(&conn, "lane", &[], now_f64());
+        assert!(matches!(&next, Advance::Nudge { card, .. } if card == "REVIEW"));
+        let Advance::Nudge { target, card, text, .. } = next else { unreachable!() };
+        let row = bs::get_issue(&conn, &card).unwrap().unwrap();
+        let identity = reminder_identity(&target, &text, &row, 0.0);
+        conn.execute("INSERT INTO steering_history(id,session,text,queued_at,delivered_at,outcome) VALUES(?1,'lane',?2,1,2,'sent')",
+            rusqlite::params![format!("{identity}:{}", row.rev), text]).unwrap();
+        add_card(&conn, "OTHER", "lane", "review", "Verify unrelated fix", "SCOPE: separate regression");
+        conn.execute("UPDATE issues SET updated=1 WHERE id='OTHER'", []).unwrap();
+        assert!(matches!(select_advance(&conn,"lane",&[],now_f64()), Advance::Nudge { card, .. } if card == "OTHER"));
+        // A failed/voided attempt is not confirmation and must not be skipped.
+        conn.execute("UPDATE steering_history SET outcome='void:card-stale'", []).unwrap();
+        assert!(matches!(select_advance(&conn,"lane",&[],now_f64()), Advance::Nudge { card, .. } if card == "REVIEW"));
     }
 
     #[tokio::test]
@@ -10776,6 +10875,140 @@ mod tests {
         assert_eq!(drainable_backlog_ids(&conn, "blk", now), vec!["BL-2".to_string()]);
     }
 
+    /// AF-514. mixpeek-studio's MS-1331/MS-1314/MS-1275 each auto-drained 3+
+    /// times a day: their real deferral horizon is weeks, but the only lever
+    /// with any teeth (`source_ref` + a `last_verified_at` inside
+    /// `SOURCE_REF_STALE_S`, 24h) capped what they could honestly express at
+    /// a day, so they had to re-affirm daily and each affirmation cost a
+    /// drain-and-re-park cycle. Measured on the live board before this: gating
+    /// on `source_ref` (93% of backlog) or a future `due` (65%) would each
+    /// silence most of the drain fleet-wide — a signal everything carries
+    /// cannot mark anything. `defer:focused` is rare by construction instead:
+    /// nothing sets it by default, so its own test does not need a "does this
+    /// silence the drain" control the way `blocked_on`'s does — a tag is
+    /// opt-in the same way `--on` naming a cause is.
+    #[test]
+    fn a_card_tagged_defer_focused_is_not_drainable_regardless_of_source_ref_or_due() {
+        let conn = board_db();
+        let now = now_f64();
+        add_card(&conn, "MS-1", "studio", "backlog", "large focused turn", "SCOPE: x");
+        tag(&conn, "MS-1", "defer:focused", now);
+        assert!(
+            drainable_backlog_ids(&conn, "studio", now).is_empty(),
+            "a defer:focused card must never be offered to the drain"
+        );
+
+        // THE POINT OF THIS CARD, pinned directly: neither existing lever
+        // changes the verdict, because neither is what is excluding it.
+        conn.execute(
+            "UPDATE issues SET source_ref='not needed for weeks', last_verified_at=?1, \
+             due=date('now') WHERE id='MS-1'",
+            rusqlite::params![now as i64],
+        )
+        .unwrap();
+        assert!(
+            drainable_backlog_ids(&conn, "studio", now).is_empty(),
+            "a fresh source_ref or an arrived due date must not override the tag"
+        );
+
+        // THE CONTROL: removing the tag (the only interface -- PATCH tags,
+        // no new column) makes it drainable again, same as any ordinary card.
+        // Also clears the fresh source_ref set above -- otherwise THAT lever
+        // alone would still exclude it, and this cell would prove nothing
+        // about the tag specifically.
+        conn.execute("DELETE FROM issue_tags WHERE issue_id='MS-1'", []).unwrap();
+        conn.execute("UPDATE issues SET source_ref='', last_verified_at=NULL WHERE id='MS-1'", []).unwrap();
+        assert_eq!(
+            drainable_backlog_ids(&conn, "studio", now),
+            vec!["MS-1".to_string()],
+            "clearing the tag must restore ordinary drain eligibility"
+        );
+
+        // AND A DIFFERENT TAG must not accidentally match -- this excludes an
+        // exact tag, not a prefix the way needs:you% does, so a lane naming
+        // something merely SIMILAR does not silently get the same exclusion.
+        add_card(&conn, "MS-2", "studio", "backlog", "unrelated work", "SCOPE: x");
+        tag(&conn, "MS-2", "defer:focused-ish", now);
+        assert_eq!(
+            drainable_backlog_ids(&conn, "studio", now),
+            vec!["MS-1".to_string(), "MS-2".to_string()],
+            "a tag that merely starts with defer:focused must not match the exact exclusion"
+        );
+    }
+
+    /// AMUX-4782: a claim event with no `.issue` must not stop the fleet.
+    ///
+    /// The dispatch predicate used to be a CORRELATED leading-wildcard LIKE over
+    /// `session_events.data`, re-walked for every candidate row, per lane. On
+    /// the live board that cost 3073ms for 117 candidates; the non-correlated
+    /// `id NOT IN (SELECT json_extract(...))` form returned the identical rows
+    /// in 227ms, of which 218ms was transport.
+    ///
+    /// The rewrite carries one hazard the LIKE did not have, and it is the
+    /// reason this test exists rather than a benchmark. `x NOT IN (set)` is
+    /// NULL, not TRUE, when the set contains a NULL. So a SINGLE malformed
+    /// claim event whose data has no `.issue` would make the predicate reject
+    /// EVERY card on EVERY lane, and board-drive would go quietly idle with a
+    /// full queue. `json_extract(...) IS NOT NULL` inside the subquery is what
+    /// makes that impossible, and deleting it must fail here.
+    #[test]
+    fn a_claim_event_without_an_issue_id_cannot_empty_the_dispatch_queue() {
+        let conn = board_db();
+        let now = now_f64();
+        add_card(&conn, "GOOD-1", "lane", "todo", "dispatchable", "SCOPE: x");
+        add_card(&conn, "GOOD-2", "lane", "todo", "dispatchable", "SCOPE: x");
+
+        // Baseline: both cards are dispatchable with no claim events at all.
+        assert_eq!(
+            eligible_todo_count(&conn, "lane", now),
+            2,
+            "premise: both cards dispatchable before any event exists"
+        );
+
+        // A REAL claim removes exactly its own card, which pins that the
+        // rewrite still does the job the LIKE was there to do.
+        conn.execute(
+            "INSERT INTO session_events (ts,session,type,data,source) \
+             VALUES (?1,'lane','task.claimed','{\"issue\":\"GOOD-1\"}','test')",
+            [now],
+        )
+        .unwrap();
+        assert_eq!(
+            eligible_todo_count(&conn, "lane", now),
+            1,
+            "a genuine claim must still exclude its own card"
+        );
+
+        // THE TRAP: an event of a matching type whose payload has no `issue`.
+        // Under `NOT IN` with an unguarded subquery this yields NULL for every
+        // row and the count collapses to 0.
+        conn.execute(
+            "INSERT INTO session_events (ts,session,type,data,source) \
+             VALUES (?1,'lane','task.claimed','{\"note\":\"no issue field\"}','test')",
+            [now],
+        )
+        .unwrap();
+        assert_eq!(
+            eligible_todo_count(&conn, "lane", now),
+            1,
+            "a malformed claim event must not reject every card; if this reads 0 the \
+             `json_extract(...) IS NOT NULL` guard is gone and the fleet stops dispatching"
+        );
+
+        // Non-JSON data is the same hazard by a different route.
+        conn.execute(
+            "INSERT INTO session_events (ts,session,type,data,source) \
+             VALUES (?1,'lane','task.claimed','not json at all','test')",
+            [now],
+        )
+        .unwrap();
+        assert_eq!(
+            eligible_todo_count(&conn, "lane", now),
+            1,
+            "unparseable event data must not reject every card either"
+        );
+    }
+
     #[test]
     fn nudge_population_uses_dispatch_rules_and_discloses_display_truncation() {
         let conn = board_db();
@@ -10807,8 +11040,28 @@ mod tests {
         assert!(should_drain_nudge(0, 0, population.len() as i64, 0));
     }
 
+    // Callsite interest is process-wide, even with a thread-local subscriber.
+    // Run log contracts alone so concurrent subscriber registration cannot hide
+    // the diagnostic under test. Keep the production calls and every assertion.
+    fn diagnostic_test_ran_in_child(test: &str) -> bool {
+        if std::env::var("AMUX_BOARD_LOG_TEST_CHILD").as_deref() == Ok(test) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env("AMUX_BOARD_LOG_TEST_CHILD", test)
+            .output().expect("run isolated board diagnostic contract");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{stdout}{}", String::from_utf8_lossy(&output.stderr));
+        assert!(stdout.contains("1 passed"), "diagnostic child did not run: {stdout}");
+        true
+    }
+
     #[test]
     fn nudge_population_logs_exclusions_and_refuses_unreadable_input() {
+        if diagnostic_test_ran_in_child("runtime_jobs::board_drive::tests::nudge_population_logs_exclusions_and_refuses_unreadable_input") {
+            return;
+        }
         #[derive(Clone)]
         struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Sink {
@@ -11955,6 +12208,9 @@ mod tests {
 
     #[test]
     fn wip_exemptions_and_failed_measurements_write_distinct_log_signals() {
+        if diagnostic_test_ran_in_child("runtime_jobs::board_drive::tests::wip_exemptions_and_failed_measurements_write_distinct_log_signals") {
+            return;
+        }
         #[derive(Clone)]
         struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Sink {
@@ -12824,14 +13080,12 @@ mod tests {
         conn.execute("UPDATE issues SET reviewer='peer' WHERE id='B-1'", []).expect("rev");
         add_card(&conn, "D-1", "lane", "doing", "dependent", "SCOPE: x");
         conn.execute("UPDATE issues SET depends_on='[\"B-1\"]' WHERE id='D-1'", []).expect("dep");
-        // `doing` sorts ahead of `review`, so D-1 is the selected candidate.
-        match select_advance(&conn, "lane", &[], now_f64()) {
-            Advance::None { reason, detail } => {
-                assert_eq!(reason, "dep-not-actionable");
-                assert!(detail.contains("B-1"), "{detail}");
-            }
-            Advance::Nudge { text, .. } => panic!("must not nudge an unactionable dependency: {text}"),
-        }
+        // The dependent cannot be advanced; the independently actionable
+        // review is still considered instead of the first refusal ending the lane.
+        assert!(matches!(advance_card(&conn, "lane", &[], now_f64(), &|_,_|None,
+            "D-1".into(), "doing".into()), Advance::None { reason: "dep-not-actionable", .. }));
+        assert!(matches!(select_advance(&conn, "lane", &[], now_f64()),
+            Advance::Nudge { card, .. } if card == "B-1"));
     }
 
     /// GCA-91: the dependency nudge told an agent to "drive its blocker through

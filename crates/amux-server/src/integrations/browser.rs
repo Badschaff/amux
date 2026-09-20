@@ -2104,6 +2104,17 @@ pub struct CdpClient {
     next_id: u64,
 }
 
+/// What to do with a CDP frame that will not parse (AMUX-4824).
+#[derive(Debug, PartialEq, Eq)]
+enum FrameVerdict {
+    /// The frame carries OUR id, so the response we are waiting for is the
+    /// damaged one. Fail now rather than waiting out the deadline.
+    Ours,
+    /// Another command's response, or an event, or unattributable. Not this
+    /// call's problem; keep reading until the deadline.
+    Skip,
+}
+
 impl CdpClient {
     /// HARD INVARIANT (owner directive, AMUX-2598): browser automation
     /// executes on the SERVER machine, never in a dashboard-viewing client's
@@ -2132,6 +2143,47 @@ impl CdpClient {
         Ok(Self { ws, next_id: 0 })
     }
 
+/// Recover a CDP frame's `id` from text that does NOT parse as JSON (AMUX-4824).
+///
+/// A truncated frame still carries its head, and CDP puts `"id":<n>` in the
+/// object's first field, so the id survives exactly the damage that makes the
+/// frame unparseable. That is the whole point: it answers "was this mine?" when
+/// the parser cannot.
+///
+/// DELIBERATELY NOT A JSON PARSER. It scans for the first `"id":` and reads the
+/// digits after it. An EVENT has no `id` at all (it has `method`), so `None`
+/// means "not a response", which is already a reason to skip. A wrong answer
+/// here is bounded: attributing a frame to us that is not ours fails one call
+/// that would otherwise time out; failing to attribute ours turns a fast error
+/// into a deadline. Neither invents a result.
+fn cdp_frame_id_hint(text: &str) -> Option<u64> {
+    // Only look at the head. A frame whose `id` is megabytes in is not a CDP
+    // response, and scanning the whole of a large malformed payload for every
+    // skipped frame is work with no answer at the end of it.
+    let head = &text[..text.len().min(512)];
+    let at = head.find("\"id\":")? + 5;
+    let rest = head[at..].trim_start();
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// The shipped decision, as a function so a test can drive it (AMUX-4824).
+///
+/// Inline, this was a `match` arm inside the socket loop, and nothing but a
+/// live CDP connection could reach it. That is the same shape that let a
+/// deadline test pass against a rebuilt expression earlier today: a decision
+/// only exercised through machinery nobody can stand up in a test is a decision
+/// no mutation can reach.
+fn unparseable_frame_verdict(hint: Option<u64>, waiting_for: u64) -> FrameVerdict {
+    match hint {
+        Some(found) if found == waiting_for => FrameVerdict::Ours,
+        // `None` is an EVENT (no id at all) or a frame damaged past
+        // attribution. Both are skipped: claiming them would fail a call over
+        // a message it never asked for, which is the defect this fixes.
+        _ => FrameVerdict::Skip,
+    }
+}
+
     /// One CDP command. Chrome interleaves EVENT messages on the same
     /// socket; anything without our id is skipped, and the deadline caps the
     /// whole exchange so a wedged page degrades to an error, not a hung
@@ -2149,15 +2201,68 @@ impl CdpClient {
         let fut = async {
             use tokio_tungstenite::tungstenite::Message;
             self.ws.send(Message::Text(payload)).await?;
+            let mut skipped_unparseable = 0u32;
             loop {
                 let Some(frame) = self.ws.next().await else {
-                    anyhow::bail!("CDP websocket closed during {method}");
+                    anyhow::bail!(
+                        "CDP websocket closed during {method} ({skipped_unparseable} unparseable \
+                         frame(s) skipped)"
+                    );
                 };
                 match frame? {
                     Message::Text(t) => {
-                        let v: Value = serde_json::from_str(&t).map_err(|e| {
-                            anyhow::anyhow!("CDP sent non-JSON during {method}: {e}")
-                        })?;
+                        // AN UNPARSEABLE FRAME IS ONLY FATAL IF IT IS OURS
+                        // (AMUX-4824). Chrome interleaves EVENTS on this
+                        // socket, and this used to parse every text frame
+                        // before looking at the id, so a malformed event
+                        // killed an unrelated command. The comment four lines
+                        // below already says an id mismatch is "not ours, keep
+                        // reading"; a frame that will not parse never reached
+                        // that check.
+                        //
+                        // Observed: GET /api/browser/state answered 502 four
+                        // times in 16s with "unexpected end of hex escape at
+                        // line 1 column 2917" — serde's message for input that
+                        // ENDS inside a \uXXXX, i.e. a truncated frame (a lone
+                        // surrogate reports differently). Nothing distinguished
+                        // "Chrome truncated OUR result" from "Chrome truncated
+                        // some event we did not ask for".
+                        let v: Value = match serde_json::from_str(&t) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                // Recover the id WITHOUT a full parse, so a
+                                // malformed frame can still be attributed.
+                                match Self::unparseable_frame_verdict(
+                                    Self::cdp_frame_id_hint(&t),
+                                    id,
+                                ) {
+                                    FrameVerdict::Ours => {
+                                        return Err(anyhow::anyhow!(
+                                            "CDP sent non-JSON during {method}: {e}                                              (frame {} bytes, id {id} matched ours)",
+                                            t.len()
+                                        ));
+                                    }
+                                    FrameVerdict::Skip => {
+                                        // Not ours, or unattributable. Skipping
+                                        // is what an id mismatch already does.
+                                        // The deadline still bounds the loop, so
+                                        // a truly lost response degrades to a
+                                        // timeout rather than hanging.
+                                        let hint = Self::cdp_frame_id_hint(&t);
+                                        skipped_unparseable += 1;
+                                        tracing::warn!(
+                                            target: "amux::browser",
+                                            verdict = "cdp_frame_unparseable",
+                                            %method, error = %e, bytes = t.len(),
+                                            id_hint = ?hint, waiting_for = id,
+                                            measured = true, n_considered = 1,
+                                            "skipped a CDP frame that is not valid JSON and is not                                              the response this call is waiting for"
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                        };
                         if v.get("id").and_then(Value::as_u64) == Some(id) {
                             if let Some(err) = v.get("error") {
                                 anyhow::bail!(
@@ -2169,7 +2274,10 @@ impl CdpClient {
                         }
                         // No id match: a protocol event — not ours, keep reading.
                     }
-                    Message::Close(_) => anyhow::bail!("CDP websocket closed during {method}"),
+                    Message::Close(_) => anyhow::bail!(
+                        "CDP websocket closed during {method} ({skipped_unparseable} unparseable \
+                         frame(s) skipped)"
+                    ),
                     _ => {} // Ping/Pong/Binary: tungstenite answers pings itself.
                 }
             }
@@ -5433,6 +5541,91 @@ mod last_exit_persistence_tests {
         assert!(
             mem.expect("checked")["from_disk"].is_null(),
             "the in-memory copy must NOT claim it came from disk"
+        );
+    }
+}
+
+/// AMUX-4824: a CDP frame that will not parse must still say whose it was.
+#[cfg(test)]
+mod cdp_frame_attribution_tests {
+    use super::*;
+
+    /// The shape from the incident: GET /api/browser/state answered 502 four
+    /// times in 16 seconds with "unexpected end of hex escape at line 1 column
+    /// 2917" — serde's message for input that ENDS inside a \uXXXX, so the
+    /// frame was truncated. The id is in the head, which survives that damage.
+    #[test]
+    fn a_truncated_response_still_yields_its_id() {
+        let truncated = format!("{}{}", r#"{"id":7,"result":{"value":""#, "x".repeat(200)) + r"\u00";
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&truncated).is_err(),
+            "the fixture must actually be unparseable, or this test proves nothing"
+        );
+        assert_eq!(CdpClient::cdp_frame_id_hint(&truncated), Some(7));
+    }
+
+    /// An EVENT carries no `id`, so an unparseable event is unattributable and
+    /// must not be mistaken for a response. This is the case that used to kill
+    /// an unrelated command.
+    #[test]
+    fn an_event_has_no_id_so_it_can_never_be_claimed_as_a_response() {
+        let ev = r#"{"method":"Runtime.consoleAPICalled","params":{"args":[{"value":"\u00"#;
+        assert!(serde_json::from_str::<serde_json::Value>(ev).is_err());
+        assert_eq!(
+            CdpClient::cdp_frame_id_hint(ev),
+            None,
+            "no id means not a response; skipping it is what an id mismatch already does"
+        );
+    }
+
+    /// A DIFFERENT command's malformed response is also not ours. Two calls can
+    /// be in flight on one socket, and only the matching id may fail this call.
+    #[test]
+    fn another_commands_malformed_response_is_not_ours() {
+        let other = r#"{"id":12,"result":{"value":"\u00"#;
+        assert_eq!(CdpClient::cdp_frame_id_hint(other), Some(12));
+        assert_ne!(CdpClient::cdp_frame_id_hint(other), Some(7), "id 12 is not id 7");
+    }
+
+    /// Whitespace and key order are the parser's problem, not ours, but the id
+    /// must still be found when CDP pretty-prints or puts `id` later.
+    #[test]
+    fn the_id_is_found_despite_spacing_and_ordering() {
+        assert_eq!(CdpClient::cdp_frame_id_hint(r#"{"id": 42,"result":{"#), Some(42));
+        assert_eq!(CdpClient::cdp_frame_id_hint(r#"{"result":null,"id":99,"#), Some(99));
+        assert_eq!(CdpClient::cdp_frame_id_hint("{}"), None);
+        assert_eq!(CdpClient::cdp_frame_id_hint(""), None);
+    }
+
+    /// THE SHIPPED DECISION, driven directly. `call`'s socket loop calls this
+    /// exact function, so mutating the fatal-vs-skip rule reddens here. Inline
+    /// it was a match arm only a live CDP connection could reach, which is a
+    /// decision no mutation can get at.
+    #[test]
+    fn only_our_own_id_makes_an_unparseable_frame_fatal() {
+        assert_eq!(CdpClient::unparseable_frame_verdict(Some(7), 7), FrameVerdict::Ours);
+        assert_eq!(
+            CdpClient::unparseable_frame_verdict(Some(12), 7),
+            FrameVerdict::Skip,
+            "another command's damaged response must not fail this call"
+        );
+        assert_eq!(
+            CdpClient::unparseable_frame_verdict(None, 7),
+            FrameVerdict::Skip,
+            "an event carries no id; failing on it is the defect AMUX-4824 fixes"
+        );
+    }
+
+    /// Only the head is scanned, so a huge malformed payload costs a bounded
+    /// read. A frame whose id sits past the window is treated as unattributable
+    /// rather than scanned for — skipping is the safe direction.
+    #[test]
+    fn only_the_head_is_scanned() {
+        let far = format!("{{{}\"id\":5,", " ".repeat(600));
+        assert_eq!(
+            CdpClient::cdp_frame_id_hint(&far),
+            None,
+            "an id past the head window is not searched for; the frame is skipped, not claimed"
         );
     }
 }

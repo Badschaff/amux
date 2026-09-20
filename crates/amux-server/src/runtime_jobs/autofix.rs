@@ -411,7 +411,395 @@ const LONG_BY_DESIGN: &[(&str, f64)] = &[
     // family and this entry is the only thing watching the route. If archive's
     // ladder is ever retuned, retune this number with it.
     ("/api/sessions/{name}/archive", 30_000.0),
+    // GET /api/sessions (AMUX-4817, AMUX-4778). The duration IS the fleet
+    // projection: a cold build was measured end-to-end at 4875ms, a warm one
+    // at ~2500ms, and the distribution over 48h (n=6827) is 27.7% cache hits
+    // under 100ms with ~72% paying a real build in a 1-10s band. A 10s floor
+    // therefore fires on this route's NORMAL work, which is the
+    // threshold-below-baseline defect this table exists for.
+    //
+    // 30s is the route's OWN bound, not a padded guess: a reader that waits
+    // out `AMUX_SESSIONS_BUILD_WAIT_S` (30s, sessions_legacy.rs) while the
+    // single builder is busy is REFUSED with `BuilderBusy` -> 503. So past 30s
+    // the endpoint's own wait failed to bound the call, which is the one
+    // latency story on this route that IS wrong, and it stays detectable.
+    //
+    // Measured against 48h of real traffic before adding it: 325 requests
+    // crossed the 10s floor and would file today; 21 cross 30s and still will.
+    // So this silences 304 filings about the design and keeps every one that
+    // means the refusal did not work. Worst in that window was 127749ms, which
+    // a 30s budget still reports.
+    ("/api/sessions", 30_000.0),
+    // POST /api/workers/{id}/resume (AMUX-4852). A resume is not one operation:
+    // `change_pause` -> `fleet::start_session` (api/session_verbs.rs) walks a
+    // tmux session back to a shell prompt and then waits for the agent UI to
+    // paint. The budget is that path's OWN deliberate waiting, added up off the
+    // `tmux_exists` reuse arm that a resume actually takes:
+    //
+    //   2 x   100ms  C-c / C-u settle before retyping the prompt
+    //   2 x  3000ms  poll_shell_prompt after HISTFILE and after `cd`
+    //       3000ms  poll_shell_prompt after the `tmux show-environment` import
+    //       3000ms  poll_shell_prompt after `unset ANTHROPIC_API_KEY`
+    //        150ms  settle between send_literal and Enter
+    //  20 x   500ms  the launch watch loop waiting for the agent UI to paint
+    //   = 22_350ms
+    //
+    // Measured over 7 days BEFORE choosing the number, and the two agree
+    // independently: n=49, worst 19_980ms, which sits UNDER the derived bound
+    // rather than setting it.
+    //
+    // The population is sharply BIMODAL, which is the part that matters for
+    // reading this route. 24 of 49 requests land in 0.9-22.8ms and 25 land in
+    // 847-19_980ms, with a 37.2x gap and nothing in between. The split is
+    // STRUCTURAL, read off the code rather than inferred from the numbers:
+    // api/workers.rs `change_pause` returns 200 {"applied":false} for a resume
+    // of an already-active worker BEFORE any tmux work ("A repeated Resume is a
+    // no-op"), which is the fast mode together with the 404s. Only the slow mode
+    // reaches the ladder above. So the route has no single "normal" for a flat
+    // 10s threshold to sit beside.
+    //
+    // A SECOND, INDEPENDENT FIELD agrees with that boundary: where resp_bytes
+    // is recorded the modes do not overlap at all, 44-76 bytes for the no-op
+    // body against 91-105 for the real wake. Something other than latency, and
+    // other than load, separates the population in the same place.
+    //
+    // NOT load, though a load-band split is the obvious first read and it
+    // MISLEADS here. Banding suggests a 450x load sensitivity, which is an
+    // artefact of mode mix per band: the modes OVERLAP in load (fast runs occur
+    // up to load1 39.4, slow runs down to 8.8), so load does not separate them.
+    // Inside the slow mode load does modulate the wake, Pearson r=+0.44 (n=25),
+    // so this is not a claim that load is irrelevant. It is a claim that load
+    // does not produce the gap, and the endpoint should not be blamed for it.
+    //
+    // Still reportable: every `tmux_capture` on this path carries its own 10s
+    // timeout, and the watch loop runs 20 of them. A tmux server wedged enough
+    // to pin even one capture at its limit clears this budget and still files,
+    // which is the one latency story on this route that IS wrong.
+    ("/api/workers/{id}/resume", 22_350.0),
 ];
+
+/// WARN/ERROR lines the server logged INSIDE one request's own window.
+///
+/// AMUX-4839, from AMUX-4780. That card reported a 59621ms `/api/email/inbox`
+/// request and already published `host_load_at_worst` and
+/// `arrived_into_process_life`, so it carried "is the box busy" and "is this a
+/// restart". It did NOT carry the one fact that explained the breach: a single
+/// WARN sitting 31 seconds inside the request's own window, saying the gmail
+/// batch endpoint had failed and it was falling back to 100 single fetches.
+/// Finding that by hand took a log-coverage check, a timestamp-semantics read
+/// and a correlation script.
+///
+/// THE WINDOW IS EXACT, not inferred. `_amux_request_log.ts` is stamped BEFORE
+/// the handler runs (`api/request_log.rs`, `let ts = unix_now();` above
+/// `let started = Instant::now();`) and `latency_ms` comes from
+/// `started.elapsed()` after it, so `[ts, ts + latency_ms]` is the interval the
+/// request actually occupied. Getting this backwards is easy and quiet: the
+/// AMUX-4780 warn is stamped 31s AFTER the row's `ts` and reads like it
+/// happened after the request unless you know which end is stamped.
+#[derive(Debug, Clone, PartialEq)]
+struct WindowScan {
+    /// Matching lines, capped and truncated.
+    hits: Vec<String>,
+    /// Whether a log generation actually spans the window. FALSE means the
+    /// probe could not look, which is a different answer from "nothing fired".
+    covered: bool,
+    /// How many matches were dropped by the cap.
+    dropped: u64,
+    /// AMUX-4857. How often each pattern fires across the WHOLE generation,
+    /// not just inside the window — the denominator that turns a line from a
+    /// fact into evidence.
+    ///
+    /// Accumulated in the SAME pass that finds the hits. The card proposed a
+    /// second pass; the scan already touches every line, so a second read of
+    /// the same bytes would cost twice for nothing.
+    base_counts: std::collections::BTreeMap<String, u64>,
+    /// First and last timestamp seen anywhere in the generation, which is the
+    /// period the counts above are OVER. Published rather than assumed: a
+    /// pattern looks rare when the log is young, and "occurrences in the
+    /// generation" and "occurrences in 24h" are different populations.
+    span: Option<(f64, f64)>,
+}
+
+/// Collapse a log line to a pattern key for base-rate counting (AMUX-4857).
+///
+/// Drops the leading timestamp and then every digit run, so
+/// `subagent lifecycle event did not change the live set (n=3)` and the same
+/// line with `n=17` count as one pattern. Truncated, because the tail of a
+/// long line is usually the variable part and two lines agreeing for 80
+/// characters are the same warn for this purpose.
+///
+/// Deliberately crude. A normaliser that is too clever merges two DIFFERENT
+/// warns and reports a base rate that belongs to neither, which is worse than
+/// the missing denominator this exists to supply.
+fn log_pattern_key(line: &str) -> String {
+    let body = line.split_once(" INFO ")
+        .or_else(|| line.split_once(" WARN "))
+        .or_else(|| line.split_once(" ERROR "))
+        .map(|(_, rest)| rest)
+        .unwrap_or(line);
+    let mut out = String::with_capacity(80);
+    let mut last_was_digit = false;
+    for ch in body.chars() {
+        if out.len() >= 80 {
+            break;
+        }
+        if ch.is_ascii_digit() {
+            if !last_was_digit {
+                out.push('#');
+            }
+            last_was_digit = true;
+        } else {
+            out.push(ch);
+            last_was_digit = false;
+        }
+    }
+    out.trim().to_string()
+}
+
+/// At most this many lines reach a card, and at most this many bytes each.
+/// A breach that logged 400 warns is a different story, and `dropped` carries
+/// it without pasting the log into the board.
+const WINDOW_SCAN_CAP: usize = 8;
+const WINDOW_SCAN_LINE_BYTES: usize = 240;
+
+/// Parse the leading `2026-09-19T09:04:54.415883Z` of a log line to unix
+/// seconds. `None` for any line that does not start with one, which is most
+/// continuation lines in a multi-line warn.
+fn log_line_ts(line: &[u8]) -> Option<f64> {
+    // 20 bytes is the shortest RFC3339 this writer emits; bail before the
+    // allocation on anything shorter.
+    if line.len() < 20 || line[4] != b'-' || line[10] != b'T' {
+        return None;
+    }
+    let end = line.iter().position(|b| *b == b' ')?;
+    let s = std::str::from_utf8(&line[..end]).ok()?;
+    chrono::DateTime::parse_from_rfc3339(s).ok().map(|t| t.timestamp() as f64 + f64::from(t.timestamp_subsec_millis()) / 1000.0)
+}
+
+/// Is this a line a reader would act on? WARN and ERROR only: INFO during a
+/// slow request is the normal chatter of the request itself.
+fn is_actionable_log_line(line: &[u8]) -> bool {
+    let s = String::from_utf8_lossy(line);
+    s.contains(" WARN ") || s.contains(" ERROR ")
+}
+
+/// The scan itself, over an already-opened sequence of lines.
+///
+/// Split from the file reading so the window arithmetic and the COVERAGE rule
+/// are testable without a log on disk.
+///
+/// COVERAGE IS DECIDED WITHOUT A SECOND PASS. A generation spans the window if
+/// this scan saw a timestamp at or before `start` AND one at or after `end`.
+/// The second half is what an early exit would otherwise destroy, and it is
+/// also the honest answer when a request is still running: the log simply has
+/// not reached `end` yet, so the window is not covered and the card must not
+/// claim it looked.
+fn scan_lines_for_window<I, B>(lines: I, start: f64, end: f64) -> WindowScan
+where
+    I: IntoIterator<Item = B>,
+    B: AsRef<[u8]>,
+{
+    let mut hits = Vec::new();
+    let mut dropped = 0u64;
+    let mut saw_at_or_before_start = false;
+    let mut saw_at_or_after_end = false;
+    let mut base_counts: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut span: Option<(f64, f64)> = None;
+    for line in lines {
+        let line = line.as_ref();
+        let Some(ts) = log_line_ts(line) else { continue };
+        // AMUX-4857: the denominator, gathered in this same pass. The span is
+        // taken over EVERY timestamped line, not just actionable ones, because
+        // it measures how long the generation covers — which is the period the
+        // counts below are over.
+        span = Some(match span {
+            None => (ts, ts),
+            Some((lo, hi)) => (lo.min(ts), hi.max(ts)),
+        });
+        if is_actionable_log_line(line) {
+            let key = log_pattern_key(&String::from_utf8_lossy(line));
+            if !key.is_empty() {
+                *base_counts.entry(key).or_insert(0) += 1;
+            }
+        }
+        if ts <= start {
+            saw_at_or_before_start = true;
+        }
+        if ts >= end {
+            saw_at_or_after_end = true;
+        }
+        if ts >= start && ts <= end && is_actionable_log_line(line) {
+            if hits.len() < WINDOW_SCAN_CAP {
+                let s = String::from_utf8_lossy(line);
+                let cut = s.char_indices().nth(WINDOW_SCAN_LINE_BYTES).map(|(i, _)| i).unwrap_or(s.len());
+                hits.push(s[..cut].trim_end().to_string());
+            } else {
+                dropped += 1;
+            }
+        }
+    }
+    WindowScan {
+        hits,
+        covered: saw_at_or_before_start && saw_at_or_after_end,
+        dropped,
+        base_counts,
+        span,
+    }
+}
+
+/// How a single window line compares to its own background rate (AMUX-4857).
+///
+/// `None` when the generation is too short to give a rate at all, which is a
+/// real state and not a quiet zero: a young log makes every pattern look rare.
+fn base_rate_verdict(scan: &WindowScan, line: &str, window_s: f64) -> Option<String> {
+    let (lo, hi) = scan.span?;
+    let span_s = hi - lo;
+    if span_s <= 0.0 || window_s <= 0.0 {
+        return None;
+    }
+    let key = log_pattern_key(line);
+    let total = *scan.base_counts.get(&key)?;
+    let per_min = total as f64 * 60.0 / span_s;
+    let observed = scan.hits.iter().filter(|h| log_pattern_key(h) == key).count() as f64;
+    let expected = total as f64 * window_s / span_s;
+    // The comparison is the point, and the verdict is BINARY on purpose.
+    //
+    // A three-way split with a "slightly above" middle was the first version
+    // and its own test rejected it: a line sitting exactly at background
+    // reported "slightly above" because the generation span is never exactly
+    // the round number the fixture implies (3630s, not 3600s), so
+    // observed=1 > expected=0.9917. That middle category is the defect this
+    // field exists to remove — it makes noise read as a mild finding, which is
+    // how eight background warns looked like eight leads on AMUX-4852.
+    //
+    // So: either a line clears its own background by a margin, or it is noise
+    // and says so. `LEAD_FACTOR` is the margin, and it is deliberately loose
+    // because a bursty log at its own rate must not trip it.
+    const LEAD_FACTOR: f64 = 1.5;
+    let verdict = if expected > 0.0 && observed > expected * LEAD_FACTOR {
+        format!(
+            "{:.1}x ABOVE background — this is the lead",
+            observed / expected.max(0.0001)
+        )
+    } else {
+        "at or below background — noise, not a finding".to_string()
+    };
+    Some(format!(
+        "[{observed:.0} here vs {expected:.1} expected; {per_min:.1}/min over {:.1}h of log; {verdict}]",
+        span_s / 3600.0
+    ))
+}
+
+/// Read the server log generations and scan them for `[start, end]`.
+///
+/// READS BYTES, NOT `grep`. The shell recipe for this needs `-a`, because one
+/// NUL byte anywhere makes grep treat the file as binary and SUPPRESS match
+/// output while `-c` keeps counting (CLAUDE.md, AF-481). Reading the file
+/// ourselves and converting lossily sidesteps that class entirely; the note is
+/// here so nobody "simplifies" this into a `grep` call later.
+///
+/// Both generations are read because rotation is copy-truncate with one kept
+/// generation (`runtime_jobs::storage`), and the AMUX-4780 breach lived only in
+/// `server-rs.log.1`.
+fn warns_during_request(start: f64, end: f64) -> WindowScan {
+    use std::io::BufRead;
+    let dir = crate::config::amux_home().join("logs");
+    let mut out = WindowScan {
+        hits: Vec::new(),
+        covered: false,
+        dropped: 0,
+        base_counts: Default::default(),
+        span: None,
+    };
+    for name in ["server-rs.log.1", "server-rs.log"] {
+        let Ok(f) = std::fs::File::open(dir.join(name)) else { continue };
+        let lines = std::io::BufReader::new(f).split(b'\n').filter_map(Result::ok);
+        let scan = scan_lines_for_window(lines, start, end);
+        out.covered |= scan.covered;
+        out.dropped += scan.dropped;
+        // AMUX-4857. BOTH generations are the corpus, so counts sum and the
+        // span is their union. Using one file's span against both files' counts
+        // would inflate every rate by roughly the rotation factor, which is the
+        // denominator error this field exists to prevent.
+        for (k, n) in scan.base_counts {
+            *out.base_counts.entry(k).or_insert(0) += n;
+        }
+        out.span = match (out.span, scan.span) {
+            (None, s) | (s, None) => s,
+            (Some((a_lo, a_hi)), Some((b_lo, b_hi))) => Some((a_lo.min(b_lo), a_hi.max(b_hi))),
+        };
+        for h in scan.hits {
+            if out.hits.len() < WINDOW_SCAN_CAP {
+                out.hits.push(h);
+            } else {
+                out.dropped += 1;
+            }
+        }
+    }
+    out
+}
+
+/// The card field. Says what it measured in every branch, including the two
+/// that have nothing to show (ethos rule 4: an output that can read empty must
+/// publish whether the measurement ran, in the same payload).
+fn logged_during_worst_request(scan: &WindowScan, start: f64, end: f64) -> String {
+    let window = format!(
+        "{} .. {} ({:.1}s)",
+        rl::local_when(start),
+        rl::local_when(end),
+        (end - start).max(0.0)
+    );
+    if !scan.covered {
+        return format!(
+            "NOT MEASURED for {window}: no retained log generation spans this window, so \
+             nothing can be said about what the server logged during it. The log rotates \
+             copy-truncate with one generation kept, so a breach older than the current \
+             pair is simply gone. This is an absence of coverage, not an absence of warnings."
+        );
+    }
+    if scan.hits.is_empty() {
+        return format!(
+            "none. The log covers {window} and carried no WARN or ERROR inside it, so \
+             whatever made this request slow did not announce itself in the log."
+        );
+    }
+    let more = if scan.dropped > 0 {
+        format!(" (+{} more, capped)", scan.dropped)
+    } else {
+        String::new()
+    };
+    // AMUX-4857. THE HEDGE WAS NOT ENOUGH. "This is correlation, not cause" is
+    // true and does not help: a reader still cannot tell a warn that fires 40
+    // times a minute anyway from one that fired only here. The first is
+    // background, the second is a lead, and without a denominator they print
+    // identically. Measured on AMUX-4852: 8 lines in a 14.4s window looked like
+    // eight findings, while the background rate predicted 9.3 — the window was
+    // QUIETER than usual and the lines said nothing about that request.
+    //
+    // So each line now carries its own base rate, and the corpus is named:
+    // an absent line is not evidence of silence, because the scan is
+    // WARN/ERROR only (AMUX-4848) and an INFO line explaining the latency
+    // would never appear here.
+    let window_s = (end - start).max(0.0);
+    let lines = scan
+        .hits
+        .iter()
+        .map(|h| match base_rate_verdict(scan, h, window_s) {
+            Some(rate) => format!("  {h}\n      {rate}"),
+            None => format!("  {h}\n      [no base rate: the log generation is too short to give one]"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "{} line(s) logged DURING this request{more}, window {window}. This is \
+         correlation, not cause: these lines were emitted while the request was open, \
+         which is evidence a reader can act on and not a verdict. Each line carries how \
+         often that same pattern fires across the whole retained generation, so a common \
+         warn cannot read as a finding. CORPUS IS WARN/ERROR ONLY: a quiet base-rate \
+         verdict means those levels were quiet, not that nothing was logged.\n{lines}",
+        scan.hits.len(),
+    )
+}
 
 fn design_budget_ms(target: &str) -> f64 {
     LONG_BY_DESIGN
@@ -540,6 +928,54 @@ fn ci_min_failures() -> i64 {
 /// streak reported "AT LEAST 21, last success unknown" when the truth was 31
 /// with a known green run. 200 recovers both. When the success still falls out,
 /// the finding says so rather than reporting a floor as a count.
+/// How many low-frequency workflows may be backfilled in ONE tick (AMUX-4831).
+///
+/// Each costs one `gh run list`. AF-396: a burst of requests trips a
+/// per-ACCOUNT secondary limit that 403s every other lane on every endpoint,
+/// so this is capped rather than scaling with however many workflows are red.
+/// Workflows whose `last_success` cannot be answered from the repo-wide window
+/// (AMUX-4831): the newest decisive run on the default branch is a FAILURE and
+/// no success appears at all.
+///
+/// Pure and separate so the predicate is pinned by a test rather than only by
+/// the fetch that consults it, the same reason `ci_findings` is pure.
+///
+/// The `any_success` half is what keeps this cheap: a workflow that is merely
+/// red, with a green visible behind it, needs nothing. Only a workflow whose
+/// whole visible history is red is one whose window might be too short — and
+/// that is exactly the low-frequency case, since a busy workflow accumulates a
+/// green inside 200 repo-wide runs.
+fn workflows_needing_backfill(runs: &[CiRun]) -> Vec<(String, String)> {
+    let mut by_wf: BTreeMap<(String, String), Vec<&CiRun>> = BTreeMap::new();
+    for r in runs {
+        if !r.on_default_branch || r.status != "completed" || ci_is_inconclusive(&r.conclusion) {
+            continue;
+        }
+        by_wf
+            .entry((r.repo.clone(), r.workflow.clone()))
+            .or_default()
+            .push(r);
+    }
+    let mut out = Vec::new();
+    for ((repo, wf), group) in by_wf {
+        // ONE CONDITION, not two. This read `newest_is_red && !any_success`
+        // until a mutation showed the first half is dead: `by_wf` holds only
+        // non-empty groups, so if NO run succeeded then every run failed and
+        // the newest is a failure by definition. Dropping `newest_is_red`
+        // changed no behaviour and no test could tell, which is the signature
+        // of redundancy rather than of coverage — so the redundant half is
+        // gone instead of being given a contrived test.
+        if group.iter().all(|r| ci_is_failure(&r.conclusion)) {
+            out.push((repo, wf));
+        }
+    }
+    out
+}
+
+fn ci_backfill_max() -> usize {
+    env_i64("AMUX_CI_BACKFILL_MAX", 3).clamp(0, 10) as usize
+}
+
 fn ci_run_limit() -> i64 {
     env_i64("AMUX_CI_RUN_LIMIT", 200).clamp(10, 600)
 }
@@ -829,7 +1265,7 @@ pub fn detect_5xx(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>
     let mut suppressed = Vec::new();
     let q = conn.prepare(
         "SELECT ts, method, path, family, status, latency_ms, client_ip, amux_session, \
-                worker, error_body \
+                worker, error_body, boot_at \
          FROM _amux_request_log WHERE status >= 500 AND ts >= ?1 ORDER BY ts ASC LIMIT 200000",
     );
     let mut stmt = match q {
@@ -853,6 +1289,7 @@ pub fn detect_5xx(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>
             r.get::<_, Option<String>>(7)?.unwrap_or_default(),
             r.get::<_, Option<String>>(8)?.unwrap_or_default(),
             r.get::<_, Option<String>>(9)?.unwrap_or_default(),
+            r.get::<_, Option<f64>>(10)?,
         ))
     });
     let rows = match rows {
@@ -865,7 +1302,7 @@ pub fn detect_5xx(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>
         }
     };
     for row in rows.flatten() {
-        let (ts, method, path, family, status, latency, ip, session, worker, body) = row;
+        let (ts, method, path, family, status, latency, ip, session, worker, body, boot_at) = row;
         // The honest-degradation gate, applied BEFORE grouping so a suppressed
         // code cannot dilute a real group's sample.
         if status == 501 || status == 503 {
@@ -903,8 +1340,16 @@ pub fn detect_5xx(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>
             sample_body: String::new(),
             max_latency: 0.0,
             targets: Default::default(),
+            boots: Default::default(),
         });
         g.targets.insert(target.clone());
+        // AMUX-4851. A NULL predates migration 0030 and cannot name a process,
+        // so it is skipped rather than folded in as a distinct one.
+        if let Some(b) = boot_at {
+            if b.is_finite() && b > 0.0 {
+                g.boots.insert(b as i64);
+            }
+        }
         g.count += 1;
         g.last_ts = ts;
         g.max_latency = g.max_latency.max(latency);
@@ -1009,6 +1454,34 @@ pub fn detect_5xx(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>
             ("first_seen".into(), rl::local_when(g.first_ts)),
             ("last_seen".into(), rl::local_when(g.last_ts)),
             ("count".into(), g.count.to_string()),
+            // AMUX-4851. THE FIELD THAT SAYS WHETHER THE SERVER WAS DYING.
+            // This grouping is per-endpoint with no process dimension, so
+            // without this a crash loop and a single sick handler produce
+            // identical-looking cards: every boot re-files the same endpoint,
+            // and the restart count is the thing that separates them. Measured
+            // 2026-09-19 over 3,568 5xx in 7 days, the largest incident carried
+            // 42 distinct boot_at across 1,900 responses.
+            //
+            // The count is stated even when it is 1, because "confined to one
+            // process" is a real finding and an absent field reads as unchecked
+            // rather than as checked-and-single.
+            (
+                "distinct_processes".into(),
+                if g.boots.is_empty() {
+                    "unknown: these rows predate the boot_at column (migration 0030)".into()
+                } else if g.boots.len() == 1 {
+                    "1 — confined to a single server process, so this is the handler, not a restart loop".into()
+                } else {
+                    format!(
+                        "{} — these responses span {} SERVER RESTARTS, so read this as a process \
+                         that kept dying rather than one endpoint misbehaving; the endpoint named \
+                         above may be a victim. Look at what restarted the server before looking \
+                         at the handler.",
+                        g.boots.len(),
+                        g.boots.len()
+                    )
+                },
+            ),
             (
                 "distinct_clients".into(),
                 format!(
@@ -1070,6 +1543,20 @@ struct Group {
     /// (AMUX-3840): the card has to name who was hit without being one card
     /// per victim.
     targets: std::collections::BTreeSet<String>,
+    /// Distinct `boot_at` values seen in this group (AMUX-4851).
+    ///
+    /// THE FIELD THAT SEPARATES A SICK ENDPOINT FROM A DYING SERVER. A group
+    /// confined to one process is a handler fault; a group spanning many is a
+    /// crash loop, and the per-endpoint card cannot say which because every
+    /// boot re-files the same endpoint and the RESTART COUNT is what a reader
+    /// needs. Measured 2026-09-19 over 3,568 5xx in 7 days: the largest
+    /// incident carried 42 distinct boot_at across 1,900 responses, and
+    /// 09-17 13:56 carried 23 across 206.
+    ///
+    /// A NULL `boot_at` is a legacy row predating migration 0030, so it is
+    /// skipped rather than counted as a distinct process; counting it would
+    /// inflate the restart count with rows that simply cannot answer.
+    boots: std::collections::BTreeSet<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1906,7 +2393,24 @@ fn detect_latency_with_scan_cap(
     // a reader can check against the evidence line it feeds.
     struct OutlierGroup {
         n: u64,
+        /// Rows above this route's OWN bound (AMUX-4780).
+        ///
+        /// `n` counts rows over the global outlier floor, but the filing gate
+        /// uses `design_budget_ms` for a LONG_BY_DESIGN route. So a budgeted
+        /// route's card reported a count taken against a bound the DECISION did
+        /// not use, and counted its design as breach: /api/email/inbox filed "5
+        /// request(s) exceeded 10s" when, over 48h, 52 of 99 requests passed
+        /// 10s and exactly ONE passed its 30s budget. Equal to `n` when the
+        /// route has no budget, so the untouched case stays untouched.
+        n_over_budget: u64,
         worst_ms: f64,
+        /// Unix seconds at which the WORST row STARTED (AMUX-4839).
+        ///
+        /// Not `last_ts`, which is the newest offending row and is usually a
+        /// different request. The window a reader wants is the worst one's,
+        /// and it is `[worst_ts, worst_ts + worst_ms]` because the request log
+        /// stamps `ts` before the handler runs.
+        worst_ts: f64,
         last_ts: f64,
         sample: String,
         /// AMUX-3647: seconds between the WORST row's arrival and the boot of
@@ -2004,6 +2508,19 @@ fn detect_latency_with_scan_cap(
     let mut outliers_spanned = 0usize;
     let mut outliers_considered = 0usize;
     let mut outliers_failed = 0usize;
+    // THE SAME THREE COUNTS, PER TARGET (AMUX-4859). The three above are over
+    // EVERY route in the window, because the scan below has no path predicate.
+    // The card they are published on names ONE route and puts them beside `n`,
+    // which is per-route, so a reader subtracts two numbers from different
+    // populations and finds rows missing that were never on this route.
+    //
+    // Specimen: AMUX-4852 published "11 row(s) matched ... 0 dropped ... 0
+    // dropped" beside `n_over_floor: 1`. All four numbers were correct. 8 of
+    // the 11 were /api/email/inbox, which carries its own 30s budget and was
+    // never eligible to file. Keeping the fleet-wide figure is deliberate (it
+    // is what tells a reader another route is having a bad window), so the fix
+    // is to publish BOTH and label which is which.
+    let mut per_target: BTreeMap<(String, String), (usize, usize, usize)> = BTreeMap::new();
     if let Ok(mut stmt) = conn.prepare(
         "SELECT method, path, latency_ms, ts, status, boot_at, load1, client_ip FROM _amux_request_log \
          WHERE ts >= ?1 AND latency_ms >= ?2 \
@@ -2023,9 +2540,20 @@ fn detect_latency_with_scan_cap(
             ))
         }) {
             for (method, path, ms, ts, status, row_boot, row_load, row_ip) in rows.flatten() {
+                // Resolved HERE, above both exclusions, so the per-target tally
+                // can count the rows they drop (AMUX-4859). The grouping below
+                // reuses this exact value, so the two cannot disagree about
+                // which target a row belongs to. See the AMUX-3869 note at the
+                // `seen` entry for why this is the per-VERB target.
+                let row_target = rl::normalize_target_verb(&path);
+                let tally = per_target
+                    .entry((method.clone(), row_target.clone()))
+                    .or_insert((0usize, 0usize, 0usize));
+                tally.0 += 1;
                 outliers_considered += 1;
                 if spans_own_restart(ts, ms, row_boot, boot) {
                     outliers_spanned += 1;
+                    tally.1 += 1;
                     continue;
                 }
                 // A REQUEST THAT FAILED IS NOT A LATENCY MEASUREMENT (AMUX-3709).
@@ -2056,6 +2584,7 @@ fn detect_latency_with_scan_cap(
                 // breadth rule cannot see.
                 if status >= 500 {
                     outliers_failed += 1;
+                    tally.2 += 1;
                     continue;
                 }
                 // PER-VERB, not per-route-pattern (AMUX-3869). `normalize_target`
@@ -2080,12 +2609,22 @@ fn detect_latency_with_scan_cap(
                 // Only the LATENCY axis moves. The 5xx detector above keeps the
                 // coarse target deliberately: a 500 is a 500 whatever the verb,
                 // and its rollup wants the route shape.
-                let target = rl::normalize_target_verb(&path);
+                // Resolved at the top of the loop now (AMUX-4859), so the
+                // per-target tally and this grouping key are the SAME string by
+                // construction rather than by two calls agreeing.
+                let target = row_target;
+                // Computed BEFORE the entry call, which moves `target`.
+                let row_budget = design_budget_ms(&target);
                 let e = seen
                     .entry((method.clone(), target))
                     .or_insert_with(|| OutlierGroup {
                         n: 0,
+                        n_over_budget: 0,
                         worst_ms: 0.0,
+                        // Seeded to this row's own ts, so a group whose every
+                        // row somehow failed the `ms > worst_ms` test still
+                        // names a real instant rather than the epoch.
+                        worst_ts: ts,
                         last_ts: ts,
                         sample: format!("{method} {path} → {status}"),
                         worst_since_boot: None,
@@ -2094,6 +2633,9 @@ fn detect_latency_with_scan_cap(
                         remote_n: 0,
                     });
                 e.n += 1;
+                if ms > row_budget {
+                    e.n_over_budget += 1;
+                }
                 // AMUX-4818. Loopback is the only thing that means "no client
                 // network in this number"; an absent client_ip is counted as
                 // neither, so a missing column reads as unmeasured rather than
@@ -2136,6 +2678,10 @@ fn detect_latency_with_scan_cap(
                     e.sample = format!("{method} {path} → {status}");
                     e.worst_since_boot = row_boot.map(|b| ts - b);
                     e.worst_load1 = row_load;
+                    // Same assignment as every other worst-row property, for
+                    // the reason the comment above gives: one block carries
+                    // them together or they drift onto different requests.
+                    e.worst_ts = ts;
                 }
                 e.last_ts = e.last_ts.max(ts);
             }
@@ -2373,7 +2919,9 @@ fn detect_latency_with_scan_cap(
         (method, target),
         OutlierGroup {
             n,
+            n_over_budget,
             worst_ms: worst,
+            worst_ts,
             last_ts,
             sample,
             worst_since_boot,
@@ -2385,9 +2933,14 @@ fn detect_latency_with_scan_cap(
     {
         // AMUX-3485: for long-by-design endpoints the effective threshold is
         // their design budget, not the global outlier floor.
-        if worst <= design_budget_ms(&target) {
+        let budget = design_budget_ms(&target);
+        if worst <= budget {
             continue;
         }
+        // The bound the DECISION used, which is what the card must quote. A
+        // budgeted route reporting the floor advised the reader to add a
+        // LONG_BY_DESIGN entry that already existed.
+        let effective_bound = if budget > 0.0 { budget } else { outlier_ms() };
         // ALREADY TOLD YOU, AS PART OF A WIDER FAULT (AMUX-4717).
         //
         // The rollup arm and this arm see the same rows through different
@@ -2436,7 +2989,11 @@ fn detect_latency_with_scan_cap(
         out.push(Finding {
             kind: DetectorKind::Latency,
             signature: format!("latency|outlier|{method}|{target}|{}", last_ts as i64),
-            title: format!("{method} {target} took {:.1}s ({n}x over {:.0}s)", worst / 1000.0, outlier_ms() / 1000.0),
+            title: format!(
+                "{method} {target} took {:.1}s ({n_over_budget}x over {:.0}s)",
+                worst / 1000.0,
+                effective_bound / 1000.0
+            ),
             evidence: vec![
                 // SAYS WHAT IT MEASURED (AMUX-3869). This read "This is not a
                 // percentile shift — it is individual requests going wrong, so
@@ -2448,18 +3005,45 @@ fn detect_latency_with_scan_cap(
                 // conclusion its own grouping cannot support is ethos rule 4,
                 // and this one stated it in the very field a reader trusts most.
                 ("verdict".into(), format!(
-                    "{n} request(s) to {method} {target} exceeded {:.0}s in the last {:.1}h; \
-                     worst {:.1}s. This counts rows over a FIXED floor and does not compare \
-                     them to this target's own baseline, so a route whose normal work takes \
-                     seconds can appear here on an ordinary tail. Check this target's p50/p99 \
-                     before treating it as a fault; if the duration is by design, the fix is a \
-                     LONG_BY_DESIGN entry derived from the route's own bounds, not a threshold \
-                     nudge.",
-                    outlier_ms() / 1000.0, window_h(), worst / 1000.0
+                    "{n_over_budget} request(s) to {method} {target} exceeded {:.0}s in the \
+                     last {:.1}h; worst {:.1}s.{}",
+                    effective_bound / 1000.0,
+                    window_h(),
+                    worst / 1000.0,
+                    if budget > 0.0 {
+                        format!(
+                            " That bound is this route's OWN {:.0}s LONG_BY_DESIGN budget, not \
+                             the global {:.0}s floor, and it is the same bound the filing \
+                             decision used. {n} request(s) passed the floor in this window and \
+                             are this endpoint doing its designed work; do NOT size the incident \
+                             from that number. Past the budget means the route's own bounds \
+                             failed to contain the call, which is the one latency story here \
+                             that IS wrong.",
+                            budget / 1000.0,
+                            outlier_ms() / 1000.0
+                        )
+                    } else {
+                        " This counts rows over a FIXED floor and does not compare them to this \
+                         target's own baseline, so a route whose normal work takes seconds can \
+                         appear here on an ordinary tail. Check this target's p50/p99 before \
+                         treating it as a fault; if the duration is by design, the fix is a \
+                         LONG_BY_DESIGN entry derived from the route's own bounds, not a \
+                         threshold nudge."
+                            .to_string()
+                    }
                 )),
                 ("worst_ms".into(), format!("{worst:.0}")),
                 ("sample_request".into(), sample),
-                ("threshold_ms".into(), format!("{:.0}", outlier_ms())),
+                ("threshold_ms".into(), format!("{effective_bound:.0}")),
+                // BOTH BOUNDS, so the reader can see which one the count used
+                // and that the other exists (AMUX-4780).
+                ("floor_ms".into(), format!("{:.0}", outlier_ms())),
+                ("design_budget_ms".into(), if budget > 0.0 {
+                    format!("{budget:.0}")
+                } else {
+                    "none: this route has no LONG_BY_DESIGN entry".into()
+                }),
+                ("n_over_floor".into(), n.to_string()),
                 ("last_seen".into(), rl::local_when(last_ts)),
                 // THE COUNT BESIDE THE COUNT (AMUX-3907). `n` above is what
                 // SURVIVED two filters, and until now the card published only
@@ -2481,15 +3065,39 @@ fn detect_latency_with_scan_cap(
                 // Published unconditionally, including as zeros: "3 slow, 0
                 // excluded" and "3 slow, 1052 excluded" are different facts and
                 // must not render identically (ethos rule 4).
-                ("outliers_excluded".into(), format!(
-                    "{outliers_considered} row(s) matched the threshold in this window; \
-                     {outliers_spanned} dropped as spanning a server restart (AF-175: wall time \
-                     across a boot is not service time) and {outliers_failed} dropped as failed \
-                     requests (AMUX-3709: a timeout's duration is the timeout, not a \
-                     measurement). `n` and `worst_ms` above describe only what survived. If \
-                     `excluded` dwarfs the survivors, size the incident from the re-check query \
-                     below, not from this card."
-                )),
+                //
+                // SAY WHICH POPULATION EACH COUNT IS OVER (AMUX-4859). This
+                // line used to open with the FLEET-WIDE total and then refer to
+                // `n`, which is per-target, so on a card titled with one route
+                // the two read as one population and the difference looked like
+                // rows vanishing into an unnamed filter. AMUX-4852 published
+                // "11 matched; 0 dropped; 0 dropped" beside `n_over_floor: 1`,
+                // all four numbers correct, 8 of the 11 belonging to
+                // /api/email/inbox. This target's own figures come first now
+                // because they are the ones that reconcile with `n`, and the
+                // fleet-wide figures are kept and LABELLED because they are how
+                // a reader learns another route is having a bad window.
+                ("outliers_excluded".into(), {
+                    let (t_considered, t_spanned, t_failed) = per_target
+                        .get(&(method.clone(), target.clone()))
+                        .copied()
+                        .unwrap_or((0, 0, 0));
+                    format!(
+                        "ON THIS TARGET ({method} {target}): {t_considered} row(s) matched the \
+                         threshold in this window; {t_spanned} dropped as spanning a server \
+                         restart (AF-175: wall time across a boot is not service time) and \
+                         {t_failed} dropped as failed requests (AMUX-3709: a timeout's duration \
+                         is the timeout, not a measurement). `n` and `worst_ms` above describe \
+                         only what survived, so {t_considered} - {t_spanned} - {t_failed} = {n}. \
+                         If the dropped rows dwarf the survivors, size the incident from the \
+                         re-check query below, not from this card.\n  \
+                         ACROSS ALL TARGETS in the same window: {outliers_considered} matched, \
+                         {outliers_spanned} restart-spanning, {outliers_failed} failed. That is a \
+                         DIFFERENT population from `n` and from the per-target counts above, and \
+                         it is published so a quiet route can still show you that the window \
+                         itself was bad (AMUX-4859)."
+                    )
+                }),
                 // AMUX-3647. Until 2026-08-24 a row that arrived within
                 // `latency` seconds of a boot was DROPPED here, so this card
                 // did not exist for that request and nobody could weigh it.
@@ -2533,6 +3141,15 @@ fn detect_latency_with_scan_cap(
                     ),
                     (Some(l), None) => format!("1-minute load {l:.1}; core count unavailable"),
                     (None, _) => "not recorded — this row predates migration 0034 (load1)".into(),
+                }),
+                // AMUX-4839. Sits beside the other two context fields on
+                // purpose: `host_load_at_worst` answers "was the box busy",
+                // `arrived_into_process_life` answers "was this a restart",
+                // and neither could answer the AMUX-4780 breach, which was
+                // explained by one WARN inside the request's own window.
+                ("logged_during_worst_request".into(), {
+                    let end = worst_ts + worst / 1000.0;
+                    logged_during_worst_request(&warns_during_request(worst_ts, end), worst_ts, end)
                 }),
             ],
             recheck: format!(
@@ -5947,12 +6564,31 @@ pub fn ci_findings(runs: &[CiRun], now: f64) -> (Vec<Finding>, Vec<Suppressed>) 
     for ((repo, workflow), all) in groups {
         // --- eligibility, with the exclusions PUBLISHED -----------------
         let mut n_pr = 0usize;
+        let mut n_dispatch = 0usize;
         let mut n_branch = 0usize;
         let mut n_running = 0usize;
         let mut eligible: Vec<&CiRun> = Vec::new();
         for r in &all {
             if r.event == "pull_request" || r.event == "pull_request_target" {
                 n_pr += 1;
+                continue;
+            }
+            // AMUX-4812: a HAND-DISPATCHED run is somebody's experiment, and a
+            // failing experiment is often the point of running it.
+            //
+            // This detector's own verdict says why it exists: "a red CI is
+            // invisible unless a human happens to look". A `workflow_dispatch`
+            // run is the one case where a human IS looking, because they
+            // pressed the button. Its result is theirs to read.
+            //
+            // THE SPECIMEN. `rust-soak` is weekly and its scheduled runs passed
+            // five weeks running (08-16 through 09-13). Every failure on this
+            // card was a dispatch fired the same afternoon to A/B
+            // MALLOC_ARENA_MAX against a suspected glibc arena leak. A soak
+            // exists to fail when it finds growth, so those runs failing was
+            // the experiment working, reported as production breakage.
+            if r.event == "workflow_dispatch" {
+                n_dispatch += 1;
                 continue;
             }
             if !r.on_default_branch {
@@ -5965,14 +6601,15 @@ pub fn ci_findings(runs: &[CiRun], now: f64) -> (Vec<Finding>, Vec<Suppressed>) 
             }
             eligible.push(r);
         }
-        if n_pr + n_branch + n_running > 0 {
+        if n_pr + n_dispatch + n_branch + n_running > 0 {
             suppressed.push(sup(
                 DetectorKind::CiFailure,
                 &format!("ci|{repo}|{workflow}"),
                 &format!(
-                    "excluded {n_pr} pull-request/fork run(s), {n_branch} non-default-branch \
-                     run(s), {n_running} still-running run(s) — only completed default-branch \
-                     runs are evidence about main"
+                    "excluded {n_pr} pull-request/fork run(s), {n_dispatch} hand-dispatched \
+                     run(s), {n_branch} non-default-branch run(s), {n_running} still-running \
+                     run(s) — only completed default-branch runs that nobody was already \
+                     watching are evidence about main"
                 ),
             ));
         }
@@ -6232,6 +6869,8 @@ async fn fetch_ci_runs(now: f64) -> (Vec<CiRun>, Vec<Suppressed>) {
     }
 
     let mut runs: Vec<CiRun> = Vec::new();
+
+    let mut default_branches: BTreeMap<String, String> = BTreeMap::new();
     let mut suppressed: Vec<Suppressed> = Vec::new();
     let timeout_s = ci_cmd_timeout_s();
 
@@ -6286,6 +6925,9 @@ async fn fetch_ci_runs(now: f64) -> (Vec<CiRun>, Vec<Suppressed>) {
                 continue;
             }
         };
+        // AMUX-4831: the backfill below runs after this loop and needs each
+        // repo's default branch to classify the runs it fetches.
+        default_branches.insert(repo.clone(), default_branch.clone());
         let parsed: Vec<Value> = serde_json::from_str(&list).unwrap_or_default();
         if parsed.is_empty() {
             suppressed.push(sup(
@@ -6316,6 +6958,95 @@ async fn fetch_ci_runs(now: f64) -> (Vec<CiRun>, Vec<Suppressed>) {
                 failing_step: None,
             });
         }
+    }
+
+    // BACKFILL A LOW-FREQUENCY WORKFLOW'S LAST SUCCESS (AMUX-4831).
+    //
+    // The fetch above is bounded by a run COUNT and is REPO-WIDE. Measured on
+    // mixpeek/amux: 200 runs span 18.8 hours, because checks/rust/deploy push
+    // ~65 runs each in that time. `rust-soak` fires WEEKLY, so it had 3 runs in
+    // the window and ZERO successes — its last green (5 consecutive weekly
+    // passes) sat days outside it. `last_success` then reads NONE for a gate
+    // that has never failed, and the signature falls back to
+    // `since-beyond-window`, giving low-frequency workflows a different dedupe
+    // identity from busy ones.
+    //
+    // Widening the repo-wide window is the wrong fix: a range big enough for a
+    // weekly workflow pulls thousands of runs for the daily ones. Instead ask
+    // per workflow, and ONLY for the ones where the answer is currently wrong —
+    // newest decisive run is a failure and no success is visible. Normally that
+    // set is empty and this costs nothing; it is the same bounded cost model as
+    // the step resolution below, which already spends one call per workflow.
+    let mut needs_backfill = workflows_needing_backfill(&runs);
+    // Bound the extra calls. AF-396: a burst of `gh` requests trips a per-ACCOUNT
+    // secondary limit that 403s every other lane, so this is capped rather than
+    // left to scale with however many workflows happen to be red at once.
+    needs_backfill.truncate(ci_backfill_max());
+    for (repo, wf) in needs_backfill {
+        let Ok(list) = gh(
+            &[
+                "run".into(),
+                "list".into(),
+                "--repo".into(),
+                repo.clone(),
+                "--workflow".into(),
+                wf.clone(),
+                "--limit".into(),
+                ci_run_limit().to_string(),
+                "--json".into(),
+                "databaseId,conclusion,createdAt,event,headBranch,url,workflowName,status".into(),
+            ],
+            timeout_s,
+        )
+        .await
+        else {
+            suppressed.push(sup(
+                DetectorKind::CiFailure,
+                &format!("ci|{repo}|{wf}"),
+                "could not backfill this workflow's history; last_success may read NONE because \
+                 the repo-wide window is too short, not because the gate never passed",
+            ));
+            continue;
+        };
+        let parsed: Vec<Value> = serde_json::from_str(&list).unwrap_or_default();
+        let known: std::collections::BTreeSet<i64> = runs.iter().map(|r| r.run_id).collect();
+        let mut added = 0usize;
+        for v in parsed {
+            let s = |k: &str| {
+                v.get(k)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let id = v.get("databaseId").and_then(Value::as_i64).unwrap_or(0);
+            if known.contains(&id) {
+                continue;
+            }
+            let branch = s("headBranch");
+            runs.push(CiRun {
+                repo: repo.clone(),
+                workflow: s("workflowName"),
+                run_id: id,
+                status: s("status"),
+                conclusion: s("conclusion"),
+                event: s("event"),
+                on_default_branch: default_branches.get(&repo).is_some_and(|d| *d == branch),
+                branch,
+                created_at: ci_parse_ts(&s("createdAt")),
+                url: s("url"),
+                failing_step: None,
+            });
+            added += 1;
+        }
+        suppressed.push(sup(
+            DetectorKind::CiFailure,
+            &format!("ci|{repo}|{wf}|backfill"),
+            &format!(
+                "{wf} had no visible success in the repo-wide window, so its own history was \
+                 fetched: {added} additional run(s). A weekly workflow cannot show its last \
+                 green in a count-bounded repo window"
+            ),
+        ));
     }
 
     // Resolve the failing STEP, but only for the newest failing run of each
@@ -11004,6 +11735,54 @@ mod tests {
     /// that files per-row would put 14 cards on the board for one bug, which
     /// is how a board stops being read (ethos rule 5 — at 100x volume, does
     /// this stay coherent?).
+    /// AMUX-4851. A crash loop and one sick handler produce the SAME
+    /// per-endpoint group, because this detector has no process dimension and
+    /// every boot re-files the same endpoint. The restart count is the only
+    /// thing that separates them, so the card has to carry it.
+    ///
+    /// Inserts directly rather than through `log_row`, because `Row` has 73
+    /// literal constructions in this file and widening it to carry a boot_at
+    /// would touch every one of them for a field only this cell needs.
+    #[tokio::test]
+    async fn a_group_spanning_restarts_says_so_and_one_confined_to_a_process_says_that() {
+        for (boots, expect, forbid) in [
+            (vec![111.0_f64, 222.0, 333.0], "3", "confined to a single server process"),
+            (vec![111.0_f64, 111.0, 111.0], "confined to a single server process", "SERVER RESTARTS"),
+        ] {
+            let (st, _d) = state();
+            let now = unix_now();
+            for (i, boot) in boots.iter().enumerate() {
+                let (ts, b) = (now - 60.0 - i as f64, *boot);
+                st.store
+                    .write(move |conn| {
+                        conn.execute(
+                            "INSERT INTO _amux_request_log (ts, method, path, family, status, \
+                             latency_ms, client_ip, user_agent, amux_session, worker, \
+                             answered_by, error_body, boot_at) \
+                             VALUES (?1,'GET','/api/health','/api/health',500,7.0,\
+                             '127.0.0.1','curl/8','','lane','native','{\"message\":\"boom\"}',?2)",
+                            rusqlite::params![ts, b],
+                        )?;
+                        Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                    })
+                    .unwrap();
+            }
+            let _ = autofix_tick(&st, std::path::Path::new("/nonexistent")).await;
+            let c = cards(&st);
+            assert_eq!(c.len(), 1, "three rows on one route are one card, got {c:#?}");
+            let body = format!("{:?}", c[0]);
+            assert!(
+                body.contains(expect),
+                "a group over boots {boots:?} must report {expect:?} in distinct_processes; \
+                 without it a crash loop is indistinguishable from a sick handler.\nbody: {body}"
+            );
+            assert!(
+                !body.contains(forbid),
+                "a group over boots {boots:?} must NOT claim {forbid:?}.\nbody: {body}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn n_identical_5xx_produce_one_card() {
         let (st, _d) = state();
@@ -12563,6 +13342,78 @@ mod tests {
         assert!(p95_position(0, 0.0).contains("sample 1 of 1"));
     }
 
+    /// AMUX-4831: a WEEKLY workflow cannot show its last success in a window
+    /// bounded by a repo-wide run COUNT.
+    ///
+    /// Measured on mixpeek/amux: a 200-run fetch spans 18.8 hours, because
+    /// checks/rust/deploy push ~65 runs each in that time. rust-soak fires
+    /// weekly, so it had 3 runs in that window and ZERO successes, while its
+    /// real history was five consecutive weekly passes. `last_success` then
+    /// reads NONE for a gate that has never failed.
+    ///
+    /// This pins WHICH workflows get the extra fetch. The cheap half is
+    /// `any_success`: a merely-red workflow with a green behind it needs
+    /// nothing, and that is every busy workflow.
+    #[test]
+    fn only_a_workflow_with_no_visible_green_is_backfilled() {
+        let now = unix_now();
+        let mk = |wf: &str, id: i64, concl: &str, mins: f64| {
+            let mut r = ci_run(wf, id, concl, mins);
+            r.on_default_branch = true;
+            r
+        };
+
+        // WEEKLY, all red in the window: its green is outside. Needs backfill.
+        let weekly = vec![
+            mk("rust-soak", 1, "failure", 10.0),
+            mk("rust-soak", 2, "failure", 2000.0),
+        ];
+        assert_eq!(
+            workflows_needing_backfill(&weekly),
+            vec![("mixpeek/amux".to_string(), "rust-soak".to_string())],
+            "a workflow whose whole visible history is red must be backfilled"
+        );
+
+        // A GREEN IS VISIBLE behind the red: the window already answers it, so
+        // no call. This is the assertion that keeps the fix cheap, and without
+        // it the predicate would fire for every red workflow on the board.
+        let mut busy = vec![mk("rust", 10, "failure", 5.0)];
+        busy.push(mk("rust", 11, "success", 60.0));
+        assert!(
+            workflows_needing_backfill(&busy).is_empty(),
+            "a red workflow with a visible green needs no extra fetch"
+        );
+
+        // NEWEST IS GREEN: not failing, nothing to explain.
+        let green = vec![mk("checks", 20, "success", 5.0), mk("checks", 21, "failure", 60.0)];
+        assert!(
+            workflows_needing_backfill(&green).is_empty(),
+            "a workflow that is currently passing must not be backfilled"
+        );
+
+        // NON-DEFAULT-BRANCH and STILL-RUNNING rows are not evidence about the
+        // gate and must not by themselves trigger a fetch.
+        let mut pr = mk("rust-soak", 30, "failure", 5.0);
+        pr.on_default_branch = false;
+        let mut running = mk("rust-soak", 31, "", 6.0);
+        running.status = "in_progress".into();
+        assert!(
+            workflows_needing_backfill(&[pr, running]).is_empty(),
+            "PR runs and in-flight runs must not trigger a backfill on their own"
+        );
+
+        // CANCELLED runs are inconclusive: they neither prove a green nor make
+        // one invisible, so a workflow with only cancellations is not a
+        // backfill candidate either.
+        let mut cancelled = mk("rust-soak", 40, "cancelled", 5.0);
+        cancelled.on_default_branch = true;
+        assert!(
+            workflows_needing_backfill(&[cancelled]).is_empty(),
+            "an all-cancelled workflow is not a red gate"
+        );
+        let _ = now;
+    }
+
     /// AMUX-3646: three families regressing at once is ONE event, not three
     /// tasks, and two is still two.
     ///
@@ -12727,6 +13578,93 @@ mod tests {
     /// baseline defect per-endpoint; a run PAST the design budget still
     /// files, because that means the endpoint's own timeout failed to bound
     /// the call, which is the one latency story there that IS wrong.
+    #[tokio::test]
+    async fn a_budgeted_route_counts_breaches_against_its_own_bound() {
+        let (st, _d) = state();
+        let now = unix_now();
+        // /api/email/inbox carries a 30s LONG_BY_DESIGN budget. Four requests
+        // sit ABOVE the 10s floor and inside that budget — this route is
+        // Gmail-quota-bound at ~12-15s, so those are it working — and ONE
+        // breaches the budget. The live shape this reproduces: 52 of 99
+        // requests over 48h passed 10s, exactly 1 passed 30s.
+        for (i, ms) in [12_000.0, 14_000.0, 18_000.0, 22_000.0].iter().enumerate() {
+            log_row(&st, Row {
+                ts: now - 500.0 + i as f64,
+                method: "GET", path: "/api/email/inbox", family: "/api/email",
+                status: 200, body: "", worker: "", ua: "curl/8", ms: *ms,
+            });
+        }
+        log_row(&st, Row {
+            ts: now - 100.0,
+            method: "GET", path: "/api/email/inbox", family: "/api/email",
+            status: 200, body: "", worker: "", ua: "curl/8", ms: 59_621.0,
+        });
+
+        let (f, _) = detect_latency(&st.store.read().unwrap(), now);
+        let card = f
+            .iter()
+            .find(|x| x.signature.contains("/api/email/inbox"))
+            .expect("a request past the 30s budget must still file");
+        let ev: BTreeMap<_, _> = card.evidence.iter().cloned().collect();
+
+        // THE COUNT IS THE POINT. Five rows cleared the 10s floor; ONE cleared
+        // the budget the filing decision actually used. Reporting 5 counts this
+        // route's design as breach.
+        assert!(
+            ev["verdict"].starts_with("1 request(s)"),
+            "the count must be over the BUDGET, not the floor: {}",
+            ev["verdict"]
+        );
+        assert!(
+            card.title.contains("(1x over 30s)"),
+            "the title must quote the bound the decision used: {}",
+            card.title
+        );
+        assert_eq!(ev["threshold_ms"], "30000", "threshold must be the budget");
+        assert_eq!(ev["n_over_floor"], "5", "the floor count stays available, just not as THE count");
+        assert_eq!(ev["design_budget_ms"], "30000");
+        assert!(
+            ev["verdict"].contains("do NOT size the incident from that number"),
+            "the card must say the floor count is not the incident size: {}",
+            ev["verdict"]
+        );
+        // And it must NOT advise adding an entry that already exists.
+        assert!(
+            !ev["verdict"].contains("the fix is a LONG_BY_DESIGN entry"),
+            "a budgeted route must not be told to add the budget it already has: {}",
+            ev["verdict"]
+        );
+    }
+
+    /// THE CONTROL: an UNBUDGETED route must be completely unchanged, or this
+    /// fix would silently rewrite every latency card on the board.
+    #[tokio::test]
+    async fn an_unbudgeted_route_still_counts_and_advises_against_the_floor() {
+        let (st, _d) = state();
+        let now = unix_now();
+        for (i, ms) in [11_000.0, 12_000.0].iter().enumerate() {
+            log_row(&st, Row {
+                ts: now - 300.0 + i as f64,
+                method: "GET", path: "/api/no-such-budget", family: "/api/no-such-budget",
+                status: 200, body: "", worker: "", ua: "curl/8", ms: *ms,
+            });
+        }
+        let (f, _) = detect_latency(&st.store.read().unwrap(), now);
+        let card = f
+            .iter()
+            .find(|x| x.signature.contains("/api/no-such-budget"))
+            .expect("an unbudgeted route over the floor must file");
+        let ev: BTreeMap<_, _> = card.evidence.iter().cloned().collect();
+        assert!(ev["verdict"].starts_with("2 request(s)"), "{}", ev["verdict"]);
+        assert_eq!(ev["threshold_ms"], "10000", "no budget means the floor IS the bound");
+        assert!(
+            ev["verdict"].contains("the fix is a LONG_BY_DESIGN entry"),
+            "an unbudgeted route must still get the original advice: {}",
+            ev["verdict"]
+        );
+        assert!(ev["design_budget_ms"].starts_with("none:"));
+    }
+
     #[tokio::test]
     async fn a_long_by_design_endpoint_files_only_past_its_own_budget() {
         let (st, _d) = state();
@@ -13497,6 +14435,142 @@ mod tests {
         );
     }
 
+    /// AMUX-4859. The per-target counts and the window-wide counts are
+    /// different populations, and the card must say which is which.
+    ///
+    /// Specimen: AMUX-4852 published "11 row(s) matched ... 0 dropped ... 0
+    /// dropped" directly beside `n_over_floor: 1`, on a card whose title names
+    /// ONE route. All four numbers were correct. 8 of the 11 belonged to
+    /// /api/email/inbox, which carries its own 30s budget and could never have
+    /// filed. A reader subtracting the published numbers finds 10 rows removed
+    /// by a filter that does not exist, which is the opposite of the
+    /// mis-sizing AMUX-3907 added this field to prevent.
+    ///
+    /// The fixture reproduces that shape on purpose: the filing route
+    /// contributes ONE row, and a BUDGETED route contributes three more that
+    /// count toward the window while never filing. The two figures are 1 and 4
+    /// here, so a regression that fed either number into the other's slot
+    /// cannot keep both assertions green.
+    #[tokio::test]
+    async fn outliers_excluded_separates_this_target_from_the_whole_window() {
+        let (st, _d) = state();
+        let now = unix_now();
+        // The route under test: one slow row, no budget, so it files.
+        log_row(
+            &st,
+            Row {
+                ts: now - 50.0,
+                method: "GET",
+                path: "/api/board",
+                family: "/api/board",
+                status: 200,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 21_000.0,
+            },
+        );
+        // A DIFFERENT route, over the 10s floor but under its OWN 30s
+        // LONG_BY_DESIGN budget, so these three count toward the window and
+        // never produce a card. This is the /api/email/inbox role in the
+        // specimen.
+        for i in 0..3 {
+            log_row(
+                &st,
+                Row {
+                    ts: now - 40.0 + i as f64,
+                    method: "GET",
+                    path: "/api/sessions",
+                    family: "/api/sessions",
+                    status: 200,
+                    body: "",
+                    worker: "",
+                    ua: "curl/8",
+                    ms: 12_000.0,
+                },
+            );
+        }
+        // TWO ROWS THIS TARGET'S OWN `failed` FILTER DROPS. Without these the
+        // per-target failed counter is never exercised: a mutation deleting it
+        // stayed green, which is how this half got here (the tally counters
+        // were added with a fixture that had nothing for them to count).
+        for i in 0..2 {
+            log_row(
+                &st,
+                Row {
+                    ts: now - 30.0 + i as f64,
+                    method: "GET",
+                    path: "/api/board",
+                    family: "/api/board",
+                    status: 502,
+                    body: "",
+                    worker: "",
+                    ua: "curl/8",
+                    ms: 15_000.0,
+                },
+            );
+        }
+        // AND ONE THE restart-spanning FILTER DROPS. `spans_own_restart` takes
+        // `Some(boot) => ts < boot`, so a row stamped with a boot_at LATER than
+        // itself is one the process cannot have served end to end. log_row
+        // leaves boot_at NULL, so this goes in directly.
+        let spanned_ts = now - 20.0;
+        st.store
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO _amux_request_log (ts, method, path, family, status, latency_ms, \
+                     client_ip, user_agent, amux_session, worker, answered_by, boot_at) \
+                     VALUES (?1,'GET','/api/board','/api/board',200,18000.0, \
+                     '127.0.0.1','curl/8','','','native',?2)",
+                    rusqlite::params![spanned_ts, spanned_ts + 1.0],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+
+        let (f, _) = detect_latency(&st.store.read().unwrap(), now);
+        let hit = f
+            .iter()
+            .find(|x| x.signature.starts_with("latency|outlier|GET"))
+            .expect("the unbudgeted 21s row files on its own");
+        let ev: BTreeMap<_, _> = hit.evidence.iter().cloned().collect();
+        let excluded = ev
+            .get("outliers_excluded")
+            .expect("the card must say what its filters removed");
+
+        // THIS TARGET'S OWN FIGURES, the ones that reconcile with `n`:
+        // 4 matched here (1 survivor + 1 restart-spanning + 2 failed).
+        assert!(
+            excluded.contains("ON THIS TARGET (GET /api/board): 4 row(s) matched"),
+            "the per-target count must be this route's own, not the window's: {excluded}"
+        );
+        assert!(
+            excluded.contains("1 dropped as spanning a server restart"),
+            "the per-target restart-spanning count must be this route's own: {excluded}"
+        );
+        assert!(
+            excluded.contains("2 dropped as failed requests"),
+            "the per-target failed count must be this route's own: {excluded}"
+        );
+        // THE WINDOW'S FIGURE, kept and LABELLED as a different population:
+        // 7 = this target's 4 plus the budgeted route's 3.
+        assert!(
+            excluded.contains("ACROSS ALL TARGETS in the same window: 7 matched"),
+            "the window-wide count must be published and named as such: {excluded}"
+        );
+        // AND THE CARD SHOWS ITS OWN ARITHMETIC, so a reader can see the
+        // per-target numbers reconcile instead of taking it on faith.
+        assert!(
+            excluded.contains("4 - 1 - 2 = 1"),
+            "the per-target figures must visibly reconcile with n: {excluded}"
+        );
+        assert_eq!(
+            ev.get("n_over_floor").map(String::as_str),
+            Some("1"),
+            "and n itself is this target's survivor count"
+        );
+    }
+
     #[tokio::test]
     async fn absurd_single_requests_file_on_their_own() {
         let (st, _d) = state();
@@ -13678,6 +14752,59 @@ mod tests {
     /// this closes), too high and a scrollback capture wedged at its own 30s
     /// timeout is swallowed (the one archive story that IS wrong). A budget is
     /// only meaningful as an interval.
+    /// AMUX-4817 / AMUX-4778: GET /api/sessions is long BY DESIGN, and the
+    /// budget has to bracket the design without hiding a broken refusal.
+    ///
+    /// The route's normal work is a fleet projection: measured end-to-end at
+    /// 4875ms cold and ~2500ms warm, with ~72% of 6827 requests over 48h paying
+    /// a real build in a 1-10s band. A 10s floor fires on that, which is the
+    /// threshold-below-baseline defect this table exists for. It is also what
+    /// produced AMUX-4817, a 9-endpoint rollup whose fleet-wide "slowdown"
+    /// turned out to be request MIX: /api/health in the same window ran 9ms
+    /// against its own 21ms baseline for that load band.
+    ///
+    /// 30s is the route's OWN bound: past `AMUX_SESSIONS_BUILD_WAIT_S` a reader
+    /// waiting on the single builder is refused with BuilderBusy -> 503, so a
+    /// request that takes longer means that refusal did not work.
+    #[test]
+    fn the_sessions_budget_covers_the_build_band_but_not_a_failed_refusal() {
+        // PIN THE LOOKUP, NOT JUST THE TABLE, for the same reason the archive
+        // cell below does: `design_budget_ms` matches `target == *p` against
+        // whatever `normalize_target_verb` produces, so an entry the
+        // normaliser never yields is a budget nothing consults.
+        let real_target = crate::api::request_log::normalize_target_verb("/api/sessions");
+        assert_eq!(
+            real_target, "/api/sessions",
+            "the LONG_BY_DESIGN key must be what the detector actually computes"
+        );
+        let b = design_budget_ms(&real_target);
+        assert!(
+            b > 0.0,
+            "the entry must be reachable through the real target, not merely present in the table"
+        );
+
+        // AN INTERVAL, because either bound alone is satisfiable by a wrong
+        // number. Too low and the routine multi-second build files forever;
+        // too high and a builder whose 30s wait failed to refuse is swallowed.
+        assert!(
+            b > 10_000.0,
+            "must sit ABOVE the 10s floor, or the design band keeps filing: {b}"
+        );
+        assert_eq!(
+            b, 30_000.0,
+            "must equal the route's own AMUX_SESSIONS_BUILD_WAIT_S bound (30s), not a padded guess"
+        );
+
+        // The sibling entry must NOT be what answered: `/api/sessions` and
+        // `/api/sessions/{name}/archive` are different routes, and a lookup
+        // that fell through to the wildcard would pass every assertion above
+        // while budgeting the wrong thing.
+        assert_ne!(
+            real_target, "/api/sessions/{name}/archive",
+            "the bare list route must not resolve to the archive verb's entry"
+        );
+    }
+
     #[test]
     fn the_archive_budget_brackets_the_sleep_ladder_without_hiding_a_wedge() {
         // PIN THE LOOKUP, NOT JUST THE TABLE. The first version of this cell
@@ -13724,6 +14851,68 @@ mod tests {
         );
     }
 
+    /// AMUX-4852. The resume budget must be the wake path's own sleep ladder,
+    /// and must still report a wedged tmux.
+    #[test]
+    fn the_resume_budget_covers_the_wake_ladder_but_not_a_wedged_capture() {
+        // PIN THE LOOKUP, NOT JUST THE TABLE. `/api/workers/{id}/resume` has a
+        // variable segment, so the entry is only ever consulted if
+        // `normalize_target_verb` collapses a real request back onto exactly
+        // this key. An entry keyed on a string the normaliser never yields is a
+        // budget nothing reads, and it is green either way.
+        let real_target =
+            crate::api::request_log::normalize_target_verb("/api/workers/gtm-engine/resume");
+        assert_eq!(
+            real_target, "/api/workers/{id}/resume",
+            "the LONG_BY_DESIGN key must be what the detector actually computes"
+        );
+        let b = design_budget_ms(&real_target);
+        assert!(
+            b > 0.0,
+            "the entry must be reachable through the real target, not merely present in the table"
+        );
+
+        // The derived bound, read off `fleet::start_session`'s `tmux_exists`
+        // reuse arm (the arm a resume takes): two 100ms settles, two 3000ms
+        // prompt polls for HISTFILE and `cd`, a 3000ms poll after the
+        // environment import, a 3000ms poll after `unset ANTHROPIC_API_KEY`, a
+        // 150ms settle before Enter, and the 20-iteration launch watch loop at
+        // 500ms per turn.
+        let derived_ms =
+            2.0 * 100.0 + 2.0 * 3_000.0 + 3_000.0 + 3_000.0 + 150.0 + 20.0 * 500.0;
+        assert_eq!(
+            b, derived_ms,
+            "budget {b} must BE the wake path's own ladder ({derived_ms}ms), not a number chosen to cover a sample"
+        );
+
+        // Above the flat floor, or the entry changes nothing: every value in
+        // the slow mode crosses 10s and would keep filing.
+        assert!(
+            b > outlier_ms(),
+            "budget {b} must sit above the {}ms outlier floor to suppress anything",
+            outlier_ms()
+        );
+
+        // And it must clear every value measured on the route in the 7 days
+        // that produced this entry (worst 19_980ms). Asserted SEPARATELY from
+        // the derivation above: that the two agree is the evidence the budget
+        // was derived rather than fitted, and collapsing them into one
+        // assertion would destroy exactly that.
+        assert!(
+            b > 19_980.0,
+            "budget {b} must clear the measured worst resume"
+        );
+
+        // THE HALF AN OVER-EAGER FIX DESTROYS. Every `tmux_capture` on this
+        // path carries its own 10s timeout and the watch loop runs 20 of them.
+        // A tmux server wedged enough to pin even ONE capture at its limit must
+        // still cross the budget and file.
+        assert!(
+            b < derived_ms + 10_000.0,
+            "budget {b} must not swallow a resume whose tmux capture wedged at its own 10s timeout"
+        );
+    }
+
     /// AMUX-3940. A budgeted route must be RECORDED as suppressed, not silently
     /// dropped.
     ///
@@ -13767,6 +14956,67 @@ mod tests {
             hit.reason.contains("LONG_BY_DESIGN") && hit.reason.contains("30s budget"),
             "the suppression must name the budget that applied: {}",
             hit.reason
+        );
+    }
+
+    /// AMUX-4852. The resume budget must hold on the SHIPPED detector path, not
+    /// just in a `design_budget_ms` lookup.
+    ///
+    /// The table entry and the filter are different layers: the key has a
+    /// variable segment, so the budget only ever applies if a real request path
+    /// survives `normalize_target_verb` onto it AND the filter then consults it.
+    /// The lookup test above pins the first half. This pins both at once, in
+    /// both directions, which is the behaviour the card asked for: the 14.4s
+    /// sample stops filing, and a wedged tmux still does.
+    #[tokio::test]
+    async fn a_resume_inside_its_ladder_is_suppressed_and_a_wedged_one_still_files() {
+        let insert = |st: &AppState, ts: f64, ms: f64, path: &str| {
+            let p = path.to_string();
+            st.store
+                .write(move |conn| {
+                    conn.execute(
+                        "INSERT INTO _amux_request_log (ts, method, path, family, status,                          latency_ms, client_ip, user_agent, amux_session, worker, answered_by)                          VALUES (?1,'POST',?2,'/api/workers',200,?3,                         '127.0.0.1','curl/8','','','native')",
+                        rusqlite::params![ts, p, ms],
+                    )?;
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                })
+                .unwrap();
+        };
+
+        // THE CARD'S OWN SAMPLE: 14376ms against a real worker id, so the row
+        // exercises the normalisation rather than being handed the template.
+        // Over the 10s floor, inside the 22_350ms ladder.
+        let (st, _d) = state();
+        let now = unix_now();
+        insert(&st, now - 300.0, 14_376.0, "/api/workers/gtm-engine/resume");
+        let conn = st.store.read().unwrap();
+        let (f, sup) = detect_latency_at(&conn, now, None);
+
+        assert!(
+            !f.iter().any(|x| x.signature.contains("resume")),
+            "a resume inside its own wake ladder must not file: {f:?}"
+        );
+        let hit = sup
+            .iter()
+            .find(|x| x.signature.contains("resume"))
+            .expect("...and the decision must be RECORDED, or a suppressed filing and an unreachable budget entry are the same absence");
+        assert!(
+            hit.reason.contains("LONG_BY_DESIGN"),
+            "the suppression must name the budget that applied: {}",
+            hit.reason
+        );
+        drop(conn);
+
+        // THE HALF AN OVER-EAGER FIX DESTROYS, on the shipped path. One
+        // `tmux_capture` pinned at its own 10s timeout puts the request past the
+        // ladder, and that is the one latency story this route can still tell.
+        let (st2, _d2) = state();
+        insert(&st2, now - 300.0, 22_350.0 + 10_000.0, "/api/workers/gtm-engine/resume");
+        let conn2 = st2.store.read().unwrap();
+        let (f2, _s2) = detect_latency_at(&conn2, now, None);
+        assert!(
+            f2.iter().any(|x| x.signature.contains("resume")),
+            "a resume past its ladder is a wedge and must still file: {f2:?}"
         );
     }
 
@@ -14526,6 +15776,57 @@ mod tests {
         assert!(
             s.iter().any(|x| x.reason.contains("pull-request")),
             "the exclusion must be visible, not silent: {s:?}"
+        );
+
+        // AMUX-4812: a HAND-DISPATCHED red is somebody's experiment, not a gate.
+        //
+        // THE SPECIMEN. `rust-soak` is weekly; its scheduled runs passed five
+        // weeks running, and three dispatches fired the same afternoon to A/B
+        // MALLOC_ARENA_MAX all failed. A soak exists to fail when it finds
+        // growth, so the experiment working filed as production breakage.
+        //
+        // The green scheduled run is in this fixture ON PURPOSE. Without it the
+        // test would pass merely because nothing was left to file, which is a
+        // different reason and would not catch a change that drops dispatches
+        // from the WINDOW instead of from the STREAK.
+        let mut d1 = ci_run("rust-soak", 70, "failure", 10.0);
+        d1.event = "workflow_dispatch".into();
+        let mut d2 = ci_run("rust-soak", 71, "failure", 20.0);
+        d2.event = "workflow_dispatch".into();
+        let mut d3 = ci_run("rust-soak", 72, "failure", 30.0);
+        d3.event = "workflow_dispatch".into();
+        let sched = {
+            let mut r = ci_run("rust-soak", 69, "success", 9000.0);
+            r.event = "schedule".into();
+            r
+        };
+        let (f, s) = ci_findings(&[d1.clone(), d2.clone(), d3.clone(), sched.clone()], now);
+        assert!(
+            f.is_empty(),
+            "three failed dispatches over a passing weekly gate must not file: {f:?}"
+        );
+        assert!(
+            s.iter().any(|x| x.reason.contains("hand-dispatched")),
+            "the exclusion must be PUBLISHED, not silent: {s:?}"
+        );
+
+        // THE CONTROL, and the load-bearing half: the same three failures on
+        // the SCHEDULE still file. Without this, deleting the streak entirely
+        // would also make the assertion above pass.
+        let sched_fail: Vec<CiRun> = [70i64, 71, 72]
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let mut r = ci_run("rust-soak", *id, "failure", 10.0 + i as f64 * 10.0);
+                r.event = "schedule".into();
+                r
+            })
+            .collect();
+        let (f, _) = ci_findings(&sched_fail, now);
+        assert_eq!(
+            f.len(),
+            1,
+            "a genuinely red WEEKLY GATE must still file; only dispatches are excluded: {f:?}"
         );
 
         // One red run is below the threshold — and says so, rather than
@@ -15308,5 +16609,256 @@ mod tests {
             (open as u64) < limit,
             "a healthy test process is under its own limit ({open}/{limit})"
         );
+    }
+}
+
+/// AMUX-4839: the window arithmetic, and the coverage rule that keeps an empty
+/// result from reading as a measured absence.
+#[cfg(test)]
+mod window_scan_tests {
+    use super::*;
+
+    /// Lines shaped like the real log, with the timestamps AMUX-4780 produced.
+    /// The breach ran 04:37:33 -> 04:38:33 and the warn sits 31s inside it.
+    fn breach_log() -> Vec<Vec<u8>> {
+        [
+            "2026-09-18T04:36:51.131048Z  WARN amux_server::runtime_jobs::autofix: connector_auth: needs re-authorization",
+            "2026-09-18T04:37:33.000000Z  INFO amux_server::api: GET /api/email/inbox",
+            "2026-09-18T04:38:04.881382Z  WARN amux_server::integrations::email: gmail batch transport error — falling back to single fetches for 100 ids",
+            "2026-09-18T04:38:52.464986Z  WARN amux_server::runtime_jobs::autofix: connector_auth: needs re-authorization",
+        ]
+        .iter()
+        .map(|s| s.as_bytes().to_vec())
+        .collect()
+    }
+
+    fn at(s: &str) -> f64 {
+        chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp() as f64
+    }
+
+    /// The whole point: the warn INSIDE the window is found, and the two warns
+    /// outside it are not. Both neighbours are real lines from that log, and
+    /// both are the kind a looser window would sweep in.
+    #[test]
+    fn only_lines_inside_the_request_window_are_reported() {
+        let scan = scan_lines_for_window(
+            breach_log(),
+            at("2026-09-18T04:37:33Z"),
+            at("2026-09-18T04:38:33Z"),
+        );
+        assert!(scan.covered, "the fixture spans the window");
+        assert_eq!(scan.hits.len(), 1, "got {:?}", scan.hits);
+        assert!(scan.hits[0].contains("gmail batch transport error"), "{:?}", scan.hits);
+        assert!(
+            !scan.hits.iter().any(|h| h.contains("connector_auth")),
+            "warns outside the window must not be reported: {:?}",
+            scan.hits
+        );
+    }
+
+    /// A log that stops before the window ends has NOT measured it. This is the
+    /// case that would otherwise print an empty list and read as "nothing
+    /// fired", which is a negative the probe never established (ethos rule 4).
+    #[test]
+    fn a_log_that_does_not_reach_the_end_is_not_covered() {
+        let short: Vec<Vec<u8>> = breach_log().into_iter().take(2).collect();
+        let scan = scan_lines_for_window(
+            short,
+            at("2026-09-18T04:37:33Z"),
+            at("2026-09-18T04:38:33Z"),
+        );
+        assert!(!scan.covered, "nothing at or after the window end was seen");
+        assert!(scan.hits.is_empty());
+    }
+
+    /// And a log that starts after the window began is equally unmeasured. This
+    /// is the rotation case: AMUX-4780's breach lived only in server-rs.log.1,
+    /// and scanning the current generation alone would have found nothing.
+    #[test]
+    fn a_log_that_starts_after_the_window_is_not_covered() {
+        let late: Vec<Vec<u8>> = breach_log().into_iter().skip(2).collect();
+        let scan = scan_lines_for_window(
+            late,
+            at("2026-09-18T04:37:33Z"),
+            at("2026-09-18T04:38:33Z"),
+        );
+        assert!(!scan.covered, "nothing at or before the window start was seen");
+    }
+
+    /// Covered with no hits is a REAL answer and must read differently from
+    /// "could not look". These two branches are the whole contract.
+    #[test]
+    fn covered_and_empty_reads_differently_from_uncovered() {
+        let start = at("2026-09-18T04:37:33Z");
+        let end = at("2026-09-18T04:38:33Z");
+        let quiet = WindowScan { hits: vec![], covered: true, dropped: 0, base_counts: Default::default(), span: None };
+        let blind = WindowScan { hits: vec![], covered: false, dropped: 0, base_counts: Default::default(), span: None };
+        let quiet_s = logged_during_worst_request(&quiet, start, end);
+        let blind_s = logged_during_worst_request(&blind, start, end);
+        assert!(quiet_s.starts_with("none."), "{quiet_s}");
+        assert!(blind_s.starts_with("NOT MEASURED"), "{blind_s}");
+        assert_ne!(quiet_s, blind_s, "an absence of warnings is not an absence of coverage");
+        assert!(
+            blind_s.contains("not an absence of warnings"),
+            "the uncovered branch must say what it could not do: {blind_s}"
+        );
+    }
+
+    /// The report hedges on purpose. The correlation is evidence, and a card
+    /// that reads as a verdict sends the next actor at a conclusion the data
+    /// does not carry.
+    #[test]
+    fn a_hit_is_presented_as_correlation_not_cause() {
+        let start = at("2026-09-18T04:37:33Z");
+        let end = at("2026-09-18T04:38:33Z");
+        let scan = scan_lines_for_window(breach_log(), start, end);
+        let s = logged_during_worst_request(&scan, start, end);
+        assert!(s.contains("correlation, not cause"), "{s}");
+        assert!(s.contains("gmail batch transport error"), "{s}");
+    }
+
+    /// INFO during a slow request is the request's own chatter. Reporting it
+    /// would bury the one line that matters under the ones that always appear.
+    #[test]
+    fn info_lines_are_not_actionable() {
+        assert!(is_actionable_log_line(b"2026-01-01T00:00:00Z  WARN x: y"));
+        assert!(is_actionable_log_line(b"2026-01-01T00:00:00Z  ERROR x: y"));
+        assert!(!is_actionable_log_line(b"2026-01-01T00:00:00Z  INFO x: y"));
+    }
+
+    /// Continuation lines of a multi-line warn carry no timestamp, and a line
+    /// with no timestamp cannot be placed in or out of the window.
+    #[test]
+    fn a_line_without_a_timestamp_is_skipped_rather_than_guessed() {
+        assert_eq!(log_line_ts(b"    at some::frame (src/lib.rs:1)"), None);
+        assert_eq!(log_line_ts(b""), None);
+        assert!(log_line_ts(b"2026-09-18T04:38:04.881382Z  WARN x: y").is_some());
+    }
+
+    /// THE WINDOW MUST COME FROM THE WORST ROW, not the newest one.
+    ///
+    /// `last_ts` and `worst_ts` are both `f64` unix seconds in the same scope,
+    /// so swapping them compiles, runs, and produces a card that looks entirely
+    /// normal while scanning a DIFFERENT request's minute. No runtime assertion
+    /// can catch that: both are real instants and both find plausible warns.
+    /// This is the same reason `every_blocking_subprocess_here_goes_through_a_bounded_helper`
+    /// below reads the source rather than observing behaviour.
+    #[test]
+    fn the_scanned_window_is_built_from_the_worst_row_not_the_newest() {
+        let src = include_str!("autofix.rs");
+        let prod = src.split("\n#[cfg(test)]").next().unwrap_or(src);
+        let at = prod
+            .find("(\"logged_during_worst_request\".into()")
+            .expect("the evidence field exists");
+        // Bound to the field's own block, not the file: a version of this that
+        // searched the whole source stayed green with the wrong variable,
+        // because `worst_ts` appears elsewhere.
+        let block = &prod[at..at + 400.min(prod.len() - at)];
+        assert!(
+            block.contains("worst_ts + worst / 1000.0"),
+            "the window must be [worst_ts, worst_ts + worst_ms]: {block}"
+        );
+        assert!(
+            !block.contains("last_ts"),
+            "last_ts is the NEWEST offending row, usually a different request: {block}"
+        );
+    }
+
+    /// AMUX-4857. A line at its background rate and a line far above it must
+    /// NOT read the same. On AMUX-4852 eight identical warns inside a 14.4s
+    /// window looked like eight findings; the background rate predicted 9.3,
+    /// so the window was QUIETER than usual and the lines said nothing.
+    ///
+    /// Both arms in one cell on purpose. A test that only checks a rate is
+    /// PRINTED is exactly as green when the rate is computed over the wrong
+    /// window, which is the failure the card names.
+    #[test]
+    fn a_warn_above_its_background_reads_differently_from_one_at_it() {
+        // One hour of log. "chatty" fires every minute (60 total), "rare"
+        // fires 3 times in the hour. The window is the last 60s and holds
+        // one of each — so chatty is AT background and rare is ~20x above it.
+        let mut lines: Vec<Vec<u8>> = Vec::new();
+        for m in 0..60 {
+            lines.push(
+                format!("2026-09-18T04:{m:02}:05.000000Z  WARN noisy: chatty thing happened")
+                    .into_bytes(),
+            );
+        }
+        for m in [7u32, 23, 59] {
+            lines.push(
+                format!("2026-09-18T04:{m:02}:30.000000Z  WARN rareish: rare thing happened")
+                    .into_bytes(),
+            );
+        }
+        let start = at("2026-09-18T04:59:00Z");
+        let end = at("2026-09-18T05:00:00Z");
+        lines.push("2026-09-18T04:00:00.000000Z  INFO gen start".as_bytes().to_vec());
+        lines.push("2026-09-18T05:00:30.000000Z  INFO gen end".as_bytes().to_vec());
+
+        let scan = scan_lines_for_window(lines, start, end);
+        let out = logged_during_worst_request(&scan, start, end);
+
+        assert!(
+            out.contains("rare thing happened"),
+            "the rare line must appear at all: {out}"
+        );
+        // The discrimination itself.
+        let rare_line = out
+            .lines()
+            .skip_while(|l| !l.contains("rare thing happened"))
+            .nth(1)
+            .unwrap_or("");
+        let chatty_line = out
+            .lines()
+            .skip_while(|l| !l.contains("chatty thing happened"))
+            .nth(1)
+            .unwrap_or("");
+        assert!(
+            rare_line.contains("ABOVE background"),
+            "a warn ~20x its base rate must be called out as the lead, got {rare_line:?}\n{out}"
+        );
+        assert!(
+            chatty_line.contains("at or below background"),
+            "a warn AT its base rate must be named as noise, or it reads as a finding \
+             exactly like the AMUX-4852 case, got {chatty_line:?}\n{out}"
+        );
+        assert_ne!(
+            rare_line, chatty_line,
+            "the two must not print identically; that identity IS the defect"
+        );
+        // The denominator travels with the number (the card's second rule).
+        assert!(
+            out.contains("of log"),
+            "the period the rate is OVER must be stated: {out}"
+        );
+        // And the corpus caveat, so a quiet verdict is not read as silence.
+        assert!(
+            out.contains("WARN/ERROR ONLY"),
+            "the payload must say what corpus it scanned: {out}"
+        );
+    }
+
+    /// The cap bounds what reaches the board, and `dropped` carries the rest
+    /// rather than silently truncating.
+    #[test]
+    fn the_cap_reports_what_it_dropped() {
+        let many: Vec<Vec<u8>> = (0..20)
+            .map(|i| format!("2026-09-18T04:38:{:02}.000000Z  WARN x: line {i}", i % 60).into_bytes())
+            .chain(std::iter::once(
+                "2026-09-18T04:37:33.000000Z  INFO start".as_bytes().to_vec(),
+            ))
+            .chain(std::iter::once(
+                "2026-09-18T04:38:33.000000Z  INFO end".as_bytes().to_vec(),
+            ))
+            .collect();
+        let scan = scan_lines_for_window(
+            many,
+            at("2026-09-18T04:37:33Z"),
+            at("2026-09-18T04:38:33Z"),
+        );
+        assert_eq!(scan.hits.len(), WINDOW_SCAN_CAP);
+        assert!(scan.dropped > 0, "the overflow must be counted, not dropped silently");
+        let s = logged_during_worst_request(&scan, at("2026-09-18T04:37:33Z"), at("2026-09-18T04:38:33Z"));
+        assert!(s.contains("more, capped"), "{s}");
     }
 }

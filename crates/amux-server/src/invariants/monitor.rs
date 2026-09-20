@@ -395,6 +395,31 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
             runtime,
         ));
 
+        // -- 6b. the DEPLOY path is still ticking (AMUX-4809). launchd stopped
+        // firing com.amux.server-rs-builder for 59 consecutive cycles and
+        // NOTHING SAID SO: the log stopped, /health's `commit` quietly stopped
+        // moving, and a human found it an hour later while wondering whether a
+        // fix was live. Every lane's commits stopped deploying for that hour.
+        //
+        // The log's mtime is the signal because it is what the builder touches
+        // every cycle, and it is observable without asking launchd anything.
+        // That matters: `launchctl list` and `launchctl print` returned nothing
+        // for this label AND for com.amux.server-rs while the latter was
+        // definitely running, so a probe built on them cannot produce a
+        // positive and is not evidence either way.
+        //
+        // A stat failure becomes Unknown inside the check, never a pass.
+        let builder_log_age_s = std::fs::metadata(amux_home.join("logs/rust-auto-build.log"))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|d| d.as_secs_f64());
+        out.extend(checks::builder_has_ticked_recently(
+            builder_log_age_s,
+            checks::BUILDER_INTERVAL_S,
+            checks::BUILDER_MAX_INTERVALS,
+        ));
+
         // The helper-model read router is the third consumer of the same
         // installed-script rule. Keeping it here means an uncommitted runtime
         // edit cannot silently change fleet-wide context routing.
@@ -431,6 +456,12 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     out.extend(reports_attributed_check(state));
 
     tm.mark(&out, "6c. are session reports ATTRIBUTED?");
+    // -- 6c2. does the CURRENT staged-guard reach every checkout? (AF-410,
+    // restored under AF-943 after 9c17d990 silently dropped it in a wholesale
+    // merge-resolution rewrite of this file. See checks.rs for the incident.)
+    out.extend(guard_reach_check(state));
+
+    tm.mark(&out, "6c2. does the staged-guard reach every checkout?");
     // -- 6d. are auto-filed cards DISPATCHABLE? (AF-137: 215 session=NULL
     // reports invisible to auto-pickup's session-keyed predicate, both
     // halves reporting success for 11 days).
@@ -450,6 +481,7 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // fact with nothing between them.
     out.extend(frustration_ledger_check(state));
     out.extend(schedule_kind_check(state));
+    out.extend(schedule_target_check(state));
     // AF-582: the announcement for an interrupted schedule fire already
     // existed (scheduler.rs's own AF-515 warn on startup) and reached
     // nobody — it fired 20 times through gtm-ticker's incident window and
@@ -747,6 +779,66 @@ fn alert_channel_check(state: &AppState) -> Vec<InvariantResult> {
 /// `deleted` and `enabled` are filtered HERE rather than in the check, because a
 /// disabled or deleted schedule costs nothing per fire — it does not fire. The
 /// claim under test is about what a LIVE schedule spends.
+/// AMUX-4784: enabled schedules pointed at a lane that refuses them.
+///
+/// The deliverability question is NOT answered here. It delegates to
+/// `session_verbs::schedule_target_refusal`, which is the same function
+/// `deliver_automated` refuses with, so this check cannot drift from the
+/// mechanism it describes. Re-deriving the rules locally is exactly the defect
+/// one layer up: a view that does not share the predicate of the thing it
+/// reports on.
+fn schedule_target_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "schedule.target_can_receive";
+    let Ok(conn) = state.store.read() else {
+        // Cannot read: Unknown, never Pass.
+        return vec![InvariantResult::new(ID, Status::Unknown)];
+    };
+    // `consecutive_refusals` counts back only to the last run that was NOT
+    // refused, so a schedule that recovered does not carry its old refusals
+    // forever. It is evidence of how long this has been going on; it is not
+    // part of the predicate, which is purely the target's state right now.
+    let rows: Vec<(String, String, String, String, i64)> = conn
+        .prepare(
+            "SELECT s.id, COALESCE(s.title,''), COALESCE(s.session,''), COALESCE(s.kind,'tmux'), \
+                    (SELECT COUNT(*) FROM schedule_runs r \
+                       WHERE r.schedule_id = s.id \
+                         AND COALESCE(r.delivery,'') = 'refused' \
+                         AND r.ran_at > COALESCE((SELECT MAX(r2.ran_at) FROM schedule_runs r2 \
+                                                    WHERE r2.schedule_id = s.id \
+                                                      AND COALESCE(r2.delivery,'') <> 'refused'), 0)) \
+             FROM schedules s WHERE s.enabled=1 AND COALESCE(s.deleted,0)=0",
+        )
+        .and_then(|mut st| {
+            st.query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .map(|it| it.flatten().collect::<Vec<_>>())
+        })
+        .unwrap_or_default();
+
+    let mut total_enabled = 0i64;
+    let mut bad = Vec::new();
+    for (id, title, target, kind, refusals) in rows {
+        // `shell` runs a command with no lane to deliver into, so it has no
+        // target that could refuse. Named in the evidence, not silently dropped.
+        if kind == "shell" {
+            continue;
+        }
+        total_enabled += 1;
+        if let Some(refusal) = crate::api::session_verbs::schedule_target_refusal(&target) {
+            bad.push(checks::UndeliverableSchedule {
+                schedule_id: id,
+                title,
+                target,
+                cause: refusal.cause().to_string(),
+                refusals,
+                terminal: refusal.is_terminal(),
+            });
+        }
+    }
+    checks::schedule_targets_can_receive(&bad, total_enabled)
+}
+
 fn schedule_kind_check(state: &AppState) -> Vec<InvariantResult> {
     let Ok(conn) = state.store.read() else {
         // Cannot read: Unknown, never Pass. A store we could not open is not a
@@ -2366,6 +2458,55 @@ fn reports_attributed_check(state: &AppState) -> Vec<InvariantResult> {
     }
 }
 
+/// AF-410 (restored under AF-943): roll `guard_verdicts` up to one row per
+/// checkout — the newest `GUARD_VERSION` it has reported in the window, and
+/// how much traffic that version served.
+///
+/// `COALESCE(guard_version, 0)` deliberately keeps version-0 rows in the
+/// rollup rather than filtering them in SQL: a checkout whose ONLY rows are
+/// version 0 must reach the check and be reported as unmeasured, not vanish
+/// into an empty result that reads identically to "no data at all". The
+/// check applies the `>= 1` predicate itself, where the distinction is
+/// expressible.
+fn guard_reach_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "hooks.guard_reaches_every_checkout";
+    let days = std::env::var("AMUX_INVARIANT_GUARD_WINDOW_D")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(14.0);
+    let since = crate::config::now_f64() - days * 86_400.0;
+    let Ok(conn) = state.store.read() else {
+        return vec![InvariantResult::unknown(ID, "store unreadable")];
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT g.dir, g.gv, COUNT(*), COUNT(DISTINCT v.session) \
+         FROM (SELECT dir, MAX(COALESCE(guard_version, 0)) gv FROM guard_verdicts \
+               WHERE ts >= ?1 GROUP BY dir) g \
+         JOIN guard_verdicts v \
+           ON v.dir = g.dir AND COALESCE(v.guard_version, 0) = g.gv AND v.ts >= ?1 \
+         GROUP BY g.dir, g.gv",
+    ) {
+        Ok(s) => s,
+        Err(e) => return vec![InvariantResult::unknown(ID, format!("prepare failed: {e}"))],
+    };
+    let rows = stmt.query_map([since], |r| {
+        Ok(checks::GuardCheckout {
+            dir: r.get::<_, String>(0)?,
+            version: r.get::<_, i64>(1)?,
+            runs: r.get::<_, i64>(2)?,
+            lanes: r.get::<_, i64>(3)?,
+        })
+    });
+    let checkouts: Vec<checks::GuardCheckout> = match rows {
+        Ok(it) => match it.collect::<Result<Vec<_>, _>>() {
+            Ok(v) => v,
+            Err(e) => return vec![InvariantResult::unknown(ID, format!("row decode failed: {e}"))],
+        },
+        Err(e) => return vec![InvariantResult::unknown(ID, format!("query failed: {e}"))],
+    };
+    checks::guard_reaches_every_checkout(&checkouts)
+}
+
 /// The steering queue, joined against each target's reported state.
 ///
 /// Reads the same `session_reports` blob the delivery gate reads, so the check
@@ -3412,6 +3553,53 @@ mod tests {
                     || r.invariant_id == "status.contradicts_fresh_idle_report"
             }),
             "unexpected invariant id — the sweep contract greps for these exact strings"
+        );
+    }
+
+    /// AF-410 (restored under AF-943): the binding must REACH A VERDICT
+    /// against a real store, and it must be reachable from `evaluate_all`
+    /// rather than merely existing. The original of this test (and the check
+    /// it wires) shipped under AF-410 and was silently dropped ~10 hours
+    /// later by a wholesale file-replacement merge resolution (9c17d990) that
+    /// named neither in its commit message.
+    #[test]
+    fn the_guard_reach_check_is_actually_wired_into_the_monitor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::db::Store::open(&dir.path().join("t.db")).unwrap();
+        let state = AppState {
+            store: std::sync::Arc::new(store),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let rs = guard_reach_check(&state);
+        assert!(!rs.is_empty(), "the binding must always reach a verdict");
+        assert!(
+            rs.iter().all(|r| r.invariant_id == "hooks.guard_reaches_every_checkout"),
+            "unexpected invariant id — the sweep contract greps for this exact string"
+        );
+        assert_eq!(rs[0].status, crate::invariants::Status::Unknown, "empty table must not read as healthy");
+        assert_eq!(rs[0].evidence["measured"], serde_json::json!(false));
+    }
+
+    /// ...and the binding must be REGISTERED in `evaluate_all`, not merely
+    /// callable — a check that exists but is never called is exactly what
+    /// 9c17d990 produced for ten hours (well, it dropped the check entirely,
+    /// but a defined-and-unregistered check is the same failure mode this
+    /// guards against for next time).
+    #[test]
+    fn the_guard_reach_check_is_registered_in_evaluate_all() {
+        let src = include_str!("monitor.rs");
+        let start = src
+            .find("pub async fn evaluate_all")
+            .expect("evaluate_all must exist — the registry is the thing being checked");
+        let body = &src[start..];
+        let end = body.find("\n}\n").map(|e| e + start).unwrap_or(src.len());
+        assert!(
+            src[start..end].contains("guard_reach_check(state)"),
+            "hooks.guard_reaches_every_checkout is defined but never registered in \
+             evaluate_all — it would never run"
         );
     }
 

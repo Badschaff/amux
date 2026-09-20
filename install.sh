@@ -569,6 +569,23 @@ launchctl_reload_agent() {
 # terminal you debug from.
 LAUNCHD_PATH="$HOME/.cargo/bin:$BIN_DIR:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
 
+# NO LimitLoadToSessionType KEY BELOW — worth saying explicitly, because its
+# absence is itself a property, not a gap. It defaults the server agent (and
+# the builder and fleet-start below) to `Aqua`: launchd loads it at GUI
+# LOGIN, same "starts at login, not at boot" property the fleet-start note
+# further down names for the WORKERS. AEAB-28/AF-656, real: the machine was
+# up and on the network at 15:18 after a hardware fault, but amux did not
+# start until the console login at 18:28 — a ~75-minute hardware outage
+# became a 4h26m amux one, unbounded on a headless box.
+#
+# `LimitLoadToSessionType = Background` would start the server at BOOT
+# instead. Not set here, and this is deliberately a NAMED trade rather than
+# a default (ethos rule 8): Background sessions load before the login
+# keychain unlocks, so any lane whose provider credentials live in the
+# keychain can fail in a way that reads as a broken lane, not a locked
+# keychain. Automatic login (see the fleet-start note below) fixes both
+# starts-at-login properties at once but is the bigger posture change —
+# incompatible with FileVault, and this machine is Tailscale-reachable.
 cat > "$SERVER_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -595,6 +612,13 @@ PLIST
 # (Re)load: bootout is a no-op complaint when the label isn't loaded yet.
 launchctl_reload_agent "$LABEL" "$SERVER_PLIST"
 say "launchd agent loaded: $LABEL"
+say "  NOTE (AEAB-28/AF-656): this agent has no LimitLoadToSessionType, so it"
+say "  loads at GUI LOGIN, not at boot — an unattended reboot leaves the"
+say "  server itself down, not just the fleet (see the fleet-start note below"
+say "  for the same property on the workers). LimitLoadToSessionType=Background"
+say "  starts it at boot instead, but the login keychain is still locked at"
+say "  that point, so provider-credential lookups can fail in a way that reads"
+say "  as a broken lane. Not set here — your call, not this installer's."
 
 if [[ "${AMUX_NO_BUILDER:-}" != "1" ]]; then
   BUILDER_LABEL="$LABEL-builder"

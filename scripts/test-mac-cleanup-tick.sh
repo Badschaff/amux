@@ -55,6 +55,40 @@ case "$(classify_owner root /System/Library/Frameworks/Virtualization.framework/
   *"macOS daemon"*) echo "  ok   a system daemon is named as reboot-only" ;;
   *) echo "  FAIL a system daemon is misattributed"; fails=$((fails+1)) ;;
 esac
+# DESKT-44. Apple's VM helper lives under /System/Library/Frameworks, so the
+# /System/* arm above claimed it was SIP-protected and reboot-only. It runs as
+# the invoking user and stops from userspace. Measured 2026-09-19: pid 9701,
+# user ethan, 31 GB resident, reported as reboot-only on a box that runs 24/7.
+# The argv below is that process's real one, copied from `ps -axo command`.
+VMXPC=/System/Library/Frameworks/Virtualization.framework/Versions/A/XPCServices/com.apple.Virtualization.VirtualMachine.xpc/Contents/MacOS/com.apple.Virtualization.VirtualMachine
+case "$(classify_owner ethan "$VMXPC")" in
+  *"guest VM"*) echo "  ok   a user's guest VM is named as a VM, not a daemon" ;;
+  *) echo "  FAIL a user's guest VM is misattributed: $(classify_owner ethan "$VMXPC")"; fails=$((fails+1)) ;;
+esac
+# THE HALF THAT COST THE REBOOT, asserted separately: naming it correctly is
+# worth nothing if the line still sends the owner to a restart.
+#
+# Matched on "reboot only", the daemon arm's own phrasing, NOT on the bare word
+# "reboot". The first version of this cell used `*reboot*` and went red against
+# a correct fix, because the remedy says "no reboot" and a substring cannot tell
+# a instruction to reboot from a statement that none is needed.
+case "$(classify_owner ethan "$VMXPC")" in
+  *"reboot only"*) echo "  FAIL a stoppable VM still asks for a reboot: $(classify_owner ethan "$VMXPC")"; fails=$((fails+1)) ;;
+  *) echo "  ok   a stoppable VM is not called reboot-only" ;;
+esac
+# AND IT MUST CARRY A COMMAND, or the cell above passes on a line that names no
+# remedy at all, which is the same dead end in a politer sentence.
+case "$(classify_owner ethan "$VMXPC")" in
+  *"stop"*) echo "  ok   a stoppable VM carries the command that stops it" ;;
+  *) echo "  FAIL a stoppable VM names no remedy: $(classify_owner ethan "$VMXPC")"; fails=$((fails+1)) ;;
+esac
+# AND THE BOUNDARY: the narrow case must not swallow the arm above it. A real
+# SIP-protected binary under the SAME framework stays reboot-only, so this
+# cell goes red if the new pattern is widened to /System/*Virtualization*.
+case "$(classify_owner root /System/Library/Frameworks/Virtualization.framework/Versions/A/Resources/vmnetd)" in
+  *"macOS daemon"*) echo "  ok   a real daemon under the same framework is untouched" ;;
+  *) echo "  FAIL the VM case swallowed a genuine SIP daemon"; fails=$((fails+1)) ;;
+esac
 check "a user's own app" "user process" "$(classify_owner ethan /Applications/Google Chrome.app/Contents/MacOS/Chrome)"
 case "$(classify_owner ethan /Applications/Ollama.app/Contents/Resources/llama-server)" in
   *"ollama stop"*) echo "  ok   an ollama model server carries its unload command" ;;

@@ -140,6 +140,25 @@ fi
 
 die() { echo "${RED}error:${RESET} $*" >&2; exit 1; }
 
+# AF-927. Every CC_WORKTREE=1 cleanup path force-removes the worker's
+# ephemeral worktree (`git worktree remove --force`, the exact flag that
+# overrides git's own refusal to drop a dirty worktree) with no check first.
+# That is fine for the common case -- a worktree with nothing uncommitted in
+# it -- and silent data loss for the uncommon one: real work never committed
+# before `amux stop`/`amux rm` ran, or a crash routed through the same path.
+# This does not block the removal (breaking a script that calls `amux stop`
+# unconditionally is its own regression), it makes the loss OBSERVABLE
+# instead of silent, which is the minimum ethos rule 4 asks for.
+warn_if_worktree_dirty() {
+  local wt_dir="$1"
+  [[ -d "$wt_dir" ]] || return 0
+  local dirty
+  dirty=$(git -C "$wt_dir" status --porcelain --untracked-files=all 2>/dev/null) || return 0
+  [[ -z "$dirty" ]] && return 0
+  echo "${YELLOW}warn: removing $wt_dir with uncommitted work still in it:${RESET}" >&2
+  echo "$dirty" | sed 's/^/  /' >&2
+}
+
 # ── Every server call goes through _curl ─────────────────────────────────────
 #
 # A CONNECT TIMEOUT, in one place, because a per-call-site flag is a thing every
@@ -502,6 +521,27 @@ is_running() {
   [[ "$migrate_rc" -eq 124 ]] && return 124
   tmux_has_session_exact "=$(tmux_name "$1")"
 }
+_amux_tmpfile() {
+  # A temp file a SANDBOXED AGENT can actually create.
+  #
+  # Muse Code sandboxes filesystem writes to the workspace and offers no per-directory
+  # grant — no `--add-dir`, only `--disable-sandbox` or a named permission profile — so
+  # $TMPDIR is denied and a bare `mktemp` fails with "Operation not permitted". A muse
+  # worker hit exactly this on `amux board ls`, whose header capture is PURE DIAGNOSTICS,
+  # and the whole board read died on it: the agent could not close its own card and had to
+  # ask a human to do it. Codex is unaffected only because its sandbox grants $TMPDIR.
+  #
+  # Try the normal temp directories, then fall back to the working directory — the one
+  # place a workspace-sandboxed agent can always write. Callers must tolerate failure
+  # rather than die: a diagnostic file is never worth losing the command.
+  local d f
+  for d in "${TMPDIR:-/tmp}" /tmp .; do
+    [ -d "$d" ] || continue
+    f=$(mktemp "${d%/}/.amux.XXXXXX" 2>/dev/null) && { printf '%s\n' "$f"; return 0; }
+  done
+  return 1
+}
+
 
 # ─── Shell-safe flag quoting ─────────────────────────────────────────────────
 #
@@ -516,8 +556,8 @@ _run_py_safe() {
   shift
   local result err err_file
   local rc=0
-  err_file=$(mktemp) || {
-    echo "amux: error: mktemp failed (cannot create temp file for python3 stderr)" >&2
+  err_file=$(_amux_tmpfile) || {
+    echo "amux: error: no writable temp directory (tried $TMPDIR, /tmp, .)" >&2
     return 1
   }
   # `|| rc=$?` is critical: under set -e (which the source-guard makes
@@ -778,6 +818,7 @@ cmd_start() {
     worktree_dir="$CC_HOME/worktrees/$name"
     if [[ -d "$worktree_dir" ]]; then
       # Stale worktree from a previous run that wasn't cleaned up
+      warn_if_worktree_dirty "$worktree_dir"
       git -C "$dir" worktree remove --force "$worktree_dir" 2>/dev/null || rm -rf "$worktree_dir"
     fi
     mkdir -p "$(dirname "$worktree_dir")"
@@ -813,7 +854,12 @@ cmd_start() {
   # This is D6 (two launch constructions) leaking through the door the server
   # does not own. Delegating means the provider->binary map has one home.
   local _provider="${CC_PROVIDER:-claude}"
-  if [[ "$_provider" == "codex" || "$_provider" == "ollama" || "$_provider" == "gemini" ]]; then
+  # muse belongs in this list for the reason the comment above gives: the server owns the
+  # provider->binary map. Left out, `amux start` on a muse worker fell through to the claude
+  # builder below and launched `claude --model sonnet --continue` -- the WRONG AGENT, silently,
+  # because the fallback is a default rather than a failure. The server-side arm was correct the
+  # whole time; only this door was. Observed live before the fix (muse-hooks-probe).
+  if [[ "$_provider" == "codex" || "$_provider" == "ollama" || "$_provider" == "gemini" || "$_provider" == "muse" ]]; then
     if $dry_run; then
       echo "${BOLD}$name${RESET} ($_provider — started via server API: POST /api/sessions/$name/start; the server owns the provider→binary map and the provider-specific setup)"
       return
@@ -1272,7 +1318,7 @@ _flush_unstamped_ledger() {
   local f; f=$(_unstamped_ledger)
   [[ -s "$f" ]] || return 0
   local api="${AMUX_API:-https://localhost:8824}"
-  local tmp; tmp=$(mktemp) || return 0
+  local tmp; tmp=$(_amux_tmpfile) || return 0
   local sent=0 kept=0 line
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
@@ -1563,6 +1609,7 @@ cmd_stop() {
     if [[ -f "$wt_dir/.git" ]]; then
       repo_dir=$(sed -n 's/^gitdir: \(.*\)\/\.git\/worktrees\/.*/\1/p' "$wt_dir/.git")
     fi
+    warn_if_worktree_dirty "$wt_dir"
     if [[ -n "$repo_dir" ]] && git -C "$repo_dir" worktree remove --force "$wt_dir" 2>/dev/null; then
       echo "  ${DIM}worktree removed: $wt_dir${RESET}"
     else
@@ -1661,6 +1708,7 @@ cmd_rm() {
       if [[ -f "$wt_dir/.git" ]]; then
         repo_dir=$(sed -n 's/^gitdir: \(.*\)\/\.git\/worktrees\/.*/\1/p' "$wt_dir/.git")
       fi
+      warn_if_worktree_dirty "$wt_dir"
       if [[ -n "$repo_dir" ]]; then
         git -C "$repo_dir" worktree remove --force "$wt_dir" 2>/dev/null || rm -rf "$wt_dir"
       else
@@ -1971,7 +2019,22 @@ cmd_start_all() {
   local files=("$CC_SESSIONS"/*.env)
   shopt -u nullglob
   local f name
-  for f in "${files[@]}"; do
+  # `${files[@]+"${files[@]}"}`, never a bare `"${files[@]}"`. macOS ships bash
+  # 3.2, where expanding an EMPTY array under `set -u` is ITSELF the "unbound
+  # variable" fatal (bash fixed this in 4.4; a `#!/usr/bin/env bash` script on
+  # macOS cannot assume it). With nullglob on and no *.env registered, `files`
+  # is empty, so the bare form killed cmd_start_all before its first iteration:
+  # `line 1794: files[@]: unbound variable`, rc=1, nothing else printed.
+  #
+  # The only caller is the launchd boot agent, so the failure surfaced as a
+  # fleet that had simply never started, with the reason buried in
+  # fleet-boot.log. A machine with zero registered workers is exactly a FRESH
+  # INSTALL — so this fired hardest where there was least context to debug it.
+  #
+  # Falling through to the summary with an empty list is correct, not a special
+  # case: "0 started · 0 archived" is the count beside the zero the block
+  # comment above exists to demand.
+  for f in ${files[@]+"${files[@]}"}; do
     [[ -f "$f" ]] || continue
     name=$(basename "$f" .env)
     # Archived workers are retired on purpose. Read the flag from the env file
@@ -2058,6 +2121,70 @@ _board_id_guard() {
     -*)
       die "amux board $verb: '$id' looks like a flag, not an ISSUE-ID." ;;
   esac
+}
+
+# AF-542. `reviewer`/`shepherd` hand a card to a named session with no check
+# that the name can ever act on it — 21 of 24 named reviewers measured
+# unreachable-by-construction (isolated or gone) on 2026-09-07, each one a
+# card silently stuck in `review` forever with nobody able to honor the gate
+# (ethos rule 3: the constraint had no truthful path through for that name).
+#
+# Mirrors push-consent.sh's lane_state(): a lookup that cannot complete must
+# move the verdict toward "unknown", never manufacture a false "ok" (ethos
+# rule 4). Unlike lane_state, "no such session" is its own state here rather
+# than folded into unknown — a typo'd name is refusable outright, where a
+# push-consent probe only ever asks about names that already made a commit.
+_board_assignee_state() {  # -> "ok" | "isolated" | "archived" | "missing" | "unknown:<why>"
+  local who="$1"
+  [[ -z "$AMUX_API" ]] && { echo "unknown:AMUX_URL unset"; return; }
+  local body rc=0
+  body=$(_curl -sk -m 12 "$AMUX_API/api/sessions/$who" 2>/dev/null) || rc=$?
+  [[ "$rc" -ne 0 ]] && { echo "unknown:session lookup failed"; return; }
+  [[ -z "$body" ]] && { echo "unknown:empty response"; return; }
+  printf '%s' "$body" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("unknown:unparseable response"); sys.exit()
+if not isinstance(d, dict):
+    print("unknown:unparseable response"); sys.exit()
+if d.get("error") or "name" not in d:
+    print("missing"); sys.exit()
+if d.get("isolated"):
+    print("isolated"); sys.exit()
+if d.get("archived"):
+    print("archived"); sys.exit()
+print("ok")
+'
+}
+
+# Shared by `reviewer` and `shepherd`: both hand a card to a named peer and
+# both were missing this check (same defect, same fix, ethos rule 1 — a gap
+# fixed in one arm and left in its sibling is still the gap).
+_board_assignee_guard() {  # verb who force -> 0 (proceed) | die()s | prints warnings to stderr
+  local verb="$1" who="$2" force="$3"
+  [[ -z "$who" ]] && return 0
+  local state; state=$(_board_assignee_state "$who")
+  case "$state" in
+    missing)
+      die "amux board $verb: session '$who' does not exist — refusing to set it.
+Check the name (amux fleet lists live sessions). A $verb that can never exist
+can never act, so the gate it is meant to satisfy would be stuck shut forever." ;;
+    isolated)
+      if [[ "$force" -ne 1 ]]; then
+        die "amux board $verb: '$who' is an ISOLATED session — it refuses interaction from
+other workers and cannot be reached the normal way to deliver on this. Pass --force
+if you have another route (e.g. the owner relays it) for their sign-off, or name a
+reachable session instead. Same refusal push-consent.sh applies before a push."
+      fi
+      echo "${YELLOW}warning:${RESET} amux board $verb: '$who' is isolated — set anyway (--force). Their sign-off needs a route other than a direct send." >&2 ;;
+    archived)
+      echo "${YELLOW}warning:${RESET} amux board $verb: '$who' is archived (not isolated) — may still be reachable but is not an active lane." >&2 ;;
+    unknown:*)
+      echo "${YELLOW}warning:${RESET} amux board $verb: could not confirm '$who' is reachable (${state#unknown:}) — proceeding anyway." >&2 ;;
+  esac
+  return 0
 }
 
 
@@ -3490,6 +3617,22 @@ print(json.dumps(b))' \
       echo "$result" | _board_outcome "$id" "" "${subcmd}d"
       return $?
       ;;
+    undelete)
+      # AF-922. DELETE had no un-do anywhere -- the raw API endpoint
+      # (/{id}/undelete) exists so a mistaken delete does not need a hand-run
+      # SQL UPDATE against the live database to recover. Same shape as
+      # archive/unarchive above: an attributed setter for a state raw curl
+      # would otherwise touch unattributed.
+      local id="${1:-}"
+      [[ -n "$id" ]] || die "Usage: amux board undelete <ISSUE-ID>"
+      _board_id_guard "undelete" "$id"
+      local result
+      result=$(_curl -sk -X POST -H 'Content-Type: application/json' \
+        -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
+        "$AMUX_API/api/board/$id/undelete")
+      echo "$result" | _board_outcome "$id" "" "undeleted"
+      return $?
+      ;;
     reviewer)
       # review->done is gated on a NAMED reviewer's sign-off, and until now nothing
       # in the CLI could set that name — `amux board review <id> --reviewer X` died
@@ -3502,9 +3645,19 @@ print(json.dumps(b))' \
       # just the ones someone tripped over.
       local id="${1:-}"; local who="${2:-}"
       _board_id_guard "reviewer" "$id"
-      [[ -n "$id" && -n "$who" ]] || die "Usage: amux board reviewer <ISSUE-ID> <session>   (pass 'none' to clear)
-Sets the session whose sign-off is required for review -> done."
+      [[ -n "$id" && -n "$who" ]] || die "Usage: amux board reviewer <ISSUE-ID> <session> [--force]   (pass 'none' to clear)
+Sets the session whose sign-off is required for review -> done.
+--force: set it even if the session is isolated (see the refusal this overrides)."
+      shift 2
+      local _force=0
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --force) _force=1; shift ;;
+          *) die "Usage: amux board reviewer <ISSUE-ID> <session> [--force]" ;;
+        esac
+      done
       [[ "$who" == "none" ]] && who=""
+      _board_assignee_guard "reviewer" "$who" "$_force"
       local result
       result=$(R="$who" python3 -c 'import json,os;print(json.dumps({"reviewer":os.environ["R"]}))' \
         | _curl -sk -X PATCH -H 'Content-Type: application/json' \
@@ -3526,9 +3679,19 @@ Sets the session whose sign-off is required for review -> done."
       # not a raw PATCH (ethos rule 6's unaudited back door).
       local id="${1:-}"; local who="${2:-}"
       _board_id_guard "shepherd" "$id"
-      [[ -n "$id" && -n "$who" ]] || die "Usage: amux board shepherd <ISSUE-ID> <session>   (pass 'none' to clear)
-Names the peer this card is handed off to, without moving it onto their board."
+      [[ -n "$id" && -n "$who" ]] || die "Usage: amux board shepherd <ISSUE-ID> <session> [--force]   (pass 'none' to clear)
+Names the peer this card is handed off to, without moving it onto their board.
+--force: set it even if the session is isolated (see the refusal this overrides)."
+      shift 2
+      local _force=0
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --force) _force=1; shift ;;
+          *) die "Usage: amux board shepherd <ISSUE-ID> <session> [--force]" ;;
+        esac
+      done
       [[ "$who" == "none" ]] && who=""
+      _board_assignee_guard "shepherd" "$who" "$_force"
       local result
       result=$(S="$who" python3 -c 'import json,os;print(json.dumps({"shepherd":os.environ["S"]}))' \
         | _curl -sk -X PATCH -H 'Content-Type: application/json' \
@@ -4337,7 +4500,9 @@ for tag in item.get('tags',[]):
       # nobody reads response headers from a pipe, which is ethos rule 4's
       # second layer: a tag in a store the reader never opens. So read them
       # here and print one line, in the place the reader is already looking.
-      local _hdr; _hdr=$(mktemp)
+      # Tolerates failure: under a workspace-only sandbox there may be nowhere to write,
+      # and a diagnostic header is not worth losing the board read (see _amux_tmpfile).
+      local _hdr; _hdr=$(_amux_tmpfile) || _hdr=""
       # MARK THE ARCHIVED ROWS (AF-461). `archived` is a boolean FLAG, not a
       # status, so a card can be archived AND `backlog` at once — and then it is
       # listed as ordinary work while every closing verb refuses it with
@@ -4355,7 +4520,12 @@ for tag in item.get('tags',[]):
       # which could never fire for exactly the flag-vs-status reason above: a
       # dead branch that made the renderer look like it handled this. Keyed off
       # the flag now, where it can actually fire.
-      local _lsout; _lsout=$(_curl -sk -D "$_hdr" "$AMUX_API/api/board?$_lsq")
+      local _lsout
+      if [ -n "$_hdr" ]; then
+        _lsout=$(_curl -sk -D "$_hdr" "$AMUX_API/api/board?$_lsq")
+      else
+        _lsout=$(_curl -sk "$AMUX_API/api/board?$_lsq")
+      fi
       printf '%s' "$_lsout" | python3 -c "
 import sys,json
 items=json.load(sys.stdin)
@@ -4436,7 +4606,7 @@ print(', '.join(d) if isinstance(d,list) and d else '')
         echo "    amux board ls --mine        # this session, uncapped"
         echo "    curl -sk \"\$AMUX_API/api/board?session=\$AMUX_SESSION&done_limit=0\"${RESET}"
       fi
-      rm -f "$_hdr"
+      [ -n "$_hdr" ] && rm -f "$_hdr"
       ;;
     help|*)
       # An UNKNOWN verb must not exit 0. `amux board note X "..."` printed this
@@ -4523,6 +4693,7 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
                                    that have opted in (AMUX_CONTINUATION_REQUIRED).
   amux board archive <ID>          Hide a card from every view AND every autonomy loop
   amux board unarchive <ID>        Bring an archived card back (the un-do, AMUX-2492)
+  amux board undelete <ID>         Bring a deleted card back (the un-do for DELETE, AF-922)
   amux board retitle <ID> <title>  Rewrite a title/desc so the card stands alone
                                    (--stdin/--file preferred; --desc-stdin for the body)
 
@@ -5563,6 +5734,30 @@ cmd_grid() {
 # `source amux`), $0 is the parent shell's $0 and the guard skips dispatch.
 # This lets the test suite source the script to access helper functions
 # without triggering CLI side effects.
+#
+# AF-928. That last sentence used to be false: this guard correctly skipped
+# the dispatch `case`, but the file's tail (further down, unconditional
+# `exit "$?"` right before the closing `}`) still ran either way, and `exit`
+# terminates the CURRENT SHELL regardless of how execution got there — there
+# is no bash mechanism that makes it behave like `return` just because the
+# file was sourced. So `source amux` killed the sourcing shell before any
+# code after the `source` line ever ran. No existing test exercised the
+# pattern (grepped for `source amux`: zero hits), which is how a comment can
+# describe a capability nothing had tried to use.
+#
+# THE FIX IS AN EARLY, INVERTED CHECK — placed further down, right before
+# dispatch begins, AFTER every function in this file (including
+# _warn_stale_amux_url below) is defined — not a change to the tail. Moving
+# the tail's `exit "$?"` inside the `then` block was the obvious first
+# attempt and it reddens test-cli-offset-safe.sh: that test requires the
+# file's literal last two non-blank lines to be `exit "$?"` then `}`, at
+# column 0, so bash always parses to the closing `}` before running anything
+# (AMUX-3891 — a live-edited, constantly-invoked symlinked CLI can otherwise
+# resume a read at a shifted byte offset). That invariant is real and left
+# untouched. Instead: when sourced, `return` before dispatch OR the tail's
+# `exit` are ever reached — `return` at the top level of a sourced file is
+# exactly what bash provides for this, and it is unreachable dead code (never
+# evaluated) on the direct-invocation path, where that condition is false.
 # One-time-per-session warning when $AMUX_URL points at a DEAD port (mvs-infra,
 # AMUX-2944). A session started before the 8822 compat bind was removed carries
 # the retired value for its whole life — env can't be re-read live — and a raw
@@ -5588,6 +5783,18 @@ _warn_stale_amux_url() {
   return 0
 }
 
+# AF-928's actual check: everything below this point (dispatch, and the
+# tail's unconditional `exit "$?"`) must never run when sourced. Placed here,
+# not near the top comment, because every function above — including
+# _warn_stale_amux_url just defined — must already exist for a sourced test
+# to use it.
+if [[ "${BASH_SOURCE[0]:-$0}" != "${0}" ]]; then
+  return 0
+fi
+
+# Always true from here on (the sourced case already returned above) --
+# kept as an `if` rather than de-indenting this whole block, to keep this
+# fix a minimal, reviewable diff rather than a full-file reformat.
 if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
   ensure_dirs
   # Every verb must resolve the same installation as `amux url`; most legacy

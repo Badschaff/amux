@@ -67,6 +67,7 @@ test('one active worker marks exactly its claimed card as Working now', async ({
     row.task_board_id = claimed;
     row.runtime_board = {
       measured: true,
+      runtime_status: 'active',
       n_considered: 4,
       verdict: 'linked',
       status: 'linked',

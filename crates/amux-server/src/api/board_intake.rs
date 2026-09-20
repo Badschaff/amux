@@ -7,9 +7,10 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use super::mdai::ModelClient;
 
 static MODEL: OnceLock<Arc<dyn ModelClient>> = OnceLock::new();
-/// AMUX-4655: a model call this slow is named in a WARN. The p50 is ~20 s on
-/// the amux Mac, so a lower floor would fire on most creates and teach nothing.
-const SLOW_MODEL_MS: u64 = 60_000;
+/// Fraction of the call's own deadline at which it is named in a WARN
+/// (AMUX-4847). See [`slow_model_ms`].
+const SLOW_MODEL_DEADLINE_NUM: u64 = 3;
+const SLOW_MODEL_DEADLINE_DEN: u64 = 4;
 type LaneLocks = std::collections::HashMap<String, Weak<tokio::sync::Mutex<()>>>;
 static LOCKS: OnceLock<Mutex<LaneLocks>> = OnceLock::new();
 
@@ -22,6 +23,49 @@ pub fn initialize() {
 }
 
 pub(crate) fn model_client() -> Option<Arc<dyn ModelClient>> { MODEL.get().cloned() }
+
+/// How long a create will wait for the semantic comparison before giving up on
+/// it and filing the card anyway (AMUX-4836). Override with
+/// `AMUX_INTAKE_MODEL_TIMEOUT_MS`; the floor keeps a misconfiguration from
+/// turning the comparison off entirely by setting it to something unreachable.
+fn intake_model_timeout_ms() -> u64 {
+    std::env::var("AMUX_INTAKE_MODEL_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(20_000)
+        .max(1_000)
+}
+
+/// The WARN threshold for a slow classifier call, DERIVED from that call's own
+/// deadline rather than written as a second literal (AMUX-4847).
+///
+/// IT WAS A LITERAL AND IT WENT DEAD. `SLOW_MODEL_MS` was 60_000, chosen when
+/// the call was unbounded and its p50 was ~20 s. Then 184cdb22 (AMUX-4836) gave
+/// the call a 20 s deadline. `model_ms` is the duration of that call, so it can
+/// never reach 60 s: the warn at the use site below became structurally
+/// unreachable, and no input could produce it. Measured over 262 intake calls
+/// on 2026-09-19 (min 1,625 / p50 3,133 / p90 4,952 / p99 9,211 / max 14,122 ms)
+/// a 60,000 ms threshold warned on 0 of 262. A fix in one place silently
+/// invalidated a check in another, and nothing connected them.
+///
+/// Deriving it is the repair for that class, not just for this instance: raise
+/// `AMUX_INTAKE_MODEL_TIMEOUT_MS` and the threshold follows, where a fresh
+/// literal would quietly go dead again.
+///
+/// THE FRACTION IS THE POINT, not a percentile. The latency story worth telling
+/// here is "the classifier came close to being killed by its own deadline", so
+/// this sits just under the bound. At the 20 s default that is 15 s, which
+/// warns on none of the 262 measured calls — correctly, because none of them
+/// came close to dying. That is a check that CAN fire and currently has nothing
+/// to say, which is a different thing from the one it replaces, which could not
+/// fire at all.
+///
+/// `intake_model_timeout_ms` floors at 1,000 ms, so this is always strictly
+/// below it and never zero. `slow_model_never_exceeds_its_own_deadline` pins
+/// that, and would have caught the original the moment the deadline landed.
+fn slow_model_ms() -> u64 {
+    intake_model_timeout_ms() / SLOW_MODEL_DEADLINE_DEN * SLOW_MODEL_DEADLINE_NUM
+}
 
 pub async fn lock(session: &str, owner: &str) -> tokio::sync::OwnedMutexGuard<()> {
     let lane = {
@@ -58,12 +102,22 @@ pub struct Plan {
     /// 2026-09-15: creates that skip it return in ~0 s, creates that make it
     /// take ~20 s at p50), so a slow create has to be able to say so.
     pub model_ms: Option<u64>,
+    /// AMUX-4880: cards that recently CLOSED and resemble this request.
+    ///
+    /// Advisory and read-only. The merge predicate still excludes terminal
+    /// rows, because appending into a closed card is the failure that
+    /// exclusion prevents; this only lets a capture SAY that the thing being
+    /// asked for looks like something that already shipped. Empty is the
+    /// common case and means "nothing recent resembles this", which is a real
+    /// answer rather than a missing one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completed_hints: Vec<CompletedHint>,
     #[serde(skip)] candidates: Vec<Candidate>,
 }
 impl Plan {
     fn create(reason: &str, candidates: Vec<Candidate>, available: usize, measured: bool) -> Self {
         Self { decision: Decision { action:"create".into(), task_id:None, reason:reason.into(), title:None, confidence:1.0 }, measured,
-            n_considered:candidates.len(), n_available:available, candidates, model:None, model_ms:None }
+            n_considered:candidates.len(), n_available:available, candidates, model:None, model_ms:None, completed_hints:Vec::new() }
     }
     pub fn preserve_structured_request(&mut self) {
         self.decision.action = "create".into();
@@ -76,6 +130,24 @@ impl Plan {
             self.decision.task_id.as_deref().unwrap_or("new"), self.measured, self.n_considered, self.n_available, model_ms, self.decision.reason)
     }
 }
+
+/// The keys whose presence proves a create already carries its own structure,
+/// so the semantic comparison is skipped and no model call is made.
+///
+/// AMUX-4846: NAMED ONCE so the create response can tell a caller which keys
+/// would have skipped the call it just waited on. The hint and the gate must
+/// read the same list, or the advice drifts from the behaviour and sends people
+/// to fields that no longer help.
+///
+/// Measured 2026-09-19 over one 28h window: 963 of 1185 intake decisions took
+/// this path and made no model call; the 222 that did have a p50 of 3322ms.
+/// So this list is what separates a create that returns immediately from one
+/// that waits about three seconds.
+pub(crate) const STRUCTURED_KEYS: [&str; 15] = [
+    "depends_on", "gate", "callback", "due", "due_time", "reviewer", "shepherd",
+    "ask_actor", "ask_type", "ask_question", "ask_unblocks", "tags", "request_to",
+    "next_action", "acceptance_criteria",
+];
 
 /// Explicit graph/gate metadata already determines that a new record is needed.
 /// Keep the comparison lazy: invoking and then discarding a model result holds
@@ -97,8 +169,7 @@ where
     // AF-616's auto-fold hazard with a requester attached: there, a capture was
     // folded into an unrelated finding carded in the same minute, and the trail
     // from the report to its fix ran through a card about something else.
-    let structured = ["depends_on", "gate", "callback", "due", "due_time", "reviewer", "shepherd",
-        "ask_actor", "ask_type", "ask_question", "ask_unblocks", "tags", "request_to", "next_action", "acceptance_criteria"].iter()
+    let structured = STRUCTURED_KEYS.iter()
         .any(|key| map.get(*key).is_some_and(|v| !v.is_null() && v != "" && v != &serde_json::json!([])))
         || matches!(item_type, "epic" | "watch" | "tripwire");
     if structured {
@@ -174,6 +245,54 @@ fn classify(client: &dyn ModelClient, model: &str, title: &str, description: &st
     Ok(decision)
 }
 
+/// `classify` with a deadline, as `plan` calls it (AMUX-4836).
+///
+/// A NAMED FUNCTION BECAUSE THE TEST HAS TO DRIVE THE SHIPPED PATH. The first
+/// version of this test rebuilt the `timeout(...)` expression inside the test
+/// body, which is a paraphrase: mutating the real deadline away left it green.
+/// Found by doing exactly that and watching nothing redden.
+///
+/// WHY A DEADLINE AT ALL. `plan` is awaited by `board::create_item` before it
+/// answers, so this sits on the POST /api/board request path and a slow model
+/// call is latency the caller sits through. Measured over 921 intakes: p50
+/// 3145ms, p90 4660ms, p99 10345ms, max 184264ms. Three minutes on a
+/// user-facing create, reachable because nothing here stopped waiting.
+///
+/// THE BOUND IS DERIVED, NOT PICKED: ~2x the measured p99, which would have cut
+/// 1 of those 921 calls (0.11%), the 184s one. A tighter 10s bound cuts 13
+/// (1.41%), and each of those is a create that silently loses its duplicate
+/// check. A missed dedup is how the same finding gets filed twice, so cutting
+/// more is not a free win.
+///
+/// IT BOUNDS THE WAIT, NOT THE WORK: `spawn_blocking` cannot be cancelled, so
+/// on elapse the model call keeps running and its answer is discarded. That is
+/// still strictly better than the caller waiting for it.
+async fn classify_within_deadline(
+    client: Arc<dyn ModelClient>,
+    model: String,
+    title: String,
+    description: String,
+    candidates: Vec<Candidate>,
+) -> Result<Result<Decision, String>, tokio::task::JoinError> {
+    let deadline = intake_model_timeout_ms();
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(deadline),
+        tokio::task::spawn_blocking(move || {
+            classify(client.as_ref(), &model, &title, &description, &candidates)
+        }),
+    )
+    .await
+    {
+        Ok(joined) => joined,
+        // The SAME arm a model error already takes: the honest outcome of "no
+        // comparison" is identical whether the model failed or never answered,
+        // and that path is already tested.
+        Err(_elapsed) => Ok(Err(format!(
+            "semantic intake exceeded its {deadline}ms deadline; creating without a duplicate check"
+        ))),
+    }
+}
+
 pub async fn plan(store: &Store, session: &str, owner: &str, title: &str, description: &str) -> Plan {
     let loaded = (|| -> anyhow::Result<(Vec<Candidate>, usize)> {
         let conn = store.read()?;
@@ -185,18 +304,33 @@ pub async fn plan(store: &Store, session: &str, owner: &str, title: &str, descri
         }))?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok((candidates,available))
     })();
+    // AMUX-4880. Read-only, and computed on the SAME connection the candidate
+    // read already opened, so it costs one extra query rather than a second
+    // connection. Failure is silent by construction: an advisory hint that
+    // cannot be produced must not take the create down with it.
+    let completed_hints = (|| -> anyhow::Result<Vec<CompletedHint>> {
+        let conn = store.read()?;
+        Ok(recently_completed_matches(&conn, title, chrono::Utc::now().timestamp()))
+    })()
+    .unwrap_or_default();
+    // AMUX-4880. EVERY early return below carries the hints too. The
+    // "no open work in this ownership scope" path is the one that matters
+    // most: nothing open to compare against is exactly when a reader has no
+    // other way to learn the thing already shipped, and it was the shape of
+    // the incident that produced this feature.
+    let with_hints = |mut plan: Plan| -> Plan { plan.completed_hints = completed_hints.clone(); plan };
     let (candidates, available) = match loaded {
-        Ok(v) => v, Err(e) => { tracing::warn!(target:"amux::board_intake", error=%e, "semantic intake candidate read failed"); return Plan::create("candidate read failed; request preserved",vec![],0,false); }
+        Ok(v) => v, Err(e) => { tracing::warn!(target:"amux::board_intake", error=%e, "semantic intake candidate read failed"); return with_hints(Plan::create("candidate read failed; request preserved",vec![],0,false)); }
     };
-    if candidates.is_empty() { return Plan::create("no open work in this ownership scope", candidates,available,true); }
-    let Some(client) = MODEL.get().cloned() else { return Plan::create("semantic provider unavailable or explicitly disabled; request preserved",candidates,available,false) };
+    if candidates.is_empty() { return with_hints(Plan::create("no open work in this ownership scope", candidates,available,true)); }
+    let Some(client) = MODEL.get().cloned() else { return with_hints(Plan::create("semantic provider unavailable or explicitly disabled; request preserved",candidates,available,false)) };
     let model = super::mdai::resolve_model(None);
-    let (t,d,rows,m) = (title.to_string(), description.to_string(), candidates.clone(), model.clone());
+    let (t,d,rows) = (title.to_string(), description.to_string(), candidates.clone());
     let started = std::time::Instant::now();
-    let result = tokio::task::spawn_blocking(move || classify(client.as_ref(), &m, &t, &d, &rows)).await;
+    let result = classify_within_deadline(client, model.clone(), t, d, rows).await;
     let model_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let mut plan = match result {
-        Ok(Ok(decision)) => Plan {decision, measured:true, n_considered:candidates.len(), n_available:available, model:Some(model), model_ms:Some(model_ms), candidates},
+        Ok(Ok(decision)) => Plan {decision, measured:true, n_considered:candidates.len(), n_available:available, model:Some(model), model_ms:Some(model_ms), candidates, completed_hints:Vec::new()},
         result => {
             tracing::warn!(target:"amux::board_intake", error=?result, model_ms, "semantic comparison unavailable; incoming request preserved");
             let mut failed = Plan::create("semantic comparison failed; request preserved separately",candidates,available,false);
@@ -204,15 +338,151 @@ pub async fn plan(store: &Store, session: &str, owner: &str, title: &str, descri
             failed
         }
     };
-    if model_ms >= SLOW_MODEL_MS {
+    let slow_ms = slow_model_ms();
+    if model_ms >= slow_ms {
         tracing::warn!(target:"amux::board_intake", verdict = "board_intake_model_slow", session, model_ms,
-            threshold_ms = SLOW_MODEL_MS, n_considered = plan.n_considered, measured = true,
-            "board intake model call was slow; the create waited on it");
+            threshold_ms = slow_ms, deadline_ms = intake_model_timeout_ms(),
+            n_considered = plan.n_considered, measured = true,
+            "board intake model call came close to its own deadline; the create waited on it");
     }
     // A matching title alone never makes an unavailable model count as measured.
     if plan.decision.action == "create" { plan.decision.task_id = None; }
+    // AMUX-4880: attach on EVERY path, including the ones that skipped the
+    // model. A create that never reached the classifier is exactly the case
+    // where a reader has least other information about duplication.
+    if !completed_hints.is_empty() {
+        tracing::info!(target:"amux::board_intake", session,
+            hints = completed_hints.len(),
+            first = %completed_hints[0].id,
+            verdict = "board_intake_resembles_completed_work",
+            "captured request resembles recently completed work");
+    }
+    plan.completed_hints = completed_hints;
     tracing::info!(target:"amux::board_intake", session, decision=%plan.log_line(), "board intake compared");
     plan
+}
+
+/// A card that recently CLOSED and resembles the incoming request (AMUX-4880).
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct CompletedHint {
+    pub id: String,
+    pub title: String,
+    pub session: String,
+    pub status: String,
+    /// Unix seconds of the close, so a reader can say "yesterday" without
+    /// re-querying.
+    pub updated: i64,
+}
+
+/// Tokens too common to carry any signal about what a request is ABOUT.
+/// `amux` is in here on purpose: on this board it appears in a large share of
+/// titles and would make unrelated requests look alike.
+const HINT_STOPWORDS: &[&str] = &[
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "that", "this",
+    "it", "is", "be", "was", "are", "as", "at", "by", "from", "into", "our", "we", "i",
+    "can", "you", "your", "my", "me", "so", "if", "not", "no", "do", "does", "did",
+    "amux", "card", "cards", "task", "tasks", "board", "worker", "workers", "lane",
+];
+
+fn hint_tokens(text: &str) -> std::collections::BTreeSet<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| w.len() >= 3 && !HINT_STOPWORDS.contains(w))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether an incoming title resembles a closed card's title (AMUX-4880).
+///
+/// PURE, so the motivating pair can be replayed in a test without a database.
+///
+/// Requires both an absolute overlap (three distinctive words agreeing is not
+/// a coincidence at title length) and a proportional one, so a long title
+/// cannot swallow a short unrelated one.
+///
+/// THE RATIO IS CALIBRATED ON THE REAL PAIR, not on taste. My first version
+/// used 0.5 and its own replay test rejected it: the motivating titles share
+/// {create, scheduler, weekly, simplification} = 4 tokens against a 10-token
+/// title, which is 0.40. I had calibrated against the TRUNCATED title as shown
+/// on the board ("...goes thru the…"), where the denominator is smaller and
+/// the ratio flattered the threshold. Calibrating a matcher on an abbreviated
+/// specimen is how it comes to miss the full-length case it exists for.
+///
+/// 0.35 sits below the measured 0.40 with margin rather than on the boundary.
+/// The absolute floor does the real work: the negative tests include a pair
+/// that shares nothing BUT scaffolding words, which a matcher without its
+/// stopword list would score as perfect.
+const HINT_MIN_OVERLAP: usize = 3;
+const HINT_MIN_RATIO: f64 = 0.35;
+
+fn title_resembles(incoming: &str, closed: &str) -> bool {
+    let (a, b) = (hint_tokens(incoming), hint_tokens(closed));
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    let overlap = a.intersection(&b).count();
+    let smaller = a.len().min(b.len());
+    overlap >= HINT_MIN_OVERLAP && (overlap as f64 / smaller as f64) >= HINT_MIN_RATIO
+}
+
+/// How far back a close still counts as "recent" for the hint.
+fn completed_hint_window_days() -> i64 {
+    std::env::var("AMUX_INTAKE_COMPLETED_HINT_DAYS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|d| *d > 0)
+        .unwrap_or(14)
+}
+
+/// Recently-closed cards resembling this request, ACROSS ALL SESSIONS.
+///
+/// CROSS-SESSION ON PURPOSE, and the card asked for that decision explicitly.
+/// The motivating case is exactly the cross-lane one: Ethan asked for a weekly
+/// simplification scan on the `amux` lane 17 hours after `amux-frustrations`
+/// had built it and its scheduler had already fired once. A same-session-only
+/// hint would have stayed silent on the incident that produced this feature.
+///
+/// A read-only LOOKUP is not the thing `cross_board_create_forbidden` governs.
+/// That rule stops one lane WRITING to another's board; this writes nothing,
+/// assigns nothing, and cannot move a card. It only lets a capture say "this
+/// looks like something that shipped".
+///
+/// THE MERGE PREDICATE IS UNTOUCHED. Terminal cards remain ineligible as merge
+/// targets, because appending new text into a closed card is the failure that
+/// exclusion exists to prevent. This is a separate, additive read.
+fn recently_completed_matches(conn: &rusqlite::Connection, title: &str, now_s: i64) -> Vec<CompletedHint> {
+    if hint_tokens(title).is_empty() {
+        return Vec::new();
+    }
+    let cutoff = now_s - completed_hint_window_days() * 86_400;
+    let mut out = Vec::new();
+    let q = conn.prepare(
+        "SELECT id, title, COALESCE(session,''), status, COALESCE(updated,0) FROM issues \
+         WHERE status IN ('done','verified') AND archived=0 AND deleted IS NULL \
+           AND COALESCE(updated,0) >= ?1 \
+         ORDER BY updated DESC LIMIT 400",
+    );
+    let Ok(mut stmt) = q else { return out };
+    let Ok(rows) = stmt.query_map(rusqlite::params![cutoff], |r| {
+        Ok(CompletedHint {
+            id: r.get(0)?,
+            title: r.get(1)?,
+            session: r.get(2)?,
+            status: r.get(3)?,
+            updated: r.get(4)?,
+        })
+    }) else {
+        return out;
+    };
+    for hint in rows.flatten() {
+        if title_resembles(title, &hint.title) {
+            out.push(hint);
+            if out.len() >= 3 {
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// The size past which a semantic append is refused and the request becomes its
@@ -463,4 +733,292 @@ mod tests {
         }).unwrap();
     }
 
+}
+
+/// AMUX-4836: the create must not wait forever on the classifier.
+#[cfg(test)]
+mod structured_skip_tests {
+    use super::*;
+    use serde_json::json;
+    use std::cell::Cell;
+
+    /// AMUX-4846. Every key the create response advertises as avoiding the
+    /// classifier must actually avoid it.
+    ///
+    /// The response now tells a caller which keys would have skipped the ~3.3s
+    /// wait it just paid, and that advice is only worth anything if the gate
+    /// honours the same list. Both read `STRUCTURED_KEYS`, so this pins that
+    /// the list MEANS what the hint claims: each key on it, alone, prevents the
+    /// comparison from being invoked at all.
+    ///
+    /// THE CONTROL ARM IS THE POINT. Asserting that a structured create skips
+    /// the call passes just as well against a plan_create that never calls the
+    /// model for anything, which would silently disable semantic intake
+    /// entirely. The bare create below is what catches that.
+    #[tokio::test]
+    async fn every_advertised_key_skips_the_model_and_a_bare_create_does_not() {
+        // THE LOOP BELOW CANNOT CHECK THE KEY NAMES, so these do it first.
+        //
+        // Iterating STRUCTURED_KEYS and setting whatever it contains is
+        // self-consistent by construction: rename a key and the test renames
+        // with it, so the gate still honours what the test sends. Caught by
+        // mutating `"next_action"` to `"next_action_NOT_HONOURED"` and watching
+        // the suite stay green.
+        //
+        // These names are the CONTRACT, because the create response prints them
+        // as advice a caller will type, so a rename has to redden something.
+        // Asserted as literals, independent of the const.
+        for required in ["next_action", "acceptance_criteria", "depends_on", "request_to"] {
+            assert!(
+                STRUCTURED_KEYS.contains(&required),
+                "`{required}` is advertised to callers and must stay on the list the gate reads"
+            );
+            let called = Cell::new(false);
+            let mut m = serde_json::Map::new();
+            m.insert(required.to_string(), json!("x"));
+            let _ = plan_create(&m, "code", || async {
+                called.set(true);
+                Plan::create("compared", vec![], 0, true)
+            })
+            .await;
+            assert!(
+                !called.get(),
+                "a create carrying the literal key `{required}` must skip the comparison"
+            );
+        }
+
+        for key in STRUCTURED_KEYS {
+            let called = Cell::new(false);
+            let mut map = serde_json::Map::new();
+            map.insert(key.to_string(), json!("x"));
+            let plan = plan_create(&map, "code", || async {
+                called.set(true);
+                Plan::create("compared", vec![], 0, true)
+            })
+            .await;
+            assert!(
+                !called.get(),
+                "a create carrying `{key}` must skip the comparison, or the response's own \
+                 advice to add it is false"
+            );
+            assert!(
+                plan.model_ms.is_none(),
+                "and it must report no model call for `{key}`"
+            );
+        }
+
+        // CONTROL: nothing structured, so the comparison DOES run. Without this
+        // the loop above is satisfied by a gate that skips everything.
+        let called = Cell::new(false);
+        let mut bare = serde_json::Map::new();
+        bare.insert("title".into(), json!("a bare card"));
+        let _ = plan_create(&bare, "code", || async {
+            called.set(true);
+            Plan::create("compared", vec![], 0, true)
+        })
+        .await;
+        assert!(
+            called.get(),
+            "a create with no structure must still be compared, or semantic intake is off"
+        );
+
+        // AND AN EMPTY VALUE IS NOT STRUCTURE. `{\"next_action\": \"\"}` must
+        // not buy a skip, or a caller sending the key with nothing in it gets
+        // the fast path and an undispatchable card.
+        let called = Cell::new(false);
+        let mut empty = serde_json::Map::new();
+        empty.insert("next_action".into(), json!(""));
+        let _ = plan_create(&empty, "code", || async {
+            called.set(true);
+            Plan::create("compared", vec![], 0, true)
+        })
+        .await;
+        assert!(
+            called.get(),
+            "an empty structured value must not count as structure"
+        );
+    }
+}
+
+#[cfg(test)]
+mod intake_deadline_tests {
+    use super::*;
+
+    /// AMUX-4880. THE INCIDENT, REPLAYED WITH THE REAL TITLES.
+    ///
+    /// 2026-09-17 17:32 AF-916 closed, having built the weekly scan and its
+    /// scheduler. 2026-09-18 10:39 Ethan asked for exactly that, and it was
+    /// captured as AMUX-4799 with nothing saying it already existed. The
+    /// capture could not have been flagged for two independent reasons: AF-916
+    /// was `done` (excluded by status) and sat on another lane (excluded by
+    /// session). This pins that the hint fires on that pair.
+    #[test]
+    fn the_amux_4799_request_resembles_the_af_916_work_that_shipped() {
+        let asked = "Create an amux scheduler that runs weekly which goes thru the entire amux server/ui to find simplification opportunities";
+        let shipped = "Design and test a weekly amux simplification-scan prompt; create the scheduler with the winning version";
+        assert!(
+            title_resembles(asked, shipped),
+            "the request that produced this card must resemble the work that shipped"
+        );
+    }
+
+    /// The other arm. Without it, `fn title_resembles(_,_) -> true` passes the
+    /// test above and marks every capture as a duplicate, which destroys the
+    /// signal more thoroughly than not having it.
+    #[test]
+    fn unrelated_titles_do_not_resemble_each_other() {
+        let cases = [
+            ("Create an amux scheduler that runs weekly", "Fix the iOS Safari composer attachment race"),
+            ("Peek latency: the transcript render is uncached", "Board payload ships 25% nulls"),
+            // Shares only the stopword-ish scaffolding, which must not count.
+            ("The amux board card for this task", "This amux worker card board task"),
+        ];
+        for (a, b) in cases {
+            // The third case is the interesting one: it is nothing BUT common
+            // tokens, so a matcher that forgot its stopword list would score it
+            // as a perfect match.
+            assert!(
+                !title_resembles(a, b),
+                "{a:?} must not resemble {b:?}; a false positive costs trust in every later hint"
+            );
+        }
+    }
+
+    /// An empty or punctuation-only title has no tokens, and must not match
+    /// everything by vacuous intersection.
+    #[test]
+    fn a_title_with_no_distinctive_tokens_matches_nothing() {
+        for empty in ["", "   ", "-- ...", "a the of"] {
+            assert!(
+                !title_resembles(empty, "Create an amux scheduler that runs weekly"),
+                "{empty:?} has no distinctive tokens and must match nothing"
+            );
+        }
+    }
+
+    /// AMUX-4847. THE CHECK THIS FILE ALREADY SHIPPED COULD NOT FIRE.
+    /// `SLOW_MODEL_MS` was a 60_000 literal while the call it measures is
+    /// aborted at 20_000, so no input reached the WARN. This is the cell that
+    /// would have caught it the moment the deadline landed, and it is the one
+    /// that keeps the pair honest as either side moves.
+    ///
+    /// Asserting a specific number would not do it: the bug was a RELATIONSHIP
+    /// between two constants, and any literal here goes stale the same way the
+    /// original did.
+    #[test]
+    fn slow_model_never_exceeds_its_own_deadline() {
+        for knob in ["", "1000", "5", "20000", "45000", "600000"] {
+            if knob.is_empty() {
+                std::env::remove_var("AMUX_INTAKE_MODEL_TIMEOUT_MS");
+            } else {
+                std::env::set_var("AMUX_INTAKE_MODEL_TIMEOUT_MS", knob);
+            }
+            let deadline = intake_model_timeout_ms();
+            let slow = slow_model_ms();
+            assert!(
+                slow < deadline,
+                "knob {knob:?}: warn threshold {slow}ms must sit BELOW the {deadline}ms \
+                 deadline, or model_ms can never reach it and the WARN is dead"
+            );
+            assert!(
+                slow > 0,
+                "knob {knob:?}: a zero threshold warns on every call, which is the \
+                 opposite failure and just as useless"
+            );
+        }
+        std::env::remove_var("AMUX_INTAKE_MODEL_TIMEOUT_MS");
+    }
+
+    /// The threshold has to track the knob, not merely sit under it. A literal
+    /// that happened to be smaller than the default would pass the test above
+    /// and still go dead the moment someone raised the deadline.
+    #[test]
+    fn raising_the_deadline_raises_the_threshold_with_it() {
+        std::env::set_var("AMUX_INTAKE_MODEL_TIMEOUT_MS", "20000");
+        let at_default = slow_model_ms();
+        std::env::set_var("AMUX_INTAKE_MODEL_TIMEOUT_MS", "40000");
+        let at_double = slow_model_ms();
+        assert!(
+            at_double > at_default,
+            "doubling the deadline must move the threshold ({at_default} -> {at_double}); \
+             a hardcoded value is how this check died the first time"
+        );
+        std::env::remove_var("AMUX_INTAKE_MODEL_TIMEOUT_MS");
+        assert_eq!(
+            slow_model_ms(),
+            15_000,
+            "at the 20s default the warn fires only within 5s of the deadline; measured \
+             2026-09-19 over 262 intakes (p50 3133, p99 9211, max 14122) this is quiet, \
+             which is a check with nothing to say rather than one that cannot speak"
+        );
+    }
+
+    /// The knob is bounded below, so a misconfiguration cannot disable the
+    /// comparison by making the deadline unreachably small.
+    #[test]
+    fn the_deadline_has_a_floor_and_a_measured_default() {
+        std::env::remove_var("AMUX_INTAKE_MODEL_TIMEOUT_MS");
+        assert_eq!(
+            intake_model_timeout_ms(),
+            20_000,
+            "the default is derived: ~2x the measured p99 of 10345ms, which cuts 1 of 921 \
+             observed intakes rather than the 13 a 10s bound would cut"
+        );
+        std::env::set_var("AMUX_INTAKE_MODEL_TIMEOUT_MS", "5");
+        assert_eq!(intake_model_timeout_ms(), 1_000, "a too-small value is floored, not honoured");
+        std::env::set_var("AMUX_INTAKE_MODEL_TIMEOUT_MS", "not a number");
+        assert_eq!(intake_model_timeout_ms(), 20_000, "garbage falls back to the default");
+        std::env::remove_var("AMUX_INTAKE_MODEL_TIMEOUT_MS");
+    }
+
+    /// The behaviour that matters: a classifier that never answers must not
+    /// hold the create open. The caller gets a card, without a dedup check.
+    ///
+    /// This drives the REAL deadline path (`tokio::time::timeout` around the
+    /// `spawn_blocking`), not a paraphrase of it, by blocking the classifier
+    /// far longer than the deadline and asserting the wait ends anyway.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_classifier_that_never_answers_does_not_hold_the_create_open() {
+        struct Hangs;
+        impl ModelClient for Hangs {
+            fn complete(&self, _: &str, _: &str) -> Result<String, String> {
+                // 2s, not 30: the deadline below is 1s, so this still proves
+                // the wait ends early, and the SUITE pays only 2s. A
+                // spawn_blocking thread cannot be cancelled, so the runtime
+                // joins it at shutdown and a long sleep here is time added to
+                // every test run — the first version of this slept 30s and the
+                // cell took 30.14s.
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                Ok(r#"{"action":"append","task_id":"A-1","reason":"late","confidence":1}"#.into())
+            }
+        }
+        std::env::set_var("AMUX_INTAKE_MODEL_TIMEOUT_MS", "1000");
+        let started = std::time::Instant::now();
+        // The SHIPPED function, not a rebuilt timeout expression. `plan` calls
+        // exactly this, so mutating the deadline away reddens here.
+        let out = classify_within_deadline(
+            Arc::new(Hangs),
+            "test".into(),
+            "t".into(),
+            "d".into(),
+            vec![Candidate { id: "A-1".into(), title: "x".into(), description: "y".into(), rev: 1 }],
+        )
+        .await;
+        let waited = started.elapsed();
+        std::env::remove_var("AMUX_INTAKE_MODEL_TIMEOUT_MS");
+
+        let inner = out.expect("the join itself must not fail");
+        let err = inner.expect_err("a classifier that never answers yields no decision");
+        assert!(
+            err.contains("deadline"),
+            "the give-up reason must say it was a deadline, so the card's log line explains \
+             the missing dedup: {err}"
+        );
+        assert!(
+            waited < std::time::Duration::from_millis(1800),
+            "the create waited {waited:?} on a classifier that sleeps 2s; the deadline did not \
+             bound it"
+        );
+        // that nobody is waiting on it.
+    }
 }

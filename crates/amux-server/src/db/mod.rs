@@ -92,6 +92,12 @@ type WriteFn = Box<dyn FnOnce(&Connection) -> rusqlite::Result<WriteOutcome> + S
 struct WriteRequest {
     work: WriteFn,
     origin: &'static str,
+    /// AMUX-4781: WHERE the write was issued, not just which function.
+    /// `origin` is `type_name::<F>()`, and every closure inside one function
+    /// renders identically, so `Runtime::tick_once`'s twelve `write_async`
+    /// call sites all logged one indistinguishable string. That is what made
+    /// the top writer hold unattributable.
+    site: &'static std::panic::Location<'static>,
     queued_at: std::time::Instant,
     interaction_id: Option<String>,
     reply: mpsc::Sender<rusqlite::Result<WriteReply>>,
@@ -113,6 +119,17 @@ pub struct Store {
     /// only testable by holding every connection, and the paths that must hold
     /// it (`api::policy::enforce`) live in other modules.
     pub(crate) read_pool: ReadPool,
+    /// AF-937: held only for its lifetime -- an RAII guard, not state. An
+    /// flock on a sidecar file next to `db_path`, acquired in
+    /// [`claim_sole_writer`] at open time. The OS releases it automatically
+    /// when every clone of this `Arc` (and so the underlying `File`) drops,
+    /// including on a crash or SIGKILL, so a stale lock cannot outlive the
+    /// process that took it. `None` means either another live process
+    /// already held it (a WARN was logged) or the probe itself could not run
+    /// (never treated as contention). Read only by the `#[cfg(test)]`
+    /// accessor below; production code never inspects it, only outlives it.
+    #[allow(dead_code, reason = "RAII guard: outlived, not read, outside tests")]
+    pub(crate) writer_lock: Option<Arc<std::fs::File>>,
     db_path: Arc<std::path::PathBuf>,
     pub(crate) health_probe: Arc<tokio::sync::Semaphore>,
     pub(crate) health_probe_started: Arc<std::sync::atomic::AtomicU64>,
@@ -167,6 +184,99 @@ pub(crate) fn record_blocking_dispatch(
     }
 }
 
+/// Sidecar to `db_path` recording which live process holds it open for
+/// writing. A `.holder-lock` suffix, distinct from SQLite's own `-wal`,
+/// `-shm` and `-journal` files, so nothing that globs those is affected.
+fn holder_lock_path(db_path: &Path) -> std::path::PathBuf {
+    let mut s = db_path.as_os_str().to_owned();
+    s.push(".holder-lock");
+    std::path::PathBuf::from(s)
+}
+
+/// What a contended lock probe learned about the process that beat us to it.
+/// `pid`/`port` are `None` only when the lock file's content could not be
+/// parsed (an old-format or corrupt write) -- never a stand-in for "nobody
+/// holds it", which is the `Ok` case in [`claim_sole_writer`]'s caller.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ExistingWriter {
+    pub pid: Option<u32>,
+    pub port: Option<u16>,
+}
+
+pub(crate) enum WriterLockOutcome {
+    /// We hold the lock. Keep the `File` alive for the store's lifetime, or
+    /// the OS releases it immediately.
+    Acquired(std::fs::File),
+    /// Another live OS process already holds it.
+    HeldByOther(Option<ExistingWriter>),
+    /// The recorded holder IS this process (a same-process reopen of the
+    /// same `db_path` while the first handle is still alive -- e.g. a test
+    /// simulating a restart without an actual exec). flock() is scoped to
+    /// the open file description, not the process, so a second open()
+    /// within the same process still contends; that is not a second OS
+    /// process and must not be reported as one.
+    HeldBySelf,
+}
+
+/// Claim sole-writer status on `db_path` via an advisory `flock` on a sidecar
+/// file, or report who already holds it.
+///
+/// AF-937 / AEAB-11 recurrence: a manual `amux-server-rs` run with no
+/// `AMUX_RS_PORT` falls onto `DEFAULT_PORT` and the default `AMUX_HOME`,
+/// landing on the exact `db_path` the real server already has open -- and
+/// nothing said so for 13 hours (both processes reported healthy the whole
+/// time; SQLite's own WAL locking serializes the writes correctly, so this
+/// was never about corruption, only a silent second writer). This makes that
+/// coexistence loud. It never blocks or fails startup: a probe that cannot
+/// even open the sidecar file degrades to `HeldByOther(None)` treated as
+/// "unknown", not a reason to refuse.
+fn claim_sole_writer(db_path: &Path) -> WriterLockOutcome {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::io::AsRawFd;
+
+    let lock_path = holder_lock_path(db_path);
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        // Explicit: opening must NOT clear a prior holder's content -- the
+        // contended branch below reads it before this fn's caller ever
+        // decides whether to overwrite it (only the lock-winning branch
+        // truncates, deliberately, via `set_len(0)`).
+        .truncate(false)
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        Err(_) => return WriterLockOutcome::HeldByOther(None),
+    };
+
+    // SAFETY: `file` is a valid, open fd for the lifetime of this call.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        let mut f = &file;
+        let _ = f.set_len(0);
+        let _ = f.seek(SeekFrom::Start(0));
+        let payload =
+            serde_json::json!({"pid": std::process::id(), "port": crate::config::canonical_port()});
+        let _ = write!(f, "{payload}");
+        let _ = f.flush();
+        return WriterLockOutcome::Acquired(file);
+    }
+
+    let mut buf = String::new();
+    let mut f = &file;
+    let _ = f.read_to_string(&mut buf);
+    let existing = serde_json::from_str::<serde_json::Value>(&buf).ok().map(|v| ExistingWriter {
+        pid: v.get("pid").and_then(serde_json::Value::as_u64).map(|x| x as u32),
+        port: v.get("port").and_then(serde_json::Value::as_u64).map(|x| x as u16),
+    });
+    if existing.as_ref().and_then(|e| e.pid) == Some(std::process::id()) {
+        WriterLockOutcome::HeldBySelf
+    } else {
+        WriterLockOutcome::HeldByOther(existing)
+    }
+}
+
 impl Store {
     /// Open the store: apply migrations, start the writer thread, build the
     /// read pool.
@@ -174,6 +284,28 @@ impl Store {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // AF-937: probe BEFORE opening anything else, so a warning is the
+        // first thing this open logs if it fires, and so the probe never
+        // depends on migrations or the writer thread having succeeded.
+        let writer_lock = match claim_sole_writer(db_path) {
+            WriterLockOutcome::Acquired(f) => Some(Arc::new(f)),
+            WriterLockOutcome::HeldBySelf => None,
+            WriterLockOutcome::HeldByOther(existing) => {
+                tracing::warn!(
+                    target: "store",
+                    verdict = "concurrent_writer_detected",
+                    db = %db_path.display(),
+                    other_pid = existing.as_ref().and_then(|e| e.pid),
+                    other_port = existing.as_ref().and_then(|e| e.port),
+                    measured = true,
+                    "another live process already has this database open for writing -- \
+                     AEAB-11/AF-937: a manual amux-server-rs run with no AMUX_RS_PORT set \
+                     falls onto the compiled-in default port and can silently collide with \
+                     the real server on this exact db_path"
+                );
+                None
+            }
+        };
         // Migrations run on a dedicated connection before anything else may
         // touch the DB. Health returns 503 until `open` completes.
         let mut conn = Connection::open(db_path)?;
@@ -251,6 +383,7 @@ impl Store {
         Ok(Store {
             write_tx,
             read_pool,
+            writer_lock,
             db_path: Arc::new(db_path.to_path_buf()),
             health_probe: Arc::new(tokio::sync::Semaphore::new(1)),
             health_probe_started: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -262,16 +395,32 @@ impl Store {
         })
     }
 
+    /// AF-937: whether this instance won the sidecar `flock` at open time.
+    /// `false` covers both "another live process already held it" (a WARN
+    /// was logged) and "this process already held it" (a same-process
+    /// reopen, silently benign) -- callers that need to tell those apart
+    /// read the log, not this method.
+    #[cfg(test)]
+    pub(crate) fn holds_writer_lock(&self) -> bool {
+        self.writer_lock.is_some()
+    }
+
     /// Run a mutation on the writer thread and wait for commit. Returns the
     /// revision assigned to this write (unchanged if the write was a no-op).
+    #[track_caller]
     pub fn write<F>(&self, f: F) -> anyhow::Result<WriteReply>
     where
         F: FnOnce(&Connection) -> rusqlite::Result<WriteOutcome> + Send + 'static,
     {
-        self.write_correlated(f, interactions::current_id())
+        self.write_correlated(f, interactions::current_id(), std::panic::Location::caller())
     }
 
-    fn write_correlated<F>(&self, f: F, interaction_id: Option<String>) -> anyhow::Result<WriteReply>
+    fn write_correlated<F>(
+        &self,
+        f: F,
+        interaction_id: Option<String>,
+        site: &'static std::panic::Location<'static>,
+    ) -> anyhow::Result<WriteReply>
     where
         F: FnOnce(&Connection) -> rusqlite::Result<WriteOutcome> + Send + 'static,
     {
@@ -284,6 +433,7 @@ impl Store {
             .send(WriteRequest {
                 work: Box::new(f),
                 origin: std::any::type_name::<F>(),
+                site,
                 queued_at: std::time::Instant::now(),
                 interaction_id,
                 reply: reply_tx,
@@ -321,7 +471,15 @@ impl Store {
 
     /// Async wrapper: parks the wait on the blocking pool so an API handler
     /// can await a write without pinning a runtime worker.
-    pub async fn write_async<F>(&self, f: F) -> anyhow::Result<WriteReply>
+    /// NOT an `async fn` on purpose: `#[track_caller]` does not propagate
+    /// through the generated future, and the call site is the whole point
+    /// (AMUX-4781). Returning a `'static` future keeps every `.await` caller
+    /// source-compatible.
+    #[track_caller]
+    pub fn write_async<F>(
+        &self,
+        f: F,
+    ) -> impl std::future::Future<Output = anyhow::Result<WriteReply>> + Send
     where
         F: FnOnce(&Connection) -> rusqlite::Result<WriteOutcome> + Send + 'static,
     {
@@ -329,6 +487,8 @@ impl Store {
         let interaction_id = interactions::current_id();
         let dispatch = self.blocking_dispatch_max_ms.clone();
         let queued = std::time::Instant::now();
+        let site = std::panic::Location::caller();
+        async move {
         tokio::task::spawn_blocking(move || {
             // TIME SPENT WAITING FOR A BLOCKING THREAD, which every other
             // instrument on this path is structurally blind to (AMUX-4744).
@@ -343,9 +503,10 @@ impl Store {
             // a 90s request with a small `queued_ms` and a large value here
             // means the writer was never the problem.
             record_blocking_dispatch(&dispatch, queued.elapsed());
-            this.write_correlated(f, interaction_id)
+            this.write_correlated(f, interaction_id, site)
         })
         .await?
+        }
     }
 
     /// Run a read WITHOUT pinning a runtime worker (AF-640 / AMUX-4744).
@@ -554,6 +715,46 @@ fn parse_entity_type(raw: &str) -> amux_core::revision::EntityType {
         .unwrap_or_else(|_| EntityType::Other(raw.to_string()))
 }
 
+/// `cache_size` AND `mmap_size` ARE DELIBERATELY LEFT AT SQLITE'S DEFAULTS.
+///
+/// They are absent on purpose, not by oversight, and the measurement is written
+/// down here so the next person to notice "2MB of page cache against a 4.6GB
+/// database" does not re-derive it (AMUX-4842 — which I filed myself, arguing
+/// the cache should be raised, and then disproved).
+///
+/// RAISING IT IS SLOWER ON THIS BOX. Measured 2026-09-19 against the live 4.62GB
+/// database, 600 random point lookups per round over `_amux_request_log`
+/// (3.45M rows) and `token_ledger`, 16 rounds, arms INTERLEAVED with the order
+/// reshuffled each round and an identical key sequence per round:
+///   cache_size=-2000    (2MB)    median 3.8ms   p25 3.5  p75 4.0
+///   cache_size=-65536   (64MB)   median 4.3ms   p25 4.2  p75 5.0   +14.7%
+///   cache_size=-262144  (256MB)  median 4.2ms   p25 4.2  p75 4.3   +13.0%
+///
+/// WHY, and the arithmetic is the whole argument: 3.8ms for 600 lookups is
+/// 6.3us each. An NVMe read is ~100us, so those pages were already in memory.
+/// The host has 103GB of RAM with 54GB free or reclaimable against a 4.62GB
+/// file, so the OS page cache holds the entire database. SQLite's own cache
+/// therefore saves no I/O at all and can only add hash and LRU bookkeeping on
+/// top of a cache that already has the page. That is the cost the numbers show.
+///
+/// AND THE FIRST MEASUREMENT SAID THE OPPOSITE, which is why the method is
+/// recorded and not just the result. A block-ordered A-B-A run (2MB, then
+/// 512MB, then 2MB again) showed 48ms -> 36ms -> 48ms and looked conclusive:
+/// the control returned to baseline, so OS warming appeared to be ruled out.
+/// It was not. A-B-A only controls for MONOTONIC drift, and this box compiles
+/// and tests continuously, so a quieter middle arm produces exactly that shape.
+/// Interleaving the arms is what a noisy host actually requires, and the effect
+/// disappeared and then reversed once it was applied.
+///
+/// `mmap_size` stays 0 for a different reason, a risk one rather than a
+/// measured one: with mmap, an I/O error reaches the process as SIGBUS instead
+/// of a return code, so a read fault becomes a crash of the fleet's control
+/// plane rather than a handled error. There is no measured benefit here to pay
+/// for that, since the OS already holds the file.
+///
+/// What would change this: a host where the database no longer fits in RAM, or
+/// a working set that outgrows the page cache. Re-measure with interleaved arms
+/// before changing either value.
 fn configure_connection(c: &Connection) -> rusqlite::Result<()> {
     c.pragma_update(None, "journal_mode", "WAL")?;
     c.pragma_update(None, "synchronous", "NORMAL")?;
@@ -570,6 +771,10 @@ fn writer_loop(
     while let Ok(req) = rx.recv() {
         let queued_ms = req.queued_at.elapsed().as_millis() as u64;
         let started = std::time::Instant::now();
+        // Reset first: a mutation that fails before committing must not report
+        // the PREVIOUS write's commit time as its own.
+        LAST_COMMIT_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+        LAST_BEGIN_MS.store(0, std::sync::atomic::Ordering::Relaxed);
         // A panicking caller must not kill the sole writer and strand every
         // later mutation. The transaction guard rolls back during unwinding.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -581,11 +786,38 @@ fn writer_loop(
                 std::io::Error::other("writer mutation panicked; transaction rolled back"))))
         });
         let work_ms = started.elapsed().as_millis() as u64;
+        // SPLIT THE HOLD (AMUX-4830, corrected by AMUX-4837). This comment used
+        // to assert "on this box it is the commit". THE MEASUREMENT SAYS THE
+        // OPPOSITE and the wrong sentence is what kept AMUX-4781's chain aimed
+        // at the commit: across 130 writer_slow lines carrying the split, all of
+        // them ok=true, `commit_ms` was 3.2% of `work_ms` and SUB-MILLISECOND on
+        // 118 of 130. The commit is free; the hold is everything before it.
+        //
+        // So the split goes one level further. `stmt_ms` was derived as
+        // everything-that-is-not-commit, which lumps acquiring the write lock in
+        // with running the statements. Those need separating, because the
+        // cheapest site in the fleet refutes the statement explanation on its
+        // own: api/interactions.rs does ONE indexed SELECT plus ONE INSERT and
+        // returns no events, so it never touches the `_amux_state_events` loop,
+        // and it still averaged 466ms with a 0ms commit. One indexed lookup and
+        // one insert are not 466ms of statement execution.
+        //
+        // `begin_ms` is the candidate that fits the rest of the evidence:
+        // BEGIN IMMEDIATE takes the write lock, and SQLite's busy handler backs
+        // off in 1/2/5/10/25/50/100ms steps, which quantises a contended
+        // acquisition into exactly the site-independent floor observed here.
+        // It also explains why the number does not track host load (measured
+        // r = -0.002 against load1 over the same 130 lines): a backoff schedule
+        // is a function of contention, not of CPU.
+        let commit_ms = LAST_COMMIT_MS.load(std::sync::atomic::Ordering::Relaxed);
+        let begin_ms = LAST_BEGIN_MS.load(std::sync::atomic::Ordering::Relaxed);
+        let stmt_ms = work_ms.saturating_sub(commit_ms).saturating_sub(begin_ms);
         if work_ms >= 250 || queued_ms >= 1000 {
             // Function identity only; never record the request body or SQL
             // values. Separate the slow writer from callers waiting behind it.
             tracing::warn!(target: "store", verdict = "writer_slow", origin = req.origin,
-                queued_ms, work_ms, ok = result.is_ok(), measured = true, n_considered = 1,
+                site = %req.site, queued_ms, work_ms, commit_ms, begin_ms, stmt_ms, ok = result.is_ok(),
+                measured = true, n_considered = 1,
                 "serialized write delayed; origin identifies the blocking mutation");
         }
         if let Err(error) = &result {
@@ -600,6 +832,28 @@ fn writer_loop(
     // checkpoints on connection close.
 }
 
+/// How long the LAST `apply_write` spent inside `transaction.commit()`.
+///
+/// AMUX-4830: `work_ms` spans statements AND the commit, and on this box the
+/// commit dominates. Thirteen writer sites doing completely different work
+/// clustered between 589ms and 2189ms (coefficient of variation 0.32) — a
+/// single small insert at `api/interactions.rs:101` cost 589ms, which cannot be
+/// statement time. That floor was only visible by comparing sites against each
+/// other; splitting it out makes it readable in one line.
+///
+/// A static counter rather than a thread-local: the writer is a single thread
+/// (`writer_loop` owns the connection) so both are exact, but a thread-local is
+/// invisible to a test, which reads its OWN thread's copy and sees 0 forever.
+/// My first version of this was a thread-local and both of its mutations passed
+/// green, which is how I found out.
+static LAST_COMMIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Milliseconds spent acquiring the write lock in `BEGIN IMMEDIATE`, published
+/// the same way and for the same reason as [`LAST_COMMIT_MS`]: an atomic rather
+/// than a thread-local, because `writer_loop` owns the connection and a
+/// thread-local reads 0 forever from a test's own thread.
+static LAST_BEGIN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn apply_write(
     conn: &Connection,
     work: WriteFn,
@@ -609,7 +863,12 @@ fn apply_write(
     // Roll back EVERY failure path, including revision/event writes, failed
     // COMMIT and unwinding. A bare BEGIN left the connection in a transaction
     // after those errors, making all later mutations fail until restart.
+    // STAMPED AROUND THE BEGIN ITSELF (AMUX-4837), because this is where the
+    // busy handler sleeps. Stamping after `work` would fold the lock wait back
+    // into statement time, which is the conflation this split exists to end.
+    let begin_started = std::time::Instant::now();
     let transaction = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    LAST_BEGIN_MS.store(begin_started.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
     let outcome = work(&transaction)?;
     let mut committed_events = Vec::new();
     let rev = if outcome.applied {
@@ -672,7 +931,9 @@ fn apply_write(
         let rev: u64 = conn.query_row("SELECT rev FROM _amux_rev WHERE id = 1", [], |r| r.get(0))?;
         StateRevision(rev)
     };
+    let commit_started = std::time::Instant::now();
     transaction.commit()?;
+    LAST_COMMIT_MS.store(commit_started.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
     // Publish only after commit: a subscriber must never see an event whose
     // transaction later rolled back.
     for ev in &committed_events {
@@ -891,13 +1152,197 @@ mod amux4744_write_queue_tests {
         // A verdict with no numbers says something was slow and not how slow,
         // and without `origin` it cannot say WHAT was slow, which is the field
         // that turns this line into a lead instead of a notification.
-        for field in ["queued_ms", "work_ms", "origin = req.origin"] {
+        // BOUND TO THE WARN, not the function. `commit_ms` also appears in the
+        // `stmt_ms` arithmetic above the macro, so a version of this that
+        // scanned the whole body stayed GREEN when the field was deleted from
+        // the warn itself. Measured: that mutation passed.
+        let warn_at = body.find("writer_slow").expect("the verdict is in this function");
+        let warn = &body[warn_at..body[warn_at..].find(");").map(|i| warn_at + i).unwrap_or(body.len())];
+        for field in [
+            "queued_ms",
+            "work_ms",
+            "origin = req.origin",
+            "site = %req.site",
+            "commit_ms",
+            "begin_ms",
+            "stmt_ms",
+        ] {
             assert!(
-                body.contains(field),
+                warn.contains(field),
                 "the writer_slow verdict must carry `{field}`; without it the line \
                  reports that a stall happened and not what caused it"
             );
         }
+    }
+
+    /// AMUX-4830: a slow write must say whether it was slow WORK or a slow COMMIT.
+    ///
+    /// `work_ms` spans both, and conflating them sent this card at the wrong
+    /// target. Thirteen writer sites doing completely different work clustered
+    /// between 589ms and 2189ms (CV 0.32) on the live box: a single small insert
+    /// at `api/interactions.rs:101` cost 589ms, which cannot be statement time.
+    /// Per-site optimisation cannot move a shared commit floor, and without this
+    /// split the only way to see that was to compare sites against each other.
+    #[test]
+    fn a_slow_write_separates_its_commit_from_its_statements() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("split.db")).unwrap();
+        // A real write, so a real commit happens and the thread-local is set by
+        // the shipped path rather than by the test.
+        store
+            .write(|conn| {
+                conn.execute("CREATE TABLE IF NOT EXISTS t_split (k INTEGER)", [])?;
+                conn.execute("INSERT INTO t_split (k) VALUES (1)", [])?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+
+        // The arithmetic the warn publishes must hold: stmt + commit == work,
+        // and neither half may exceed the whole. `saturating_sub` makes the
+        // second one silent if the reset is ever dropped, which is why it is
+        // asserted rather than assumed.
+        let commit = LAST_COMMIT_MS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            commit < 60_000,
+            "a commit time of {commit}ms is not a measurement, it is a stuck clock"
+        );
+
+        // THE RESET IS LOAD-BEARING. Without it a write that fails BEFORE
+        // committing reports the previous write's commit time as its own, which
+        // is a wrong number that looks entirely plausible.
+        // SEED a non-zero value first. Without this the assertion below passes
+        // whether or not the reset exists, because a fast commit leaves 0
+        // behind anyway — the exact way my first version of this test was
+        // vacuous, confirmed by a mutation that dropped the reset and stayed
+        // green.
+        LAST_COMMIT_MS.store(4242, std::sync::atomic::Ordering::Relaxed);
+        let failed = store.write(|_conn| {
+            Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other("deliberate failure before commit"),
+            )))
+        });
+        assert!(failed.is_err(), "the fixture must actually fail");
+        assert_eq!(
+            LAST_COMMIT_MS.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a write that never committed must report commit_ms 0, not the last \
+             successful write's commit time"
+        );
+    }
+
+    /// AMUX-4837: `begin_ms` must capture the WRITE-LOCK WAIT, not round to zero.
+    ///
+    /// This is the half `stmt_ms` was hiding. `stmt_ms` was derived as
+    /// everything-that-is-not-commit, so a write that spent 400ms asleep in
+    /// SQLite's busy handler waiting for the lock reported 400ms of "statement"
+    /// time, and the fleet then went looking for a slow query that does not
+    /// exist. The live shape that motivated this: `api/interactions.rs` does one
+    /// indexed SELECT and one INSERT, emits no events, and still averaged 466ms
+    /// with a 0ms commit.
+    ///
+    /// A RESET TEST CANNOT COVER THIS and that is why the test is contention
+    /// rather than a sentinel. `writer_loop` zeroes the atomic before every
+    /// write, and an uncontended BEGIN also leaves 0, so "stamped 0" and "never
+    /// stamped" are the same observation on a quiet database. Only a BEGIN that
+    /// genuinely has to wait can tell them apart.
+    #[test]
+    fn begin_ms_measures_the_wait_for_the_write_lock() {
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("beginwait.db");
+        let store = Store::open(&path).unwrap();
+        store
+            .write(|conn| {
+                conn.execute("CREATE TABLE IF NOT EXISTS t_begin (k INTEGER)", [])?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+
+        // A SECOND connection holds the write lock for a while. The store's
+        // writer must sit in BEGIN IMMEDIATE until this one commits.
+        let blocker = Connection::open(&path).unwrap();
+        blocker.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE; INSERT INTO t_begin (k) VALUES (99);").unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let held_ms = 400;
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(held_ms));
+            blocker.execute_batch("COMMIT;").unwrap();
+            let _ = tx.send(());
+        });
+
+        store
+            .write(|conn| {
+                conn.execute("INSERT INTO t_begin (k) VALUES (1)", [])?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+        rx.recv_timeout(std::time::Duration::from_secs(10)).expect("blocker committed");
+
+        let begin = LAST_BEGIN_MS.load(std::sync::atomic::Ordering::Relaxed);
+        // Generous floor: the point is that the wait lands in `begin_ms` at all,
+        // not that the busy handler wakes on any particular step of its backoff.
+        assert!(
+            begin >= held_ms / 2,
+            "begin_ms must carry the write-lock wait; the lock was held ~{held_ms}ms and \
+             begin_ms reported {begin}ms. A 0 here means the wait is being charged to \
+             stmt_ms, which is the conflation AMUX-4837 exists to end"
+        );
+        assert!(
+            begin < 60_000,
+            "a begin time of {begin}ms is not a measurement, it is a stuck clock"
+        );
+    }
+
+    /// AMUX-4781: `origin` names the FUNCTION, and that is not enough to act on.
+    ///
+    /// `origin` is `type_name::<F>()`, and every closure inside one function
+    /// renders as the identical string. `Runtime::tick_once` holds twelve
+    /// `write_async` call sites and was the largest writer hold on this box
+    /// (n=4, median 1917ms over one build), yet all twelve logged
+    /// `Runtime::tick_once::{{closure}}::{{closure}}`. There was no way to ask
+    /// which write was slow, which is why the card that sent me here could not
+    /// name a target.
+    ///
+    /// The fix is `#[track_caller]` plus `Location::caller()`. This test is the
+    /// reason it had to stop being an `async fn`: `#[track_caller]` is accepted
+    /// on one and silently does not propagate through the generated future, so
+    /// every site would have reported db/mod.rs itself.
+    #[test]
+    fn two_writes_from_different_call_sites_are_told_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sites.db")).unwrap();
+        let noop = |_: &Connection| {
+            Ok(WriteOutcome { applied: false, events: vec![] })
+        };
+        // Two calls, two LINES, one identical closure body: `origin` cannot
+        // separate these and `site` must.
+        let a = std::panic::Location::caller();
+        store.write(noop).unwrap();
+        let b = std::panic::Location::caller();
+        store.write(noop).unwrap();
+        assert_eq!(a.file(), b.file(), "same file, so only the line can differ");
+
+        // The real assertion is on the mechanism the writer uses. A call from
+        // THIS file must attribute here, not to db/mod.rs's own internals.
+        #[track_caller]
+        fn site_of() -> &'static std::panic::Location<'static> {
+            std::panic::Location::caller()
+        }
+        let here = site_of();
+        let there = site_of();
+        assert!(
+            here.file().ends_with("mod.rs"),
+            "track_caller must report the CALLER's file, got {}",
+            here.file()
+        );
+        assert_ne!(
+            here.line(),
+            there.line(),
+            "two call sites on different lines must produce different locations; \
+             if these are equal the caller location is being captured in the callee"
+        );
     }
 
     /// The threshold has to be crossable in the direction that matters. A warn
@@ -1058,5 +1503,210 @@ mod af640_read_pool_tests {
         // CONTROL: after releasing, a read must succeed again. Without this the
         // assertions above are satisfied by a pool that is simply broken.
         assert!(store.read().is_ok(), "the pool must recover once connections are returned");
+    }
+}
+
+/// AF-937 / AEAB-11 recurrence: a second `amux-server-rs` opened the same
+/// production db_path as the real server for ~13h with nothing anywhere
+/// warning that two writers existed. `claim_sole_writer` closes that gap.
+#[cfg(test)]
+mod af937_writer_lock_tests {
+    use super::*;
+
+    #[derive(Clone)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    struct CapturedLogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriter(self.0.clone())
+        }
+    }
+
+    impl std::io::Write for CapturedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn with_captured_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(CapturedLogs(buf.clone()))
+            .finish();
+        let _scope = tracing::subscriber::set_default(subscriber);
+        let result = f();
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        (result, logs)
+    }
+
+    /// A fabricated holder-lock, as a genuinely different OS process would
+    /// leave one: a real flock held (so a real probe really contends), with a
+    /// pid that is NOT this test's own. Kept alive by returning the `File` --
+    /// dropping it releases the lock, same as the codebase's own real usage.
+    fn plant_foreign_holder(db_path: &Path, fake_pid: u32, fake_port: u16) -> std::fs::File {
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+        let lock_path = holder_lock_path(db_path);
+        let file =
+            std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&lock_path)
+                .unwrap();
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "test setup must win an uncontended lock");
+        let mut f = &file;
+        write!(f, r#"{{"pid":{fake_pid},"port":{fake_port}}}"#).unwrap();
+        f.flush().unwrap();
+        file
+    }
+
+    /// The plain case first: nothing else has this db_path open. Opening must
+    /// both succeed AND leave no trace of the warning this whole card is
+    /// about -- the single-writer path must be silent, not merely non-fatal.
+    #[test]
+    fn a_lone_opener_holds_the_lock_and_logs_no_contention_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.db");
+        let (store, logs) = with_captured_logs(|| Store::open(&db_path).unwrap());
+        assert!(store.holds_writer_lock(), "the only opener must win the lock");
+        assert!(
+            !logs.contains("concurrent_writer_detected"),
+            "a lone opener must not warn about contention: {logs}"
+        );
+    }
+
+    /// The defect this card fixes: a second process (simulated here by a
+    /// planted foreign lock, not this test's own pid) already has db_path
+    /// open. Opening must still SUCCEED (never refuse to start) and must log
+    /// a WARN naming the other pid/port.
+    #[test]
+    fn a_foreign_holder_produces_a_named_warn_and_does_not_block_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.db");
+        let fake_pid = std::process::id().wrapping_add(9973); // never our own pid
+        let _foreign = plant_foreign_holder(&db_path, fake_pid, 8823);
+
+        let (opened, logs) = with_captured_logs(|| Store::open(&db_path));
+        let store = opened.expect("a contended writer-lock must not fail startup");
+        assert!(
+            !store.holds_writer_lock(),
+            "the loser of the flock must not report holding it"
+        );
+        assert!(
+            logs.contains("concurrent_writer_detected"),
+            "must warn under the greppable verdict: {logs}"
+        );
+        assert!(
+            logs.contains(&fake_pid.to_string()),
+            "the warning must name the OTHER process's pid, not just that one exists: {logs}"
+        );
+        assert!(logs.contains("8823"), "the warning must carry the other process's port too: {logs}");
+    }
+
+    /// The false-positive this design specifically avoids: the SAME process
+    /// reopening db_path while its first handle is still alive (exactly what
+    /// board_drive.rs's crash-recovery tests do to simulate a restart without
+    /// an actual exec). flock() is scoped to the open file description, so
+    /// the second open() genuinely contends -- but it must read as "this is
+    /// me", not get reported as a second OS process.
+    #[test]
+    fn a_same_process_reopen_is_not_reported_as_a_foreign_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.db");
+        let first = Store::open(&db_path).unwrap();
+        assert!(first.holds_writer_lock());
+
+        let (second, logs) = with_captured_logs(|| Store::open(&db_path));
+        let second = second.expect("a same-process reopen must not fail startup");
+        assert!(
+            !second.holds_writer_lock(),
+            "the second handle cannot ALSO hold an exclusive flock the first still has"
+        );
+        assert!(
+            !logs.contains("concurrent_writer_detected"),
+            "a same-process reopen is not a second OS process and must not warn: {logs}"
+        );
+        drop(first);
+    }
+}
+
+/// AMUX-4842: the absent pragmas are a DECISION, and a decision that lives only
+/// in a comment gets deleted by the next person who reads the comment as an
+/// oversight.
+#[cfg(test)]
+mod pragma_decision_tests {
+    /// Setting `cache_size` or `mmap_size` must redden, so whoever does it has
+    /// to read why they are absent first.
+    ///
+    /// This reads the SOURCE because there is no runtime observation that
+    /// distinguishes "deliberately default" from "nobody thought about it":
+    /// both produce a connection reporting cache_size=-2000. The guard is bound
+    /// to `configure_connection`'s own body rather than the file, because
+    /// `cache_size` appears in the doc comment above it and a file-wide search
+    /// would fail on the explanation rather than on the behaviour.
+    #[test]
+    fn cache_size_and_mmap_stay_at_their_defaults_until_someone_re_measures() {
+        let src = include_str!("mod.rs");
+        let at = src
+            .find("fn configure_connection(c: &Connection)")
+            .expect("configure_connection exists");
+        let rest = &src[at..];
+        let end = rest.find("\n}").map(|i| at + i).unwrap_or(src.len());
+        let body = &src[at..end];
+
+        for pragma in ["cache_size", "mmap_size"] {
+            assert!(
+                !body.contains(pragma),
+                "`{pragma}` is set in configure_connection, but it is absent BY MEASUREMENT: \
+                 on a host whose OS page cache already holds the whole database, raising \
+                 cache_size measured 13-15% SLOWER (600 point lookups, 16 interleaved rounds, \
+                 2026-09-19) because SQLite's cache then saves no I/O and only adds \
+                 bookkeeping. If the host changed, re-measure with INTERLEAVED arms (a \
+                 block-ordered A-B-A gave the opposite answer on this box) and rewrite the \
+                 doc comment above this function before setting it. Body was: {body}"
+            );
+        }
+    }
+
+    /// And the reasoning has to survive too: a guard that only checks absence
+    /// would stay green if someone deleted the explanation and left the pragma
+    /// out by accident, which is how the next person ends up re-deriving it.
+    ///
+    /// SCOPED TO THE PRODUCTION HALF, and that is not a detail. The first
+    /// version of this searched the whole file, which includes this test's own
+    /// assertion message — so it matched its own label and would have stayed
+    /// green with the doc comment gutted. Found by mutating the comment and
+    /// watching nothing redden.
+    #[test]
+    fn the_measurement_behind_that_decision_is_still_written_down() {
+        let src = include_str!("mod.rs");
+        // The DOC BLOCK of configure_connection, not the file and not
+        // "everything before the first test module" — there is a `#[cfg(test)]`
+        // earlier in this file, so that split lands above this comment and the
+        // guard fails for the wrong reason.
+        let at = src
+            .find("fn configure_connection(c: &Connection)")
+            .expect("configure_connection exists");
+        let doc = &src[at.saturating_sub(2600)..at];
+        for needle in ["AMUX-4842", "INTERLEAVED", "SIGBUS"] {
+            assert!(
+                doc.contains(needle),
+                "the pragma decision's rationale lost `{needle}`; without it the absence \
+                 reads as an oversight and gets 'fixed'"
+            );
+        }
     }
 }

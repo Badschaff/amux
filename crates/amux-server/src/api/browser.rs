@@ -2874,7 +2874,48 @@ fn validate_file_action(body: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Records WHICH action ran, then delegates (AMUX-4779).
+///
+/// `POST /api/browser/action` is one route over seven verbs with wildly
+/// different costs: measured over 7 days, n=2027, p50 9ms and p99 12698ms. A
+/// `click` is the 9ms case; a `wait` polls to a caller-chosen budget. The
+/// request log stored only the path, so the latency detector grouped them into
+/// one target and no reader could split them afterwards either. Quoting a slow
+/// `wait` beside a `click`'s baseline sends the reader at the wrong verb, which
+/// is the same defect `autofix.rs` already documents for the wildcard target
+/// `/api/sessions/{name}/{*verb}`.
+///
+/// A WRAPPER, NOT A HEADER PER ARM. The inner handler returns from a dozen
+/// `audited_return!` sites, one per verb and several per error path. Stamping
+/// each one is how you end up stamping most of them: this file's neighbour
+/// already shipped a marker set on one `Ok` arm and missing from the other.
+/// Setting it once around the call covers every path that exists today and
+/// every one added later.
+///
+/// Rides the SAME mechanism as `x-amux-command-kind` and `x-amux-slow-ok`: the
+/// handler sets a response header and `request_log`'s middleware lifts it into
+/// `req_meta`. No schema change, and nothing new to keep in sync.
 async fn action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    let verb = body
+        .as_ref()
+        .and_then(|Json(v)| v.get("action"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let mut res = action_inner(State(state), headers, body).await;
+    // An empty or absurd verb is still worth recording as what the caller sent:
+    // "unknown action: dance" is a 400 the log should be able to group.
+    if let Ok(v) = axum::http::HeaderValue::from_str(&crate::api::truncate_verb(&verb)) {
+        res.headers_mut().insert("x-amux-action", v);
+    }
+    res
+}
+
+async fn action_inner(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Option<Json<Value>>,
@@ -4702,6 +4743,80 @@ mod tests {
             v["error"].as_str().unwrap_or("").contains("takeover"),
             "the refusal must name the escape: {v}"
         );
+    }
+
+    /// AMUX-4779: the VERB reaches the request log, on every return path.
+    ///
+    /// This drives the real route through the real router, so it exercises the
+    /// wrapper rather than a paraphrase of it. The cases below all return from
+    /// DIFFERENT `audited_return!` sites inside the handler (schema refusals,
+    /// an unknown verb, a missing browser), which is the property the wrapper
+    /// exists for: a header stamped per-arm would have covered some of them.
+    #[tokio::test]
+    async fn the_action_verb_is_recorded_on_every_return_path() {
+        let app = app();
+        async fn verb_header(app: &Router, body: &str) -> Option<String> {
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/browser/action")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap();
+            let res = app.clone().oneshot(req).await.unwrap();
+            res.headers()
+                .get("x-amux-action")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        }
+
+        // Schema refusals (400), one per verb, each from its own return site.
+        for (body, verb) in [
+            (r#"{"action":"click"}"#, "click"),
+            (r#"{"action":"eval"}"#, "eval"),
+            (r#"{"action":"wait"}"#, "wait"),
+            (r#"{"action":"viewport"}"#, "viewport"),
+        ] {
+            assert_eq!(
+                verb_header(&app, body).await.as_deref(),
+                Some(verb),
+                "the log must be able to tell {verb} apart from the other six"
+            );
+        }
+
+        // An UNKNOWN verb is still what the caller sent, and a 400 the log
+        // should be able to group.
+        assert_eq!(verb_header(&app, r#"{"action":"dance"}"#).await.as_deref(), Some("dance"));
+
+        // A body with no action at all records an empty verb rather than a
+        // stale or invented one. request_log drops the empty value, so the row
+        // simply carries no `action` key instead of a wrong one.
+        assert_eq!(verb_header(&app, r#"{}"#).await.as_deref(), Some(""));
+    }
+
+    /// The verb is caller-supplied, so it is bounded before it becomes a header.
+    /// An unbounded value would widen every request-log row it touches, and a
+    /// newline in a header value is not representable at all.
+    #[test]
+    fn a_hostile_verb_cannot_shape_the_header() {
+        use crate::api::truncate_verb;
+        assert_eq!(truncate_verb("click"), "click");
+        assert_eq!(truncate_verb("wait-for_thing"), "wait-for_thing");
+        // Assert the PROPERTY, not a golden string: `-` is allowed on purpose
+        // (a verb may legitimately contain one), so pinning the exact output
+        // here would only re-encode the charset and would fail the next time a
+        // character is deliberately permitted. What must hold is that nothing
+        // survives which could terminate or extend a header.
+        let hostile = truncate_verb("click\r\nX-Injected: 1");
+        assert!(
+            !hostile.chars().any(|c| c.is_control() || c == ':' || c == ' '),
+            "a header value cannot carry CR, LF, a colon or a space: {hostile:?}"
+        );
+        assert!(
+            axum::http::HeaderValue::from_str(&hostile).is_ok(),
+            "whatever survives must still be a legal header value: {hostile:?}"
+        );
+        assert_eq!(truncate_verb(&"a".repeat(500)).len(), 32, "capped");
+        assert_eq!(truncate_verb(""), "");
     }
 
     /// The action schema answers 400 for malformed requests BEFORE any

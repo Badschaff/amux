@@ -1282,6 +1282,22 @@ pub fn title_from_prompt(text: &str) -> Option<String> {
         }
         break;
     }
+    // A list marker is syntax, not a sentence. Cutting "1. retire Celery"
+    // at its first period produced the live task title "1" (MFEM1-53).
+    // Keep the full message for classification, but derive the label from its
+    // first nonempty content line after removing a Markdown list prefix.
+    let label = t.lines().map(str::trim).find_map(|line| {
+        let line = line.strip_prefix(['-', '*', '+'])
+            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+            .unwrap_or(line).trim_start();
+        let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+        let line = line.get(digits..)
+            .filter(|rest| digits > 0 && (rest.starts_with('.') || rest.starts_with(')')))
+            .map(|rest| &rest[1..])
+            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+            .unwrap_or(line).trim_start();
+        (!line.is_empty()).then_some(line)
+    }).unwrap_or(t);
     let collapsed = t.split_whitespace().collect::<Vec<_>>().join(" ");
     let bare = collapsed
         .trim_end_matches(['.', '!', '?'])
@@ -1296,12 +1312,13 @@ pub fn title_from_prompt(text: &str) -> Option<String> {
     }
 
     // First sentence/clause: cut after ". " / "! " / "? " or at "; ".
-    let mut head: &str = &collapsed;
-    let chars: Vec<(usize, char)> = collapsed.char_indices().collect();
+    let label = label.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut head: &str = &label;
+    let chars: Vec<(usize, char)> = label.char_indices().collect();
     for w in chars.windows(2) {
         let ((i, c), (_, next)) = (w[0], w[1]);
         if matches!(c, '.' | '!' | '?' | ';') && next == ' ' {
-            head = &collapsed[..i + c.len_utf8()];
+            head = &label[..i + c.len_utf8()];
             break;
         }
     }
@@ -1964,7 +1981,10 @@ pub fn title_needs_self_description(title: &str) -> Option<&'static str> {
         .filter(|w| !w.is_empty())
         .collect();
     if words.is_empty() {
-        return None;
+        return Some("it contains no task subject");
+    }
+    if words.iter().all(|word| word.chars().all(|c| c.is_numeric())) {
+        return Some("it contains only a list number, not a task subject");
     }
     let n = words.len();
     let w = |i: usize| words.get(i).map(String::as_str).unwrap_or("");
@@ -3163,6 +3183,17 @@ mod self_description_tests {
 
         let t2 = title_from_prompt("please add a route for /api/board/clear-done").unwrap();
         assert_eq!(title_needs_self_description(&t2), None, "{t2:?}");
+    }
+
+    #[test]
+    fn numbered_requests_have_a_subject_not_a_list_number() {
+        for prefix in ["1. ", "12) ", "1.\t", "1.\n", "- ", "* ", "+ "] {
+            assert_eq!(title_from_prompt(&format!("[02:58 PM] {prefix}retire Celery safely\n2. reduce unused capacity")),
+                Some("Retire Celery safely".into()), "{prefix:?}");
+        }
+        assert_eq!(title_from_prompt("1.5 times more memory is needed"), Some("1.5 times more memory is needed".into()));
+        assert!(title_needs_self_description("1").is_some());
+        assert!(title_needs_self_description("12.").is_some());
     }
 
     #[test]

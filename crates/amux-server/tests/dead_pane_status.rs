@@ -112,6 +112,8 @@ async fn retained_dead_pane_cannot_remain_idle_in_worker_api() {
                 "--nocapture",
             ])
             .env_remove("TMUX")
+            .env_remove("ENV")
+            .env_remove("BASH_ENV")
             .env("TMUX_TMPDIR", socket_dir.path())
             .env("AMUX_DEAD_PANE_TEST_CHILD", "1")
             .env("AMUX_REQUIRE_TMUX", "1")
@@ -134,6 +136,18 @@ async fn retained_dead_pane_cannot_remain_idle_in_worker_api() {
             "isolated dead-pane specimen failed"
         );
         return;
+    }
+    // A private socket alone still loads ~/.tmux.conf and a login shell's
+    // profile. Slow host startup can leave the typed fixture command unexecuted
+    // for the entire observation window. This specimen tests exit detection,
+    // not the developer's shell initialization; use a private minimal server.
+    let bootstrap = std::process::Command::new("tmux")
+        .args(["-f", "/dev/null", "new-session", "-d", "-s", "dead-pane-fixture", "/bin/sh"])
+        .status().unwrap();
+    assert!(bootstrap.success(), "private fixture server must start");
+    for (key, value) in [("default-shell", "/bin/sh"), ("default-command", "exec /bin/sh")] {
+        assert!(std::process::Command::new("tmux")
+            .args(["set-option", "-g", key, value]).status().unwrap().success());
     }
     let dir = tempfile::tempdir().unwrap();
     let store: SharedStore = Arc::new(Store::open(&dir.path().join("probe.db")).unwrap());

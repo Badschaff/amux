@@ -765,7 +765,7 @@ fn pt(name: &str) -> String {
     pane_target(&tmux_name(name))
 }
 
-async fn run_cmd(bin: &str, args: &[&str], timeout: Duration) -> Option<std::process::Output> {
+pub(crate) async fn run_cmd(bin: &str, args: &[&str], timeout: Duration) -> Option<std::process::Output> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args(args)
         .stdin(std::process::Stdio::null())
@@ -1221,8 +1221,16 @@ fn is_prompt_line(s: &str) -> bool {
     s.chars().next().map(|c| PROMPT_GLYPHS.contains(&c)).unwrap_or(false)
 }
 
-/// py:8229 _claude_ui_visible (claude + codex + gemini markers).
-fn claude_ui_visible(clean_output: &str) -> bool {
+/// py:8229 _claude_ui_visible (claude + codex + gemini + muse markers).
+/// Is an AGENT's composer up in this pane — for ANY provider, not just Claude.
+///
+/// The name said claude and the body already answered for codex too, which is how muse got
+/// missed: nothing about `claude_ui_visible` invites you to add a provider to it. Muse then
+/// never read as ready, and `send_after_ready` polled for its whole 60s timeout and DROPPED
+/// the start/wake prompt — measured on worker-muse, twice in one minute, logged as "Claude UI
+/// never became ready" on a lane that runs no Claude. Renamed so the next provider added to
+/// amux is a grep away from this function instead of a silent timeout.
+fn agent_ui_visible(clean_output: &str) -> bool {
     let lines: Vec<&str> = clean_output.lines().filter(|l| !l.trim().is_empty()).collect();
     let shell_prompt = cached_re!(r"^.*[$%]\s");
     let n = lines.len();
@@ -1253,6 +1261,13 @@ fn claude_ui_visible(clean_output: &str) -> bool {
             && (ls.contains("full-auto") || ls.contains("suggest") || ls.contains("workspace")
                 || ls.contains("approval") || ls.contains("-a never"))
         {
+            return true;
+        }
+        // Muse Code. Its composer frame prints the voice-input hint and its footer is
+        // "<model> · <effort> · <cwd>"; both are present the moment the TUI is up and no
+        // shell prints either. The model prefix is the second marker rather than the only
+        // one because a model rename would silently take the check with it.
+        if ls.contains("voice input") || ls.contains("muse-spark") {
             return true;
         }
     }
@@ -1311,7 +1326,7 @@ fn at_resume_picker(clean_output: &str) -> bool {
 
 /// py:8307 _at_shell_prompt.
 fn at_shell_prompt(clean_output: &str) -> bool {
-    if claude_ui_visible(clean_output) {
+    if agent_ui_visible(clean_output) {
         return false;
     }
     let lines: Vec<&str> = clean_output.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -3470,65 +3485,10 @@ fn last_assistant_message(name: &str, max_chars: usize) -> String {
     last.chars().take(max_chars).collect()
 }
 
-/// Rendered transcripts, keyed by file and cap, valid while the file's length
-/// and mtime are unchanged (AMUX-4802).
-///
-/// The port dropped Python's cache with a note to "reintroduce a cache if the
-/// SPA's poll cadence lands here". It landed: `_amux_request_log` holds 40,832
-/// real-browser peek requests in one day, and EVERY one of them, the 350ms live
-/// poll included, re-read the last 5MB of the JSONL, parsed each record and
-/// re-ran the render, to trim an overlap against text that had not changed.
-/// Measured as `live=1` against `live=1&notrim=1` on a 106MB transcript: p50
-/// 164ms against 111ms, a third of the request. A transcript is append-only,
-/// so (len, mtime) moving is exactly "there is something new to render".
-type TranscriptStamp = (u64, Option<std::time::SystemTime>);
-type TranscriptRenders = std::collections::HashMap<(PathBuf, usize), (TranscriptStamp, Arc<str>)>;
-static TRANSCRIPT_RENDERS: std::sync::OnceLock<std::sync::Mutex<TranscriptRenders>> =
-    std::sync::OnceLock::new();
-static TRANSCRIPT_RENDER_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static TRANSCRIPT_RENDER_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 fn render_session_transcript(name: &str, max_chars: usize) -> String {
     let Some(path) = session_jsonl_path(name) else { return String::new() };
-    render_transcript_file(&path, max_chars)
-}
-
-fn render_transcript_file(path: &Path, max_chars: usize) -> String {
-    use std::sync::atomic::Ordering::Relaxed;
-    let stamp: Option<TranscriptStamp> =
-        std::fs::metadata(path).ok().map(|m| (m.len(), m.modified().ok()));
-    let key = (path.to_path_buf(), max_chars);
-    let cache = TRANSCRIPT_RENDERS.get_or_init(Default::default);
-    if let Some(stamp) = stamp {
-        if let Some((cached, text)) = cache.lock().unwrap().get(&key) {
-            if *cached == stamp {
-                TRANSCRIPT_RENDER_HITS.fetch_add(1, Relaxed);
-                return text.to_string();
-            }
-        }
-    }
     let max_read = std::cmp::max(max_chars * 5, 5_000_000) as u64;
-    let rendered = render_transcript_records(iter_jsonl_tail(path, max_read), max_chars);
-    let misses = TRANSCRIPT_RENDER_MISSES.fetch_add(1, Relaxed) + 1;
-    // The signal that says the cache is doing its job, or has stopped. A ratio
-    // near zero on a busy fleet means the key is churning (a path or stamp
-    // that never repeats) and every poll is paying the full render again.
-    if misses.is_multiple_of(500) {
-        tracing::info!(target: "amux::peek", verdict = "transcript_render_cache",
-            hits = TRANSCRIPT_RENDER_HITS.load(Relaxed), misses, measured = true,
-            n_considered = TRANSCRIPT_RENDER_HITS.load(Relaxed) + misses,
-            "transcript render cache: hits against full re-renders since boot");
-    }
-    // Stamped BEFORE the read, so an append that lands mid-render leaves a
-    // stale stamp behind and the next call re-renders rather than serving it.
-    if let Some(stamp) = stamp {
-        let mut guard = cache.lock().unwrap();
-        if guard.len() >= 64 {
-            guard.clear();   // bounded: one entry per open view, a few dozen at most
-        }
-        guard.insert(key, (stamp, rendered.as_str().into()));
-    }
-    rendered
+    render_transcript_records(iter_jsonl_tail(&path, max_read), max_chars)
 }
 
 fn render_transcript_records(records: Vec<Value>, max_chars: usize) -> String {
@@ -3674,7 +3634,8 @@ fn render_transcript_records(records: Vec<Value>, max_chars: usize) -> String {
 // contract).
 // ---------------------------------------------------------------------------
 
-pub const SESSION_PROVIDERS: [&str; 5] = ["claude", "codex", "gemini", "iterm2", "ollama"];
+pub const SESSION_PROVIDERS: [&str; 6] =
+    ["claude", "codex", "gemini", "iterm2", "ollama", "muse"];
 const PROVIDER_YOLO_FLAGS: [&str; 3] = [
     "--dangerously-skip-permissions",
     "--dangerously-bypass-approvals-and-sandbox",
@@ -3863,7 +3824,7 @@ fn extract_model_from_flags(flags: &str) -> String {
 
 const MODEL_ID_MAX_LEN: usize = 100;
 
-fn validate_model_name(value: &Value) -> Result<String, String> {
+pub(crate) fn validate_model_name(value: &Value) -> Result<String, String> {
     let Some(s) = value.as_str() else { return Err("model must be a string".into()) };
     let normalized = s.trim().to_string();
     if normalized.chars().count() > MODEL_ID_MAX_LEN {
@@ -3915,7 +3876,7 @@ fn set_effort_flag(flags: &str, effort: &str) -> Result<String, String> {
 fn provider_yolo_flag(provider: &str) -> &'static str {
     match provider {
         "codex" | "ollama" => "--dangerously-bypass-approvals-and-sandbox",
-        "gemini" => "--yolo",
+        "gemini" | "muse" => "--yolo",
         _ => "--dangerously-skip-permissions",
     }
 }
@@ -4045,6 +4006,8 @@ fn default_model_for_provider(provider: &str) -> String {
         // was a fact about one machine compiled into a public server. See
         // `static_providers::ollama_default_model` (DESKT-6).
         "ollama" => crate::provider::static_providers::ollama_default_model(),
+        // The catalog default (is_default/is_current) as of 1.0.3.
+        "muse" => "muse-spark-1.3-contributor".into(),
         _ => get_default_model(),
     }
 }
@@ -4101,7 +4064,7 @@ fn effort_is_model_derived(provider: &str) -> bool {
 /// map. A resolver bound to one parser's type is a resolver the other caller
 /// cannot share, and not sharing it is what AMUX-4728 is (`fleet_roster`
 /// resolved the model for the one provider nobody runs).
-fn configured_model_for(provider: &str, cc_model: &str, cc_flags: &str) -> String {
+pub(crate) fn configured_model_for(provider: &str, cc_model: &str, cc_flags: &str) -> String {
     configured_model_with_default(
         provider,
         cc_model,
@@ -4142,7 +4105,7 @@ fn configured_model_with_default(
 /// fleet table, which reads CC_MODEL with no provider test; and a worker
 /// swapped INTO ollama that kept `--model` in CC_FLAGS would hit the inert-flag
 /// WARN on every launch. One key set, one key cleared, decided in one place.
-fn route_model_to_env(cfg: &mut EnvFile, provider: &str, model: &str, flags_no_model: &str) -> String {
+pub(crate) fn route_model_to_env(cfg: &mut EnvFile, provider: &str, model: &str, flags_no_model: &str) -> String {
     if model_lives_in_cc_model(provider) {
         cfg.set("CC_MODEL", model);
         return flags_no_model.to_string();
@@ -4180,6 +4143,7 @@ pub fn launch_base_binary(provider: &str) -> &'static str {
     match provider {
         // ollama runs codex under the hood (`--oss --local-provider ollama`).
         "codex" | "ollama" => "codex",
+        "muse" => "muse",
         "gemini" => "gemini",
         // claude, iterm2, and anything unknown launch via build_claude_cmd,
         // whose default binary is `claude` (overridable by AMUX_CLAUDE_CMD).
@@ -4209,6 +4173,351 @@ fn writes_claude_transcript(provider: &str) -> bool {
     launch_base_binary(provider) == "claude"
 }
 
+/// Muse Code (`muse`) is the one provider whose session id amux CANNOT mint.
+///
+/// grok takes `--session-id <uuid>` on a new conversation, so the id is chosen
+/// before the process exists and resume is trivial. Muse has no such flag:
+/// `muse resume` accepts `--last` or an existing `<session-uuid>` and nothing
+/// else, so a new run's id is knowable only AFTER it starts. `muse_pick_session`
+/// is how amux learns it.
+///
+/// `--last` is the obvious shortcut and is WRONG here: it resolves to the most
+/// recent session IN THE WORKSPACE, and amux lanes routinely share a CC_DIR, so
+/// two workers on one repo would resume into each other's conversation. Storing
+/// the real uuid is the only spelling that cannot cross lanes.
+pub(crate) fn muse_launch_command(
+    existing_session_id: &str,
+    flags: &str,
+    extra_flags: &str,
+    default_model: &str,
+) -> String {
+    // Provider swaps and old generic yolo toggles may leave another binary's flag in
+    // CC_FLAGS. Muse rejects Claude's flag, so normalize every yolo spelling at the
+    // launch boundary as well as when configuration is written.
+    let muse_yolo = yolo_enabled(flags, None) || yolo_enabled(extra_flags, None);
+    if let Some(f) = PROVIDER_YOLO_FLAGS
+        .iter()
+        .find(|f| **f != "--yolo" && (flags.contains(*f) || extra_flags.contains(*f)))
+    {
+        tracing::warn!(
+            stored_yolo_flag = %f,
+            launched_yolo_flag = "--yolo",
+            "muse worker carries a yolo flag muse does not accept; launch substitutes muse's flag"
+        );
+    }
+    let flags = strip_provider_yolo_flags(flags);
+    let extra_flags = strip_provider_yolo_flags(extra_flags);
+    let mut opts = String::new();
+    if !flags.is_empty() {
+        opts += &format!(" {}", shell_quote_flags(&flags));
+    }
+    if !extra_flags.is_empty() {
+        opts += &format!(" {}", shell_quote_flags(&extra_flags));
+    }
+    if !opts.contains("--model") && !opts.contains("-m ") && !default_model.is_empty() {
+        opts += &format!(" --model {}", shell_quote_flags(default_model));
+    }
+    if muse_yolo {
+        opts += " --yolo";
+    } else if !opts.contains("--approval-mode") && !opts.contains("--disable-approval") {
+        // Muse defaults to on-request even when the saved user settings say never.
+        // Lanes have nobody at the composer to answer, so make the supported automatic
+        // mode explicit on every launch while leaving the filesystem sandbox enabled.
+        opts += " --approval-mode never";
+    }
+    // --trust-workspace, because A LANE HAS NOBODY TO ANSWER A PROMPT.
+    //
+    // On a workspace it has not seen before, muse stops on an interactive gate before the
+    // model runs — "Trusting allows project-local skills, rules, hooks, and plugin config
+    // to load ... 1 Trust and continue / 2 Quit". In a lane that prompt is answered by no
+    // one: the pane sits on it, and `amux send` then delivers the task to the CHOOSER, not
+    // to an agent. Observed as a muse worker that reported "not submitted — text is sitting
+    // in the input box" while the pane had actually fallen back to a shell and run the
+    // briefing as a command (`zsh: command not found: Reply`).
+    //
+    // Every lane amux starts is on a checkout amux created for it, so the trust decision is
+    // already made by the act of dispatching the work; the prompt is asking a human who is
+    // not there. Skills, rules and hooks load only under trust, so without this a muse lane
+    // also cannot self-report — this is the other half of docs/provider-parity.md row 11.
+    if !opts.contains("--trust-workspace") {
+        opts += " --trust-workspace";
+    }
+    // MUSE_EXPERIMENTAL_PLUGINS=on because muse delivers hooks as a PLUGIN capability and
+    // plugin loading is gated behind this flag in 1.0.3. Without it a session composes
+    // `hooks=0` and self-reports nothing.
+    //
+    // NECESSARY BUT NOT YET SUFFICIENT, and the honest state is worth writing down rather
+    // than discovering twice. Measured against 1.0.3-R2198.1 with a user-scope plugin
+    // installed and its four hook capabilities approved:
+    //   - `muse exec` (headless) FIRES them: SessionStart, UserPromptSubmit and Stop each ran
+    //     and each reached amux (three HTTP 200s in the matching second).
+    //   - the interactive TUI — which is what a lane actually runs — fires NOTHING, with
+    //     plugins enabled AND the workspace trusted (`--trust-workspace`).
+    // So this flag is the half amux controls, and TUI hook delivery is the half it does not.
+    // Until that lands, a muse lane still falls back to scraping and docs/provider-parity.md
+    // row 11 stays PARTIAL, not MET. Drop the flag when plugins leave experimental.
+    let env = "MUSE_EXPERIMENTAL_PLUGINS=on ";
+    if !existing_session_id.is_empty() {
+        format!("{env}muse resume {}{opts}", sh_quote(existing_session_id))
+    } else {
+        format!("{env}muse{opts}")
+    }
+}
+
+/// Root under which muse writes one directory per session,
+/// `<data>/muse/sessions/YYYY/MM/DD/<uuid>/` (verified against 1.0.3-R2198.1).
+pub(crate) fn muse_sessions_root() -> PathBuf {
+    match std::env::var("XDG_DATA_HOME") {
+        Ok(x) if !x.trim().is_empty() => PathBuf::from(x).join("muse").join("sessions"),
+        _ => PathBuf::from(std::env::var("HOME").unwrap_or_default())
+            .join(".local")
+            .join("share")
+            .join("muse")
+            .join("sessions"),
+    }
+}
+
+/// Every session id on disk, mapped to its directory. Directory names only —
+/// this never opens a log, so it is cheap enough to run on every start.
+pub(crate) fn muse_scan_sessions(
+    root: &std::path::Path,
+) -> std::collections::BTreeMap<String, PathBuf> {
+    let mut out = std::collections::BTreeMap::new();
+    let Ok(years) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for y in years.flatten() {
+        let Ok(months) = std::fs::read_dir(y.path()) else {
+            continue;
+        };
+        for m in months.flatten() {
+            let Ok(days) = std::fs::read_dir(m.path()) else {
+                continue;
+            };
+            for d in days.flatten() {
+                let Ok(sessions) = std::fs::read_dir(d.path()) else {
+                    continue;
+                };
+                for sd in sessions.flatten() {
+                    let id = sd.file_name().to_string_lossy().into_owned();
+                    if id.starts_with('.') || !sd.path().is_dir() {
+                        continue;
+                    }
+                    out.insert(id, sd.path());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The workspace a muse session recorded, from a BOUNDED prefix of its
+/// `session.jsonl`. Bounded because that file reaches megabytes within a single
+/// turn while `workspace_root` is written in the opening records; reading it
+/// whole to find a value in the first page would make start cost scale with
+/// transcript length. Both the plain and the backslash-escaped spelling are
+/// accepted — the file carries records nested as escaped JSON strings.
+pub(crate) fn muse_session_workspace(dir: &std::path::Path) -> Option<String> {
+    use std::io::Read as _;
+    let mut f = std::fs::File::open(dir.join("session.jsonl")).ok()?;
+    let mut buf = vec![0u8; 256 * 1024];
+    let n = f.read(&mut buf).ok()?;
+    let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+    for (key, end) in [
+        ("\"workspace_root\":\"", '"'),
+        ("\\\"workspace_root\\\":\\\"", '\\'),
+    ] {
+        if let Some(i) = head.find(key) {
+            let rest = &head[i + key.len()..];
+            if let Some(j) = rest.find(end) {
+                return Some(rest[..j].to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Which of the sessions that appeared during launch belongs to this lane.
+///
+/// `new` is (session id, the workspace that session recorded, if any);
+/// `work_dir` is the worker's CC_DIR.
+///
+/// IDENTITY COMES FROM THE DIFF, NOT FROM THE WORKSPACE. The first version of
+/// this matched `workspace_root` against CC_DIR and rejected everything, which a
+/// live launch caught and the unit tests could not: muse writes `workspace_root`
+/// LAZILY — a freshly started session logs `"workspace_roots":[]` and only
+/// records a root once it engages the workspace. At the instant amux finishes
+/// launching, the field this keyed on does not exist yet. Verified against
+/// 1.0.3-R2198.1, with and without `--workspace`.
+///
+/// So the before/after snapshot IS the identification: a session directory that
+/// did not exist before this start and does now was created by this start. The
+/// workspace only breaks TIES, and it can, because by the time two lanes race
+/// the loser is usually an older session that has already recorded its root.
+///
+/// AMBIGUITY IS STILL REPORTED, NEVER GUESSED. When several sessions appear and
+/// none can be attributed, picking the newest would be a coin flip that reads as
+/// certainty, and a wrong id resumes a lane into another lane's conversation —
+/// the exact failure `--last` was rejected for. `Err` means the caller stores
+/// nothing and the next start opens a fresh conversation: recoverable, logged,
+/// and never silently wrong.
+pub(crate) fn muse_pick_session(
+    new: &[(String, Option<String>)],
+    work_dir: &str,
+) -> Result<String, String> {
+    if new.len() == 1 {
+        return Ok(new[0].0.clone());
+    }
+    if new.is_empty() {
+        return Err("no new muse session directory appeared during launch".into());
+    }
+    // Tie-break on the recorded workspace. Trailing slashes are trimmed on BOTH
+    // sides: CC_DIR carries one (`/Users/x/projects/obrist/`) and muse records
+    // none, so a naive `==` compares unequal strings for the same directory.
+    let want = work_dir.trim_end_matches('/');
+    let hits: Vec<&String> = new
+        .iter()
+        .filter(|(_, ws)| ws.as_deref().map(|w| w.trim_end_matches('/')) == Some(want))
+        .map(|(id, _)| id)
+        .collect();
+    match hits.len() {
+        1 => Ok(hits[0].clone()),
+        0 => Err(format!(
+            "{} new muse sessions appeared and none has recorded workspace_root={want} yet; \
+             refusing to guess which is this lane",
+            new.len()
+        )),
+        n => Err(format!(
+            "{n} new muse sessions claim workspace_root={want}; refusing to guess which is this lane"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod muse_launch_tests {
+    use super::{
+        launch_base_binary, muse_launch_command, muse_pick_session, provider_yolo_flag,
+        SESSION_PROVIDERS,
+    };
+
+    #[test]
+    fn muse_is_a_session_provider_and_launches_muse() {
+        assert!(SESSION_PROVIDERS.contains(&"muse"));
+        assert_eq!(launch_base_binary("muse"), "muse");
+        assert_ne!(launch_base_binary("muse"), "claude");
+    }
+
+    #[test]
+    fn muse_first_start_is_bare_with_no_session_id_flag() {
+        let cmd = muse_launch_command("", "", "", "muse-spark-1.3-contributor");
+        assert_eq!(cmd,
+            "MUSE_EXPERIMENTAL_PLUGINS=on muse --model muse-spark-1.3-contributor --approval-mode never --trust-workspace");
+        assert!(!cmd.contains("--session-id"), "muse has no such flag: {cmd}");
+        assert!(!cmd.contains("resume"), "a first start has nothing to resume");
+    }
+
+    #[test]
+    fn muse_resume_uses_the_stored_uuid_never_last() {
+        let cmd = muse_launch_command(
+            "01a081b8-006e-7182-98af-dd0820be4f61",
+            "--model muse-spark-1.2",
+            "",
+            "muse-spark-1.3-contributor",
+        );
+        assert_eq!(
+            cmd,
+            "MUSE_EXPERIMENTAL_PLUGINS=on muse resume 01a081b8-006e-7182-98af-dd0820be4f61 \
+             --model muse-spark-1.2 --approval-mode never --trust-workspace".replace("\\\n             ", " ").as_str()
+        );
+        assert!(!cmd.contains("--last"), "--last crosses lanes in a shared CC_DIR");
+    }
+
+    #[test]
+    fn muse_launch_uses_provider_correct_yolo_and_never_claudes_flag() {
+        assert_eq!(provider_yolo_flag("muse"), "--yolo");
+        let cmd = muse_launch_command(
+            "",
+            "--dangerously-skip-permissions --model muse-spark-1.3-contributor",
+            "",
+            "muse-spark-1.3-contributor",
+        );
+        assert_eq!(
+            cmd,
+            "MUSE_EXPERIMENTAL_PLUGINS=on muse --model muse-spark-1.3-contributor --yolo --trust-workspace"
+        );
+        assert!(!cmd.contains("--dangerously-skip-permissions"), "{cmd}");
+    }
+
+    #[test]
+    fn muse_automatic_approval_keeps_the_sandbox() {
+        let cmd = muse_launch_command("", "", "", "muse-spark-1.3-contributor");
+        assert!(cmd.contains("--approval-mode never"), "{cmd}");
+        assert!(!cmd.contains("--disable-sandbox"), "{cmd}");
+        assert!(!cmd.contains("--yolo"), "{cmd}");
+    }
+
+    #[test]
+    fn pick_session_takes_the_one_new_session_even_with_no_workspace_recorded() {
+        // THE CASE A LIVE LAUNCH ACTUALLY PRODUCES: muse has not written
+        // workspace_root yet (it logs `"workspace_roots":[]` at startup). An
+        // earlier version keyed on that field and rejected every real start.
+        let new = vec![("id-1".to_string(), None)];
+        assert_eq!(muse_pick_session(&new, "/repo/obrist/").unwrap(), "id-1");
+    }
+
+    #[test]
+    fn pick_session_trims_the_trailing_slash_cc_dir_carries() {
+        let new = vec![
+            ("id-1".to_string(), Some("/repo/obrist".to_string())),
+            ("id-2".to_string(), Some("/repo/other".to_string())),
+        ];
+        assert_eq!(muse_pick_session(&new, "/repo/obrist/").unwrap(), "id-1");
+    }
+
+    #[test]
+    fn pick_session_ignores_sessions_from_other_workspaces() {
+        let new = vec![
+            ("id-1".to_string(), Some("/repo/other".to_string())),
+            ("id-2".to_string(), Some("/repo/obrist".to_string())),
+        ];
+        assert_eq!(muse_pick_session(&new, "/repo/obrist").unwrap(), "id-2");
+    }
+
+    #[test]
+    fn pick_session_refuses_when_several_appear_and_none_is_attributable() {
+        let new = vec![("id-1".to_string(), None), ("id-2".to_string(), None)];
+        let err = muse_pick_session(&new, "/repo/obrist").unwrap_err();
+        assert!(err.contains("refusing to guess"), "{err}");
+    }
+
+    #[test]
+    fn pick_session_refuses_to_guess_between_two_in_one_workspace() {
+        let new = vec![
+            ("id-1".to_string(), Some("/repo/obrist".to_string())),
+            ("id-2".to_string(), Some("/repo/obrist".to_string())),
+        ];
+        let err = muse_pick_session(&new, "/repo/obrist").unwrap_err();
+        assert!(err.contains("refusing to guess"), "{err}");
+    }
+
+    #[test]
+    fn muse_intent_scan_finds_an_accepted_prompt_and_ignores_other_records() {
+        use super::muse_intent_in_tail;
+        // Shape taken from a real muse session.jsonl.
+        let accepted = r#"{"payload_type":"runtime.session.user_intent.accepted","payload":{"semantic_kind":{"kind":"chat"},"refill_blocks":[{"kind":"text","text":"Reply with only the word ok"}]}}"#;
+        assert!(muse_intent_in_tail(accepted, "Reply with only the word ok"));
+        // The same text in a NON-acceptance record is not proof it was submitted.
+        let other = r#"{"payload_type":"runtime.session.task","payload":{"text":"Reply with only the word ok"}}"#;
+        assert!(!muse_intent_in_tail(other, "Reply with only the word ok"));
+        assert!(!muse_intent_in_tail(accepted, "some other message"));
+    }
+
+    #[test]
+    fn pick_session_reports_when_nothing_matched() {
+        assert!(muse_pick_session(&[], "/repo/obrist").is_err());
+    }
+}
+
 fn provider_label(provider: &str) -> &str {
     match provider {
         "claude" => "Claude Code",
@@ -4216,6 +4525,7 @@ fn provider_label(provider: &str) -> &str {
         "gemini" => "Gemini",
         "iterm2" => "iTerm2",
         "ollama" => "Ollama",
+        "muse" => "Muse Code",
         other => {
             if other.is_empty() {
                 "Claude Code"
@@ -4700,7 +5010,7 @@ pub(crate) fn format_captured_desc(body: &str) -> String {
     }
 }
 
-fn mint_capture_card(
+pub(crate) fn mint_capture_card(
     conn: &rusqlite::Connection,
     session_name: &str,
     body: &str,
@@ -4850,7 +5160,7 @@ fn mint_capture_card(
     // its current card. Keep follow-ups visible without claiming concurrent
     // execution or redispatching a prompt the worker already received.
     let (active_count, active_card): (i64, Option<String>) = conn.query_row(
-        "SELECT COUNT(*), MIN(id) FROM issues WHERE session=?1 AND status='doing' AND COALESCE(archived,0)=0",
+        "SELECT COUNT(*), MIN(id) FROM issues WHERE session=?1 AND status='doing' AND deleted IS NULL AND COALESCE(archived,0)=0",
         [session_name], |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let capture_status = if active_count > 0 { "backlog" } else { "doing" };
@@ -5840,19 +6150,31 @@ pub(crate) async fn steer_enqueue_idempotent_report(
     .await
 }
 
+/// Shared read-side disposition for selection and enqueue. A suppressed card
+/// must yield to another candidate, while voided attempts remain retryable.
+type StateReminderStatus = (bool, Option<(String, Option<i64>)>);
+pub(crate) fn state_reminder_status(
+    conn: &rusqlite::Connection, name: &str, identity: &str,
+) -> rusqlite::Result<StateReminderStatus> {
+    use rusqlite::OptionalExtension;
+    let prefix = format!("{identity}:*");
+    let mut stmt = conn.prepare("SELECT outcome FROM steering_history WHERE id GLOB ?1 AND session=?2")?;
+    let outcomes = stmt.query_map([&prefix, name], |r| r.get::<_, Option<String>>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let queued = conn.query_row(
+        "SELECT id,precond_rev FROM steering_queue WHERE id GLOB ?1 AND session=?2 ORDER BY queued_at LIMIT 1",
+        [&prefix, name], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+    Ok((outcomes.iter().flatten().any(|v| matches!(submit_verdict_of(v), Some("confirmed" | "retried"))), queued))
+}
+
 /// Only a confirmed prior submission suppresses this state. Voided/failed
 /// attempts are observable refusals, never mislabeled as successful delivery.
 pub(crate) async fn enqueue_state_reminder(store:&crate::db::SharedStore,name:&str,text:&str,guard:&str,card:&str,rev:i64,identity:&str)->Result<bool,String> {
-    use rusqlite::OptionalExtension;
-    let prefix=format!("{identity}:*");
-    let session=name.to_string();
-    let (already_sent,queued_id)=store.read_async(move |c| {
-        let mut stmt=c.prepare("SELECT outcome FROM steering_history WHERE id GLOB ?1 AND session=?2")?;
-        let outcomes=stmt.query_map([&prefix, &session],|r|r.get::<_,Option<String>>(0))?
-            .collect::<Result<Vec<_>,_>>()?;
-        let queued_id=c.query_row("SELECT id,precond_rev FROM steering_queue WHERE id GLOB ?1 AND session=?2 ORDER BY queued_at LIMIT 1",[&prefix, &session],|r|Ok((r.get::<_,String>(0)?, r.get::<_,Option<i64>>(1)?))).optional()?;
-        Ok((outcomes.iter().flatten().any(|v|matches!(submit_verdict_of(v),Some("confirmed"|"retried"))),queued_id))
-    }).await.map_err(|e|e.to_string())?;
+    let session = name.to_string();
+    let lookup_identity = identity.to_string();
+    let (already_sent,queued_id) = store.read_async(move |c|
+        Ok(state_reminder_status(c, &session, &lookup_identity)?)
+    ).await.map_err(|e|e.to_string())?;
     if already_sent || queued_id.as_ref().is_some_and(|(_,queued_rev)| *queued_rev == Some(rev)) { return Ok(false); }
     store.write_async(|c|{ensure_fleet_tables(c)?;Ok(crate::db::WriteOutcome{applied:false,events:vec![]})}).await.map_err(|e|e.to_string())?;
     // A revision only distinguishes previously voided attempts. Confirmed
@@ -6897,6 +7219,30 @@ fn possible_codex_footer_chrome(raw: &str) -> bool {
         && !codex_model_footer_chrome(raw, &stripped)
 }
 
+/// A row of Muse Code's `/` command popup (`/clear   Clear terminal and start a fresh
+/// session`) or of its numbered picker (`1. Allow this stage once (y)`). Both are drawn
+/// under the prompt and above the divider, exactly where typed continuation lines
+/// would be, and neither is SGR-dim. Real multi-line input does not start with a
+/// slash-command followed by two or more spaces, nor with `N. ` — and a picker is a
+/// question for a human, which is `waiting`, never "unsubmitted text".
+fn muse_popup_row(t: &str) -> bool {
+    let help = t.starts_with('/')
+        && t[1..].split_whitespace().next().is_some_and(|w| !w.is_empty() && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        && t.contains("  ");
+    let more = t.starts_with('\u{2193}') && t.contains("more");
+    let picker = t.split_once(". ").is_some_and(|(n, rest)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) && !rest.is_empty());
+    help || more || picker
+}
+
+/// Muse's empty-composer hint, painted grey rather than dim: `❯ Start a message with !
+/// to run a shell command yourself`. Enter here submits nothing; there is nothing stuck.
+fn muse_prompt_hint(prompt_line: &str) -> bool {
+    prompt_line
+        .trim()
+        .trim_start_matches(['\u{276f}', ' ', '\u{a0}'])
+        .starts_with("Start a message with")
+}
+
 pub(crate) fn composer_state(raw_frame: &str) -> ComposerState {
     let clean = strip_ansi(raw_frame);
     // The manager view owns the keyboard: its own status bar says so. Positive
@@ -6947,11 +7293,27 @@ pub(crate) fn composer_state(raw_frame: &str) -> ComposerState {
     else {
         return ComposerState::NotVisible;
     };
+    // MUSE CODE draws Claude's `❯` glyph but different chrome around it, and paints
+    // that chrome in a grey COLOUR rather than SGR dim — so the dim mask, which is
+    // how Claude's placeholder is told from input, sees plain text. Two shapes
+    // measured on a live fleet (2026-09-16), each stamped "unsubmitted text" with
+    // the chrome as the preview: the `/` command popup (rows of `/name   description`
+    // under the prompt, previews like `/tasksshowsworkflows...`) and the empty-
+    // composer hint (`❯ Start a message with ! to run a shell command yourself`).
+    // The frame is identified by muse's own composer header, never by the model
+    // name, so a rename cannot take the check with it.
+    let is_muse = stripped[..idx].iter().any(|l| l.contains("Voice input ("));
+    if is_muse && muse_prompt_hint(&stripped[idx]) {
+        return ComposerState::Placeholder(
+            stripped[idx].trim().trim_start_matches(['\u{276f}', ' ', '\u{a0}']).split_whitespace().collect(),
+        );
+    }
     let mut block: Vec<&str> = vec![raw_lines[idx]];
     for (i, s) in stripped.iter().enumerate().skip(idx + 1) {
         let t = s.trim();
         if matches!(t.chars().next(), Some('\u{2500}') | Some('\u{23f5}'))
             || codex_model_footer_chrome(raw_lines[i], s)
+            || (is_muse && muse_popup_row(t))
         {
             break;
         }
@@ -7173,6 +7535,63 @@ fn submission_records_have(records: &[Value], text: &str, since: f64) -> bool {
     }))
 }
 
+/// Muse's durable proof that a message was submitted — the analogue of
+/// `jsonl_submission_since` for Claude.
+///
+/// Muse writes `runtime.session.user_intent.accepted` into its session transcript at the
+/// moment it accepts a prompt, with the text in `refill_blocks`. That record is the same
+/// class of evidence as Claude's JSONL user message: written by the AGENT on acceptance,
+/// not inferred from the pane.
+///
+/// Without it a muse send that worked was reported "not submitted — text is sitting in the
+/// input box", because every read `verify_submitted` had was Claude-shaped. Measured live:
+/// the pane showed the prompt answered while the API returned ok:false, which makes callers
+/// re-send a message the agent is already working on.
+pub(crate) fn muse_user_intent_since(name: &str, text: &str, since: f64) -> bool {
+    let needle = text.trim();
+    if needle.is_empty() {
+        return false;
+    }
+    let id = meta_str(&load_meta(name), "muse_session_id");
+    if id.is_empty() {
+        return false;
+    }
+    let Some(dir) = muse_scan_sessions(&muse_sessions_root()).get(&id).cloned() else {
+        return false;
+    };
+    let path = dir.join("session.jsonl");
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return false;
+    };
+    // The transcript must have been written since the send. Muse nests records as escaped
+    // JSON strings, so the timestamp beside a given intent is awkward to attribute; the file
+    // mtime is a coarser but honest bound, and the needle is text we sent seconds ago.
+    let fresh = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64() >= since - 1.0)
+        .unwrap_or(false);
+    if !fresh {
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(&path) else {
+        return false;
+    };
+    let start = bytes.len().saturating_sub(262_144);
+    let tail = String::from_utf8_lossy(&bytes[start..]);
+    muse_intent_in_tail(&tail, needle)
+}
+
+/// Pure scan, so it is testable against a planted transcript rather than a file mock.
+pub(crate) fn muse_intent_in_tail(tail: &str, needle: &str) -> bool {
+    tail.match_indices("user_intent.accepted").any(|(i, _)| {
+        let end = tail.len().min(i + 8192);
+        tail[i..end].contains(needle)
+    })
+}
+
+
 /// The evidence scan itself, over already-parsed records — pure so it can be
 /// tested against a planted transcript rather than a mock of the file reader.
 pub(crate) fn jsonl_records_have(recs: &[Value], needle: &str, since: f64) -> bool {
@@ -7283,6 +7702,15 @@ pub(crate) fn final_frame_confirms(frame: FrameRead) -> bool {
         // Never a confirmation, whatever else is done about it.
         FrameRead::CollapsedPaste => false,
     }
+}
+
+/// A repaint may briefly release input before drawing it again. Confirmation
+/// requires consecutive clear observations, including the final fallback read.
+fn observe_submission_frame(frame: FrameRead, cleared_once: &mut bool) -> bool {
+    let clear = final_frame_confirms(frame);
+    let confirmed = clear && *cleared_once;
+    *cleared_once = clear;
+    confirmed
 }
 
 pub(crate) fn read_frame(raw: &str, tail_sq: &str) -> FrameRead {
@@ -7467,15 +7895,13 @@ pub(crate) enum Submission {
 /// delivering" bug.
 ///
 /// Returns `Confirmed` once the input prompt no longer holds our text. If it
-/// still does AND the session is idle, a picker likely ate the Enter → press
-/// Escape+Enter to submit (`retry_keys`), spaced ≥1.3s from any earlier Escape
-/// because two Escapes inside ~1s read as a double-press and EAT the pending
-/// message. Biased to `Unverified` rather than `Stuck` when uncertain, so we
-/// never double-send.
+/// still does AND the session is idle, retry bare Enter. Picker-shaped text
+/// uses bracketed paste, so no autocomplete needs closing here. Escape can
+/// interrupt a just-accepted turn before its spinner/transcript is visible and
+/// restore the input after we have falsely reported submission.
 async fn verify_submitted(
     name: &str,
     text: &str,
-    esc_at: Option<std::time::Instant>,
     sent_at: f64,
     retry_keys: bool,
 ) -> (Submission, bool) {
@@ -7488,14 +7914,15 @@ async fn verify_submitted(
     // the pane width, splitting the tail across visual lines at arbitrary
     // points.
     let tail_sq: String = tail.split_whitespace().collect();
-    let mut esc_at = esc_at;
     let mut cleared_once = false;
     let mut stuck_looks = 0;
     let mut no_ui_looks = 0;
     for _ in 0..5 {
         sleep_ms(300).await;
         let raw = tmux_capture(name, 25).await;
-        match read_frame(&raw, &tail_sq) {
+        let frame = read_frame(&raw, &tail_sq);
+        let confirmed = observe_submission_frame(frame, &mut cleared_once);
+        match frame {
             // NO INPUT BOX AT ALL IS "NOT READY", NOT "SUBMITTED" (AC-271). A
             // successful submit leaves the composer rendered and EMPTY — the ❯
             // line is still there. So the absence of any ❯/› means Claude Code
@@ -7540,10 +7967,9 @@ async fn verify_submitted(
                 // text can render into the box AFTER our first look (keystrokes
                 // buffered through boot), so one clear look is not proof.
                 // Require two.
-                if cleared_once {
+                if confirmed {
                     return (Submission::Confirmed, retried);
                 }
-                cleared_once = true;
                 continue;
             }
             // The native queue clears the composer after accepting Enter.
@@ -7565,7 +7991,6 @@ async fn verify_submitted(
             // does not try.
             FrameRead::CollapsedPaste => {}
         }
-        cleared_once = false;
         // ONE stuck look is not proof either: for ~1s after a successful submit
         // the pane still shows the echoed text and no spinner yet (worse during
         // a resize repaint), which reads exactly like "stuck + idle". Acting on
@@ -7579,7 +8004,8 @@ async fn verify_submitted(
         // Durable evidence beats the pane: the conversation JSONL gets the user
         // message appended at submission. If it is there stamped after this send
         // began, it submitted and the pane read is a repaint lie.
-        if sent_at > 0.0 && jsonl_submission_since(name, text, sent_at) {
+        if sent_at > 0.0 && (jsonl_submission_since(name, text, sent_at)
+            || muse_user_intent_since(name, text, sent_at)) {
             return (Submission::Confirmed, retried);
         }
         let active_now = detect_claude_status(&raw) == "active";
@@ -7590,20 +8016,9 @@ async fn verify_submitted(
             }
             return (Submission::Stuck, retried);
         }
-        // Idle with our text genuinely stuck → press Escape (closes a picker
-        // WITHOUT selecting an entry; a bare Enter would pick one and rewrite an
-        // @path) then Enter. Any two Escapes within ~1s read as a double-press
-        // and EAT the pending message (v2.1.205), so space each retry's Escape
-        // ≥1.3s from the previous one, including the one send_text itself sent.
-        if let Some(at) = esc_at {
-            let elapsed = at.elapsed();
-            if elapsed < Duration::from_millis(1300) {
-                tokio::time::sleep(Duration::from_millis(1300) - elapsed).await;
-            }
-        }
-        send_key(name, "Escape").await;
-        esc_at = Some(std::time::Instant::now());
-        sleep_ms(60).await;
+        // Literal/paste delivery has already avoided autocomplete. Never
+        // interrupt a turn which accepted the first Enter but has not painted
+        // its active footer yet; bare Enter can submit/queue our pending text.
         send_key(name, "Enter").await;
         // A retry is EVIDENCE THE SEND PATH FAILED, not a routine step, so it
         // is logged at WARN and reported back to the caller (`retried` in the
@@ -7611,13 +8026,14 @@ async fn verify_submitted(
         // says "the keystroke path is dropping Enters on this lane".
         retried = true;
         tracing::warn!(
-            session = %name,
-            "send: Enter did not submit — retried Escape+Enter (keystroke delivery failure)"
+            session = %name, retry_mode="enter", verdict="submission_enter_retry",
+            "send: Enter did not submit — retried without interrupting the worker"
         );
         stuck_looks = 0;
     }
+    if cleared_once { sleep_ms(300).await; }
     let raw = tmux_capture(name, 25).await;
-    if final_frame_confirms(read_frame(&raw, &tail_sq)) {
+    if observe_submission_frame(read_frame(&raw, &tail_sq), &mut cleared_once) {
         return (Submission::Confirmed, retried);
     }
     // Last resort before reporting a failure (which makes callers re-send):
@@ -7627,7 +8043,8 @@ async fn verify_submitted(
     // A re-send now happens only when the message is genuinely absent from the
     // durable record, which is precisely when re-sending is the right move; the
     // old path traded that for a silent drop.
-    if sent_at > 0.0 && jsonl_submission_since(name, text, sent_at) {
+    if sent_at > 0.0 && (jsonl_submission_since(name, text, sent_at)
+            || muse_user_intent_since(name, text, sent_at)) {
         (Submission::Confirmed, retried)
     } else {
         (Submission::Stuck, retried)
@@ -7696,7 +8113,7 @@ async fn send_after_ready(
         let out = tmux_capture(&name, 15).await;
         if !out.is_empty() {
             let clean = strip_ansi(&out);
-            if claude_ui_visible(&clean) && !at_resume_picker(&clean) {
+            if agent_ui_visible(&clean) && !at_resume_picker(&clean) {
                 sleep_ms(1200).await;
                 let _ = send_text_boxed(&state, &name, &text, false, origin).await;
                 return;
@@ -7715,7 +8132,12 @@ async fn send_after_ready(
         session = %name,
         timeout_s,
         chars = text.chars().count(),
-        "send_after_ready: Claude UI never became ready before timeout; start/wake prompt DROPPED undelivered"
+        // Name the PROVIDER, not "Claude". This line said "Claude UI" on a muse lane, which
+        // reads as a launch bug — the Producer reported it as amux having started Claude for
+        // a provider=muse lane. It had not; the readiness predicate simply knew no muse
+        // markers. A message that misnames what it watched sends the next reader after the
+        // wrong defect.
+        "send_after_ready: agent UI never became ready before timeout; start/wake prompt DROPPED undelivered"
     );
     emit_event(
         &state,
@@ -7903,23 +8325,36 @@ pub(crate) async fn deliver_automated(
         AutoDelivery { message: msg, submitted, submission, queue_id: None, refused: !ok }
     };
 
-    if name.trim().is_empty() {
-        return refuse("schedule has no target session".into());
-    }
-    if !env_path(name).exists() {
-        return refuse(format!("target '{name}' is not a registered session"));
-    }
+    // SAME PREDICATE AS THE INVARIANT (AMUX-4784). The conditions and their
+    // order are unchanged; what changed is that `schedule_target_refusal` is now
+    // the single place they are written, so `schedule.target_can_receive` cannot
+    // drift from what actually refuses.
+    //
     // A schedule must never be a wake path for an ARCHIVED lane (Ethan,
     // 2026-08-02). The send path would refuse anyway, but refusing here keeps
     // the reason in the run row instead of surfacing as a nightly `error`
-    // forever. Unarchiving is a human's call (ethos rule 8).
-    if parse_env(name).get("CC_ARCHIVED") == Some("1") {
-        return refuse(format!("target '{name}' is archived — not delivered, not woken"));
-    }
-    // AMUX-4574: a paused lane is not a wake target for a schedule either; say so
-    // in the run row instead of letting auto-wake fail with a 500.
-    if parse_env(name).get("CC_PAUSED") == Some("1") {
-        return refuse(format!("target '{name}' is paused — not delivered, not woken; resume it to receive schedules"));
+    // forever. Unarchiving is a human's call (ethos rule 8). AMUX-4574 added
+    // the paused arm for the same reason: say it in the run row rather than
+    // letting auto-wake fail with a 500.
+    match schedule_target_refusal(name) {
+        Some(TargetRefusal::NoTarget) => return refuse("schedule has no target session".into()),
+        Some(TargetRefusal::Unregistered) => {
+            return refuse(format!("target '{name}' is not a registered session"))
+        }
+        Some(TargetRefusal::Archived) => {
+            return refuse(format!("target '{name}' is archived — not delivered, not woken"))
+        }
+        Some(TargetRefusal::Paused) => {
+            return refuse(format!(
+                "target '{name}' is paused — not delivered, not woken; resume it to receive schedules"
+            ))
+        }
+        // ISOLATION IS NOT HOISTED HERE, deliberately. It is refused further
+        // down, by `isolation_refusal` on the send path, and moving it would
+        // change both the message and the refusal point for a case this card
+        // only needed to REPORT on. The invariant still names it, through the
+        // same function.
+        Some(TargetRefusal::Isolated) | None => {}
     }
     // A blocked session is on a permission/approval dialog. Delivering input
     // could accidentally answer that dialog. The message stays queued (via the
@@ -8179,15 +8614,15 @@ async fn send_text_inner(
     // shell prompt OR the provider composer. Sending then types the user's
     // prompt into the startup script. Wait on positive UI evidence, not the
     // process existence or the model name echoed by the launch command.
-    if boot_in_flight && !claude_ui_visible(&strip_ansi(&out_st)) {
+    if boot_in_flight && !agent_ui_visible(&strip_ansi(&out_st)) {
         tracing::info!(session = %name, verdict = "send_waiting_for_boot_ui",
             "new worker has not drawn its provider UI — holding message before typing");
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while std::time::Instant::now() < deadline && !claude_ui_visible(&strip_ansi(&out_st)) {
+        while std::time::Instant::now() < deadline && !agent_ui_visible(&strip_ansi(&out_st)) {
             sleep_ms(250).await;
             out_st = tmux_capture(name, 15).await;
         }
-        if !claude_ui_visible(&strip_ansi(&out_st)) {
+        if !agent_ui_visible(&strip_ansi(&out_st)) {
             tracing::warn!(session = %name, verdict = "send_boot_ui_not_ready",
                 "provider UI did not appear — message was not typed into the launch shell");
             return (false, "worker is still starting — message not sent; retry when its terminal is ready".into());
@@ -8651,7 +9086,23 @@ async fn send_text_inner(
     } else if !send_literal(name, &text).await {
         return (false, "send-keys failed".into());
     }
-    sleep_ms(20).await;
+    // HOW LONG THE COMPOSER NEEDS BEFORE Enter MEANS "SUBMIT".
+    //
+    // 20ms is what Claude Code needs and it is far too short for muse: measured on a live
+    // muse lane, paste+20ms+Enter leaves the text resting in the composer every time, while
+    // paste+300ms+Enter submits it. The failure is invisible from here — the keys are
+    // delivered, so send-keys succeeds — and surfaces only as amux's own verdict "not
+    // submitted, text is sitting in the input box", which is exactly what a muse worker
+    // reported on every send.
+    //
+    // Per provider rather than one global raise: 20ms is a real latency budget for Claude,
+    // paid on every send by every lane, and there is no reason to make the common case
+    // slower for a provider-specific composer.
+    let settle_ms = match provider_of(&parse_env(name)).as_str() {
+        "muse" => 350,
+        _ => 20,
+    };
+    sleep_ms(settle_ms).await;
     // Only reachable if picker-shaped text was TYPED, which `use_paste` now
     // prevents. Kept as a belt-and-braces closer rather than deleted: if a
     // future change routes picker text back through send-keys, the Escape that
@@ -8684,10 +9135,11 @@ async fn send_text_inner(
     //
     // Mid-turn we retry with a BARE Enter and never an Escape: Escape mid-turn
     // is an INTERRUPT that kills the running response (py:25597's warning, and
-    // this session's own "[Request interrupted by user]" records). Idle, the
-    // Escape+Enter pair is correct because a picker may be holding the Enter.
+    // this session's own "[Request interrupted by user]" records). Idle retries
+    // also use bare Enter: picker-shaped input was pasted, so Escape would only
+    // risk interrupting a newly accepted turn.
     // ------------------------------------------------------------------
-    let (first, retried) = verify_submitted(name, &text, esc_at, sent_at, !generating).await;
+    let (first, retried) = verify_submitted(name, &text, sent_at, !generating).await;
     if first == Submission::Stuck && generating {
         // One bare-Enter retry, then re-read the evidence. No sleep-tuning: the
         // retry is gated on the OBSERVED composer contents, not on a guess
@@ -8698,7 +9150,7 @@ async fn send_text_inner(
             "send: mid-turn Enter was not accepted — retrying with a bare Enter (keystroke delivery failure)"
         );
         send_key(name, "Enter").await;
-        let (second, _) = verify_submitted(name, &text, None, sent_at, false).await;
+        let (second, _) = verify_submitted(name, &text, sent_at, false).await;
         return send_outcome(second, generating, true);
     }
     send_outcome(first, generating, retried)
@@ -8977,7 +9429,7 @@ fn build_claude_cmd(cfg: &EnvFile, flags: &str, default_flags: &str, session_fla
 /// experienced as "the fresh claude exited immediately". Each start/stop now
 /// owns the pane exclusively; a queued second start finds claude running and
 /// returns "already running" instead of typing over a healthy boot.
-fn session_op_lock(name: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+pub(crate) fn session_op_lock(name: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     static LOCKS: std::sync::Mutex<Option<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>> =
         std::sync::Mutex::new(None);
     let mut g = LOCKS.lock().unwrap();
@@ -9265,8 +9717,17 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
     };
 
     // --- Worktree isolation (opt-in via CC_WORKTREE=1) ---
-    let worktree_enabled = cfg.get_or("CC_WORKTREE", "") == "1";
-    if worktree_enabled {
+    let fanout = cfg.get("CC_EPHEMERAL") == Some("1");
+    let worktree_enabled = fanout || cfg.get_or("CC_WORKTREE", "") == "1";
+    if fanout {
+        match crate::fanout_workspace::ensure(&home(), name, &work_dir).await {
+            Ok(workspace) => work_dir = workspace.path,
+            Err(error) => {
+                tracing::warn!(session=name,%error,verdict="fanout_workspace_required", "fan-out start refused; workspace preserved");
+                return (false,error);
+            }
+        }
+    } else if worktree_enabled {
         let wt_dir = home().join("worktrees").join(name);
         let wt_path = wt_dir.to_string_lossy().into_owned();
         // Clean up stale worktree from a previous run.
@@ -9494,6 +9955,19 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
             let session = gemini_session_flag(&mut meta, skip_conv_id);
             format!("{base_bin}{opts} {session}")
         }
+        "muse" => {
+            // Muse Code. A NEW run launches bare — there is no `--session-id` to
+            // mint (see muse_launch_command) — and the id is learned from disk
+            // once the process is up, below. A stored id resumes exactly that
+            // conversation. Do NOT fall through to build_claude_cmd; that would
+            // launch `claude`.
+            muse_launch_command(
+                &meta_str(&meta, "muse_session_id"),
+                &flags,
+                extra_flags,
+                &default_model_for_provider("muse"),
+            )
+        }
         "ollama" => {
             // Ollama workers run through `codex --oss --local-provider ollama`
             // so they get a full coding agent (file editing, hooks, structured
@@ -9618,7 +10092,7 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
     // cd, source the global agent credentials.
     let mut has_oauth = false;
     let mut shell_rc = String::new();
-    if provider != "codex" && provider != "gemini" && provider != "ollama" {
+    if provider != "codex" && provider != "gemini" && provider != "ollama" && provider != "muse" {
         shell_rc.push_str("unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT; ");
         if let Ok(t) = std::fs::read_to_string(PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".claude.json")) {
             if let Ok(v) = serde_json::from_str::<Value>(&t) {
@@ -9686,7 +10160,7 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
             sh_quote(&f.to_string_lossy())
         ));
     }
-    if provider != "codex" && provider != "gemini" && provider != "ollama" && has_oauth {
+    if provider != "codex" && provider != "gemini" && provider != "ollama" && provider != "muse" && has_oauth {
         shell_rc.push_str("unset ANTHROPIC_API_KEY; ");
     }
     // Settings writes provider keys to server.env at runtime. Reading that file
@@ -9702,17 +10176,34 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
             .map(|(_, value)| value.clone())
     };
     let mut env_args: Vec<String> = Vec::new();
+    // SECRET VALUES NEVER GO IN ARGV (AMUX-4803). Process arguments are
+    // world-readable on macOS, and a tmux SERVER keeps the argv of the
+    // new-session that created it for its whole lifetime — measured at 3d22h,
+    // with `ps -axo command` showing `-e OPENAI_API_KEY=<full key>` to every
+    // lane, script and diagnostic on the box. From there it reaches transcripts
+    // and logs, which has already happened at least once.
+    //
+    // These are deferred to `tmux set-environment` after the session exists,
+    // then imported into the pane's shell. That is not a new mechanism: the
+    // auto-wake path ~70 lines below already does exactly this, and its comment
+    // says why it works ("the typed command contains no values, so provider
+    // keys cannot land in terminal history or pane logs").
+    //
+    // set-environment still passes the value as an argv element, but to a
+    // SHORT-LIVED tmux client that exits immediately, not to the server process
+    // that outlives it by days. That is the difference this fixes.
+    let mut deferred_secrets: Vec<(String, String)> = Vec::new();
     if has_oauth {
+        // Empty, so not a secret: it must stay in argv because it is what
+        // SUPPRESSES an inherited key for an OAuth worker.
         env_args.push("-e".into());
         env_args.push("ANTHROPIC_API_KEY=".into());
     } else if let Some(v) = provider_value("ANTHROPIC_API_KEY") {
-        env_args.push("-e".into());
-        env_args.push(format!("ANTHROPIC_API_KEY={v}"));
+        deferred_secrets.push(("ANTHROPIC_API_KEY".into(), v));
     }
     for k in ["OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"] {
         if let Some(v) = provider_value(k) {
-            env_args.push("-e".into());
-            env_args.push(format!("{k}={v}"));
+            deferred_secrets.push((k.to_string(), v));
         }
     }
     for k in [
@@ -9920,10 +10411,26 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
         let _ = tmux(&["set-option", "-t", &stq, "allow-rename", "off"]).await;
         let _ = tmux(&["set-window-option", "-t", &stq, "automatic-rename", "off"]).await;
         let _ = tmux(&["rename-window", "-t", &stq, name]).await;
+        // The secrets kept out of argv above, handed over the tmux control
+        // socket and then imported by the shell (AMUX-4803). Order matters:
+        // set-environment changes what the SESSION carries, and this shell is
+        // already running, so the import below is what actually gives the
+        // provider its key. Same two steps, same order, as the auto-wake path.
+        for (key, value) in &deferred_secrets {
+            let _ = tmux(&["set-environment", "-t", &stq, key, value]).await;
+        }
+        if !deferred_secrets.is_empty() {
+            type_line(
+                name,
+                &format!("eval \"$(tmux show-environment -s -t {})\"", sh_quote(&stq)),
+            )
+            .await;
+            poll_shell_prompt(name, 3000).await;
+        }
         type_line(name, &shell_rc).await;
         poll_shell_prompt(name, 3000).await;
     }
-    if has_oauth && provider != "codex" && provider != "gemini" {
+    if has_oauth && provider != "codex" && provider != "gemini" && provider != "muse" {
         type_line(name, "unset ANTHROPIC_API_KEY").await;
         poll_shell_prompt(name, 3000).await;
     }
@@ -9933,6 +10440,16 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
     let cmd = format!("cd {} && {cmd}", sh_quote(&work_dir));
     tracing::info!(session = name, cwd = %work_dir, verdict = "provider_launch_workspace_pinned",
         "launching provider in resolved worker workspace");
+    // Snapshot muse's session directory BEFORE the process exists, so the set
+    // that appears during launch is exactly the set this start created. Scanning
+    // only afterwards could not tell a session this lane just opened from one a
+    // different lane opened a second earlier.
+    let muse_before = if provider == "muse" && meta_str(&meta, "muse_session_id").is_empty() {
+        muse_scan_sessions(&muse_sessions_root())
+    } else {
+        std::collections::BTreeMap::new()
+    };
+    // Launch the provider command.
     let _ = send_literal(name, &cmd).await;
     sleep_ms(150).await;
     send_key(name, "Enter").await;
@@ -9943,7 +10460,7 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
         let out = tmux_capture(name, 10).await;
         if !out.is_empty() {
             let clean = strip_ansi(&out);
-            if claude_ui_visible(&clean) {
+            if agent_ui_visible(&clean) {
                 launched = true;
                 break;
             }
@@ -9952,6 +10469,33 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
             }
             if i >= 6 && at_resume_picker(&clean) {
                 break;
+            }
+        }
+    }
+    // Learn the muse session id (see muse_pick_session). Only on a FIRST start:
+    // once stored, the id is the resume key and must never be overwritten by a
+    // later scan.
+    if provider == "muse" && meta_str(&meta, "muse_session_id").is_empty() {
+        let after = muse_scan_sessions(&muse_sessions_root());
+        let new: Vec<(String, Option<String>)> = after
+            .iter()
+            .filter(|(id, _)| !muse_before.contains_key(id.as_str()))
+            .map(|(id, dir)| (id.clone(), muse_session_workspace(dir)))
+            .collect();
+        match muse_pick_session(&new, &work_dir) {
+            Ok(id) => {
+                tracing::info!(session = %name, muse_session_id = %id, "muse session id learned");
+                meta.insert("muse_session_id".into(), json!(id));
+                save_meta(name, &meta);
+            }
+            Err(why) => {
+                // Not fatal, and deliberately loud: the lane works, it just will
+                // not RESUME. Silence here would look identical to a stored id
+                // until the next start quietly opened a second conversation.
+                tracing::warn!(
+                    session = %name, why = %why,
+                    "muse session id not stored; the next start will open a FRESH conversation"
+                );
             }
         }
     }
@@ -9989,7 +10533,7 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
             for _ in 0..10 {
                 sleep_ms(500).await;
                 let o = strip_ansi(&tmux_capture(name, 10).await);
-                if claude_ui_visible(&o) {
+                if agent_ui_visible(&o) {
                     launched = true;
                     break;
                 }
@@ -10024,7 +10568,7 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
             for _ in 0..10 {
                 sleep_ms(500).await;
                 let out2 = tmux_capture(name, 10).await;
-                if !out2.is_empty() && claude_ui_visible(&strip_ansi(&out2)) {
+                if !out2.is_empty() && agent_ui_visible(&strip_ansi(&out2)) {
                     launched = true;
                     break;
                 }
@@ -10071,7 +10615,7 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
             for _ in 0..20 {
                 sleep_ms(500).await;
                 let o2 = strip_ansi(&tmux_capture(name, 10).await);
-                if claude_ui_visible(&o2) {
+                if agent_ui_visible(&o2) {
                     relaunched = true;
                     break;
                 }
@@ -10468,7 +11012,8 @@ async fn stop_session(state: &AppState, name: &str) -> (bool, String) {
             return (false, format!("worker stopped but status reset failed: {error}"));
         }
     }
-    cleanup_worktree(name).await;
+    // A stop/pause is a process lifecycle event, never workspace disposal.
+    tracing::info!(session=name,verdict="workspace_preserved_on_stop", "stopped worker retains its workspace and uncommitted files");
     result
 }
 
@@ -10585,37 +11130,6 @@ async fn stop_session_process(name: &str) -> (bool, String) {
         return (false, "could not confirm the worker process stopped".into());
     }
     (true, "stopped (hard-kill)".into())
-}
-
-/// Remove the per-worker worktree if one exists. Resolves the parent repo from
-/// the worktree's `.git` file so `git worktree remove` prunes the lock.
-async fn cleanup_worktree(name: &str) {
-    let wt_dir = home().join("worktrees").join(name);
-    if !wt_dir.exists() {
-        return;
-    }
-    let wt_path = wt_dir.to_string_lossy().into_owned();
-    // The worktree's .git is a file containing "gitdir: <repo>/.git/worktrees/<name>"
-    let repo_dir = match tokio::fs::read_to_string(wt_dir.join(".git")).await {
-        Ok(content) => {
-            content.strip_prefix("gitdir: ")
-                .and_then(|s| s.split("/.git/worktrees/").next())
-                .map(|s| s.trim().to_string())
-        }
-        Err(_) => None,
-    };
-    let removed = if let Some(ref repo) = repo_dir {
-        matches!(
-            run_cmd("git", &["-C", repo, "worktree", "remove", "--force", &wt_path], OP_TIMEOUT).await,
-            Some(o) if o.status.success()
-        )
-    } else {
-        false
-    };
-    if !removed && wt_dir.exists() {
-        let _ = tokio::fs::remove_dir_all(&wt_dir).await;
-    }
-    tracing::info!(session = name, worktree = %wt_path, "worktree cleaned up on stop");
 }
 
 async fn kill_tmux_session(name: &str) {
@@ -10768,8 +11282,8 @@ pub(crate) async fn stop_for_pause(state: &AppState, name: &str) -> anyhow::Resu
         let (ok, detail) = stop_session_process(name).await;
         anyhow::ensure!(ok, "{detail}");
     } else {
-        let pane_target = pt(name);
-        let pane = tmux(&["list-panes", "-t", &pane_target, "-F", "#{pane_pid}"]).await;
+        let pt = pt(name);
+        let pane = tmux(&["list-panes", "-t", &pt, "-F", "#{pane_pid}"]).await;
         if let Some(out) = pane.filter(|o| o.status.success()) {
             for line in String::from_utf8_lossy(&out.stdout).lines() {
                 let root: i32 = line.trim().parse()?;
@@ -11723,32 +12237,16 @@ fn parse_pane_geometry(raw: &str) -> Option<(i64, i64)> {
     Some((cols, rows))
 }
 
-/// [`render_session_transcript`] on the blocking pool. A panic in the render
-/// degrades to "no transcript", which every caller already handles as the
-/// worker simply having none yet.
-async fn render_session_transcript_off_thread(name: &str, max_chars: usize) -> String {
-    let owned = name.to_owned();
-    tokio::task::spawn_blocking(move || render_session_transcript(&owned, max_chars))
-        .await
-        .unwrap_or_default()
-}
-
 async fn peek_response(name: &str, lines: i64, live_only: bool, no_trim: bool) -> Value {
     let provider = provider_of(&parse_env(name));
     if live_only {
-        // The capture is a subprocess and the transcript is file work, and
-        // neither needs the other to start, so they run together. The render
-        // goes to the blocking pool: on a miss it parses megabytes of JSONL,
-        // which is what `runtime_job_blocking_poll` was reporting from here.
-        let wants_trim = !no_trim && provider == "claude";
-        let (captured, transcript) = tokio::join!(tmux_capture(name, lines), async {
-            if wants_trim { render_session_transcript_off_thread(name, 120_000).await } else { String::new() }
-        });
-        let output = strip_scroll_pill(&captured);
+        let output = strip_scroll_pill(&tmux_capture(name, lines).await);
         let live = if output.is_empty() { String::new() } else { strip_launch_noise(output.trim()) };
-        // The live=1 trim needs the transcript the CLIENT is displaying.
-        let live = if !live.is_empty() && !transcript.is_empty() {
-            trim_live_overlap(&transcript, &live)
+        // The live=1 trim needs the transcript the CLIENT is displaying; the
+        // rust origin re-renders it (bounded) instead of a process cache.
+        let live = if !live.is_empty() && !no_trim && provider == "claude" {
+            let tr = render_session_transcript(name, 120_000);
+            if tr.is_empty() { live } else { trim_live_overlap(&tr, &live) }
         } else {
             live
         };
@@ -11782,7 +12280,7 @@ async fn peek_response(name: &str, lines: i64, live_only: bool, no_trim: bool) -
         } else if provider != "claude" {
             (String::new(), clean_gemini_frame(&tmux_capture(name, 0).await))
         } else {
-            (render_session_transcript_off_thread(name, 120_000).await, output)
+            (render_session_transcript(name, 120_000), output)
         };
         let mut live = if output.is_empty() { String::new() } else { strip_launch_noise(output.trim()) };
         if !transcript.is_empty() && !live.is_empty() {
@@ -15088,9 +15586,27 @@ pub const PIPE_RECONCILE_SECS: u64 = 60;
 pub async fn pipe_reconcile_loop() {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(PIPE_RECONCILE_SECS)).await;
-        crate::runtime_jobs::registry::tick(crate::runtime_jobs::registry::ids::PIPE_RECONCILE);
-        if let Err(e) = crate::db::interactions::spawn(pipe_reconcile_tick()).await {
-            tracing::error!(error = %e, "pipe reconcile tick panicked");
+        // AMUX-4814: bracket the work; do not stamp a one-shot before it.
+        //
+        // The old line stamped `registry::tick(...)` BEFORE the tick ran. That
+        // is the defect invariants::monitor::one_pass already fixed, and its
+        // guard states both halves: the one-shot "sets last_start and last_end
+        // to the same instant, so it can neither express a duration nor
+        // separate start from finish", and "a tick taken first means a pass
+        // that was STARTED, while every reader takes ticks to mean a pass that
+        // is DONE".
+        //
+        // Both bit here. `last_tick_ms` read `never` through 36 ticks, so the
+        // only branch in `classify_observed` that can say `slow` was dead for
+        // this job, and a tick that merely ran LONG surfaced as `stalled`.
+        crate::runtime_jobs::registry::tick_start(crate::runtime_jobs::registry::ids::PIPE_RECONCILE);
+        match crate::db::interactions::spawn(pipe_reconcile_tick()).await {
+            // Only a COMPLETED tick may stamp the end: a panicking tick that
+            // still stamped would make a dead reconciler read as a working one.
+            Ok(_) => crate::runtime_jobs::registry::tick_end(
+                crate::runtime_jobs::registry::ids::PIPE_RECONCILE,
+            ),
+            Err(e) => tracing::error!(error = %e, "pipe reconcile tick panicked"),
         }
     }
 }
@@ -15396,11 +15912,21 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
 pub async fn steer_deliver_loop(state: AppState) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(STEER_TICK_SECS)).await;
-        crate::runtime_jobs::registry::tick(crate::runtime_jobs::registry::ids::STEER_DELIVER);
+        // AMUX-4828: bracket the pass rather than stamping a one-shot before it.
+        // The one-shot writes no duration, so `classify_observed`'s only `slow`
+        // branch was dead for this job and a long tick could only present as
+        // `ok` or `stalled`. tick_end is in the Ok arm only, so a panicking
+        // delivery tick cannot read as a working one.
+        crate::runtime_jobs::registry::tick_start(
+            crate::runtime_jobs::registry::ids::STEER_DELIVER,
+        );
         // A panic in one tick must not kill delivery for the whole fleet.
         let st = state.clone();
-        if let Err(e) = crate::db::interactions::spawn(async move { steer_deliver_tick(&st).await }).await {
-            tracing::warn!(error = %e, "steering delivery tick panicked");
+        match crate::db::interactions::spawn(async move { steer_deliver_tick(&st).await }).await {
+            Ok(_) => crate::runtime_jobs::registry::tick_end(
+                crate::runtime_jobs::registry::ids::STEER_DELIVER,
+            ),
+            Err(e) => tracing::warn!(error = %e, "steering delivery tick panicked"),
         }
         // Time-gated so the 5s steering cadence does not become a 5s fleet-wide
         // pane capture (AMUX-2820).
@@ -15437,6 +15963,9 @@ pub fn routes() -> Router<AppState> {
         // where a sweep or an autofix loop asks "did anything get delivered
         // twice, and to whom" without grepping a pane log.
         .route("/api/debug/duplicate-deliveries", axum::routing::get(debug_duplicate_deliveries))
+        // AF-510: the fleet-wide needs:you digest producer. Read-only, no
+        // channel wired to it — see the handler doc comment.
+        .route("/api/debug/needsyou-digest", axum::routing::get(debug_needsyou_digest))
         .route("/api/sessions/{name}/{*verb}", any(session_verb_handler))
         // Why steering is or is not moving. See `steering_debug`.
         .route("/api/debug/steering", axum::routing::get(steering_debug))
@@ -15638,12 +16167,6 @@ async fn dispatch(
         return share_handler(&state, &name, &method, &headers, &body).await;
     }
 
-    if method == Method::GET && action == "peek" {
-        // The one GET verb the dashboard polls conditionally; the dispatcher
-        // below has no headers to answer that with.
-        let sent = headers.get(axum::http::header::IF_NONE_MATCH).and_then(|v| v.to_str().ok());
-        return peek_verb_conditional(&name, &qs, sent).await;
-    }
     if method == Method::GET || method == Method::HEAD {
         return get_dispatch(&state, &name, &action, &subid, &qs).await;
     }
@@ -15813,6 +16336,79 @@ fn json_str_after(blob: &str, key: &str) -> Option<String> {
     (!v.is_empty() && v.len() <= 200).then(|| v.to_string())
 }
 
+/// GET /api/debug/needsyou-digest — the fleet-wide needs:you queue, oldest
+/// first, capped.
+///
+/// AF-510: 506 needs:you cards named Ethan as the blocker and nothing told
+/// him — the only reminder that exists (`needsyou.renag` in board_drive.rs)
+/// nags the LANE that filed the ask, never the human who owes the answer.
+/// This is the PRODUCER half of the fix: what the digest would say, computed
+/// and testable, independent of which channel eventually carries it to him.
+///
+/// DELIBERATELY NOT WIRED TO A DELIVERY CHANNEL. Which channel — email,
+/// dashboard, push once it is repaired — is Ethan's call (ethos rule 8), and
+/// per CLAUDE.md both urgent channels are currently degraded, so the choice
+/// is not a detail to default past. This endpoint is read-only and pull-based
+/// on purpose: it changes nothing about what reaches him until that decision
+/// lands and something is pointed at it.
+///
+/// `cap` defaults to 20 (`AMUX_NEEDSYOU_DIGEST_CAP`) — small enough to skim,
+/// which matters because autofix.rs's own comment records what "show
+/// everything newly visible" costs: "the owner digest emitted 92 cards in one
+/// SMS". `n_considered` is the TRUE fleet-wide total before capping, not the
+/// length of the array returned, so a capped digest never quietly reads as
+/// complete (ethos rule 4).
+async fn debug_needsyou_digest(State(state): State<AppState>, RawQuery(q): RawQuery) -> Response {
+    let params = parse_qs(q.as_deref().unwrap_or(""));
+    let cap = qs_get(&params, "cap")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or_else(|| crate::config::env_i64("AMUX_NEEDSYOU_DIGEST_CAP", 20))
+        .clamp(1, 500) as usize;
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(e) => return jresp(StatusCode::SERVICE_UNAVAILABLE, json!({"error": e.to_string()})),
+    };
+    let now = crate::config::now_f64();
+    let (rows, total) = match crate::db::board_store::needsyou_digest(&conn, now, cap) {
+        Ok(v) => v,
+        Err(e) => return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})),
+    };
+    // GROUPED FOR DISPLAY, ORDERED FOR TRIAGE. The underlying rows are already
+    // oldest-first (recommendation c on the card: age is the ordering signal
+    // that costs him, not today's newest asks) — grouping by lane afterward
+    // must not silently re-sort within a lane, or the "oldest first" property
+    // this endpoint exists to provide would be true of the flat list and false
+    // of the thing a reader actually looks at.
+    let mut by_lane: Vec<(String, Vec<Value>)> = Vec::new();
+    for r in &rows {
+        let entry = json!({
+            "id": r.id,
+            "title": r.title,
+            "ask_question": r.ask_question,
+            "ask_actor": r.ask_actor,
+            "archived": r.archived,
+            "age_days": (r.age_days * 10.0).round() / 10.0,
+        });
+        match by_lane.iter_mut().find(|(s, _)| s == &r.session) {
+            Some((_, v)) => v.push(entry),
+            None => by_lane.push((r.session.clone(), vec![entry])),
+        }
+    }
+    j200(crate::api::measured::measured(
+        json!({
+            "cap": cap,
+            "truncated": total > rows.len(),
+            "shown": rows.len(),
+            "by_lane": by_lane.into_iter().map(|(s, cards)| json!({"session": s, "cards": cards})).collect::<Vec<_>>(),
+            "note": "oldest needs:you ask fleet-wide first, per lane below it. `shown` can be \
+                     less than `n_considered` when `truncated` is true -- that is the cap \
+                     working, not the count being wrong (autofix.rs: a prior digest emitted 92 \
+                     cards in one SMS). No delivery channel is wired to this endpoint; which one \
+                     to use is Ethan's call, still open on AF-510.",
+        }),
+        total,
+    ))
+}
 
 /// GET /api/debug/duplicate-deliveries?since_h=24 — every lane that received
 /// the SAME text twice inside the detector's window, newest first.
@@ -17339,6 +17935,110 @@ pub(crate) fn session_is_isolated(name: &str) -> bool {
     env_flag_on(parse_env(name).get("CC_ISOLATED"))
 }
 
+/// Why an automated schedule delivery can never reach this lane, or `None`.
+///
+/// PERMANENT conditions only. `blocked` (on a permission dialog) and `stopped`
+/// are deliberately absent: both deliver later, the first when the dialog
+/// clears and the second through `send_text`'s auto-wake, so reporting them
+/// would be crying wolf over a schedule that is working.
+///
+/// ONE DEFINITION, TWO READERS (AMUX-4784). [`deliver_automated`] refuses on
+/// these, and the `schedule.target_can_receive` invariant reports them. The
+/// card that asked for the invariant named the hazard precisely: a check that
+/// re-derives deliverability from its own copy of the rules will disagree with
+/// the deliverer eventually, and a check that disagrees with the mechanism it
+/// describes is the same class of defect one layer up. So both call this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TargetRefusal {
+    /// The schedule names no target at all.
+    NoTarget,
+    /// No `.env` for that name: nothing registers the lane.
+    Unregistered,
+    Archived,
+    Paused,
+    Isolated,
+}
+
+impl TargetRefusal {
+    /// A stable slug for grouping, distinct from the human sentence.
+    pub(crate) fn cause(self) -> &'static str {
+        match self {
+            TargetRefusal::NoTarget => "no_target",
+            TargetRefusal::Unregistered => "unregistered",
+            TargetRefusal::Archived => "archived",
+            TargetRefusal::Paused => "paused",
+            TargetRefusal::Isolated => "isolated",
+        }
+    }
+
+    /// Whether the lane could ever start receiving again without someone
+    /// changing the SCHEDULE. Archived is the one state with no such future,
+    /// which is why it is the subset that can be acted on without guessing at
+    /// intent; paused and isolated are ordinary temporary states and their
+    /// schedules are right to keep their cadence.
+    pub(crate) fn is_terminal(self) -> bool {
+        matches!(self, TargetRefusal::Archived | TargetRefusal::Unregistered | TargetRefusal::NoTarget)
+    }
+}
+
+pub(crate) fn schedule_target_refusal(name: &str) -> Option<TargetRefusal> {
+    // Each lookup is the one the deliverer already used; the ORDER and the
+    // decision live in `target_refusal_from_state` so they can be tested
+    // without AMUX_HOME. `session_is_isolated` is delegated to rather than
+    // re-reading CC_ISOLATED, so that arm shares its predicate with
+    // `isolation_refusal` the way the others share theirs.
+    if name.trim().is_empty() {
+        return Some(TargetRefusal::NoTarget);
+    }
+    if !env_path(name).exists() {
+        return Some(TargetRefusal::Unregistered);
+    }
+    let env = parse_env(name);
+    target_refusal_from_state(
+        name,
+        true,
+        env.get("CC_ARCHIVED") == Some("1"),
+        env.get("CC_PAUSED") == Some("1"),
+        session_is_isolated(name),
+    )
+}
+
+/// The decision itself, with every lookup already done.
+///
+/// Split out so the precedence can be pinned by a test that touches no files
+/// and no process-global home. That matters here beyond convenience: swapping
+/// `AMUX_HOME` under parallel tests is a known source of interleaved reads in
+/// this crate (AMUX-4838), so a test that set it to prove a point about
+/// reading it would be racing a bug rather than describing one.
+pub(crate) fn target_refusal_from_state(
+    name: &str,
+    registered: bool,
+    archived: bool,
+    paused: bool,
+    isolated: bool,
+) -> Option<TargetRefusal> {
+    if name.trim().is_empty() {
+        return Some(TargetRefusal::NoTarget);
+    }
+    if !registered {
+        return Some(TargetRefusal::Unregistered);
+    }
+    // ARCHIVED BEFORE PAUSED, and both before ISOLATED, because a lane can be
+    // more than one at once and the report should name the most permanent
+    // cause. An archived lane that is also paused is not going to be resumed
+    // into service by un-pausing it.
+    if archived {
+        return Some(TargetRefusal::Archived);
+    }
+    if paused {
+        return Some(TargetRefusal::Paused);
+    }
+    if isolated {
+        return Some(TargetRefusal::Isolated);
+    }
+    None
+}
+
 /// Why a lane cannot receive a ROUTED board request, or `None` when it can
 /// (AMUX-4653). Returns `(code, message)`.
 ///
@@ -18695,6 +19395,13 @@ pub(crate) fn memory_post_verb(name: &str, body: &Value) -> Response {
     j200(json!({"ok": true}))
 }
 
+/// Seed a role prompt without overwriting instructions edited by the owner.
+pub(crate) fn set_initial_instructions(name: &str, instructions: &str) {
+    if meta_str(&load_meta(name), "instructions").trim().is_empty() {
+        update_meta(name, &[("instructions", json!(instructions))]);
+    }
+}
+
 /// `instructions` as a callable verb, extracted for the promoted
 /// `/api/workers/{id}/instructions` route (AF-293).
 pub(crate) async fn instructions_post_verb(state: &AppState, name: &str, body: &Value) -> Response {
@@ -19411,24 +20118,6 @@ pub(crate) fn lane_env_exists(name: &str) -> bool {
 /// it was asked about. `send` never had the problem because it falls back to
 /// the key and lands here; this is the same landing spot for peek.
 pub(crate) async fn peek_verb(name: &str, qs: &[(String, String)]) -> Response {
-    peek_verb_conditional(name, qs, None).await
-}
-
-/// `peek`, answering `If-None-Match` (AMUX-4802).
-///
-/// The dashboard has always sent it. Its poll cadence is written around "idle
-/// ticks are 304s, near-free" and it keeps one ETag per payload shape. This
-/// origin never sent an ETag, so there was nothing to send back: 0 of 40,832
-/// real-browser peek requests in a day were a 304, and the ~135KB history
-/// payload crossed the wire whole on every refresh of an unchanged worker.
-///
-/// Weak validator: the compression layer re-encodes the body, so the bytes on
-/// the wire are equivalent to the hashed ones, not identical to them.
-pub(crate) async fn peek_verb_conditional(
-    name: &str,
-    qs: &[(String, String)],
-    if_none_match: Option<&str>,
-) -> Response {
     let lines: i64 = qs_first(qs, "lines", "80").parse().unwrap_or(80);
     let live_only = qs_flag(qs, "live");
     let no_trim = qs_flag(qs, "notrim");
@@ -19436,46 +20125,14 @@ pub(crate) async fn peek_verb_conditional(
     // that function has six return points (live_only, alt-screen, normal,
     // short-output, empty…) and a key added to one of them is a key the
     // reader cannot rely on. One injection site covers every shape.
-    //
-    // Concurrently with the capture, not after it: both are tmux subprocesses
-    // at ~70-120ms each on this box, and run in series they were most of a
-    // live poll.
-    let (mut resp, geometry) =
-        tokio::join!(peek_response(name, lines, live_only, no_trim), tmux_pane_geometry(name));
-    if let (Some((cols, rows)), Some(obj)) = (geometry, resp.as_object_mut()) {
+    let mut resp = peek_response(name, lines, live_only, no_trim).await;
+    if let (Some((cols, rows)), Some(obj)) =
+        (tmux_pane_geometry(name).await, resp.as_object_mut())
+    {
         obj.insert("pane_cols".into(), json!(cols));
         obj.insert("pane_rows".into(), json!(rows));
     }
-    let Ok(body) = serde_json::to_vec(&resp) else { return j200(resp) };
-    let etag = peek_etag(&body);
-    if if_none_match.is_some_and(|sent| etag_matches(sent, &etag)) {
-        return (StatusCode::NOT_MODIFIED, [(axum::http::header::ETAG, etag)]).into_response();
-    }
-    (
-        StatusCode::OK,
-        [
-            (axum::http::header::CONTENT_TYPE, "application/json".to_string()),
-            (axum::http::header::ETAG, etag),
-        ],
-        body,
-    )
-        .into_response()
-}
-
-fn peek_etag(body: &[u8]) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    body.hash(&mut h);
-    format!("W/\"{:016x}\"", h.finish())
-}
-
-/// Weak comparison over a possibly comma-separated `If-None-Match`. A proxy or
-/// the compression layer may hand a weak tag back as strong or the reverse, so
-/// the `W/` prefix is ignored on both sides, which is what weak comparison is.
-fn etag_matches(sent: &str, ours: &str) -> bool {
-    let bare = |t: &str| t.trim().trim_start_matches("W/").trim_matches('"').to_string();
-    let ours = bare(ours);
-    sent.split(',').any(|t| t.trim() == "*" || bare(t) == ours)
+    j200(resp)
 }
 
 /// `duplicate` as a callable verb, so the canonical `/api/workers/{id}/duplicate`
@@ -21716,6 +22373,42 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
     }
     let f = env_path(name);
     let mut cfg = parse_env(name);
+
+    // Fan-out integration configuration is durable and takes effect at the
+    // next boundary; changing it never restarts a worker or weakens its gates.
+    if let Some(value) = body.get("worktree_verify") {
+        let Some(command) = value.as_str().filter(|s| !s.trim().is_empty() && s.len() <= 8192) else {
+            return jresp(StatusCode::BAD_REQUEST, json!({"error":"worktree_verify must be a nonempty command (maximum 8192 bytes)"}));
+        };
+        if let Some(workspace) = crate::fanout_workspace::load(&home(), name) {
+            if let Err(error) = crate::fanout_workspace::validate_verification_command(&workspace, command) {
+                return jresp(StatusCode::BAD_REQUEST, json!({"error":error}));
+            }
+        }
+        cfg.set("CC_WORKTREE_VERIFY", command);
+        return match cfg.write(&f) {
+            Ok(()) => j200(json!({"ok":true,"worktree_verify":command})),
+            Err(e) => jresp(StatusCode::INTERNAL_SERVER_ERROR,json!({"error":env_write_error(&f,&e)})),
+        };
+    }
+    if let Some(value) = body.get("worktree_base") {
+        let Some(base) = value.as_str().filter(|s| s.len()==40 && s.bytes().all(|b|b.is_ascii_hexdigit())) else {
+            return jresp(StatusCode::BAD_REQUEST,json!({"error":"worktree_base must be an exact reviewed 40-character commit SHA"}));
+        };
+        let Some(mut workspace)=crate::fanout_workspace::load(&home(),name) else {
+            return jresp(StatusCode::CONFLICT,json!({"error":"No durable fan-out workspace is registered"}));
+        };
+        for tip in ["HEAD","origin/main"] {
+            if crate::fanout_workspace::git(&workspace.path,&["merge-base","--is-ancestor",base,tip]).await.is_err() {
+                return jresp(StatusCode::CONFLICT,json!({"error":format!("Reviewed base is not an ancestor of {tip}")}));
+            }
+        }
+        workspace.base=base.to_string();
+        return match crate::fanout_workspace::save(&home(),name,&workspace) {
+            Ok(()) => j200(json!({"ok":true,"worktree_base":base})),
+            Err(e) => jresp(StatusCode::INTERNAL_SERVER_ERROR,json!({"error":e})),
+        };
+    }
 
     // Rename — convergent cascade with journaling (owner addendum on
     // AMUX-2598: "if we change a name of a worker nothing happens — we
@@ -26634,8 +27327,43 @@ mod tests {
         (status, v)
     }
 
+    /// EVERY PROVIDER'S COMPOSER MUST READ AS READY, not just Claude's.
+    ///
+    /// `send_after_ready` waits for this predicate and DROPS the start/wake prompt when it
+    /// never fires. Muse had no markers here, so a muse lane timed out and lost its prompt —
+    /// observed twice on a live muse worker — while the log said "Claude UI never became
+    /// ready" on a lane running no Claude, which is what made it look like a launch bug.
     #[test]
-    fn a_value_with_command_substitution_is_INERT_when_the_file_is_sourced() {
+    fn every_provider_s_composer_reads_as_ready() {
+        // Real captures, ANSI already stripped.
+        let muse = "── Voice input (\u{2325} + v to start) ──────────────\n\
+                    \u{27e9}\n\
+                    ──────────────────────────────────────────────\n\
+                    muse-spark-1.3-contributor \u{b7} high \u{b7} ~/w";
+        assert!(agent_ui_visible(muse), "muse composer not recognised:\n{muse}");
+        // The two muse markers must work INDEPENDENTLY, or the pair is decoration: with both
+        // in one sample the suite stays green after either is deleted. The footer alone
+        // covers a muse build that drops the voice hint; the composer frame alone covers the
+        // model being renamed, which is the likelier of the two.
+        let footer_only = "  muse-spark-1.3-contributor \u{b7} high \u{b7} ~/w";
+        assert!(agent_ui_visible(footer_only), "footer marker does not stand alone");
+        let frame_only = "── Voice input (\u{2325} + v to start) ──\n\u{27e9}\n  future-model \u{b7} high \u{b7} ~/w";
+        assert!(agent_ui_visible(frame_only), "composer frame does not stand alone");
+
+        let codex = "\u{203a} Ask Codex to do anything\n\
+                     gpt-5.6-sol default \u{b7} ~/w";
+        assert!(agent_ui_visible(codex), "codex composer not recognised");
+
+        let claude = "\u{23f5}\u{23f5} auto mode on (shift+tab to cycle) \u{b7} \u{2190} for agents";
+        assert!(agent_ui_visible(claude), "claude composer not recognised");
+
+        // A bare shell is still NOT ready — otherwise the prompt is typed into a shell.
+        assert!(!agent_ui_visible("slopmachine@host worker-muse % "),
+                "a shell prompt was read as an agent composer");
+    }
+
+    #[test]
+    fn a_value_with_command_substitution_is_inert_when_the_file_is_sourced() {
         // THE REGRESSION. This file is sourced. Before env_quote, a value containing
         // $(...) ran on every source: a CC_WORKTREE_VERIFY value executed `git
         // rev-parse` and printed `graft_inflight_order_key: command not found` from a
@@ -26856,7 +27584,7 @@ mod tests {
     #[test]
     fn detectors_read_real_frames() {
         let claude_idle = "some output\n\u{276f} \n  ⏵⏵ bypass permissions on (shift+tab to cycle)";
-        assert!(claude_ui_visible(claude_idle));
+        assert!(agent_ui_visible(claude_idle));
         assert!(!at_shell_prompt(claude_idle));
         // AMUX-3055: the DEFAULT footer (no --dangerously-skip-permissions) is
         // "manual mode on · ? for shortcuts", NOT the bypass footer. This frame
@@ -26864,15 +27592,15 @@ mod tests {
         // the old detector, so send_after_ready dropped its start prompt. The
         // assertion fails against that old detector, which is the point.
         let claude_manual = "some output\n\u{276f} Try \"fix typecheck errors\"\n────\n⏸ manual mode on · ? for shortcuts · ← 2 agents";
-        assert!(claude_ui_visible(claude_manual), "manual-mode idle UI must read as visible");
+        assert!(agent_ui_visible(claude_manual), "manual-mode idle UI must read as visible");
         assert!(!at_shell_prompt(claude_manual));
         let shell = "Last login: Sat\nmixpeek$ ";
-        assert!(!claude_ui_visible(shell));
+        assert!(!agent_ui_visible(shell));
         assert!(at_shell_prompt(shell));
         let launching = "source /tmp/lab/amux.env 2>/dev/null; set +a; unset ANTHROPIC_API_KEY;\nclaude --model sonnet --session-id test-id";
-        assert!(!claude_ui_visible(launching), "the model in a launch command is not a ready provider");
+        assert!(!agent_ui_visible(launching), "the model in a launch command is not a ready provider");
         let sonnet = "Claude Code v2.1.267\nSonnet 5 with xhigh effort · Claude Max\n❯ \n⏵⏵ auto mode on (shift+tab to cycle) · ← 2 agents";
-        assert!(claude_ui_visible(sonnet), "the actual Sonnet footer releases a held startup send");
+        assert!(agent_ui_visible(sonnet), "the actual Sonnet footer releases a held startup send");
         // Spinner = active; prompt-glyph lines never count as chrome.
         let active = "\u{273b} Crunching\u{2026} (12s)\n\u{276f} typed text";
         assert_eq!(detect_claude_status(active), "active");
@@ -27286,49 +28014,6 @@ CLAUDE-POSTFIX-COMPLETE
         assert_eq!(parse_pane_geometry("0x50"), None);
         assert_eq!(parse_pane_geometry("220x0"), None);
         assert_eq!(parse_pane_geometry("-1x50"), None);
-    }
-
-    #[test]
-    fn peek_etag_names_the_body_and_compares_weakly() {
-        let a = peek_etag(br#"{"live":"x"}"#);
-        assert_eq!(a, peek_etag(br#"{"live":"x"}"#), "same frame, same tag, or no poll is ever a 304");
-        assert_ne!(a, peek_etag(br#"{"live":"y"}"#), "a changed frame must not be answered 304");
-        assert!(a.starts_with("W/\""), "weak: the compression layer re-encodes the body");
-        let strengthened = a.trim_start_matches("W/").to_string();
-        assert!(etag_matches(&a, &a));
-        assert!(etag_matches(&strengthened, &a), "a hop that drops W/ still matches");
-        assert!(etag_matches(&format!("\"other\", {a}"), &a), "list form");
-        assert!(etag_matches("*", &a));
-        assert!(!etag_matches("W/\"0000000000000000\"", &a));
-        assert!(!etag_matches("", &a));
-    }
-
-    #[test]
-    fn a_transcript_render_is_reused_until_the_file_changes() {
-        use std::io::Write;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("conv.jsonl");
-        let record = |text: &str| {
-            json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":text}]}}).to_string()
-        };
-        std::fs::write(&path, format!("{}\n", record("first reply"))).unwrap();
-        let cold = render_transcript_file(&path, 120_000);
-        assert!(cold.contains("first reply"), "{cold}");
-        let hits = TRANSCRIPT_RENDER_HITS.load(std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(render_transcript_file(&path, 120_000), cold);
-        assert!(
-            TRANSCRIPT_RENDER_HITS.load(std::sync::atomic::Ordering::Relaxed) > hits,
-            "an unchanged file must be served from the cache, which is the whole change"
-        );
-        // An append moves len, so the next poll sees the new turn. Serving the
-        // cached render here would freeze the peek on the previous reply.
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
-        writeln!(f, "{}", record("second reply")).unwrap();
-        drop(f);
-        let warm = render_transcript_file(&path, 120_000);
-        assert!(warm.contains("second reply"), "{warm}");
-        // A different cap is a different render, not a hit on the first one.
-        assert!(render_transcript_file(&path, 5).chars().count() <= cold.chars().count());
     }
 
     #[test]
@@ -28168,18 +28853,28 @@ CLAUDE-POSTFIX-COMPLETE
         use tokio::io::{AsyncBufReadExt, BufReader};
         use std::process::Stdio;
         let mut pane = tokio::process::Command::new("sh")
-            .args(["-c", "sh -c 'sleep 120 & wait' & echo $!; read done"])
+            .args(["-c", "sh -c 'sleep 120 & echo grandchild:$!; wait' & echo child:$!; read done"])
             .stdin(Stdio::piped()).stdout(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
         let mut lines = BufReader::new(pane.stdout.take().unwrap()).lines();
-        let child: i32 = lines.next_line().await.unwrap().unwrap().parse().unwrap();
+        // Observe both forks instead of assuming the grandchild started within
+        // 100ms on a machine running the fleet and the full test suite.
+        let mut fixture = std::collections::HashMap::new();
+        for _ in 0..2 {
+            let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+                .await.expect("process fixture did not start").unwrap().unwrap();
+            let (kind, pid) = line.split_once(':').unwrap();
+            fixture.insert(kind.to_string(), pid.parse::<i32>().unwrap());
+        }
+        let child = fixture["child"];
+        let grandchild = fixture["grandchild"];
         let mut peer = tokio::process::Command::new("sleep").arg("120").kill_on_drop(true).spawn().unwrap();
-        sleep_ms(100).await;
         let ps = run_cmd("ps", &["-axo", "pid=,ppid="], OP_TIMEOUT).await.unwrap();
         let rows: Vec<(i32,i32)> = String::from_utf8_lossy(&ps.stdout).lines().filter_map(|l| {
             let mut w = l.split_whitespace(); Some((w.next()?.parse().ok()?, w.next()?.parse().ok()?))
         }).collect();
         let descendants = descendant_pids(pane.id().unwrap() as i32, &rows);
         assert!(descendants.contains(&child));
+        assert!(descendants.contains(&grandchild));
         assert!(descendants.len() >= 2, "fixture must include a running tool grandchild");
         terminate_pane_children(pane.id().unwrap() as i32).await.unwrap();
         for pid in descendants {
@@ -28190,6 +28885,105 @@ CLAUDE-POSTFIX-COMPLETE
         assert!(pane.try_wait().unwrap().is_none(), "pane shell must survive");
         assert!(peer.try_wait().unwrap().is_none(), "unrelated worker must survive");
         pane.kill().await.unwrap(); peer.kill().await.unwrap();
+    }
+
+    /// AMUX-4828: steering delivery must report a tick that FINISHED, with its
+    /// duration. Same defect and same fix as the reconciler guard below.
+    ///
+    /// This loop is one of the two the card named first, because it is already
+    /// known to run long: a job whose slowness can only present as `stalled` is
+    /// one a reader will act on as if it were dead.
+    #[test]
+    fn steer_delivery_brackets_its_tick_and_only_stamps_a_completed_one() {
+        let src = include_str!("session_verbs.rs");
+        // BOUND THE SLICE TO THE FUNCTION, for the reason the sibling guard
+        // states: a fixed window reaches this test module, whose assertions
+        // contain the literal being searched for.
+        let start = src
+            .find("pub async fn steer_deliver_loop(")
+            .expect("steer_deliver_loop exists");
+        let rest = &src[start..];
+        let body = &rest[..rest.find("\n}\n").map(|i| i + 2).expect("the loop is closed")];
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let start_at = code.find("tick_start(").expect("the tick is bracketed with tick_start");
+        let work_at = code.find("steer_deliver_tick(").expect("the loop runs the tick");
+        let end_at = code.find("tick_end(").expect("the loop records a tick_end");
+        let ok_at = code.find("Ok(_) =>").expect("the completed arm is matched explicitly");
+        assert!(start_at < work_at, "tick_start must precede the work");
+        assert!(
+            work_at < end_at,
+            "tick_end must come AFTER the work: a tick stamped first reports one that STARTED"
+        );
+        assert!(
+            ok_at < end_at,
+            "tick_end must sit in the Ok arm: a panicking delivery tick that still stamps makes \
+             a dead deliverer read as a working one"
+        );
+        assert!(
+            !code.contains("registry::tick("),
+            "the one-shot cannot express a duration, so a long tick could only ever present as \
+             ok or stalled"
+        );
+    }
+
+    /// AMUX-4814: the reconciler must report a tick that FINISHED, and how
+    /// long it took.
+    ///
+    /// The card read `status: stalled, ticks: 36, last_tick_ms: never`. Both
+    /// halves came from stamping a one-shot `registry::tick(` BEFORE the work:
+    /// that call sets last_start and last_end to the same instant, so no
+    /// duration is ever recorded, and it marks a tick that had only STARTED.
+    /// `classify_observed` uses `last_tick_ms` for exactly one thing, upgrading
+    /// `ok` to `slow`, so with it permanently None a long tick could only ever
+    /// present as `stalled`.
+    ///
+    /// Mirrors the guard on `invariants::monitor::one_pass`, same shape and
+    /// same fix. Source-reading is the weaker instrument and the one that fits:
+    /// driving this loop means a 60s sleep and a fleet-wide tmux sweep.
+    #[test]
+    fn the_reconciler_brackets_its_tick_and_only_stamps_a_completed_one() {
+        let src = include_str!("session_verbs.rs");
+        // BOUND THE SLICE TO THE FUNCTION. A fixed window sweeps into this very
+        // test, whose assertions contain the literal being searched for, and
+        // the guard then matches its own source. That trap is documented in
+        // invariants/monitor.rs and it is real.
+        let start = src
+            .find("pub async fn pipe_reconcile_loop(")
+            .expect("pipe_reconcile_loop exists");
+        let rest = &src[start..];
+        let body = &rest[..rest.find("\n}\n").map(|i| i + 2).expect("the loop is closed")];
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let start_at = code.find("tick_start(").expect("the tick is bracketed with tick_start");
+        let work_at = code.find("pipe_reconcile_tick(").expect("the loop runs the tick");
+        let end_at = code.find("tick_end(").expect("the loop records a tick_end");
+        let ok_at = code.find("Ok(_) =>").expect("the completed arm is matched explicitly");
+
+        assert!(start_at < work_at, "tick_start must precede the work");
+        assert!(
+            work_at < end_at,
+            "tick_end must come AFTER the work: a tick stamped first reports a reconcile that \
+             was STARTED, and every reader takes a tick to mean one that is DONE"
+        );
+        assert!(
+            ok_at < end_at,
+            "tick_end must sit in the Ok arm: a panicking tick that still stamps makes a dead \
+             reconciler indistinguishable from a working one"
+        );
+        assert!(
+            !code.contains("registry::tick("),
+            "the one-shot tick cannot express a duration, which is why this job reported \
+             last_tick_ms=never through 36 ticks and read as stalled rather than slow"
+        );
     }
 
     /// AMUX-4826: a killed child is a ZOMBIE, and a zombie is not a live child.
@@ -28243,16 +29037,26 @@ CLAUDE-POSTFIX-COMPLETE
         struct Pane(String);
         impl Drop for Pane {
             fn drop(&mut self) {
-                let _ = std::process::Command::new("tmux").args(["kill-session", "-t", &session_target(&self.0)]).output();
+                let st = session_target(&self.0);
+                let _ = std::process::Command::new("tmux").args(["kill-session", "-t", &st]).output();
             }
         }
         let pane = Pane(tmux_name(&name));
         let created = tmux(&["new-session", "-d", "-s", &pane.0, "/bin/sh"]).await.expect("tmux required for stop-route proof");
         assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
-        let typed = tmux(&["send-keys", "-t", &pt(&name), "/bin/sh -c 'sleep 120 & wait'", "Enter"]).await.unwrap();
+        let pt = pt(&name);
+        let typed = tmux(&["send-keys", "-t", &pt, "/bin/sh -c 'sleep 120 & wait'", "Enter"]).await.unwrap();
         assert!(typed.status.success(), "{}", String::from_utf8_lossy(&typed.stderr));
-        sleep_ms(150).await;
-        assert_eq!(pane_has_live_child(&name).await, Some(true), "busy-tool fixture must be running");
+        // Readiness is a condition, not a 150ms scheduling assumption. The
+        // Stop deadline below still measures the actual interruption time.
+        let ready_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let busy = pane_has_live_child(&name).await;
+            if busy == Some(true) { break; }
+            assert!(std::time::Instant::now() < ready_deadline,
+                "busy-tool fixture did not become ready within 10s; live child: {busy:?}");
+            sleep_ms(50).await;
+        }
         let state = AppState {store:Arc::new(crate::db::Store::open(&home.path().join("stop.db")).unwrap()),
             started:std::time::Instant::now(),build_hash:"test".into(),auth_token:None,
             reconciled:Arc::new(std::sync::atomic::AtomicBool::new(true))};
@@ -30845,6 +31649,72 @@ mod submission_gate_tests {
         assert!(!submission_records_have(&[quoted], GHOST, 119.0));
     }
 
+    #[test]
+    fn submission_confirmation_requires_consecutive_clear_frames() {
+        let mut cleared_once = false;
+        for interruption in [FrameRead::NoUi, FrameRead::StillThereIdle,
+            FrameRead::StillThereGenerating, FrameRead::CollapsedPaste] {
+            assert!(!observe_submission_frame(FrameRead::Cleared, &mut cleared_once));
+            assert!(!observe_submission_frame(interruption, &mut cleared_once));
+        }
+        assert!(!observe_submission_frame(FrameRead::Cleared, &mut cleared_once),
+            "a final single clear frame is not confirmation after a repaint or retry");
+        assert!(observe_submission_frame(FrameRead::Cleared, &mut cleared_once));
+    }
+
+    #[tokio::test]
+    #[ignore = "real tmux retry replay; no model or production worker; run explicitly"]
+    async fn real_tmux_paste_retry_never_sends_escape() {
+        struct Pane(String);
+        impl Drop for Pane {
+            fn drop(&mut self) {
+                let st = session_target(&self.0);
+                let _ = std::process::Command::new("tmux")
+                    .args(["kill-session", "-t", &st]).output();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let initial = dir.path().join("pending.txt");
+        let cleared = dir.path().join("cleared.txt");
+        let keys = dir.path().join("keys.bin");
+        std::fs::write(&initial, frame_stuck_idle(GHOST)).unwrap();
+        std::fs::write(&cleared, frame_cleared()).unwrap();
+        let lane = format!("paste-retry-{}-{}", std::process::id(), (now_f64() * 1_000_000.0) as u64);
+        let pane = Pane(tmux_name(&lane));
+        let replay = r#"import os,pathlib,select,sys,time,tty
+        "#;
+        let replay = format!("{}\n{}", replay.trim(), r#"tty.setraw(sys.stdin.fileno())
+def paint(path):
+    sys.stdout.write('\x1b[2J\x1b[H'+pathlib.Path(path).read_text().replace('\n','\r\n'))
+    sys.stdout.flush()
+paint(sys.argv[1])
+end=time.monotonic()+20
+with open(sys.argv[3],'ab',buffering=0) as log:
+    while time.monotonic()<end:
+        if not select.select([sys.stdin],[],[],0.2)[0]: continue
+        key=os.read(sys.stdin.fileno(),1)
+        log.write(key)
+        if key in (b'\r',b'\n'): paint(sys.argv[2])
+"#);
+        let output = std::process::Command::new("tmux").args([
+            "new-session", "-d", "-s", &pane.0, "-x", "200", "-y", "24",
+            "python3", "-c", &replay, initial.to_str().unwrap(), cleared.to_str().unwrap(), keys.to_str().unwrap(),
+        ]).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if read_frame(&tmux_capture(&lane, 25).await, &tail_sq(GHOST)) == FrameRead::StillThereIdle { break; }
+            assert!(std::time::Instant::now() < deadline, "replay never drew the pending input");
+            sleep_ms(50).await;
+        }
+        let (observed, retried) = verify_submitted(&lane, GHOST, 0.0, true).await;
+        assert_eq!(observed, Submission::Confirmed);
+        assert!(retried);
+        let delivered = std::fs::read(&keys).unwrap();
+        assert!(delivered.contains(&b'\r'), "retry must actually submit pending input");
+        assert!(!delivered.contains(&0x1b), "paste retry must not interrupt a newly accepted turn: {delivered:?}");
+    }
+
     #[tokio::test]
     #[ignore = "real tmux capture replay; no model or production worker; run explicitly"]
     async fn real_tmux_submission_replay_keeps_generating_input_unconfirmed() {
@@ -30870,7 +31740,7 @@ mod submission_gate_tests {
             // Walk the actual asynchronous capture/verification loop, with no
             // key retries or transcript claims. The busy fixture must fail
             // verification; the drawn empty composer is the positive control.
-            let (observed, retried) = verify_submitted(&lane, GHOST, None, 0.0, false).await;
+            let (observed, retried) = verify_submitted(&lane, GHOST, 0.0, false).await;
             assert_eq!(observed, expected);
             assert!(!retried);
         }
@@ -31252,9 +32122,9 @@ mod composer_state_tests {
             include_str!("../../tests/fixtures/boundary/gemini-0.58-idle.txt"),
             include_str!("../../tests/fixtures/boundary/gemini-0.59-yolo-idle.txt"),
         ] {
-            assert!(claude_ui_visible(frame));
-            assert!(!claude_ui_visible("cd /tmp && gemini --model auto --yolo --skip-trust"));
-            assert!(!claude_ui_visible("Gemini CLI v0.59.0\n│ ● 1. Yes\n│   2. Yes, and remember the directories as trusted"));
+            assert!(agent_ui_visible(frame));
+            assert!(!agent_ui_visible("cd /tmp && gemini --model auto --yolo --skip-trust"));
+            assert!(!agent_ui_visible("Gemini CLI v0.59.0\n│ ● 1. Yes\n│   2. Yes, and remember the directories as trusted"));
             assert_eq!(detect_claude_status(frame), "idle");
             assert!(pane_is_at_boundary(frame));
             assert!(matches!(composer_state(frame), ComposerState::Placeholder(_)));
@@ -31334,6 +32204,40 @@ mod composer_state_tests {
             Some("continuewiththequeue"),
             "a pre-stripped frame re-creates the blindness — callers MUST pass the raw capture"
         );
+    }
+
+
+    /// Muse Code 1.3.0, captured 2026-09-16 with `/` typed: the command popup draws
+    /// under the prompt in grey, not dim. The composer holds exactly `/`; the popup
+    /// rows are chrome. Before this, the preview read `/clearClearterminal...`.
+    const LIVE_MUSE_SLASH_POPUP: &str = "\u{1b}[2m\u{1b}[38;2;103;108;116m── \u{1b}[0m\u{1b}[38;2;138;144;152mVoice input (⌥ + v to start)\u{1b}[2m\u{1b}[38;2;103;108;116m ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n\u{1b}[0m\u{1b}[38;2;90;160;255m❯ \u{1b}[38;2;204;211;219m/\u{1b}[39m\n\u{1b}[38;2;103;108;116m  \u{1b}[1m\u{1b}[38;2;90;160;255m/clear\u{1b}[0m\u{1b}[38;2;103;108;116m                                       \u{1b}[38;2;138;144;152mClear terminal and start a fresh session\u{1b}[39m\n\u{1b}[38;2;103;108;116m  \u{1b}[38;2;204;211;219m/compact\u{1b}[38;2;103;108;116m                                     \u{1b}[38;2;138;144;152mSummarize the conversation to free up context\u{1b}[39m\n\u{1b}[38;2;103;108;116m  \u{1b}[38;2;204;211;219m/copy\u{1b}[38;2;103;108;116m                                        \u{1b}[38;2;138;144;152mCopy the last response to the clipboard\u{1b}[39m\n\u{1b}[38;2;103;108;116m  \u{1b}[38;2;204;211;219m/deep-research\u{1b}[38;2;103;108;116m                               \u{1b}[38;2;138;144;152mResearch a question across sources with cross-checking and citations\u{1b}[39m\n\u{1b}[38;2;103;108;116m  \u{1b}[38;2;204;211;219m/effort\u{1b}[38;2;103;108;116m                                      \u{1b}[38;2;138;144;152mSet the model's effort level\u{1b}[39m\n\u{1b}[38;2;103;108;116m  \u{1b}[38;2;204;211;219m/export\u{1b}[38;2;103;108;116m                                      \u{1b}[38;2;138;144;152mSave the conversation, or the full session log\u{1b}[39m\n\u{1b}[38;2;103;108;116m  \u{1b}[38;2;204;211;219m/feedback\u{1b}[38;2;103;108;116m                                    \u{1b}[38;2;138;144;152mSend quick feedback to the team\u{1b}[39m\n\u{1b}[38;2;103;108;116m  \u{1b}[2m↓ 38 more\u{1b}[0m\n\u{1b}[2m\u{1b}[38;2;103;108;116m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n\u{1b}[0m\u{1b}[38;2;103;108;116m  \u{1b}[38;2;90;160;255mmuse-spark-1.3-contributor\u{1b}[38;2;138;144;152m · \u{1b}[38;2;90;160;255mhigh\u{1b}[38;2;138;144;152m · ~/.claude/jobs/d9c47e72/tmp/muse-probe/ws\u{1b}[39m\n";
+
+    /// Same session after a turn: the empty-composer hint, grey not dim.
+    const LIVE_MUSE_PROMPT_HINT: &str = "\u{1b}[1m\u{1b}[38;2;204;211;219m◆ \u{1b}[0m\u{1b}[38;2;204;211;219mREADME.md\u{1b}[39m\n\u{1b}[2m\u{1b}[38;2;103;108;116m── \u{1b}[0m\u{1b}[38;2;138;144;152mVoice input (⌥ + v to start)\u{1b}[2m\u{1b}[38;2;103;108;116m ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n\u{1b}[0m\u{1b}[38;2;90;160;255m❯ \u{1b}[38;2;103;108;116mStart a message with ! to run a shell command yourself\u{1b}[39m\n\u{1b}[2m\u{1b}[38;2;103;108;116m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n\u{1b}[0m\u{1b}[38;2;103;108;116m  \u{1b}[38;2;90;160;255mmuse-spark-1.3-contributor\u{1b}[38;2;138;144;152m · \u{1b}[38;2;90;160;255mhigh\u{1b}[38;2;138;144;152m · ~/.claude/jobs/d9c47e72/tmp/muse-probe/ws\u{1b}[39m\n";
+
+    #[test]
+    fn a_muse_command_popup_is_chrome_not_typed_text() {
+        let state = composer_state(LIVE_MUSE_SLASH_POPUP);
+        assert_eq!(state.typed(), Some("/"), "only the slash the user typed is input: {state:?}");
+    }
+
+    #[test]
+    fn a_muse_prompt_hint_is_a_placeholder_not_stuck_text() {
+        let state = composer_state(LIVE_MUSE_PROMPT_HINT);
+        assert!(matches!(state, ComposerState::Placeholder(_)), "{state:?}");
+        assert_eq!(state.typed(), None);
+        // With real input in place of the hint, the same frame is pending input.
+        let typed = LIVE_MUSE_PROMPT_HINT.replace("Start a message with ! to run a shell command yourself", "ship it");
+        assert_eq!(composer_state(&typed).typed(), Some("shipit"));
+    }
+
+    /// RECONSTRUCTED from the sweep's own preview (`1.Allowthisstageonce(y)2.Abortt...`),
+    /// not a raw capture: the approval gate would not fire under a probe. Shape only —
+    /// numbered rows under the prompt inside muse's frame.
+    #[test]
+    fn a_muse_numbered_picker_is_not_typed_text() {
+        let frame = "── Voice input (⌥ + v to start) ──────\n\u{276f} \n  1. Allow this stage once (y)\n  2. Abort the stage\n──────────\n  muse-spark-1.3-contributor · high · ~/w\n";
+        assert_eq!(composer_state(frame).typed(), None, "a picker is a question, not stuck input");
     }
 
     #[test]
@@ -34379,6 +35283,179 @@ mod amux4770_worktree_isolation_tests {
             code.contains("o.status.success() && materialized"),
             "success must require the directory to exist, not just a zero exit; the incident \
              behind this card had git reporting success with no directory"
+        );
+    }
+}
+
+/// AMUX-4784: the precedence `deliver_automated` refuses by, and the invariant
+/// reports by, pinned in one place so the two cannot drift.
+#[cfg(test)]
+mod schedule_target_refusal_tests {
+    use super::*;
+
+    #[test]
+    fn a_healthy_target_has_no_refusal() {
+        assert_eq!(target_refusal_from_state("amux", true, false, false, false), None);
+    }
+
+    /// Each condition on its own, so a mutation that drops one arm cannot hide
+    /// behind another arm catching the same row.
+    #[test]
+    fn each_condition_is_named_on_its_own() {
+        assert_eq!(
+            target_refusal_from_state("", true, false, false, false),
+            Some(TargetRefusal::NoTarget)
+        );
+        assert_eq!(
+            target_refusal_from_state("   ", true, false, false, false),
+            Some(TargetRefusal::NoTarget),
+            "a whitespace-only target is no target"
+        );
+        assert_eq!(
+            target_refusal_from_state("ghost", false, false, false, false),
+            Some(TargetRefusal::Unregistered)
+        );
+        assert_eq!(
+            target_refusal_from_state("amux-cloud", true, true, false, false),
+            Some(TargetRefusal::Archived)
+        );
+        assert_eq!(
+            target_refusal_from_state("ts-gke", true, false, true, false),
+            Some(TargetRefusal::Paused)
+        );
+        assert_eq!(
+            target_refusal_from_state("self", true, false, false, true),
+            Some(TargetRefusal::Isolated)
+        );
+    }
+
+    /// A lane can be several of these at once, and the report should name the
+    /// most PERMANENT cause. Un-pausing an archived lane does not put it back
+    /// into service, so "paused" would send someone at the wrong remedy.
+    #[test]
+    fn the_most_permanent_cause_wins_when_several_apply() {
+        assert_eq!(
+            target_refusal_from_state("x", true, true, true, true),
+            Some(TargetRefusal::Archived)
+        );
+        assert_eq!(
+            target_refusal_from_state("x", true, false, true, true),
+            Some(TargetRefusal::Paused)
+        );
+    }
+
+    /// `is_terminal` is what splits "a decision someone can make now" from
+    /// "this lane comes back on its own". Getting it backwards would push a
+    /// reader toward disabling a schedule whose target resumes tomorrow.
+    #[test]
+    fn only_states_with_no_future_delivery_are_terminal() {
+        assert!(TargetRefusal::Archived.is_terminal());
+        assert!(TargetRefusal::Unregistered.is_terminal());
+        assert!(TargetRefusal::NoTarget.is_terminal());
+        assert!(!TargetRefusal::Paused.is_terminal(), "a paused lane resumes");
+        assert!(!TargetRefusal::Isolated.is_terminal(), "isolation is toggled off, not permanent");
+    }
+
+    /// The slugs are grouped on and appear in evidence, so they are contract.
+    #[test]
+    fn every_cause_has_a_distinct_stable_slug() {
+        let all = [
+            TargetRefusal::NoTarget,
+            TargetRefusal::Unregistered,
+            TargetRefusal::Archived,
+            TargetRefusal::Paused,
+            TargetRefusal::Isolated,
+        ];
+        let slugs: std::collections::HashSet<&str> = all.iter().map(|r| r.cause()).collect();
+        assert_eq!(slugs.len(), all.len(), "two causes share a slug, so grouping would merge them");
+    }
+}
+
+/// AMUX-4803: the worker-spawn path must not put provider keys in tmux argv.
+#[cfg(test)]
+mod spawn_argv_secret_tests {
+    /// A SOURCE GUARD, because nothing observable distinguishes the two.
+    ///
+    /// Both spellings compile, both spawn a working worker, and both look
+    /// entirely ordinary in review. The only difference is whether the value
+    /// lands in a process argument list that every lane on the box can read for
+    /// as long as the tmux server lives — which is invisible from inside the
+    /// program and was found by reading `ps`, not by a failing test.
+    ///
+    /// Scoped to the env_args block rather than the file: `format!("{k}={v}")`
+    /// is an ordinary thing to write elsewhere, and a file-wide search would
+    /// fail on innocent code while missing a rename here.
+    #[test]
+    fn provider_keys_are_deferred_off_argv_at_spawn() {
+        let src = include_str!("session_verbs.rs");
+        let at = src
+            .find("let mut env_args: Vec<String> = Vec::new();")
+            .expect("the spawn env_args block exists");
+        let end = src[at..]
+            .find("args.extend(env_args")
+            .map(|i| at + i)
+            .unwrap_or_else(|| (at + 4000).min(src.len()));
+        let block = &src[at..end];
+
+        // SCOPE TO THE SECRET LOOP, because the two loops are indistinguishable
+        // by what they push.
+        //
+        // The block also configures ANTHROPIC_API_BASE, GOOGLE_CLOUD_PROJECT and
+        // friends with the SAME `format!("{k}={v}")` expression, and those are
+        // not secrets and must keep travelling in argv. So the discriminator is
+        // which KEY LIST a loop iterates, not the shape of its push.
+        //
+        // The first version of this checked `!block.contains("OPENAI_API_KEY={v}")`
+        // and was VACUOUS: the source never held that literal, because the loop
+        // formats over a key list. Re-introducing the leak left it green, which
+        // a mutation proved.
+        let loop_at = block
+            .find("for k in [\"OPENAI_API_KEY\"")
+            .expect("the provider-key loop exists; if it was renamed, re-point this guard");
+        let loop_end = block[loop_at..]
+            .find("\n    }")
+            .map(|i| loop_at + i)
+            .unwrap_or(block.len());
+        let secret_loop = &block[loop_at..loop_end];
+        assert!(
+            !secret_loop.contains("env_args.push"),
+            "the provider-key loop pushes into tmux argv again. Process arguments are \
+             world-readable and a tmux server keeps its creating argv for its whole lifetime \
+             (measured 3d22h with a live OPENAI_API_KEY in it). Loop body was: {secret_loop}"
+        );
+        assert!(
+            secret_loop.contains("deferred_secrets.push"),
+            "the provider-key loop must defer to set-environment: {secret_loop}"
+        );
+        assert!(
+            block.contains("deferred_secrets.push"),
+            "the deferral is gone; secrets would travel in argv again"
+        );
+        // The EMPTY suppression value must survive: it is how an OAuth worker
+        // runs without an inherited key, and it carries no secret.
+        assert!(
+            block.contains("\"ANTHROPIC_API_KEY=\""),
+            "the empty ANTHROPIC_API_KEY suppression must stay in argv"
+        );
+    }
+
+    /// Deferring is only half of it: a set-environment nobody imports leaves the
+    /// provider with no key at all, which is a broken worker rather than a leak.
+    #[test]
+    fn the_deferred_secrets_are_handed_over_and_imported() {
+        let src = include_str!("session_verbs.rs");
+        let at = src
+            .find("for (key, value) in &deferred_secrets {")
+            .expect("the hand-over loop exists");
+        let block = &src[at..(at + 700).min(src.len())];
+        assert!(
+            block.contains("\"set-environment\""),
+            "secrets must reach the session over the control socket"
+        );
+        assert!(
+            block.contains("show-environment"),
+            "the pane's shell already exists when set-environment runs, so without the \
+             import the provider never sees the key"
         );
     }
 }

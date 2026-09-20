@@ -417,7 +417,8 @@ impl ScanLoop {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            crate::runtime_jobs::registry::tick(crate::runtime_jobs::registry::ids::SCAN);
+            // AMUX-4828: bracket the pass; the one-shot records no duration.
+            crate::runtime_jobs::registry::tick_start(crate::runtime_jobs::registry::ids::SCAN);
             match self.scan_once().await {
                 Ok(r) if !r.scanned.is_empty()
                         || !r.capture_failures.is_empty()
@@ -439,8 +440,14 @@ impl ScanLoop {
                         failures = r.capture_failures.len(),
                         "terminal scan pass"
                     );
+                    // BOTH Ok arms stamp: this is the BUSY one, and stamping
+                    // only the quiet arm would make an actively-working
+                    // scanner the one that reads as stalled.
+                    crate::runtime_jobs::registry::tick_end(crate::runtime_jobs::registry::ids::SCAN);
                 }
-                Ok(_) => {}
+                Ok(_) => {
+                    crate::runtime_jobs::registry::tick_end(crate::runtime_jobs::registry::ids::SCAN);
+                }
                 Err(e) => tracing::warn!(error = %e, "terminal scan pass failed"),
             }
         }

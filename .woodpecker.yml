@@ -59,20 +59,31 @@
 when:
   event: [push, pull_request, manual]
 
-# Steer scheduling away from build-02.baar -- confirmed live 2026-09-01 (see
-# the clone-fix comment below) that host's own network egress stalls
-# completely on anything past a couple hundred MB, which a git clone of
-# this repo's ~150MB packed .git reliably triggers. build.home/build.virt04
-# came online the same day with none of that problem (13s clone, vs. 10+
-# minutes hanging on build-02.baar). Every Woodpecker agent auto-provides a
-# `hostname` label; pinning to build.virt04 specifically for now (higher
-# capacity: 4 vs build.home's 2, and it's the one already confirmed working
-# end to end). Woodpecker's label match is a single equality/wildcard per
-# key, not a list -- can't express "either build.home or build.virt04, but
-# not build-02.baar" in one line. If infra adds a shared custom label (e.g.
+# Steer scheduling away from the fleet's flaky-uplink host -- confirmed live
+# 2026-09-01 (see the clone-fix comment below) that host's own network
+# egress stalls completely on anything past a couple hundred MB, which a
+# git clone of this repo's ~150MB packed .git reliably triggers. The other
+# two hosts came online the same day with none of that problem (13s clone,
+# vs. 10+ minutes hanging on the flaky one). Every Woodpecker agent
+# auto-provides a `hostname` label; pinning to the good host with more
+# capacity specifically for now (roughly double the other good host's, and
+# it's the one already confirmed working end to end -- see CLAUDE.local.md
+# for real hostnames, this repo is public and hostnames don't belong in
+# it). Woodpecker's label match is a single equality/wildcard per key, not
+# a list -- can't express "either good host, but not the flaky one" in one
+# line. If infra adds a shared custom label (e.g.
 # WOODPECKER_AGENT_LABELS="tier=fast") to both good hosts, switch this to
 # `tier: fast` instead so load balances across both and any future
 # fast node picks it up automatically without another edit here.
+#
+# AF-546: the `hostname:` value below is still a real, live hostname -- the
+# one exception the prose above avoids. There is no working substitute yet
+# (the custom-label path just described needs infra to add it first), and
+# blanking this line would leave scheduling unpinned, letting jobs land on
+# the flaky/OOM-prone hosts this whole comment exists to steer away from.
+# Left in place pending either the custom label or an explicit call that a
+# single already-public hostname is an acceptable trade against breaking
+# CI. Not a decision this comment makes unilaterally.
 labels:
   hostname: build.virt04
 
@@ -95,9 +106,9 @@ labels:
 # commit, and they're a small fraction of total build time.
 #
 # Shallow, non-partial clone -- pipeline #1 sat in `clone` alone for 10+
-# minutes (consistent with CLAUDE.local.md's note that this build fleet's
-# `.baar` hosts sit behind a slower/less reliable link than
-# `atlantis`/`home`); pipeline #2's plain `depth: 1` used a partial
+# minutes (consistent with CLAUDE.local.md's own note about which hosts in
+# this build fleet sit behind a slower/less reliable link); pipeline #2's
+# plain `depth: 1` used a partial
 # (`--filter=tree:0`) fetch by default, which then needs a SECOND
 # lazy-fetch round-trip for tree objects on `git reset --hard` -- that
 # second round-trip is what actually failed ("could not fetch ... from

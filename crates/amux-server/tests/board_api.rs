@@ -1402,6 +1402,114 @@ async fn archive_restore_round_trip_preserves_every_field() {
     assert!(log.contains("restored"), "log: {log}");
 }
 
+/// AF-922. A genuine create must say so unmistakably at the top level, not
+/// only via the status code (already 201 vs 200) or the `intake.action`
+/// field a caller has no reason to know exists -- the exact shape of the
+/// near-miss this card records, where a fold looked identical to a create.
+/// Named `card_created`, NOT `created` -- that key already belongs to the
+/// row's own creation timestamp (`detail_body`/`IssueRow::snapshot`), and a
+/// same-named boolean would silently clobber it.
+///
+/// The OTHER direction (`card_created: false` on a fold) is not exercisable
+/// from this test binary: `board_intake::MODEL` is a private OnceLock that
+/// only `board_intake::initialize()` populates, and that only runs from real
+/// server startup -- deliberately, so a router-only test can never launch a
+/// billable model provider by accident. Without it, `plan()` always takes
+/// the "semantic provider unavailable" branch and `reused` is always false.
+/// `card_created = !reused` is a one-line negation of an already-tested value
+/// (`board_intake`'s own unit tests cover `Plan.decision.action` under a
+/// mock model); this test covers the half actually reachable here.
+#[tokio::test]
+async fn create_response_names_itself_a_create_at_the_top_level() {
+    let (app, _dir) = app();
+    let (st, _, v) = send(
+        &app,
+        "POST",
+        "/api/board",
+        Some(json!({ "title": "plain create", "type": "chore" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{v}");
+    assert_eq!(v["card_created"], json!(true), "{v}");
+    assert_eq!(v["intake"]["action"], json!("create"), "{v}");
+    // The pre-existing `created` field (the row's own creation timestamp)
+    // must survive untouched -- this is the exact collision the rename
+    // above exists to avoid.
+    assert!(v["created"].is_i64(), "created must stay the row's timestamp: {v}");
+}
+
+/// AF-922. Before `undelete_item` existed, a soft-deleted card had no
+/// sanctioned recovery path at all -- `get_issue` filters `deleted IS NULL`
+/// everywhere, so once DELETE ran, the only way back was a raw SQL UPDATE
+/// against the live database (the exact incident this card records).
+#[tokio::test]
+async fn delete_undelete_round_trip_preserves_every_field_and_who_did_it() {
+    let (app, _dir) = app();
+    let card = create(
+        &app,
+        json!({
+            "title": "accidentally deleted", "status": "doing", "session": "my-project",
+            "desc": "still needed", "type": "research", "tags": ["q3"]
+        }),
+    )
+    .await;
+    let id = card["id"].as_str().unwrap().to_string();
+
+    // A live card cannot be undeleted -- there is nothing to reverse.
+    let (st, _, v0) = send(&app, "POST", &format!("/api/board/{id}/undelete"), None).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v0}");
+    assert_eq!(v0["code"], json!("not_deleted"), "{v0}");
+
+    // A card that never existed is not-found, not a `not_deleted` conflict --
+    // the two are different answers and issue_exists_including_deleted exists
+    // precisely to tell them apart.
+    let (st, _, _) = send(&app, "POST", "/api/board/NOPE-1/undelete", None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    let (st, _, _) = send_with(
+        &app,
+        "DELETE",
+        &format!("/api/board/{id}"),
+        None,
+        &[("X-Amux-Session", "orch")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Deleted: invisible to the normal read path, exactly like an archived
+    // card is invisible to a scoped list -- but unlike archive, nothing short
+    // of undelete can reach it again.
+    let (st, _, _) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    let (st, _, v) = send_with(
+        &app,
+        "POST",
+        &format!("/api/board/{id}/undelete"),
+        None,
+        &[("X-Amux-Session", "recover-lane")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["id"], json!(id));
+    assert_eq!(v["title"], json!("accidentally deleted"));
+    assert_eq!(v["desc"], json!("still needed"));
+    assert_eq!(v["session"], json!("my-project"));
+    assert_eq!(v["type"], json!("research"));
+    assert_eq!(v["tags"], json!(["q3"]));
+    assert_eq!(v["status"], json!("doing"), "undelete must not touch status");
+    let log = v["log"].as_str().unwrap();
+    assert!(log.contains("orch: deleted"), "who deleted it must survive: {log}");
+    assert!(log.contains("recover-lane: undeleted"), "who undeleted it: {log}");
+
+    // Fully live again: the normal read path sees it, and a second undelete
+    // now correctly refuses (nothing left to reverse).
+    let (st, _, _) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _, v2) = send(&app, "POST", &format!("/api/board/{id}/undelete"), None).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v2}");
+}
+
 // ---- circular depends_on -------------------------------------------------
 
 /// A refused cross-board create must stop before either the requested child or
@@ -1946,7 +2054,7 @@ async fn blocked_refuses_a_card_that_names_no_watch() {
     assert!(fix["on_a_person"].as_str().unwrap().contains("needsyou"), "{v}");
 
     // A dependency satisfies it.
-    let other = create(&app, json!({"title": "the thing that must land first"})).await;
+    let other = create(&app, json!({"title": "the thing that must land first", "session": "w2"})).await;
     let (st, _, v) = send(
         &app,
         "PATCH",
@@ -4684,7 +4792,8 @@ async fn terminal_transition_records_summary_and_preserves_provenance_for_provid
                 "session": lane,
                 "source_ref": "message:ATE-75",
                 "epic": "ATE-75",
-                "depends_on": ["AMUX-4018"],
+                // Historical dangling provenance is seeded through the writer
+                // below; new API writes correctly reject missing dependencies.
             }),
         )
         .await;
@@ -6441,6 +6550,17 @@ async fn a_gate_refusal_offers_the_reassignment_exit_and_says_it_is_not_a_bypass
     // The gate itself is untouched: this is offered BESIDE the refusal.
     assert_eq!(v["kind"], json!("gate_blocked"), "{v}");
     assert!(v["how_to_ack"]["gate_ack"] == json!(true), "{v}");
+
+    // The owner must get a local completion path, not advice to recreate an
+    // outside dependency as reviewer/shepherd prose after storage rejects it.
+    let (st, _, owned) = send_with(
+        &app, "PATCH", &format!("/api/board/{id}"),
+        Some(json!({ "status": "done", "evidence": EV })),
+        &[("X-Amux-Session", "mvs-infra")],
+    ).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert!(owned["or_reassign"]["how"].as_str().unwrap().contains("complete the missing work locally"), "{owned}");
+    assert!(!owned["or_reassign"].to_string().contains("<owning-lane>"), "{owned}");
 }
 
 /// AF-506, second pass — EVERY refusal that blocks closing or reviewing a card
@@ -6921,7 +7041,7 @@ async fn a_dependency_refusal_names_the_dependencys_own_type() {
 #[tokio::test]
 async fn doing_ack_cannot_bypass_readiness_and_repairs_are_atomic() {
     let (app, store, _dir) = app_with_store();
-    let dep = create(&app, json!({"title":"Import census", "type":"code", "status":"backlog"})).await;
+    let dep = create(&app, json!({"title":"Import census", "session":"parity", "type":"code", "status":"backlog"})).await;
     let dep_id = dep["id"].as_str().unwrap();
     let dep_w = dep_id.to_string();
     store.write(move |conn| {
@@ -6948,8 +7068,21 @@ async fn doing_ack_cannot_bypass_readiness_and_repairs_are_atomic() {
 
     // A missing input and a stored blocker also obey the parker's predicate.
     for fields in [json!({"depends_on":["MISSING-999"]}), json!({"depends_on":[],"blocked_on":"required access absent"})] {
+        let missing = fields["depends_on"][0] == "MISSING-999";
         let (status,_,body) = send(&app,"PATCH",&path,Some(fields)).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
+        if missing {
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(body["code"], "cross_board_dependency_forbidden");
+            // New writes are refused; seed historical corruption separately
+            // to preserve the read-side rule that a missing input blocks work.
+            let legacy_id = id.to_string();
+            store.write(move |conn| {
+                conn.execute("UPDATE issues SET depends_on='[\"MISSING-999\"]' WHERE id=?1", [legacy_id])?;
+                Ok(amux_server::db::WriteOutcome { applied:true, events:vec![] })
+            }).unwrap();
+        } else {
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
         let (status,_,body) = send(&app,"PATCH",&path,Some(json!({"status":"doing","gate_checked":["Input census is available"]}))).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert_eq!(body["code"], "acceptance_checks_failed");

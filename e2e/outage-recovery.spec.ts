@@ -1,5 +1,6 @@
 import { test, expect, Page, allowUnusedRoute } from './fixtures';
 import type { Route } from '@playwright/test';
+import { cleanup } from './teardown';
 
 async function setup(page: Page) {
   await page.addInitScript(() => {
@@ -167,16 +168,54 @@ test('a peer edit causes a visible revision conflict without clobbering either d
   expect(durable).toBe('Peer committed title');
 });
 
-test('a board read failure overrides a live SSE connection', async ({page}) => {
+for (const latestFails of [true, false]) test(`the latest board read ${latestFails ? 'failure' : 'recovery'} wins over an older response and live SSE`, async ({page}) => {
   await setup(page);
-  await page.route('**/api/board/statuses', route => route.fulfill({status: 500, body: 'timed out waiting for connection'}));
-  await page.evaluate(async () => {
-    (window as any).eval('_liveSSE = true; online = true');
-    await (window as any).fetchBoard();
-    (window as any).eval('_liveSSE = true; online = true');
-    (window as any).updateConnectionStatus();
-  });
-  await expect(page.locator('#conn-status').first()).toHaveText('Sync error');
+  await page.evaluate(() => (window as any).fetchBoard());
+  // Install and start synchronously: the held response belongs to this read,
+  // never to a boot/background poll that happened to reach page.route first.
+  await page.evaluate(latestFails => {
+    const w = window as any, original = window.fetch;
+    let first = true;
+    const response = (fails: boolean) => new Response(fails ? 'board read failed' : '[]',
+      {status:fails ? 500 : 200, headers:{'Content-Type':'application/json'}});
+    w.__restoreBoardFetch = () => { window.fetch = original; };
+    window.fetch = (input, init) => {
+      if (String(input).endsWith('/api/board/statuses')) {
+        if (first) {
+          first = false;
+          return new Promise<Response>(resolve => { w.__releaseOlderBoardRead = () => resolve(response(!latestFails)); });
+        }
+        return Promise.resolve(response(latestFails));
+      }
+      return original(input, init);
+    };
+    w.__olderBoardRead = w.fetchBoard();
+  }, latestFails);
+  try {
+    const newest = await page.evaluate(async () => {
+      const w = window as any;
+      w.eval('_liveSSE = true; online = true');
+      await w.fetchBoard();
+      w.updateConnectionStatus();
+      return document.querySelector('#conn-status')?.textContent;
+    });
+    expect(newest).toBe(latestFails ? 'Sync error' : 'Live');
+    const afterOlder = await page.evaluate(async () => {
+      const w = window as any;
+      w.__releaseOlderBoardRead();
+      await w.__olderBoardRead;
+      w.eval('_liveSSE = true; online = true');
+      w.updateConnectionStatus();
+      return document.querySelector('#conn-status')?.textContent;
+    });
+    // Snapshot, not a polling assertion: a later poll must not conceal a stale
+    // publication that already changed what the user saw.
+    expect(afterOlder).toBe(latestFails ? 'Sync error' : 'Live');
+  } finally {
+    await cleanup('restore board read transport', () => page.evaluate(() => {
+      const w = window as any; w.__releaseOlderBoardRead?.(); w.__restoreBoardFetch?.();
+    }), test.info());
+  }
 });
 
 

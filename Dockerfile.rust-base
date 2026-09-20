@@ -9,11 +9,11 @@
 # enough that the cached deps are meaningfully stale:
 #   docker --context <host> build -t amux-rust-base -f Dockerfile.rust-base .
 #
-# Across all 3 real Woodpecker build hosts at once (build-02.baar,
-# build.home, build.northstage — the last a 2026-09-04 rename of what was
-# build.virt04, confirmed live via /api/agents), use
-# scripts/rebuild-rust-base.sh instead — this is amux's own job as of
-# 2026-09-05, see docs/woodpecker-setup.md.
+# Across all 3 real Woodpecker build hosts at once (see CLAUDE.local.md for
+# their real names and the 2026-09-04 rename of one of them, confirmed
+# live via /api/agents -- this repo is public and hostnames don't belong
+# in it), use scripts/rebuild-rust-base.sh instead — this is amux's own
+# job as of 2026-09-05, see docs/woodpecker-setup.md.
 #
 # Deliberately a REAL build of the actual current source, not a
 # dependency-only dummy-crate trick — simpler, always correct, and this
@@ -54,7 +54,7 @@ ENV CARGO_TARGET_DIR=/build/target
 # LTO release build (-C linker-plugin-lto in this workspace's own release
 # profile) is genuinely memory-hungry per codegen unit, and a host that
 # looks capable by CPU count can still be memory-starved. Confirmed live:
-# build.home (4 CPUs, 3.8GB RAM) OOM-killed rustc mid-compile
+# one of the build hosts (4 CPUs, 3.8GB RAM) OOM-killed rustc mid-compile
 # ("(signal: 9, SIGKILL: kill)" right there in cargo's own error, NOT a
 # source/compile error, though the outer `exit code: 101` alone reads as
 # one -- that's exactly the ethos-rule-4 shape, the wrong-looking signal

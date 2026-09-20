@@ -702,9 +702,18 @@ pub async fn run_event_processors(store: SharedStore, protocol: Arc<dyn AgentPro
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
-        crate::runtime_jobs::registry::tick(crate::runtime_jobs::registry::ids::EVENT_PROCESSORS);
-        if let Err(e) = supervise_once(&store, &protocol, &mut procs).await {
-            tracing::warn!(error = %e, "event-processor supervision cycle failed");
+        // AMUX-4828: bracket the cycle. The one-shot writes no duration, so
+        // `classify_observed`'s only `slow` branch is dead for this job and a
+        // long cycle can present only as `ok` or `stalled`. tick_end sits in
+        // the Ok arm, so a failing cycle cannot read as a working one.
+        crate::runtime_jobs::registry::tick_start(
+            crate::runtime_jobs::registry::ids::EVENT_PROCESSORS,
+        );
+        match supervise_once(&store, &protocol, &mut procs).await {
+            Ok(_) => crate::runtime_jobs::registry::tick_end(
+                crate::runtime_jobs::registry::ids::EVENT_PROCESSORS,
+            ),
+            Err(e) => tracing::warn!(error = %e, "event-processor supervision cycle failed"),
         }
     }
 }

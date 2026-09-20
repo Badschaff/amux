@@ -1068,6 +1068,30 @@ pub async fn start_worker(
             )
         })
         .await;
+    // A STORE MISS IS NOT A MISSING WORKER (AF-298), same shape as peek_worker:
+    // the fleet is ~125 env-file lanes and one of them is a row in this table,
+    // so 404ing every store miss answered "not found" for essentially every
+    // real lane's start. Checked AFTER `step_response` would have converted
+    // the outcome, not before, and — the point AF-398 raised — AFTER the
+    // admission check above already ran unconditionally for THIS request
+    // regardless of whether a row exists. So a fleet lane reaching this
+    // fallback is governed by the exact same memory-pressure refusal a
+    // store-row start already gets; this closes AF-398's gap for this route
+    // rather than routing around it, and does not touch session_verbs.rs's
+    // own separate dispatch of admission-free real starts.
+    if write.is_ok() {
+        let is_not_found =
+            matches!(*slot.lock().expect("outcome slot poisoned"), Some(StepOutcome::NotFound));
+        if is_not_found && crate::api::session_verbs::lane_env_exists(&key) {
+            let (ok, msg) = crate::api::session_verbs::start_session(&state, &key, "", false).await;
+            return if ok {
+                (StatusCode::ACCEPTED, Json(json!({ "ok": true, "message": msg, "worker_id": key })))
+                    .into_response()
+            } else {
+                err(StatusCode::CONFLICT, json!({ "ok": false, "error": msg, "worker_id": key }))
+            };
+        }
+    }
     step_response(write, slot, &key, StatusCode::ACCEPTED)
 }
 
@@ -1121,6 +1145,26 @@ pub async fn stop_worker(State(state): State<AppState>, Path(key): Path<String>)
             )
         })
         .await;
+    // Same fallback shape as start_worker/peek_worker (AF-298): a store miss
+    // that names a real fleet lane delegates to the dispatcher's own stop
+    // rather than 404ing. No admission gate applies to stopping (that only
+    // governs starting MORE load), so this is the caller's own request to
+    // stop a NAMED lane -- the same thing `amux stop <lane>` already does
+    // through a different path.
+    if write.is_ok() {
+        let is_not_found =
+            matches!(*slot.lock().expect("outcome slot poisoned"), Some(StepOutcome::NotFound));
+        if is_not_found && crate::api::session_verbs::lane_env_exists(&key) {
+            return match crate::api::session_verbs::stop_for_pause(&state, &key).await {
+                Ok(()) => (StatusCode::OK, Json(json!({ "applied": true, "state": "stopped", "worker_id": key })))
+                    .into_response(),
+                Err(e) => err(
+                    StatusCode::BAD_GATEWAY,
+                    json!({ "error": format!("stop failed: {e}"), "worker_id": key }),
+                ),
+            };
+        }
+    }
     step_response(write, slot, &key, StatusCode::OK)
 }
 
@@ -2031,7 +2075,7 @@ mod tests {
     }
 
     /// Like `read_fixture_sessions`, but bounded by a DEADLINE instead of an
-    /// attempt count, for the two tests that read the REAL handler.
+    /// attempt count, for tests that read the REAL handler.
     ///
     /// AMUX-4647. `SESSIONS_EPOCH` is process-wide, 12 call sites bump it, and
     /// cargo runs this binary's tests in parallel, so a sibling create or delete
@@ -2069,8 +2113,8 @@ mod tests {
         }
     }
 
-    // AF-766: both phases of the sticky truth fixture share this bounded
-    // response policy. Other tests may invalidate the process-wide epoch.
+    // The attempt-count policy has its own stub-router negative control below.
+    // Real-handler tests use the settled-read deadline above under epoch churn.
     async fn read_fixture_sessions(app: &axum::Router, stage: &str) -> (StatusCode, HeaderMap, Value) {
         for attempt in 0..5 {
             let result = send(app, "GET", "/api/sessions", None).await;
@@ -2892,7 +2936,7 @@ mod tests {
         drop(conn);
         crate::api::sessions_legacy::invalidate_sessions_cache();
 
-        let (status, _, payload) = read_fixture_sessions(&app, "active").await;
+        let (status, _, payload) = read_real_sessions_settled(&app, "active").await;
         assert_eq!(status, StatusCode::OK, "{payload}");
         let rows = payload.as_array().expect("legacy session array");
         let linked = rows.iter().find(|row| row["name"] == "linked").expect("linked row");
@@ -2961,7 +3005,7 @@ mod tests {
         drop(conn);
         crate::api::sessions_legacy::invalidate_sessions_cache();
         idle_race.store(true, std::sync::atomic::Ordering::SeqCst);
-        let (status, _, idle_payload) = read_fixture_sessions(&app, "idle").await;
+        let (status, _, idle_payload) = read_real_sessions_settled(&app, "idle").await;
         assert_eq!(injected.load(std::sync::atomic::Ordering::SeqCst), 1, "idle discovery-race control must execute");
         assert_eq!(status, StatusCode::OK, "{idle_payload}");
         let idle_tubescience = idle_payload
@@ -3293,6 +3337,95 @@ mod tests {
         let (st, _, body) = send(&app, "GET", &format!("/api/workers/{tid}/peek"), None).await;
         assert_eq!(st, StatusCode::BAD_GATEWAY, "{body}");
         assert!(body["error"].as_str().unwrap().contains("socket timeout"));
+    }
+
+    // ---- start/stop fall back to the fleet substrate (AF-298) -------------
+
+    /// AF-298: a store miss on `/api/workers/{id}/start` is not a missing
+    /// worker for the same reason peek's fix established -- the fleet is
+    /// ~125 env-file lanes and one of them is a store row. Falls back to
+    /// `start_session` for a name that IS a real lane, and a config the CLI
+    /// CLI never got to spawn (CC_PAUSED=1) proves delegation happened rather
+    /// than just getting lucky on a 404-shaped coincidence.
+    #[tokio::test]
+    async fn start_falls_back_to_a_real_fleet_lane_the_store_never_heard_of() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (app, _dir) = app();
+
+        // Unknown name, no env file at all: still a clean 404, never a
+        // plausible-looking answer for a lane that does not exist -- the
+        // exact property peek's own fix test pins.
+        let (st, _, _) = send(&app, "POST", "/api/workers/zzz-nolane-af298/start", None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+
+        // A real lane, not a store row: CC_PAUSED=1 makes start_session
+        // return a defined, non-spawning refusal, so this proves the
+        // fallback reached the fleet dispatcher rather than merely not
+        // 404ing by accident.
+        std::fs::write(
+            home.path().join("sessions/fleet-lane-af298.env"),
+            "CC_PAUSED=\"1\"\n",
+        )
+        .unwrap();
+        let (st, _, body) =
+            send(&app, "POST", "/api/workers/fleet-lane-af298/start", None).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("paused"),
+            "must reach start_session's own refusal, not a generic 404: {body}"
+        );
+    }
+
+    /// AF-298/AF-398: the fallback above must not route a fleet lane's start
+    /// AROUND the host memory-pressure refusal every store-row start already
+    /// gets. Same lane, same request shape as the test above, Admission::Deny
+    /// this time -- must 503 with the SAME refusal shape start_worker's
+    /// store-row path uses, never reaching start_session at all.
+    #[tokio::test]
+    async fn start_fallback_is_still_refused_under_memory_pressure() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        std::fs::write(
+            home.path().join("sessions/fleet-lane-af398.env"),
+            "CC_PAUSED=\"1\"\n",
+        )
+        .unwrap();
+        let (app, _dir) = app_admitting(None, Admission::Deny);
+
+        let (st, _, body) =
+            send(&app, "POST", "/api/workers/fleet-lane-af398/start", None).await;
+        assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("memory headroom"),
+            "must be the SAME admission refusal a store-row start gets, not a bypass: {body}"
+        );
+    }
+
+    /// AF-298: same fallback shape for stop. Unlike start, stop carries no
+    /// admission gate (it never adds load), so the caller's own request to
+    /// stop a NAMED real lane is delegated rather than 404ing. A lane with no
+    /// live process is `stop_for_pause`'s own honest no-op, which proves the
+    /// fallback reached the dispatcher (a truly unknown name never gets this
+    /// far at all).
+    #[tokio::test]
+    async fn stop_falls_back_to_a_real_fleet_lane_the_store_never_heard_of() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (app, _dir) = app();
+
+        let (st, _, _) = send(&app, "POST", "/api/workers/zzz-nolane-af298/stop", None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+
+        std::fs::write(home.path().join("sessions/fleet-lane-stop-af298.env"), "").unwrap();
+        let (st, _, body) =
+            send(&app, "POST", "/api/workers/fleet-lane-stop-af298/stop", None).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert_eq!(body["applied"], json!(true), "{body}");
+        assert_eq!(body["worker_id"], json!("fleet-lane-stop-af298"));
     }
 
     /// AF-288: the promoted `duplicate` route resolves a worker ID, and the

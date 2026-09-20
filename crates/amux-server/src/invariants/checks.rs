@@ -668,6 +668,82 @@ fn match_route_full(mounted: &[(&str, &[&str])], method: &str, path: &str) -> Ro
 ///
 /// Pure over (session, conversation) pairs so the real specimen is the test
 /// corpus rather than a fixture.
+/// `StartInterval` in com.amux.server-rs-builder.plist. Named here rather than
+/// spelled at the call site so the threshold and the cadence it is a multiple
+/// of cannot drift apart.
+pub const BUILDER_INTERVAL_S: f64 = 60.0;
+
+/// How many missed cycles before the deploy path is reported stalled. See
+/// [`builder_has_ticked_recently`] for why this is loose rather than tight.
+pub const BUILDER_MAX_INTERVALS: f64 = 10.0;
+
+/// The deploy path is still ticking (AMUX-4809).
+///
+/// launchd stopped firing `com.amux.server-rs-builder` for 59 consecutive
+/// 60-second cycles on 2026-09-18 (12:06 to 13:05), verified by a controlled
+/// test rather than a single read. It recovered on its own about an hour later
+/// and the cause was never established; the usual probes cannot establish it,
+/// because `launchctl list` and `launchctl print` return nothing for this label
+/// AND for `com.amux.server-rs`, which was definitely running at the time. A
+/// probe that answers identically for a known-running agent cannot produce a
+/// positive, so it is not evidence either way.
+///
+/// NOTHING NOTICED, and that is what this check is for. The log simply stopped,
+/// `/health`'s `commit` quietly stopped moving, and the gap was found by a human
+/// wondering whether a fix was live. Every commit by every lane silently stopped
+/// deploying for an hour.
+///
+/// PURE, taking the measured age rather than reading the clock, so both arms are
+/// testable without a filesystem or a stale builder. The caller stats the log.
+///
+/// `None` means the age could not be measured, and that reports
+/// [`Status::Unknown`] with a reason, never a pass. This module's first
+/// principle is that "a probe that could not run reports Unknown, never a
+/// cheerful pass", and a silent empty result would be worse still: an
+/// unexplained absence is indistinguishable from a check nobody wrote.
+///
+/// THRESHOLD IS DELIBERATELY LOOSE. The card suggested "a couple of intervals",
+/// but the builder writes its log around a cargo build that can run for minutes
+/// without emitting a line, so a 2-interval threshold would fire on healthy long
+/// builds. At 10 intervals this still catches the 59-cycle outage in a sixth of
+/// the time it actually took to notice, and a check that cries wolf gets muted,
+/// which is the failure mode that leaves the next outage silent again.
+pub fn builder_has_ticked_recently(
+    log_age_s: Option<f64>,
+    interval_s: f64,
+    max_intervals: f64,
+) -> Vec<InvariantResult> {
+    const ID: &str = "deploy.builder_is_ticking";
+    let Some(age) = log_age_s else {
+        return vec![InvariantResult::unknown(
+            ID,
+            "builder log could not be stat'd, so its age is unobserved",
+        )
+        .entity("server-rs-builder")];
+    };
+    if !age.is_finite() || age < 0.0 || !interval_s.is_finite() || interval_s <= 0.0 {
+        return vec![InvariantResult::unknown(
+            ID,
+            format!("unusable inputs: age={age:?}s interval={interval_s:?}s"),
+        )
+        .entity("server-rs-builder")];
+    }
+    let budget = interval_s * max_intervals;
+    if age <= budget {
+        vec![InvariantResult::pass(ID).entity("server-rs-builder")]
+    } else {
+        vec![InvariantResult::fail(
+            ID,
+            format!("builder log written within {budget:.0}s ({max_intervals:.0} x {interval_s:.0}s interval)"),
+            format!(
+                "last write {age:.0}s ago, about {missed:.0} missed cycle(s); deploys stop silently and /health commit stops moving",
+                missed = age / interval_s
+            ),
+        )
+        .entity("server-rs-builder")]
+    }
+}
+
 pub fn conversations_are_not_shared(pairs: &[(String, String)]) -> Vec<InvariantResult> {
     const ID: &str = "conversation.one_lane_each";
     let mut by: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
@@ -2344,6 +2420,106 @@ pub fn todo_is_reachable_by_dispatch(
     }))]
 }
 
+/// One enabled schedule whose target cannot receive it (AMUX-4784).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndeliverableSchedule {
+    pub schedule_id: String,
+    pub title: String,
+    pub target: String,
+    /// Slug from `TargetRefusal::cause()`, so the check groups on the same
+    /// vocabulary the deliverer refuses with.
+    pub cause: String,
+    /// Consecutive refusals already recorded for this schedule. Evidence of
+    /// how long it has been firing into nothing, not part of the predicate.
+    pub refusals: i64,
+    /// Whether the target has any future in which it receives without someone
+    /// editing the SCHEDULE. Archived has none; paused and isolated do.
+    pub terminal: bool,
+}
+
+/// An enabled schedule claims it will fire. One pointed at a lane that cannot
+/// receive it makes a claim nothing can honour.
+///
+/// THE PRECEDENT IS `board.todo_is_reachable_by_dispatch`, directly above, and
+/// the reasoning transfers exactly: "`todo` is the dispatch queue — a card here
+/// claims to be next" and nothing will ever offer it. This is the same shape
+/// for schedules, and it existed for cards while 37 of 76 enabled schedules
+/// refused on every tick, some for seven weeks, with no check reading
+/// `last_delivery` or `last_refusal_reason` at all.
+///
+/// SHELL SCHEDULES ARE EXEMPT, and the exemption is named rather than silent
+/// (ethos rule 1): `kind='shell'` runs a command with no lane to deliver into
+/// (scheduler.rs `run_shell`), so it has no target that could be archived.
+///
+/// TERMINAL AND TEMPORARY ARE REPORTED SEPARATELY because they are different
+/// decisions. An ARCHIVED target has no state in which it ever delivers, so its
+/// schedules can be disabled or repointed without guessing at intent. PAUSED and
+/// ISOLATED are ordinary temporary states, and those schedules are RIGHT to keep
+/// their cadence; folding them together would push someone toward disabling a
+/// schedule whose lane resumes tomorrow.
+pub fn schedule_targets_can_receive(rows: &[UndeliverableSchedule], total_enabled: i64) -> Vec<InvariantResult> {
+    const ID: &str = "schedule.target_can_receive";
+    if rows.is_empty() {
+        return vec![InvariantResult::pass(ID).evidence(json!({
+            "undeliverable": 0,
+            "total_enabled": total_enabled,
+        }))];
+    }
+    let mut sorted: Vec<&UndeliverableSchedule> = rows.iter().collect();
+    // Worst first, and "worst" is how long it has been firing into nothing.
+    sorted.sort_by(|a, b| {
+        b.terminal
+            .cmp(&a.terminal)
+            .then_with(|| b.refusals.cmp(&a.refusals))
+            .then_with(|| a.schedule_id.cmp(&b.schedule_id))
+    });
+    let terminal: Vec<&&UndeliverableSchedule> = sorted.iter().filter(|r| r.terminal).collect();
+    let temporary: Vec<&&UndeliverableSchedule> = sorted.iter().filter(|r| !r.terminal).collect();
+    let pct = if total_enabled > 0 { rows.len() as i64 * 100 / total_enabled } else { 0 };
+    let name = |r: &&&UndeliverableSchedule| {
+        format!("{} -> '{}' is {} ({} refusal(s))", r.schedule_id, r.target, r.cause, r.refusals)
+    };
+    let row = |r: &&&UndeliverableSchedule| {
+        json!({
+            "schedule_id": r.schedule_id,
+            "title": r.title,
+            "target": r.target,
+            "cause": r.cause,
+            "refusals": r.refusals,
+            "terminal": r.terminal,
+        })
+    };
+    vec![InvariantResult::fail(
+        ID,
+        "every enabled schedule targets a lane that can actually receive it".to_string(),
+        format!(
+            "{} of {total_enabled} enabled schedule(s) ({pct}%) fire into a lane that refuses \
+             them. {} have a target that can NEVER receive (archived, unregistered or unset), \
+             so those are a decision someone can make now: {}. The other {} are targets that \
+             are only temporarily unavailable (paused or isolated), and those schedules are \
+             right to keep their cadence: {}. An enabled schedule claims it will fire; these \
+             claims nothing can honour, and until this check existed nothing read \
+             `last_delivery` or `last_refusal_reason`, so they went unseen for weeks.",
+            rows.len(),
+            terminal.len(),
+            if terminal.is_empty() { "none".to_string() } else { terminal.iter().map(name).collect::<Vec<_>>().join("; ") },
+            temporary.len(),
+            if temporary.is_empty() { "none".to_string() } else { temporary.iter().map(name).collect::<Vec<_>>().join("; ") },
+        ),
+    )
+    .evidence(json!({
+        "undeliverable": rows.len(),
+        "total_enabled": total_enabled,
+        "pct_of_enabled": pct,
+        "terminal_count": terminal.len(),
+        "temporary_count": temporary.len(),
+        "terminal": terminal.iter().map(row).collect::<Vec<_>>(),
+        "temporary": temporary.iter().map(row).collect::<Vec<_>>(),
+        "shell_exempt_note": "kind='shell' schedules are not counted: they run a command with \
+                              no lane to deliver into, so they have no target to refuse.",
+    }))]
+}
+
 /// One (lane, card) pair that crossed the repeat threshold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepeatOfferPair {
@@ -2698,6 +2874,270 @@ pub fn result_log_bounded(rows: i64, budget: i64, oldest_age_s: f64) -> Vec<Inva
         ),
     )
     .evidence(json!({"rows": rows, "budget": budget, "oldest_age_s": oldest_age_s}))]
+}
+
+// ---------------------------------------------------------------------------
+// 6b2. Does the CURRENT staged-guard reach every checkout? (AF-410)
+//
+// RESTORED under AF-943, 2026-09-20. This check and its whole test module
+// shipped under AF-410 (0b6b4dfe) and were silently dropped ~10 hours later by
+// 9c17d990, an unrelated commit whose own message says "checks.rs / monitor.rs
+// taken WHOLESALE from #182" to resolve a merge conflict around subagent
+// lifecycle tracking. Nothing in that commit's message acknowledges the loss,
+// and no other invariant covers the same ground. See AF-943 for the discovery.
+// ---------------------------------------------------------------------------
+
+/// One checkout's observed staged-guard, rolled up from `guard_verdicts`.
+#[derive(Debug, Clone)]
+pub struct GuardCheckout {
+    /// Worktree top-level the hook reported running in.
+    pub dir: String,
+    /// Highest `GUARD_VERSION` that checkout has reported in the window.
+    pub version: i64,
+    /// Firings on that version.
+    pub runs: i64,
+    /// Distinct lanes served by it.
+    pub lanes: i64,
+}
+
+/// AF-410: a corroboration that never reaches a checkout is not a corroboration.
+///
+/// REPORTED BY ts-gke, 2026-09-02. The staged-guard named a peer as co-editor of
+/// a file ts-gke had just written, and named ts-gke on the mirror case, twice in
+/// one hour. Their structural read is the valuable part and it is right: the
+/// guard pairs whoever was ACTIVE with whoever was WRITING, so on a shared
+/// checkout the lane running greps and test sweeps across the tree is the default
+/// suspect for any file whose mtime moves — precisely the lane least likely to
+/// have written it. False positives concentrate on careful readers.
+///
+/// THE FIRST-ORDER CAUSE WAS NOT THE ALGORITHM. Both corroborations built for
+/// exactly that case were ABSENT from the copy that fired: `_never_wrote`
+/// (MC-1561 — the named session has no commit to this path carrying their
+/// trailer) and `_nothing_in_dispute` (AF-391). The live Mixpeek guard was 766
+/// lines at `GUARD_VERSION` 9; the amux source was 1111 at 11. `.githooks/` is a
+/// VENDORED, TRACKED copy no installer writes.
+///
+/// MEASURED, 14 days of `guard_verdicts`: Mixpeek 689 firings across 31 lanes on
+/// version 9 while amux ran 11. Top of that list is `mixpeek-cicd` at 231 —
+/// MC-1561 is mixpeek-cicd's OWN card, so the lane that reported the
+/// reader-vs-writer bug was served a guard without its fix 231 times. Ethos rule
+/// 1 in its exact shape: the capability existed and did not reach.
+///
+/// WHY NOTHING ALARMED. The server has had this data all along — the hook POSTs
+/// `guard_version` on every run and it is stored per `dir`. But the staleness
+/// test is `hook_is_outdated(v, has_op) = v < 2 && !has_op` (api/git_guard.rs), a
+/// floor set when 2 was current, so all 689 version-9 firings read as fine. A
+/// constant floor cannot express "9 when the fleet is at 11".
+///
+/// THE FLOOR HERE IS THE FLEET MAXIMUM, NOT A CONSTANT. That is the whole design:
+/// every future version bump covers itself with no edit here, so this check
+/// cannot rot into the thing it replaced.
+///
+/// TWO CASES THAT MUST NOT READ AS HEALTH, both rule 4:
+/// - **No versioned checkout reported.** `Unknown`, never `Pass`. Version 0 is
+///   `git-shared-guard.py`, a different client that legitimately sends no
+///   version; a checkout that only ever reports 0 has not been measured for this,
+///   and calling it current would be a wrong answer rather than a missing one.
+/// - **Exactly one checkout reported.** Uniformity across a set of one is
+///   vacuous: the check structurally cannot fail, so a `Pass` would be a green
+///   that means nothing (rule 7). It reports `Unknown` and says which.
+pub fn guard_reaches_every_checkout(checkouts: &[GuardCheckout]) -> Vec<InvariantResult> {
+    const ID: &str = "hooks.guard_reaches_every_checkout";
+    let versioned: Vec<&GuardCheckout> = checkouts.iter().filter(|c| c.version >= 1).collect();
+    if versioned.is_empty() {
+        return vec![InvariantResult::unknown(
+            ID,
+            "no checkout reported a versioned staged-guard in the window — version 0 is \
+             git-shared-guard.py, a different client that sends none, so there is nothing \
+             here to compare (not measured; not a clean bill)",
+        )
+        .evidence(json!({"measured": false, "n_considered": 0,
+                         "why_unmeasured": "no guard_verdicts row carried guard_version >= 1"}))];
+    }
+    let newest = versioned.iter().map(|c| c.version).max().unwrap_or(0);
+    if versioned.len() < 2 {
+        return vec![InvariantResult::unknown(
+            ID,
+            format!(
+                "only one checkout ({}) reported a versioned staged-guard, at {newest} — \
+                 uniformity across a set of one cannot fail, so a pass here would carry no \
+                 information",
+                versioned[0].dir
+            ),
+        )
+        .evidence(json!({"measured": false, "n_considered": 1, "newest_version": newest,
+                         "why_unmeasured": "a single checkout makes the comparison vacuous"}))];
+    }
+    let mut lagging: Vec<&GuardCheckout> =
+        versioned.iter().copied().filter(|c| c.version < newest).collect();
+    lagging.sort_by_key(|c| (-c.runs, c.dir.clone()));
+    if lagging.is_empty() {
+        return vec![InvariantResult::pass(ID).evidence(json!({
+            "measured": true,
+            "n_considered": versioned.len(),
+            "newest_version": newest,
+            "checkouts": versioned.iter().map(|c| json!({
+                "dir": c.dir, "version": c.version, "runs": c.runs, "lanes": c.lanes
+            })).collect::<Vec<_>>(),
+        }))];
+    }
+    lagging
+        .iter()
+        .map(|c| {
+            InvariantResult::fail(
+                ID,
+                format!("every checkout runs staged-guard {newest}, the newest the fleet reports"),
+                format!(
+                    "{} runs GUARD_VERSION {} ({} behind): {} firings across {} lanes were \
+                     served it. Every fix landed between {} and {} is absent there — a \
+                     corroboration that does not reach a checkout does not exist for the \
+                     lanes in it. Graft the current source into that checkout's hook path \
+                     (its copy may be vendored and tracked, in which case no installer \
+                     writes it and the owning lane has to commit it).",
+                    c.dir,
+                    c.version,
+                    newest - c.version,
+                    c.runs,
+                    c.lanes,
+                    c.version,
+                    newest,
+                ),
+            )
+            // One incident per checkout, not one flapping fleet-wide incident.
+            .entity(c.dir.clone())
+            .evidence(json!({
+                "measured": true,
+                "n_considered": versioned.len(),
+                "dir": c.dir,
+                "version": c.version,
+                "newest_version": newest,
+                "versions_behind": newest - c.version,
+                "runs": c.runs,
+                "lanes": c.lanes,
+                "source": "scripts/git-hooks/amux-staged-guard",
+            }))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod guard_reach_tests {
+    use super::*;
+
+    fn co(dir: &str, version: i64, runs: i64, lanes: i64) -> GuardCheckout {
+        GuardCheckout { dir: dir.to_string(), version, runs, lanes }
+    }
+
+    fn ev(r: &InvariantResult) -> &serde_json::Value {
+        &r.evidence
+    }
+
+    #[test]
+    fn no_versioned_checkout_is_unknown_not_pass() {
+        let out = guard_reaches_every_checkout(&[]);
+        assert_eq!(out[0].status, Status::Unknown);
+        assert_eq!(ev(&out[0])["measured"], json!(false));
+        assert_eq!(ev(&out[0])["n_considered"], json!(0));
+    }
+
+    /// Version 0 is git-shared-guard.py, a DIFFERENT client that legitimately
+    /// sends no version. A checkout that only ever reports 0 has not been
+    /// measured for this; calling it maximally stale would be a wrong answer.
+    #[test]
+    fn version_zero_alone_is_unmeasured_not_maximally_stale() {
+        let out = guard_reaches_every_checkout(&[co("/a", 0, 300, 30), co("/b", 0, 5, 1)]);
+        assert_eq!(out[0].status, Status::Unknown);
+        assert_eq!(ev(&out[0])["measured"], json!(false));
+    }
+
+    /// A version-0 row sitting BESIDE real ones must not drag the floor down or
+    /// appear as a lagging checkout of its own.
+    #[test]
+    fn version_zero_beside_versioned_checkouts_is_excluded_from_both_sides() {
+        let out = guard_reaches_every_checkout(&[
+            co("/shared-guard-only", 0, 338, 33),
+            co("/a", 11, 10, 2),
+            co("/b", 11, 10, 2),
+        ]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].status, Status::Pass);
+        assert_eq!(ev(&out[0])["n_considered"], json!(2), "the version-0 dir is not considered");
+        for r in &out {
+            assert!(!r.observed.contains("shared-guard-only"), "not named as lagging: {r:?}");
+        }
+    }
+
+    /// Rule 7 turned on the check's own output: with one checkout the comparison
+    /// structurally cannot fail, so a Pass would be a green that means nothing.
+    #[test]
+    fn a_single_checkout_cannot_fail_so_it_reports_unknown() {
+        let out = guard_reaches_every_checkout(&[co("/only", 11, 900, 40)]);
+        assert_eq!(out[0].status, Status::Unknown);
+        assert_eq!(ev(&out[0])["measured"], json!(false));
+        assert_eq!(ev(&out[0])["n_considered"], json!(1));
+        assert!(out[0].observed.contains("vacuous") || out[0].observed.contains("cannot fail"));
+    }
+
+    #[test]
+    fn uniform_checkouts_pass_and_say_how_many_were_compared() {
+        let out = guard_reaches_every_checkout(&[co("/a", 11, 100, 5), co("/b", 11, 20, 2)]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].status, Status::Pass);
+        assert_eq!(ev(&out[0])["measured"], json!(true));
+        assert_eq!(ev(&out[0])["n_considered"], json!(2));
+        assert_eq!(ev(&out[0])["newest_version"], json!(11));
+    }
+
+    /// THE SPECIMEN, from guard_verdicts over the 14 days to 2026-09-02.
+    #[test]
+    fn the_af410_specimen_names_mixpeek_two_versions_behind() {
+        let out = guard_reaches_every_checkout(&[
+            co("/Users/ethan/Dev/mixpeek", 9, 689, 31),
+            co("/Users/ethan/Dev/amux", 11, 165, 8),
+        ]);
+        assert_eq!(out.len(), 1, "one incident, for the one lagging checkout");
+        assert_eq!(out[0].status, Status::Fail);
+        assert_eq!(out[0].entity_key, "/Users/ethan/Dev/mixpeek");
+        assert_eq!(ev(&out[0])["versions_behind"], json!(2));
+        assert_eq!(ev(&out[0])["runs"], json!(689));
+        assert_eq!(ev(&out[0])["lanes"], json!(31));
+        // The blast radius belongs in the message, not only the evidence blob:
+        // "9 days stale" is not actionable, "689 firings across 31 lanes" is.
+        assert!(out[0].observed.contains("689"), "{}", out[0].observed);
+        assert!(out[0].observed.contains("31 lanes"), "{}", out[0].observed);
+    }
+
+    /// Two lagging checkouts are two incidents, keyed by dir — not one
+    /// fleet-wide incident that flaps as they are fixed one at a time.
+    #[test]
+    fn each_lagging_checkout_is_its_own_incident() {
+        let out = guard_reaches_every_checkout(&[
+            co("/Users/ethan/Dev/mixpeek", 9, 689, 31),
+            co("/Users/ethan/Dev/amux-GTM", 10, 1, 1),
+            co("/Users/ethan/Dev/amux", 11, 165, 8),
+        ]);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|r| r.status == Status::Fail));
+        let keys: Vec<&str> = out.iter().map(|r| r.entity_key.as_str()).collect();
+        assert!(keys.contains(&"/Users/ethan/Dev/mixpeek"));
+        assert!(keys.contains(&"/Users/ethan/Dev/amux-GTM"));
+        // Busiest first: the checkout serving 689 firings outranks the one serving 1.
+        assert_eq!(out[0].entity_key, "/Users/ethan/Dev/mixpeek");
+    }
+
+    /// The floor must MOVE. This is the property that stops this check rotting
+    /// into `guard_version < 2`, the constant it replaces: bump every checkout
+    /// past today's newest and it still passes, with no edit here.
+    #[test]
+    fn the_floor_is_the_fleet_maximum_not_a_constant() {
+        let out = guard_reaches_every_checkout(&[co("/a", 40, 10, 1), co("/b", 40, 10, 1)]);
+        assert_eq!(out[0].status, Status::Pass);
+        assert_eq!(ev(&out[0])["newest_version"], json!(40));
+        // ... and one behind at that height still fails.
+        let out = guard_reaches_every_checkout(&[co("/a", 39, 10, 1), co("/b", 40, 10, 1)]);
+        assert_eq!(out[0].status, Status::Fail);
+        assert_eq!(ev(&out[0])["versions_behind"], json!(1));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -7856,6 +8296,93 @@ mod todo_reachable_tests {
 }
 
 #[cfg(test)]
+mod schedule_target_tests {
+    use super::*;
+
+    fn sched(id: &str, target: &str, cause: &str, refusals: i64, terminal: bool) -> UndeliverableSchedule {
+        UndeliverableSchedule {
+            schedule_id: id.into(),
+            title: format!("{id} tick"),
+            target: target.into(),
+            cause: cause.into(),
+            refusals,
+            terminal,
+        }
+    }
+
+    /// Nothing refusing is a pass, and the pass still publishes the population
+    /// it looked at. A bare pass cannot be told from a probe that found no
+    /// schedules at all.
+    #[test]
+    fn no_undeliverable_schedules_passes_and_says_what_it_counted() {
+        let out = schedule_targets_can_receive(&[], 71);
+        assert_eq!(out[0].status, Status::Pass);
+        assert_eq!(out[0].evidence["undeliverable"], 0);
+        assert_eq!(out[0].evidence["total_enabled"], 71);
+    }
+
+    /// The live shape this was built from: SCHED-424 firing into an ARCHIVED
+    /// amux-cloud 479 times, beside schedules whose targets are merely paused.
+    /// Both are reported, and they are reported SEPARATELY, because disabling a
+    /// schedule whose lane resumes tomorrow is the wrong move.
+    #[test]
+    fn terminal_and_temporary_targets_are_counted_and_named_apart() {
+        let rows = vec![
+            sched("SCHED-424", "amux-cloud", "archived", 479, true),
+            sched("SCHED-402", "mixpeek-frustrations", "paused", 471, false),
+            sched("SCHED-419", "ts-gke", "paused", 195, false),
+        ];
+        let out = schedule_targets_can_receive(&rows, 71);
+        assert_eq!(out[0].status, Status::Fail);
+        assert_eq!(out[0].evidence["terminal_count"], 1);
+        assert_eq!(out[0].evidence["temporary_count"], 2);
+        assert_eq!(out[0].evidence["undeliverable"], 3);
+        // The archived one is the actionable subset and must be named as such.
+        assert_eq!(out[0].evidence["terminal"][0]["schedule_id"], "SCHED-424");
+        for needle in ["SCHED-424", "amux-cloud", "archived", "SCHED-402", "ts-gke"] {
+            assert!(out[0].observed.contains(needle), "observed must name {needle}: {}", out[0].observed);
+        }
+    }
+
+    /// A paused-only window must NOT read as "nothing can ever receive these".
+    /// The counts are the discriminator a reader acts on, so they have to be
+    /// right when one bucket is empty.
+    #[test]
+    fn only_temporary_targets_reports_zero_terminal_rather_than_folding_them_in() {
+        let rows = vec![sched("SCHED-402", "mixpeek-frustrations", "paused", 471, false)];
+        let out = schedule_targets_can_receive(&rows, 71);
+        assert_eq!(out[0].status, Status::Fail);
+        assert_eq!(out[0].evidence["terminal_count"], 0);
+        assert_eq!(out[0].evidence["temporary_count"], 1);
+        assert!(
+            out[0].observed.contains("0 have a target that can NEVER receive"),
+            "a temporary-only window must say zero terminal: {}",
+            out[0].observed
+        );
+    }
+
+    /// Worst first, and worst means the terminal ones: a target that can never
+    /// receive outranks a longer-running paused one, because only the first is
+    /// a decision someone can make today.
+    #[test]
+    fn a_terminal_target_leads_even_when_a_temporary_one_has_more_refusals() {
+        let rows = vec![
+            sched("SCHED-PAUSED", "ts-gke", "paused", 9999, false),
+            sched("SCHED-ARCH", "amux-cloud", "archived", 12, true),
+        ];
+        let out = schedule_targets_can_receive(&rows, 71);
+        let pos_arch = out[0].observed.find("SCHED-ARCH").expect("archived present");
+        let pos_paused = out[0].observed.find("SCHED-PAUSED").expect("paused present");
+        assert!(
+            pos_arch < pos_paused,
+            "the archived target leads; refusal count is the tiebreak, not the key: {}",
+            out[0].observed
+        );
+    }
+}
+
+
+#[cfg(test)]
 mod repeat_offer_tests {
     use super::*;
 
@@ -8147,5 +8674,89 @@ mod f64_roundtrip_tests {
     fn no_probes_is_unknown_not_pass() {
         let v = f64_survives_json_roundtrip(&[]);
         assert_eq!(v[0].status, Status::Unknown);
+    }
+}
+
+/// Negative controls for `builder_has_ticked_recently` (AMUX-4809), per this
+/// file's own rule that a check never demonstrated failing is not a valid
+/// health check (AMUX-2624).
+#[cfg(test)]
+mod builder_tick_tests {
+    use super::*;
+
+    const INTERVAL: f64 = 60.0;
+    const MAX: f64 = 10.0;
+
+    /// THE NEGATIVE CONTROL: the real outage, replayed. launchd missed 59
+    /// consecutive 60s cycles on 2026-09-18 and nothing anywhere said so.
+    #[test]
+    fn the_fifty_nine_missed_cycles_are_reported() {
+        let out = builder_has_ticked_recently(Some(59.0 * INTERVAL), INTERVAL, MAX);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].status,
+            Status::Fail,
+            "the outage this check exists for must FAIL it; got {:?}",
+            out[0].status
+        );
+        let seen = format!("{:?}", out[0]);
+        assert!(
+            seen.contains("59") || seen.contains("3540"),
+            "the failure must carry the observed staleness so a reader can act: {seen}"
+        );
+    }
+
+    /// The other arm. Without this, an always-fail implementation passes the
+    /// test above and pages on every healthy tick until someone mutes it.
+    #[test]
+    fn a_builder_that_just_ticked_is_quiet() {
+        for age in [0.0, 1.0, INTERVAL, INTERVAL * (MAX - 0.1)] {
+            let out = builder_has_ticked_recently(Some(age), INTERVAL, MAX);
+            assert_eq!(out.len(), 1);
+            assert_eq!(
+                out[0].status,
+                Status::Pass,
+                "age {age}s is within {MAX} x {INTERVAL}s and must not fire"
+            );
+        }
+    }
+
+    /// A long cargo build can leave the log untouched for minutes. The
+    /// threshold is loose ON PURPOSE, because a check that cries wolf gets
+    /// muted and the next outage is silent again.
+    #[test]
+    fn a_slow_build_just_under_the_budget_does_not_fire() {
+        let just_under = INTERVAL * MAX - 1.0;
+        assert_eq!(
+            builder_has_ticked_recently(Some(just_under), INTERVAL, MAX)[0].status,
+            Status::Pass
+        );
+        let just_over = INTERVAL * MAX + 1.0;
+        assert_eq!(
+            builder_has_ticked_recently(Some(just_over), INTERVAL, MAX)[0].status,
+            Status::Fail,
+            "the boundary must be a boundary, not a suggestion"
+        );
+    }
+
+    /// Unmeasured is not healthy. A missing log is exactly the state a
+    /// never-started builder leaves behind, and reporting Pass for it would
+    /// make this check assert the thing it cannot see.
+    #[test]
+    fn an_unmeasurable_log_is_unknown_not_pass() {
+        for bad in [None, Some(f64::NAN), Some(-1.0)] {
+            let out = builder_has_ticked_recently(bad, INTERVAL, MAX);
+            assert_eq!(out.len(), 1, "an unmeasured probe must still SAY so");
+            assert_eq!(
+                out[0].status,
+                Status::Unknown,
+                "input {bad:?} is unobserved, and Unknown is not Pass"
+            );
+        }
+        assert_eq!(
+            builder_has_ticked_recently(Some(10.0), 0.0, MAX)[0].status,
+            Status::Unknown,
+            "a zero interval cannot produce a budget, so it is unmeasured"
+        );
     }
 }

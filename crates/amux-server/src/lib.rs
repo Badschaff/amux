@@ -7,6 +7,7 @@
 pub mod api;
 pub mod backend;
 pub mod config;
+pub mod fanout_workspace;
 mod cargo_target_guard;
 pub mod legacy_port;
 pub mod log_dedupe;

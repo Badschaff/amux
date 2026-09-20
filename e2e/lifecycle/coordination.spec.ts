@@ -1,7 +1,7 @@
 import { test, expect } from '../fixtures';
 import { boot, auth, checkpoint, deleteOwnedWorkers, getSessionsResilient } from './evidence';
 
-test('LC-COORD-POLICY: peer task awareness spans groups; explicit deny and isolation refuse delivery', async ({ page, request }, info) => {
+test('LC-COORD-POLICY: peer task awareness spans groups; stopped targets and isolation refuse delivery without grants', async ({ page, request }, info) => {
   test.setTimeout(90_000);
   await boot(page);
   const headers = await auth(page);
@@ -43,10 +43,14 @@ test('LC-COORD-POLICY: peer task awareness spans groups; explicit deny and isola
     for (const target of [outside, raw]) {
       const refused = await request.post(`/api/sessions/${target}/send`, {
         headers: workerHeaders, data: { text: `lc-denied-${suffix}` } });
-      expect(refused.status()).toBe(403);
       const body = await refused.json();
       if (body.grant_id) grants.push(body.grant_id);
-      expect(body.error).toMatch(target === raw ? /isolated/i : /cross.group|allowance/i);
+      // These fixtures have no running process. Lifecycle refusal must precede
+      // the group approval path: a grant cannot make a stopped worker reachable.
+      expect(refused.status(), JSON.stringify(body)).toBe(target === raw ? 403 : 409);
+      expect(body.error).toMatch(target === raw ? /isolated/i : /not running/i);
+      if (target === outside) expect(body.code).toBe('target_not_running');
+      expect(body.grant_id).toBeUndefined();
       await info.attach(`refused-${target}`, { body: JSON.stringify(body), contentType: 'application/json' });
     }
     await page.locator('#board-detail-overlay.active > .overlay-header').getByRole('button', { name: /Back/ }).click();

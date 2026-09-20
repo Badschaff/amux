@@ -22,7 +22,7 @@ function card(id,session,status,title) {
     depends_on:[],archived:false,created:1,updated:1,pos:0};
 }
 const board=[card('SP-787','studio-plg','backlog','OpenAPI submission parameters'),
-  card('FX-1','linked-worker','doing','First outcome'),card('FX-2','linked-worker','doing','Second outcome'),
+  card('FX-1','linked-worker','doing','First outcome: '+ 'A legacy task title contains a whole request and must not hide the board. '.repeat(20)),card('FX-2','linked-worker','doing','Second outcome'),
   ...Array.from({length:18},(_,i)=>card('WRAP-'+i,'studio-plg','backlog',
     'A long board title must wrap inside its own row when a worker has more tasks than fit on a phone screen'))];
 let payload=[worker('studio-plg',null),worker('linked-worker','FX-1'),
@@ -61,6 +61,24 @@ try {
     assert.equal(await page.locator('.board-card-live[data-id="FX-1"]').count(),1);
     assert.equal(await page.locator('.board-card-live[data-id="FX-2"]').count(),0);
     assert.equal(await page.locator('.board-card-observed[data-id="SP-787"]').count(),1);
+    const summary=page.locator('#board-columns-activity [data-card-id="FX-1"] .board-activity-task');
+    assert.ok((await summary.textContent()).length>1000,'full task text remains accessible');
+    assert.equal(await page.evaluate(()=>_uiComponentCheck().issues.filter(i=>i.endsWith(':activity-summary-too-tall')).length),0);
+    assert.ok((await page.locator('#board-columns-activity').boundingBox()).height<190,'long task summaries keep the board visible');
+    const tall=await page.addStyleTag({content:'.board-activity-task {-webkit-line-clamp:unset !important;}'});
+    assert.ok(await page.evaluate(()=>_uiComponentCheck().issues.some(i=>i.endsWith(':activity-summary-too-tall'))),'diagnostic detects an unbounded legacy title');
+    await tall.evaluate(el=>el.remove());
+    for (const mode of ['list','worker','status']) {
+      await page.evaluate(mode=>{boardViewMode=mode;renderBoard();},mode);
+      assert.equal(await page.locator('#board-columns-activity [data-worker="linked-worker"]').count(),1);
+      assert.equal(await page.locator('#board-columns > #board-columns-activity').count(),0,
+        'activity sits above horizontal columns, not in an offscreen column');
+    }
+    await page.evaluate(()=>document.getElementById('board-columns-activity').remove());
+    assert.ok(await page.evaluate(()=>_uiComponentCheck().issues.includes('board-columns:active-work-missing')),
+      'diagnostic detects erased activity, not just card highlights');
+    await page.evaluate(()=>renderBoard());
+    assert.ok(await page.evaluate(()=>!_uiComponentCheck().issues.includes('board-columns:active-work-missing')));
     // Keep runtime active while moving to another exact card: the old active-set
     // signature missed this, and the SSE handler never repainted either board.
     payload=[worker('studio-plg',null),worker('linked-worker','FX-2'),payload[2]];
@@ -78,9 +96,9 @@ try {
     await page.waitForFunction(()=>getComputedStyle(document.getElementById('peek-overlay')).opacity==='1');
     assert.equal(await page.evaluate(()=>_uiComponentCheck().issues.filter(i=>i.endsWith(':board-row-content-overflow')).length),0);
     if(width===390) {
-      const broken=await page.addStyleTag({content:'.peek-issue-item {flex-shrink:1 !important;}'});
+      const broken=await page.addStyleTag({content:'.peek-issue-item {height:8px !important;max-height:8px !important;min-height:0 !important;flex:0 0 8px !important;}'});
       assert.ok(await page.evaluate(()=>_uiComponentCheck().issues.some(i=>i.endsWith(':board-row-content-overflow'))),
-        'diagnostic must detect the original compressed-row failure');
+        'diagnostic must detect an injected compressed-row failure');
       await broken.evaluate(el=>el.remove());
     }
     payload=[worker('studio-plg',null,{lifecycle:'paused',running:false}),payload[1],payload[2]];

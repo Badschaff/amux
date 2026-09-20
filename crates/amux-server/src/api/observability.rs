@@ -206,14 +206,75 @@ async fn rollup(State(state): State<AppState>, RawQuery(q): RawQuery) -> Respons
     })
     .collect();
 
-    let by_model: Vec<Value> = group_rows(
+    let by_model_rows = group_rows(
         "model, COALESCE(SUM(cost_usd),0) cost, COUNT(*) turns",
         "model",
         "cost DESC",
-    )
-    .into_iter()
-    .map(|r| json!({"model": r[0], "cost": r[1], "turns": r[2]}))
-    .collect();
+    );
+
+    // METERED VS UNMETERED (AMUX-4806). `total_cost` above sums `cost_usd`
+    // over every row, and until this landed an unknown model was priced at
+    // Anthropic Sonnet's rate by `PRICE_DEFAULT`. 116,966 rows of gpt-*,
+    // gemini-* and a local qwen carried $6,942.14 that nobody spent, in the
+    // same figure as measured Claude spend, and nothing here could tell them
+    // apart.
+    //
+    // Classified in RUST against the live price table rather than with a
+    // status list in SQL, for two reasons: the table is the authority and a
+    // second copy in a WHERE clause is the drift this repo keeps paying for,
+    // and it follows ~/.amux/prices.json for free — the moment the owner adds
+    // a rate, that family moves from unmetered to metered with no redeploy and
+    // no backfill.
+    //
+    // `by_model` is GROUP BY with no LIMIT, so this sum is the whole
+    // population, not a head.
+    let price_table = crate::runtime_jobs::token_ledger::prices(&crate::config::amux_home());
+    let mut unmetered_turns = 0i64;
+    let mut unmetered_cost_in_ledger = 0.0f64;
+    let mut unmetered_models: Vec<Value> = Vec::new();
+    let mut free_turns = 0i64;
+    let mut free_cost_in_ledger = 0.0f64;
+    for r in &by_model_rows {
+        let m = r[0].as_str().unwrap_or_default();
+        if m.is_empty() || m == "<synthetic>" {
+            continue;
+        }
+        let cost = r[1].as_f64().unwrap_or(0.0);
+        let turns = r[2].as_i64().unwrap_or(0);
+        match crate::runtime_jobs::token_ledger::model_rate(&price_table, m) {
+            // FREE BY RATE, not by absence. A local model's rate is a real
+            // zero, so ANY cost stored against it is a leftover from when
+            // every unknown model took Sonnet's price. Counting it as spend
+            // would assert $223.32 of bill for 551 turns that ran on this Mac
+            // and cost nothing -- the same defect, surviving in a bucket that
+            // now calls itself "priced". Cost the row by what the TABLE says.
+            Some(rate) if rate.iter().all(|r| *r == 0.0) => {
+                free_turns += turns;
+                free_cost_in_ledger += cost;
+            }
+            Some(_) => {}
+            None => {
+                unmetered_turns += turns;
+                unmetered_cost_in_ledger += cost;
+                unmetered_models.push(json!({"model": m, "turns": turns, "cost_in_ledger": cost}));
+            }
+        }
+    }
+    // The headline is METERED spend. A row whose rate nobody knows contributes
+    // its tokens and no dollars; the legacy figure it still carries in the
+    // table is reported beside it rather than folded in or deleted.
+    let metered_cost = total_cost - unmetered_cost_in_ledger - free_cost_in_ledger;
+
+    let by_model: Vec<Value> = by_model_rows
+        .into_iter()
+        .map(|r| {
+            let priced = r[0]
+                .as_str()
+                .map(|m| crate::runtime_jobs::token_ledger::model_is_priced(&price_table, m))
+                .unwrap_or(false);
+            json!({"model": r[0], "cost": r[1], "turns": r[2], "priced": priced})
+        })
+        .collect();
 
     let by_day: Vec<Value> = group_rows(
         &format!(
@@ -239,7 +300,19 @@ async fn rollup(State(state): State<AppState>, RawQuery(q): RawQuery) -> Respons
         "days": days,
         "session": if session.is_empty() { Value::Null } else { json!(session) },
         "group": if group.is_empty() { Value::Null } else { json!(group) },
-        "total_cost": (total_cost * 10_000.0).round() / 10_000.0,
+        // METERED ONLY (AMUX-4806). A caller reading this cannot silently
+        // include a row priced at a rate nobody supplied.
+        "total_cost": (metered_cost * 10_000.0).round() / 10_000.0,
+        "unmetered_turns": unmetered_turns,
+        // Legacy cost still stored on unmetered rows, from when every unknown
+        // model took Sonnet's rate. Disclosed, not deleted: it is history, and
+        // overwriting a money column is not reversible.
+        "unmetered_cost_in_ledger": (unmetered_cost_in_ledger * 10_000.0).round() / 10_000.0,
+        "unmetered_models": unmetered_models,
+        // Local inference: a known rate of zero. Reported so "$0 because we
+        // measured it" stays distinguishable from "no number to give".
+        "free_turns": free_turns,
+        "free_cost_in_ledger": (free_cost_in_ledger * 10_000.0).round() / 10_000.0,
         "total_tokens": total_tokens,
         "total_turns": total_turns,
         // py:18293 divides by `or 1` — a zero denominator would make this NaN,

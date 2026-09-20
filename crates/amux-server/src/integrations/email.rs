@@ -1031,7 +1031,17 @@ impl GmailClient {
             // message from the response. Three short backoffs (250/500/1000ms)
             // absorb a transient limit; a sustained one still errors, loudly,
             // at the caller's WARN.
-            if (status == 429 || status == 503) && attempt < 3 {
+            // 403 IS HOW GMAIL SAYS "RATE LIMIT" (AMUX-4833). The retry above
+            // was written for quota pushback and only matched 429/503, but the
+            // Gmail API answers `rateLimitExceeded` / `userRateLimitExceeded`
+            // with HTTP 403 and puts the reason in the body. So the backoff
+            // that exists to absorb a transient limit never fired on the form
+            // the API actually uses, and the call failed on the first try.
+            //
+            // Observed 2026-09-19T04:38Z: 403 with
+            // details[].reason=RATE_LIMIT_EXCEEDED, quota_metric
+            // gmail.googleapis.com/default, quota_limit_value 15000 per minute.
+            if Self::should_retry_upstream(status, &v, attempt) {
                 tokio::time::sleep(std::time::Duration::from_millis(250 << attempt)).await;
                 last = Some((status, v));
                 continue;
@@ -1043,6 +1053,67 @@ impl GmailClient {
         }
         let (status, v) = last.unwrap_or((0, Value::Null));
         Err(format!("gmail api {status} after retries: {v}"))
+    }
+
+    /// The retry decision, as a function so a test can drive it (AMUX-4833).
+    ///
+    /// Inline this was a condition inside an async HTTP loop that no test could
+    /// reach without standing up a Gmail server, which is how the 403 case went
+    /// unnoticed: the loop LOOKED like it handled quota pushback, and the one
+    /// shape Gmail actually sends fell straight through it.
+    fn should_retry_upstream(status: u16, body: &Value, attempt: u32) -> bool {
+        // Three short backoffs absorb a transient limit; a sustained one still
+        // errors, loudly, at the caller's WARN (AMUX-3495's rule, unchanged).
+        if attempt >= 3 {
+            return false;
+        }
+        status == 429 || status == 503 || Self::gmail_rate_limited(status, body)
+    }
+
+    /// Is this Gmail response a QUOTA REFUSAL rather than a fault? (AMUX-4833)
+    ///
+    /// ONE DEFINITION, TWO CALLERS. The retry loop below uses it to back off,
+    /// and `api::email` uses it to answer 429 instead of 502. This file already
+    /// learned that lesson from the OAuth refusal list: its comment says two
+    /// spellings of "which codes are refusals" would drift, so there is exactly
+    /// one here.
+    ///
+    /// STRUCTURE, NOT SUBSTRING. A genuine upstream fault whose body merely
+    /// MENTIONS a quota string must stay a fault, which is the same reasoning
+    /// `oauth_refusal_code` gives for parsing rather than searching. The
+    /// discriminators are the ones Google actually sets:
+    /// `error.details[].reason` and `error.errors[].domain`.
+    pub(crate) fn gmail_rate_limited(status: u16, body: &Value) -> bool {
+        if status != 403 && status != 429 {
+            return false;
+        }
+        let err = match body.get("error") {
+            Some(e) => e,
+            None => return false,
+        };
+        let reason_hits = err
+            .get("details")
+            .and_then(Value::as_array)
+            .map(|ds| {
+                ds.iter().any(|d| {
+                    matches!(
+                        d.get("reason").and_then(Value::as_str),
+                        Some("RATE_LIMIT_EXCEEDED")
+                            | Some("rateLimitExceeded")
+                            | Some("userRateLimitExceeded")
+                    )
+                })
+            })
+            .unwrap_or(false);
+        let domain_hits = err
+            .get("errors")
+            .and_then(Value::as_array)
+            .map(|es| {
+                es.iter()
+                    .any(|e| e.get("domain").and_then(Value::as_str) == Some("usageLimits"))
+            })
+            .unwrap_or(false);
+        reason_hits || domain_hits
     }
 
     fn metadata_url(&self, id: &str, headers: &[&str]) -> String {
@@ -3164,5 +3235,86 @@ mod tests {
         std::fs::write(tokens.join("notes.txt"), "").unwrap();
         assert_eq!(connected_accounts_in(dir.path()), vec!["a@x.com", "b@x.com"]);
         assert!(connected_accounts_in(&dir.path().join("missing")).is_empty());
+    }
+}
+
+/// AMUX-4833: the quota backoff must fire on the shape Gmail actually sends.
+#[cfg(test)]
+mod gmail_rate_limit_tests {
+    use super::*;
+
+    fn real_body() -> Value {
+        serde_json::json!({"error":{"code":403,"details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","domain":"googleapis.com","metadata":{"quota_limit":"defaultPerMinutePerUser","quota_limit_value":"15000","quota_metric":"gmail.googleapis.com/default"},"reason":"RATE_LIMIT_EXCEEDED"}],"errors":[{"domain":"usageLimits","message":"Quota exceeded for quota metric 'Queries'"}]}})
+    }
+
+    /// THE DEFECT THIS FIXES. The retry loop was written for quota pushback and
+    /// matched only 429/503, but Gmail answers rate limiting with HTTP 403 and
+    /// puts the reason in the body. So the backoff that exists to absorb a
+    /// transient limit never fired on the form the API actually uses.
+    #[test]
+    fn gmails_403_rate_limit_is_recognised() {
+        assert!(GmailClient::gmail_rate_limited(403, &real_body()));
+    }
+
+    /// Both spellings Google uses, and the lowerCamel variants from the older
+    /// error format.
+    #[test]
+    fn every_spelling_google_uses_counts() {
+        for reason in ["RATE_LIMIT_EXCEEDED", "rateLimitExceeded", "userRateLimitExceeded"] {
+            let b = serde_json::json!({"error":{"details":[{"reason":reason}]}});
+            assert!(GmailClient::gmail_rate_limited(403, &b), "reason {reason} must count");
+        }
+        // The legacy shape carries no `details`, only `errors[].domain`.
+        let legacy = serde_json::json!({"error":{"errors":[{"domain":"usageLimits","message":"Quota exceeded"}]}});
+        assert!(GmailClient::gmail_rate_limited(403, &legacy));
+    }
+
+    /// STRUCTURE, NOT SUBSTRING. A genuine fault whose text merely mentions a
+    /// quota must not be retried as one; that is the same reasoning
+    /// `oauth_refusal_code` gives for parsing instead of searching.
+    #[test]
+    fn a_fault_that_merely_mentions_a_quota_is_not_a_quota_refusal() {
+        let b = serde_json::json!({"error":{"code":500,"message":"RATE_LIMIT_EXCEEDED usageLimits appeared in a log line"}});
+        assert!(!GmailClient::gmail_rate_limited(500, &b));
+        assert!(!GmailClient::gmail_rate_limited(403, &b), "403 alone is not a rate limit");
+    }
+
+    /// A 403 is ALSO how Gmail says "forbidden". Permission failures must keep
+    /// failing fast instead of burning three backoffs on something that will
+    /// never succeed.
+    #[test]
+    fn an_ordinary_403_is_not_retried() {
+        let forbidden = serde_json::json!({"error":{"code":403,"errors":[{"domain":"global","reason":"forbidden"}],"message":"Insufficient Permission"}});
+        assert!(
+            !GmailClient::gmail_rate_limited(403, &forbidden),
+            "a permission failure is permanent; retrying it wastes the caller's time"
+        );
+    }
+
+    /// The status gate: a 200 carrying quota-shaped JSON is not a refusal.
+    #[test]
+    fn only_403_and_429_can_be_rate_limits() {
+        assert!(!GmailClient::gmail_rate_limited(200, &real_body()));
+        assert!(!GmailClient::gmail_rate_limited(500, &real_body()));
+        assert!(GmailClient::gmail_rate_limited(429, &real_body()));
+    }
+
+    /// THE SHIPPED RETRY DECISION, driven directly. The `api()` loop calls this
+    /// exact function, so dropping the 403 arm reddens here. A predicate-only
+    /// test could not: it never touches the call site where the defect lived.
+    #[test]
+    fn the_retry_decision_covers_gmails_403_and_still_gives_up() {
+        let quota = real_body();
+        assert!(GmailClient::should_retry_upstream(403, &quota, 0), "the original defect");
+        assert!(GmailClient::should_retry_upstream(429, &quota, 0));
+        assert!(GmailClient::should_retry_upstream(503, &serde_json::Value::Null, 0));
+        // A sustained limit must still stop: three backoffs, then error.
+        assert!(
+            !GmailClient::should_retry_upstream(403, &quota, 3),
+            "attempt 3 is the last; retrying forever would hide a sustained quota"
+        );
+        // And a permission 403 fails fast rather than burning the backoffs.
+        let forbidden = serde_json::json!({"error":{"code":403,"errors":[{"domain":"global","reason":"forbidden"}]}});
+        assert!(!GmailClient::should_retry_upstream(403, &forbidden, 0));
     }
 }

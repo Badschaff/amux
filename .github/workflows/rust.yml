@@ -212,6 +212,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with: { node-version: '22' }
+      # AF-932. The `check` job installs tmux (above); this job never did.
+      # The dashboard's own session/fleet code shells out to `tmux
+      # list-sessions` and degrades gracefully (a WARN log, "fleet will read
+      # as not-running") when it is missing — but a golden scenario that
+      # asserts on real running-session state has nothing graceful to show
+      # instead, so the gap surfaced as `element(s) not found` /
+      # `toBeVisible()` failures rather than as this job's own missing step.
+      - name: Install tmux (dashboard session state depends on it)
+        run: command -v tmux >/dev/null || { sudo apt-get update && sudo apt-get install -y tmux; }
       - name: Install Playwright
         # webkit is NOT optional: the ios-safari project (devices['iPhone 15'])
         # is a webkit project, and this job runs EVERY project (no --project
@@ -230,6 +239,8 @@ jobs:
         run: bash scripts/spa-lint.sh
       - name: Dashboard outage recovery contracts
         run: node --test tests/dashboard-outage-recovery.mjs
+      - name: No assignment to an undeclared client-side global (AF-940)
+        run: node --test tests/spa-no-undeclared-global-assignment.test.mjs
       # The CI checkout IS committed HEAD, so serve-head's worktree hop is
       # pure duplicate work here — and worse: without these env vars the
       # prebuild below went to ./target while serve-head defaulted to
