@@ -395,6 +395,31 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
             runtime,
         ));
 
+        // -- 6b. the DEPLOY path is still ticking (AMUX-4809). launchd stopped
+        // firing com.amux.server-rs-builder for 59 consecutive cycles and
+        // NOTHING SAID SO: the log stopped, /health's `commit` quietly stopped
+        // moving, and a human found it an hour later while wondering whether a
+        // fix was live. Every lane's commits stopped deploying for that hour.
+        //
+        // The log's mtime is the signal because it is what the builder touches
+        // every cycle, and it is observable without asking launchd anything.
+        // That matters: `launchctl list` and `launchctl print` returned nothing
+        // for this label AND for com.amux.server-rs while the latter was
+        // definitely running, so a probe built on them cannot produce a
+        // positive and is not evidence either way.
+        //
+        // A stat failure becomes Unknown inside the check, never a pass.
+        let builder_log_age_s = std::fs::metadata(amux_home.join("logs/rust-auto-build.log"))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|d| d.as_secs_f64());
+        out.extend(checks::builder_has_ticked_recently(
+            builder_log_age_s,
+            checks::BUILDER_INTERVAL_S,
+            checks::BUILDER_MAX_INTERVALS,
+        ));
+
         // The helper-model read router is the third consumer of the same
         // installed-script rule. Keeping it here means an uncommitted runtime
         // edit cannot silently change fleet-wide context routing.

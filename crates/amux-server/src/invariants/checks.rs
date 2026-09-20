@@ -668,6 +668,82 @@ fn match_route_full(mounted: &[(&str, &[&str])], method: &str, path: &str) -> Ro
 ///
 /// Pure over (session, conversation) pairs so the real specimen is the test
 /// corpus rather than a fixture.
+/// `StartInterval` in com.amux.server-rs-builder.plist. Named here rather than
+/// spelled at the call site so the threshold and the cadence it is a multiple
+/// of cannot drift apart.
+pub const BUILDER_INTERVAL_S: f64 = 60.0;
+
+/// How many missed cycles before the deploy path is reported stalled. See
+/// [`builder_has_ticked_recently`] for why this is loose rather than tight.
+pub const BUILDER_MAX_INTERVALS: f64 = 10.0;
+
+/// The deploy path is still ticking (AMUX-4809).
+///
+/// launchd stopped firing `com.amux.server-rs-builder` for 59 consecutive
+/// 60-second cycles on 2026-09-18 (12:06 to 13:05), verified by a controlled
+/// test rather than a single read. It recovered on its own about an hour later
+/// and the cause was never established; the usual probes cannot establish it,
+/// because `launchctl list` and `launchctl print` return nothing for this label
+/// AND for `com.amux.server-rs`, which was definitely running at the time. A
+/// probe that answers identically for a known-running agent cannot produce a
+/// positive, so it is not evidence either way.
+///
+/// NOTHING NOTICED, and that is what this check is for. The log simply stopped,
+/// `/health`'s `commit` quietly stopped moving, and the gap was found by a human
+/// wondering whether a fix was live. Every commit by every lane silently stopped
+/// deploying for an hour.
+///
+/// PURE, taking the measured age rather than reading the clock, so both arms are
+/// testable without a filesystem or a stale builder. The caller stats the log.
+///
+/// `None` means the age could not be measured, and that reports
+/// [`Status::Unknown`] with a reason, never a pass. This module's first
+/// principle is that "a probe that could not run reports Unknown, never a
+/// cheerful pass", and a silent empty result would be worse still: an
+/// unexplained absence is indistinguishable from a check nobody wrote.
+///
+/// THRESHOLD IS DELIBERATELY LOOSE. The card suggested "a couple of intervals",
+/// but the builder writes its log around a cargo build that can run for minutes
+/// without emitting a line, so a 2-interval threshold would fire on healthy long
+/// builds. At 10 intervals this still catches the 59-cycle outage in a sixth of
+/// the time it actually took to notice, and a check that cries wolf gets muted,
+/// which is the failure mode that leaves the next outage silent again.
+pub fn builder_has_ticked_recently(
+    log_age_s: Option<f64>,
+    interval_s: f64,
+    max_intervals: f64,
+) -> Vec<InvariantResult> {
+    const ID: &str = "deploy.builder_is_ticking";
+    let Some(age) = log_age_s else {
+        return vec![InvariantResult::unknown(
+            ID,
+            "builder log could not be stat'd, so its age is unobserved",
+        )
+        .entity("server-rs-builder")];
+    };
+    if !age.is_finite() || age < 0.0 || !interval_s.is_finite() || interval_s <= 0.0 {
+        return vec![InvariantResult::unknown(
+            ID,
+            format!("unusable inputs: age={age:?}s interval={interval_s:?}s"),
+        )
+        .entity("server-rs-builder")];
+    }
+    let budget = interval_s * max_intervals;
+    if age <= budget {
+        vec![InvariantResult::pass(ID).entity("server-rs-builder")]
+    } else {
+        vec![InvariantResult::fail(
+            ID,
+            format!("builder log written within {budget:.0}s ({max_intervals:.0} x {interval_s:.0}s interval)"),
+            format!(
+                "last write {age:.0}s ago, about {missed:.0} missed cycle(s); deploys stop silently and /health commit stops moving",
+                missed = age / interval_s
+            ),
+        )
+        .entity("server-rs-builder")]
+    }
+}
+
 pub fn conversations_are_not_shared(pairs: &[(String, String)]) -> Vec<InvariantResult> {
     const ID: &str = "conversation.one_lane_each";
     let mut by: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
@@ -8334,5 +8410,89 @@ mod f64_roundtrip_tests {
     fn no_probes_is_unknown_not_pass() {
         let v = f64_survives_json_roundtrip(&[]);
         assert_eq!(v[0].status, Status::Unknown);
+    }
+}
+
+/// Negative controls for `builder_has_ticked_recently` (AMUX-4809), per this
+/// file's own rule that a check never demonstrated failing is not a valid
+/// health check (AMUX-2624).
+#[cfg(test)]
+mod builder_tick_tests {
+    use super::*;
+
+    const INTERVAL: f64 = 60.0;
+    const MAX: f64 = 10.0;
+
+    /// THE NEGATIVE CONTROL: the real outage, replayed. launchd missed 59
+    /// consecutive 60s cycles on 2026-09-18 and nothing anywhere said so.
+    #[test]
+    fn the_fifty_nine_missed_cycles_are_reported() {
+        let out = builder_has_ticked_recently(Some(59.0 * INTERVAL), INTERVAL, MAX);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].status,
+            Status::Fail,
+            "the outage this check exists for must FAIL it; got {:?}",
+            out[0].status
+        );
+        let seen = format!("{:?}", out[0]);
+        assert!(
+            seen.contains("59") || seen.contains("3540"),
+            "the failure must carry the observed staleness so a reader can act: {seen}"
+        );
+    }
+
+    /// The other arm. Without this, an always-fail implementation passes the
+    /// test above and pages on every healthy tick until someone mutes it.
+    #[test]
+    fn a_builder_that_just_ticked_is_quiet() {
+        for age in [0.0, 1.0, INTERVAL, INTERVAL * (MAX - 0.1)] {
+            let out = builder_has_ticked_recently(Some(age), INTERVAL, MAX);
+            assert_eq!(out.len(), 1);
+            assert_eq!(
+                out[0].status,
+                Status::Pass,
+                "age {age}s is within {MAX} x {INTERVAL}s and must not fire"
+            );
+        }
+    }
+
+    /// A long cargo build can leave the log untouched for minutes. The
+    /// threshold is loose ON PURPOSE, because a check that cries wolf gets
+    /// muted and the next outage is silent again.
+    #[test]
+    fn a_slow_build_just_under_the_budget_does_not_fire() {
+        let just_under = INTERVAL * MAX - 1.0;
+        assert_eq!(
+            builder_has_ticked_recently(Some(just_under), INTERVAL, MAX)[0].status,
+            Status::Pass
+        );
+        let just_over = INTERVAL * MAX + 1.0;
+        assert_eq!(
+            builder_has_ticked_recently(Some(just_over), INTERVAL, MAX)[0].status,
+            Status::Fail,
+            "the boundary must be a boundary, not a suggestion"
+        );
+    }
+
+    /// Unmeasured is not healthy. A missing log is exactly the state a
+    /// never-started builder leaves behind, and reporting Pass for it would
+    /// make this check assert the thing it cannot see.
+    #[test]
+    fn an_unmeasurable_log_is_unknown_not_pass() {
+        for bad in [None, Some(f64::NAN), Some(-1.0)] {
+            let out = builder_has_ticked_recently(bad, INTERVAL, MAX);
+            assert_eq!(out.len(), 1, "an unmeasured probe must still SAY so");
+            assert_eq!(
+                out[0].status,
+                Status::Unknown,
+                "input {bad:?} is unobserved, and Unknown is not Pass"
+            );
+        }
+        assert_eq!(
+            builder_has_ticked_recently(Some(10.0), 0.0, MAX)[0].status,
+            Status::Unknown,
+            "a zero interval cannot produce a budget, so it is unmeasured"
+        );
     }
 }
