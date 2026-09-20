@@ -3828,6 +3828,7 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             "worktree_integration": crate::fanout_workspace::integration_status(&home, &name),
             "ephemeral": env.get("CC_EPHEMERAL").map(|v| v == "1").unwrap_or(false),
             "ephemeral_parent": env.get("CC_PARENT").cloned().unwrap_or_default(),
+            "orchestrator": env.get("CC_ORCHESTRATOR").is_some_and(|v| v == "1"),
             "mcp": env.get("CC_MCP").cloned().unwrap_or_default(),
             "session_created": session_created,
             "last_activity": last_activity,

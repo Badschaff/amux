@@ -3756,7 +3756,7 @@ fn extract_model_from_flags(flags: &str) -> String {
 
 const MODEL_ID_MAX_LEN: usize = 100;
 
-fn validate_model_name(value: &Value) -> Result<String, String> {
+pub(crate) fn validate_model_name(value: &Value) -> Result<String, String> {
     let Some(s) = value.as_str() else { return Err("model must be a string".into()) };
     let normalized = s.trim().to_string();
     if normalized.chars().count() > MODEL_ID_MAX_LEN {
@@ -3996,7 +3996,7 @@ fn effort_is_model_derived(provider: &str) -> bool {
 /// map. A resolver bound to one parser's type is a resolver the other caller
 /// cannot share, and not sharing it is what AMUX-4728 is (`fleet_roster`
 /// resolved the model for the one provider nobody runs).
-fn configured_model_for(provider: &str, cc_model: &str, cc_flags: &str) -> String {
+pub(crate) fn configured_model_for(provider: &str, cc_model: &str, cc_flags: &str) -> String {
     configured_model_with_default(
         provider,
         cc_model,
@@ -19277,6 +19277,13 @@ pub(crate) fn memory_post_verb(name: &str, body: &Value) -> Response {
         write_claude_memory(name, &wd);
     }
     j200(json!({"ok": true}))
+}
+
+/// Seed a role prompt without overwriting instructions edited by the owner.
+pub(crate) fn set_initial_instructions(name: &str, instructions: &str) {
+    if meta_str(&load_meta(name), "instructions").trim().is_empty() {
+        update_meta(name, &[("instructions", json!(instructions))]);
+    }
 }
 
 /// `instructions` as a callable verb, extracted for the promoted

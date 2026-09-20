@@ -620,20 +620,26 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <span class="launch-caret" id="launch-caret">&#x25B6;</span>
     </div>
     <div class="launch-body" id="launch-body" style="display:none;">
-      <textarea id="launch-input" class="input launch-textarea" placeholder="Type priorities, one per line:&#10;1. Consolidate GKE clusters to zero budget&#10;2. Search parity with browser validation&#10;3. Single Docker image of full platform" rows="4" spellcheck="false"></textarea>
+      <textarea id="launch-input" class="input launch-textarea" oninput="_launchInputChanged()" placeholder="Type priorities, one per line:&#10;1. Consolidate GKE clusters to zero budget&#10;2. Search parity with browser validation&#10;3. Single Docker image of full platform" rows="4" spellcheck="false"></textarea>
+      <label class="launch-workspace">Workspace from<select id="launch-session" class="input" onchange="_saveLaunchDraft()"><option value="">Choose a worker workspace…</option></select></label>
+      <div class="launch-roles">
+        <fieldset class="launch-role"><legend>Orchestrator</legend><p>One coordinating worker owns the epic, answers questions, and checks the combined outcome.</p>
+          <div class="launch-profile-fields">
+            <label>Provider<select id="launch-orchestrator-provider" class="input" onchange="_launchProviderChanged('orchestrator')"><option value="claude">Claude</option><option value="codex">Codex</option><option value="gemini">Gemini</option><option value="ollama">Ollama</option><option value="muse">Muse</option></select></label>
+            <label>Model<input id="launch-orchestrator-model" class="input" value="opus" list="launch-orchestrator-models" placeholder="Provider default" oninput="_saveLaunchDraft()" autocomplete="off" spellcheck="false"><datalist id="launch-orchestrator-models"></datalist></label>
+          </div>
+        </fieldset>
+        <fieldset class="launch-role"><legend>Fan-out workers</legend><p>Each worker owns its board and worktree, and reports to the orchestrator.</p>
+          <div class="launch-profile-fields">
+            <label>Provider<select id="launch-worker-provider" class="input" onchange="_launchProviderChanged('worker')"><option value="claude">Claude</option><option value="codex">Codex</option><option value="gemini">Gemini</option><option value="ollama">Ollama</option><option value="muse">Muse</option></select></label>
+            <label>Model<input id="launch-worker-model" class="input" value="haiku" list="launch-worker-models" placeholder="Provider default" oninput="_saveLaunchDraft()" autocomplete="off" spellcheck="false"><datalist id="launch-worker-models"></datalist></label>
+          </div>
+        </fieldset>
+      </div>
+      <details id="launch-overrides"><summary>Customize individual workers</summary><div id="launch-worker-profiles"></div></details>
       <div class="launch-controls">
-        <select id="launch-model" class="input" style="width:auto;min-height:36px;">
-          <option value="opus">Opus</option>
-          <option value="sonnet">Sonnet</option>
-          <option value="haiku">Haiku</option>
-        </select>
-        <select id="launch-provider" class="input" style="width:auto;min-height:36px;">
-          <option value="claude">Claude</option>
-        </select>
-        <select id="launch-session" class="input" style="width:auto;min-height:36px;">
-          <option value="">Orchestrator (self)</option>
-        </select>
-        <button class="btn primary" id="launch-btn" onclick="_launchFanOut()">Launch</button>
+        <button class="btn primary" id="launch-btn" onclick="_launchFanOut()">Launch orchestration</button>
+        <button class="btn" id="launch-new" onclick="_resetLaunchRequest()" hidden>New priorities</button>
       </div>
       <div class="launch-status" id="launch-status" style="display:none;"></div>
     </div>

@@ -3501,3 +3501,14 @@ CARD: CLA-4
 SYMPTOM: test-priority acknowledged Verified while its evidence still said push/CI pending. Its feature commit was not an ancestor of origin/main and the workspace had no creation base or integration receipt. The board accepted a textual assertion that contradicted the known artifact state.
 COST: A live terminal count overstated actual completion; dependent work could consume an unintegrated outcome. Requiring the whole board before integration would also deadlock a successor waiting for a verified prerequisite.
 FIX: Share a current-head/clean-worktree/integration-receipt check across Verified creation and transition, bind the async observation to the card revision/owner, and log fanout_verification_requires_integration. Integrate evidenced prerequisites before queued successors using the shared WIP predicate; active implementation and unevidenced review still refuse. Exercise real disposable Git integration and stale/dirty/missing-receipt controls through the API.
+
+## Orchestration launch has no coordinating worker or independent fan-out model profiles
+AREA: board
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-19
+SESSION: codex-lifecycle-adherence
+CARD: CLA-5
+SYMPTOM: The launch form offered one shared provider/model pair and an Orchestrator (self) workspace selector. A launch created child workers without a dedicated coordinator profile; the user could not select distinct coordinator and fan-out models or see those roles in Orchestrations.
+COST: One user-reported orchestration workflow blocked; coordinator ownership and model choices required manual worker setup.
+FIX: CLA-5 creates a coordinating worker using the existing worker/epic primitives, separates role profiles and per-child overrides, preserves exact retry intent, and records coordinator provision/start verdicts. Browser/API validation and live deployment tracked on the card.

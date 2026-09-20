@@ -797,10 +797,13 @@ async fn retry_does_not_restart_existing_children_of_a_paused_parent() {
     let parent_before=std::fs::read_to_string(&parent_path).unwrap();
     std::fs::write(parent_path,format!("{parent_before}\nCC_PAUSED=1\n")).unwrap();
     let (status,_,retry)=send(&r.app,"POST","/api/board/launch",Some(request),&[("x-amux-session","paused-parent")]).await;
-    assert_eq!(status,StatusCode::CREATED,"{retry}");
-    assert_eq!(retry["epic"],first["epic"]);
-    assert!(retry["failed"][0]["error"].as_str().unwrap().contains("parent worker is paused"));
+    assert_eq!(status,StatusCode::CONFLICT,"{retry}");
+    assert!(retry["error"].as_str().unwrap().contains("workspace worker is paused"));
     assert_eq!(std::fs::read_to_string(child_path).unwrap(),child_before);
+    let epic=get_card(&r.app,first["epic"].as_str().unwrap()).await;
+    assert_eq!(epic["session"],"paused-parent");
+    let (_,_,board)=send(&r.app,"GET","/api/board/orchestrations",None,&[]).await;
+    assert_eq!(board["cards"].as_array().unwrap().len(),2,"{board}");
 }
 
 #[tokio::test]
@@ -882,4 +885,132 @@ async fn verified_requires_the_current_clean_fanout_head_to_be_integrated() {
     assert_eq!(body["code"],"fanout_verification_requires_integration");
     let ordinary=create(&r.app,json!({"title":"Ordinary worker outcome", "session":"ordinary","status":"verified","type":"research"})).await;
     assert_eq!(ordinary["status"],"verified","ordinary worker gates remain independent of fan-out integration");
+}
+
+#[tokio::test]
+async fn launch_has_a_real_coordinator_and_independent_child_profiles() {
+    let r=rig().await;
+    write_parent_env(&r.home,"workspace");
+    let request=json!({"title":"Ship independent outcomes","parent_session":"workspace",
+        "orchestrator":{"provider":"codex","model":"gpt-5"},
+        "provider":"claude","model":"haiku",
+        "priorities":["Repair parser",{"text":"Check rendered output","profile":{"provider":"gemini","model":"gemini-2.5-flash"}},
+            {"text":"Review data contracts","profile":{"model":"sonnet"}}]});
+    let (status,_,result)=send(&r.app,"POST","/api/board/launch",Some(request.clone()),&[("x-amux-session","workspace")]).await;
+    assert_eq!(status,StatusCode::CREATED,"{result}");
+    let coordinator=result["orchestrator"]["name"].as_str().unwrap();
+    assert_ne!(coordinator,"workspace");
+    assert_eq!(result["orchestrator"]["profile"]["provider"],"codex");
+    assert_eq!(result["orchestrator"]["profile"]["model"],"gpt-5");
+    // The process-isolated fixture refuses actual provider starts, but still
+    // exercises durable creation and reports coordinator failure explicitly.
+    assert_eq!(result["orchestrator"]["started"],false);
+    assert!(result["orchestrator"]["error"].as_str().is_some());
+    let env=read_env_file(&r.home,coordinator);
+    assert_eq!(env["CC_ORCHESTRATOR"],"1");
+    assert!(!env.contains_key("CC_EPHEMERAL"));
+    assert!(env["CC_FLAGS"].contains("--model gpt-5"));
+    let epic=get_card(&r.app,result["epic"].as_str().unwrap()).await;
+    assert_eq!(epic["session"],coordinator);
+    let (status,_,instructions)=send(&r.app,"GET",&format!("/api/sessions/{coordinator}/instructions"),None,&[]).await;
+    assert_eq!(status,StatusCode::OK);
+    assert!(instructions["instructions"].as_str().unwrap().contains(epic["id"].as_str().unwrap()));
+    for (i,(provider,model)) in [("claude","haiku"),("gemini","gemini-2.5-flash"),("claude","sonnet")].iter().enumerate() {
+        let row=&result["children"][i];
+        let name=row["worker"].as_str().unwrap();
+        assert_ne!(name,coordinator);
+        let e=read_env_file(&r.home,name);
+        assert_eq!(e["CC_PARENT"],coordinator);
+        assert_eq!(e["CC_EPHEMERAL"],"1");
+        assert_eq!(e["CC_WORKTREE"],"1");
+        assert_eq!(e["CC_PROVIDER"],*provider);
+        assert!(e["CC_FLAGS"].contains(&format!("--model {model}")),"{e:?}");
+        assert_eq!(row["profile"]["model"],*model);
+        let child=get_card(&r.app,row["id"].as_str().unwrap()).await;
+        assert_eq!(child["callback"]["session"],coordinator);
+        assert_eq!(child["depends_on"],json!([]));
+        let (_,_,instructions)=send(&r.app,"GET",&format!("/api/sessions/{name}/instructions"),None,&[]).await;
+        assert!(instructions["instructions"].as_str().unwrap().contains(&format!("amux send {coordinator} --no-board")));
+    }
+    let own_followup=create(&r.app,json!({"title":"Verify combined outcomes","session":coordinator,"type":"research"})).await;
+    let (status,_,projection)=send(&r.app,"GET","/api/board/orchestrations",None,&[]).await;
+    assert_eq!(status,StatusCode::OK);
+    assert!(projection["workers"].as_array().unwrap().iter().any(|w|w["name"]==coordinator && w["role"]=="orchestrator" && w["profile"]["model"]=="gpt-5"));
+    assert!(projection["cards"].as_array().unwrap().iter().any(|c|c["id"]==own_followup["id"]));
+    assert!(!projection["ephemeral_workers"].as_array().unwrap().iter().any(|w|w==coordinator));
+    let (status,_,retry)=send(&r.app,"POST","/api/board/launch",Some(request),&[("x-amux-session","workspace")]).await;
+    assert_eq!(status,StatusCode::CREATED,"{retry}");
+    assert_eq!(retry["idempotent"],true);
+    assert_eq!(retry["orchestrator"]["name"],coordinator);
+    assert_eq!(retry["children"],result["children"]);
+    assert_eq!(retry["epic"],result["epic"]);
+}
+
+#[tokio::test]
+async fn concurrent_launch_and_retry_after_completion_reuse_one_orchestration() {
+    let r=rig().await;
+    write_parent_env(&r.home,"workspace");
+    let request=json!({"launch_id":"one-request","parent_session":"workspace","orchestrator":{"model":"opus"},"priorities":["Verify output"]});
+    let (first,second)=tokio::join!(
+        send(&r.app,"POST","/api/board/launch",Some(request.clone()),&[("x-amux-session","workspace")]),
+        send(&r.app,"POST","/api/board/launch",Some(request.clone()),&[("x-amux-session","workspace")])
+    );
+    assert_eq!(first.0,StatusCode::CREATED,"{}",first.2);
+    assert_eq!(second.0,StatusCode::CREATED,"{}",second.2);
+    assert_eq!(first.2["epic"],second.2["epic"]);
+    assert_eq!(first.2["children"],second.2["children"]);
+    // Seed a completed, renamed fixture graph, then retry its lost launch receipt.
+    // Completion/gate admission is covered by the integration test above.
+    let db=rusqlite::Connection::open(r._dir.path().join("fan-out-test.db")).unwrap();
+    db.execute("UPDATE issues SET status='verified',title='Verified output',desc='Final outcome evidence'",[]).unwrap();
+    let (status,_,retry)=send(&r.app,"POST","/api/board/launch",Some(request.clone()),&[("x-amux-session","workspace")]).await;
+    assert_eq!(status,StatusCode::CREATED,"{retry}");
+    assert_eq!(retry["epic"],first.2["epic"]);
+    assert_eq!(retry["complete"],true);
+    assert_eq!(retry["workers_started"],0);
+    assert_eq!(retry["workers_failed"],0);
+    assert_eq!(retry["orchestrator"]["started"],false);
+    assert_eq!(db.query_row("SELECT count(*) FROM issues",[],|r|r.get::<_,i64>(0)).unwrap(),2);
+    // An explicit new launch with identical text is still a distinct intent.
+    let mut fresh=request;
+    fresh["launch_id"]=json!("new-request");
+    let (status,_,next)=send(&r.app,"POST","/api/board/launch",Some(fresh),&[("x-amux-session","workspace")]).await;
+    assert_eq!(status,StatusCode::CREATED,"{next}");
+    assert_ne!(next["epic"],first.2["epic"]);
+    assert_ne!(next["orchestrator"]["name"],first.2["orchestrator"]["name"]);
+}
+
+#[tokio::test]
+async fn coordinator_retry_preserves_paused_state_and_does_not_create_more_cards() {
+    let r=rig().await;
+    write_parent_env(&r.home,"workspace");
+    let request=json!({"parent_session":"workspace","orchestrator":{"model":"opus"},"priorities":["Verify output"]});
+    let (_,_,first)=send(&r.app,"POST","/api/board/launch",Some(request.clone()),&[("x-amux-session","workspace")]).await;
+    let name=first["orchestrator"]["name"].as_str().unwrap();
+    let path=r.home.join("sessions").join(format!("{name}.env"));
+    let saved=format!("{}\nCC_PAUSED=1\nCC_FLAGS='--model sonnet'\n",std::fs::read_to_string(&path).unwrap());
+    std::fs::write(&path,&saved).unwrap();
+    let epic=get_card(&r.app,first["epic"].as_str().unwrap()).await;
+    let (status,_,result)=send(&r.app,"POST","/api/board/launch",Some(request),&[("x-amux-session","workspace")]).await;
+    assert_eq!(status,StatusCode::CONFLICT,"{result}");
+    assert_eq!(result["code"],"orchestrator_provision_refused");
+    assert_eq!(std::fs::read_to_string(path).unwrap(),saved);
+    assert_eq!(get_card(&r.app,epic["id"].as_str().unwrap()).await["rev"],epic["rev"]);
+    let (_,_,projection)=send(&r.app,"GET","/api/board/orchestrations",None,&[]).await;
+    assert_eq!(projection["cards"].as_array().unwrap().len(),2);
+}
+
+#[tokio::test]
+async fn invalid_role_profiles_refuse_before_any_worker_or_card_is_created() {
+    let r=rig().await;
+    write_parent_env(&r.home,"workspace");
+    for bad in [json!({"provider":"iterm2"}),json!({"model":"opus; touch bad"}),json!({"model":"--help"}),json!({"flags":"--model sonnet"})] {
+        let (status,_,result)=send(&r.app,"POST","/api/board/launch",Some(json!({
+            "parent_session":"workspace","orchestrator":{},"priorities":[{"text":"Verify parser","profile":bad}]
+        })),&[("x-amux-session","workspace")]).await;
+        assert_eq!(status,StatusCode::BAD_REQUEST,"{result}");
+    }
+    assert_eq!(std::fs::read_dir(r.home.join("sessions")).unwrap().filter_map(Result::ok).filter(|f|f.path().extension().is_some_and(|e|e=="env")).count(),1);
+    let (_,_,projection)=send(&r.app,"GET","/api/board/orchestrations",None,&[]).await;
+    assert_eq!(projection["cards"],json!([]));
 }

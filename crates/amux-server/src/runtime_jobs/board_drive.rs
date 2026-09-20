@@ -2300,6 +2300,10 @@ fn child_terminal_for_epic(conn: &Connection, id: &str) -> bool {
 }
 
 fn epic_completion_candidates(conn: &Connection) -> Vec<(String, Vec<(String, String)>)> {
+    epic_completion_candidates_at(conn, &crate::config::amux_home())
+}
+
+fn epic_completion_candidates_at(conn: &Connection, home: &std::path::Path) -> Vec<(String, Vec<(String, String)>)> {
     let epic_ids = conn
         .prepare(
             "SELECT id FROM issues WHERE type='epic' AND deleted IS NULL \
@@ -2326,20 +2330,47 @@ fn epic_completion_candidates(conn: &Connection) -> Vec<(String, Vec<(String, St
                     .map(|rows| rows.flatten().collect::<Vec<_>>())
                 })
                 .unwrap_or_default();
-            if let Ok(Some(root))=bs::get_issue(conn,&epic) {
-                for id in root.depends_on {
-                    if !children.iter().any(|(child,_)|child==&id) {
-                        let status=bs::get_issue(conn,&id).ok().flatten().map(|c|c.status).unwrap_or_else(||"missing".into());
-                        children.push((id,status));
+            let root = bs::get_issue(conn, &epic).ok().flatten()?;
+            for id in &root.depends_on {
+                if !children.iter().any(|(child,_)|child==id) {
+                    let status=bs::get_issue(conn,id).ok().flatten().map(|c|c.status).unwrap_or_else(||"missing".into());
+                    children.push((id.clone(),status));
+                }
+            }
+            if children.is_empty() || !children.iter().all(|(id, _)| child_terminal_for_epic(conn, id))
+                || !deps_blocking(conn, &root).is_empty() { return None; }
+
+            // Progress and completion cover the same owned boards. Follow-up
+            // work need not be manually linked to the original assignment.
+            // Ordinary parent workers may own unrelated work; only dedicated
+            // coordinators contribute their entire board to this orchestration.
+            let read_role = |name: &str| {
+                let path = home.join("sessions").join(format!("{name}.env"));
+                crate::config::parse_env_file(&if path.exists() { path } else { path.with_extension("env.reaped") })
+            };
+            let mut owners = std::collections::BTreeSet::new();
+            if let Some(owner) = root.session.as_deref() {
+                if read_role(owner).get("CC_ORCHESTRATOR").is_some_and(|v| v == "1") {
+                    owners.insert(owner.to_string());
+                }
+                let mut stmt = conn.prepare("SELECT DISTINCT session FROM issues WHERE epic=?1 AND deleted IS NULL AND COALESCE(archived,0)=0 AND session IS NOT NULL").ok()?;
+                let assigned = stmt.query_map([&epic], |r| r.get::<_,String>(0)).ok()?.collect::<rusqlite::Result<Vec<_>>>().ok()?;
+                for name in assigned {
+                    let env = read_role(&name);
+                    if env.get("CC_EPHEMERAL").is_some_and(|v| v == "1") && env.get("CC_PARENT").is_some_and(|v| v == owner) {
+                        owners.insert(name);
                     }
                 }
             }
-            (!children.is_empty()
-                && children
-                    .iter()
-                    .all(|(id, _)| child_terminal_for_epic(conn, id))
-                && bs::get_issue(conn, &epic).ok().flatten().is_some_and(|root| deps_blocking(conn, &root).is_empty()))
-            .then_some((epic, children))
+            for owner in owners {
+                let mut stmt = conn.prepare("SELECT id,status,COALESCE(type,'code') FROM issues WHERE session=?1 AND deleted IS NULL AND COALESCE(archived,0)=0 AND COALESCE(type,'code')!='epic' ORDER BY created,id").ok()?;
+                let work = stmt.query_map([&owner], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).ok()?.collect::<rusqlite::Result<Vec<_>>>().ok()?;
+                for (id, status, kind) in work {
+                    if !bs::execution_is_terminal(&status, &kind) { return None; }
+                    if !children.iter().any(|(child,_)| child == &id) { children.push((id,status)); }
+                }
+            }
+            Some((epic, children))
         })
         .collect()
 }
@@ -2432,7 +2463,7 @@ pub(crate) async fn complete_finished_epics(state: &AppState) -> usize {
                 target: "amux::board_drive",
                 %epic,
                 %children,
-                "board_drive: completed epic — every linked child is terminal"
+                "board_drive: completed epic — required outcomes and owned execution tasks are terminal"
             );
         }
     }
@@ -2442,6 +2473,34 @@ pub(crate) async fn complete_finished_epics(state: &AppState) -> usize {
 #[cfg(test)]
 mod epic_completion_unit_tests {
     use super::*;
+
+    #[test]
+    fn orchestration_waits_for_unlinked_coordinator_and_child_work() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("coordinator.env"), "CC_ORCHESTRATOR=1\n").unwrap();
+        std::fs::write(sessions.join("child.env.reaped"), "CC_EPHEMERAL=1\nCC_PARENT=coordinator\n").unwrap();
+        let conn = crate::db::migrate::test_memdb();
+        conn.execute_batch("INSERT INTO issues(id,title,status,type,session,epic,created,updated) VALUES
+            ('E','Outcome','doing','epic','coordinator',NULL,1,1),
+            ('A','Assignment','verified','code','child','E',1,1),
+            ('B','Child follow-up','backlog','code','child',NULL,1,1),
+            ('C','Combined verification','todo','research','coordinator',NULL,1,1),
+            ('D','Unrelated work','doing','code','unrelated',NULL,1,1);").unwrap();
+        assert!(epic_completion_candidates_at(&conn,home.path()).is_empty());
+        conn.execute("UPDATE issues SET status='verified' WHERE id='B'",[]).unwrap();
+        assert!(epic_completion_candidates_at(&conn,home.path()).is_empty(), "coordinator still owns work");
+        conn.execute("UPDATE issues SET status='done' WHERE id='C'",[]).unwrap();
+        let candidates = epic_completion_candidates_at(&conn,home.path());
+        assert_eq!(candidates.len(),1);
+        assert_eq!(candidates[0].1.len(),3);
+        // An existing parent with its own independent backlog is not a dedicated
+        // coordinator. Its unrelated work does not become a new execution gate.
+        std::fs::write(sessions.join("coordinator.env"), "CC_PROVIDER=claude\n").unwrap();
+        conn.execute("UPDATE issues SET status='todo' WHERE id='C'",[]).unwrap();
+        assert_eq!(epic_completion_candidates_at(&conn,home.path()).len(),1);
+    }
 
     #[test]
     fn epic_completes_only_after_every_child_is_terminal() {
@@ -4395,8 +4454,12 @@ fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String
         row.id, row.id
     ));
     prompt.push_str(&format!("\n\n[approval policy] Allowed Needs You categories: {}. Make ordinary implementation choices. Resolve operational prerequisites yourself within existing authority.", bs::approval_types(Some(session)).join(", ")));
-    if crate::api::session_verbs::parse_env(session).get("CC_EPHEMERAL") == Some("1") {
-        prompt.push_str("\n\n[fan-out workspace] Own the entire board in your dedicated amux/fanout branch. Preserve the worktree across pauses. Resolve implementation dependencies locally and never create a task on another worker board. Commit your changes and record test evidence; configure CC_WORKTREE_VERIFY with the appropriate repository verification command. When the complete board is implemented (Review/Done with evidence), the harness merges an isolated candidate, runs those checks, and pushes main without changing the shared checkout. Resolve returned conflicts/check failures yourself; keep driving to the resolved terminal gates. Only actual spend/customer-outbound authorization remains an approval.");
+    let role_env = crate::api::session_verbs::parse_env(session);
+    if role_env.get("CC_EPHEMERAL") == Some("1") {
+        if let Some(parent) = role_env.get("CC_PARENT") {
+            prompt.push_str(&format!("\n\n[orchestration] Your orchestrator is {parent}. For conflicting requirements or direction, send one concise question with this card ID and your attempted remedies using `amux send {parent} --no-board --stdin`; continue independent work. This is guidance, not an outside dependency or mandatory sign-off."));
+        }
+        prompt.push_str("\n\n[fan-out workspace] Own the entire board in your dedicated amux/fanout branch. Preserve the worktree across pauses. Resolve implementation dependencies locally and never create a task on another worker board. Commit your changes and record test evidence; configure CC_WORKTREE_VERIFY with the appropriate repository verification command. When completed outcomes have evidence and no implementation is active, the harness merges an isolated candidate, runs those checks, and pushes main without changing the shared checkout. Resolve returned conflicts/check failures yourself; keep driving to the resolved terminal gates. Only actual spend/customer-outbound authorization remains an approval.");
     }
     if let Some(next) = row.next_action.as_deref().filter(|v| !v.is_empty()) {
         prompt.push_str(&format!("\nNext action: {}", quoted_card_text(next, &row.id)));

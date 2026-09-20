@@ -11543,7 +11543,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.997';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.998';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -32286,6 +32286,14 @@ async function deleteBoardItem(id) {
 }
 
 // ── Launch bar: auto fan-out from typed priorities ──
+// Launch configuration is a durable draft. A retry uses the exact accepted
+// request, so a network timeout cannot silently create a second coordinator.
+let _launchRestored = false;
+let _launchPending = null;
+let _launchBusy = false;
+let _launchOverrides = {};
+const _launchProviders = {claude:'Claude',codex:'Codex',gemini:'Gemini',ollama:'Ollama',muse:'Muse'};
+
 function _toggleLaunchBar() {
   const body = document.getElementById('launch-body');
   const caret = document.getElementById('launch-caret');
@@ -32293,83 +32301,145 @@ function _toggleLaunchBar() {
   const open = body.style.display !== 'none';
   body.style.display = open ? 'none' : '';
   if (caret) caret.classList.toggle('open', !open);
-  if (!open) _populateLaunchSessions();
+  if (!open) {
+    _restoreLaunchDraft();
+    _populateLaunchSessions();
+    ['orchestrator','worker'].forEach(_launchLoadModels);
+    _renderLaunchOverrides();
+    _launchControlsState();
+  }
 }
 
 function _populateLaunchSessions() {
   const sel = document.getElementById('launch-session');
   if (!sel) return;
-  const sess = typeof sessions !== 'undefined' ? sessions : [];
-  const opts = ['<option value="">Orchestrator (self)</option>'];
-  sess.filter(s => s.running && !s.ephemeral && !s.archived).forEach(s => {
-    opts.push('<option value="' + esc(s.name) + '">' + esc(s.name) + '</option>');
-  });
-  sel.innerHTML = opts.join('');
+  const current = sel.value || sel.dataset.saved || '';
+  const eligible = (typeof sessions !== 'undefined' ? sessions : []).filter(s => !s.ephemeral && !s.orchestrator && !s.archived && !s.isolated && s.lifecycle !== 'paused' && s.lifecycle !== 'archived');
+  sel.innerHTML = '<option value="">Choose a worker workspace…</option>' + eligible.map(s => '<option value="'+esc(s.name)+'">'+esc(s.name)+(s.dir ? ' · '+esc(s.dir) : '')+'</option>').join('');
+  if (_launchPending && current && !eligible.some(s=>s.name===current)) sel.add(new Option(current+' (saved launch workspace)',current));
+  sel.value = eligible.some(s=>s.name===current) || _launchPending ? current : '';
 }
 
 function _parsePriorities(text) {
-  return text.split('\n')
-    .map(line => line.replace(/^\s*[\d]+[.):\-]\s*/, '').replace(/^\s*[-*+]\s*/, '').trim())
-    .filter(line => line.length > 0);
+  return text.split('\n').map(line => line.replace(/^\s*[\d]+[.):\-]\s*/, '').replace(/^\s*[-*+]\s*/, '').trim()).filter(Boolean);
+}
+
+function _launchLines() {
+  const occurrences = new Map();
+  return _parsePriorities(document.getElementById('launch-input').value).map(text => {
+    const n = occurrences.get(text) || 0; occurrences.set(text,n+1);
+    return {text,key:JSON.stringify([text,n])};
+  });
+}
+
+function _saveLaunchDraft() {
+  const fields = {};
+  ['input','session','orchestrator-provider','orchestrator-model','worker-provider','worker-model'].forEach(id => { fields[id] = document.getElementById('launch-'+id)?.value || ''; });
+  try { localStorage.setItem('amux_launch_roles_v1',JSON.stringify({fields,overrides:_launchOverrides,pending:_launchPending})); } catch (_) {}
+}
+
+function _restoreLaunchDraft() {
+  if (_launchRestored) return;
+  _launchRestored = true;
+  try {
+    const d = JSON.parse(localStorage.getItem('amux_launch_roles_v1') || '{}');
+    for (const id of ['input','session','orchestrator-provider','orchestrator-model','worker-provider','worker-model']) {
+      const el = document.getElementById('launch-'+id);
+      if (el && typeof d.fields?.[id] === 'string') { el.value=d.fields[id]; if (id==='session') el.dataset.saved=d.fields[id]; }
+    }
+    _launchOverrides = d.overrides && typeof d.overrides==='object' ? d.overrides : {};
+    _launchPending = d.pending && Array.isArray(d.pending.priorities) && d.pending.orchestrator ? d.pending : null;
+  } catch (_) {}
+}
+
+async function _launchLoadModels(role) {
+  const provider = document.getElementById('launch-'+role+'-provider').value;
+  const list = document.getElementById('launch-'+role+'-models');
+  try {
+    const models = await _workerModelsFor(provider);
+    if (document.getElementById('launch-'+role+'-provider').value !== provider) return;
+    list.innerHTML = models.map(m=>'<option value="'+esc(m.id)+'"></option>').join('');
+  } catch (_) { list.innerHTML=''; } // An open model ID remains usable if discovery is down.
+}
+function _launchProviderChanged(role) {
+  document.getElementById('launch-'+role+'-model').value='';
+  _launchLoadModels(role); _saveLaunchDraft();
+}
+function _launchInputChanged() { _renderLaunchOverrides(); _saveLaunchDraft(); }
+function _renderLaunchOverrides() {
+  const host=document.getElementById('launch-worker-profiles');
+  if (!host) return;
+  host.innerHTML=_launchLines().slice(0,20).map((line,i)=>{
+    const profile=_launchOverrides[line.key] || {};
+    return '<div class="launch-worker-profile" data-key="'+esc(line.key)+'"><p>'+esc(line.text)+'</p><div class="launch-profile-fields">'
+      +'<label>Provider<select class="input" id="launch-override-provider-'+i+'" onchange="_launchOverrideChanged('+i+',true)"><option value="">Default</option>'
+      +Object.entries(_launchProviders).map(([key,label])=>'<option value="'+key+'"'+(profile.provider===key?' selected':'')+'>'+label+'</option>').join('')+'</select></label>'
+      +'<label>Model<input class="input" id="launch-override-model-'+i+'" value="'+esc(profile.model || '')+'" placeholder="Fan-out / provider default" oninput="_launchOverrideChanged('+i+')" spellcheck="false"></label></div></div>';
+  }).join('') || '<p>Add priorities above to configure individual workers.</p>';
+  _launchControlsState();
+}
+function _launchOverrideChanged(index, providerChanged=false) {
+  const provider=document.getElementById('launch-override-provider-'+index);
+  const model=document.getElementById('launch-override-model-'+index);
+  if (providerChanged) model.value='';
+  const key=provider.closest('.launch-worker-profile').dataset.key;
+  _launchOverrides[key]={...(provider.value ? {provider:provider.value} : {}),...(model.value.trim() ? {model:model.value.trim()} : {})};
+  _saveLaunchDraft();
+}
+function _launchControlsState() {
+  const locked=_launchBusy || !!_launchPending;
+  document.querySelectorAll('#launch-body input,#launch-body select,#launch-body textarea').forEach(el=>{el.disabled=locked;});
+  const btn=document.getElementById('launch-btn');
+  btn.disabled=_launchBusy;
+  btn.textContent=_launchBusy ? 'Launching…' : (_launchPending ? 'Retry launch' : 'Launch orchestration');
+  const reset=document.getElementById('launch-new');
+  reset.hidden=!_launchPending; reset.disabled=_launchBusy;
+}
+function _resetLaunchRequest() {
+  _launchPending=null; _launchOverrides={};
+  document.getElementById('launch-input').value='';
+  _renderLaunchOverrides(); _saveLaunchDraft(); _launchControlsState();
 }
 
 async function _launchFanOut() {
-  const input = document.getElementById('launch-input');
-  const model = document.getElementById('launch-model');
-  const provider = document.getElementById('launch-provider');
-  const session = document.getElementById('launch-session');
-  const statusEl = document.getElementById('launch-status');
-  const btn = document.getElementById('launch-btn');
-  if (!input || !input.value.trim()) { showToast('Type at least one priority'); return; }
-
-  const lines = _parsePriorities(input.value);
-  if (lines.length < 1) { showToast('Could not parse any priorities from input'); return; }
-
-  const orchSession = session && session.value ? session.value : (typeof peekSession !== 'undefined' ? peekSession : '');
-  const modelVal = model ? model.value : 'opus';
-  const providerVal = provider ? provider.value : 'claude';
-
-  btn.disabled = true;
-  statusEl.style.display = '';
-  statusEl.className = 'launch-status';
-  statusEl.textContent = 'Launching ' + lines.length + ' worker' + (lines.length !== 1 ? 's' : '') + '...';
-
-  try {
-    const epicTitle = lines.length === 1 ? lines[0] : 'Fan-out: ' + lines[0] + (lines.length > 1 ? ' (+' + (lines.length - 1) + ' more)' : '');
-
-    const r = await fetch(API + '/api/board/launch', {
-      method: 'POST',
-      headers: _authHeaders({ 'Content-Type': 'application/json', 'X-Amux-Session': orchSession || 'dashboard' }),
-      body: JSON.stringify({
-        title: epicTitle,
-        priorities: lines,
-        parent_session: orchSession || 'dashboard',
-        model: modelVal,
-        provider: providerVal,
-      })
-    });
-    if (!r.ok) {
-      const errBody = await r.text();
-      throw new Error(errBody);
-    }
-    const result = await r.json();
-
-    const started = result.workers_started || 0;
-    const failed = result.workers_failed || 0;
-    statusEl.textContent = 'Launched ' + started + ' worker' + (started !== 1 ? 's' : '') + (failed ? ' (' + failed + ' failed)' : '') + '. Epic: ' + result.epic;
-    showToast('Launched: ' + result.epic + ' (' + started + ' workers)');
-    input.value = '';
-    fetchBoard();
-    fetchSessions();
-
-    setTimeout(() => { if (result.epic) openBoardDetail(result.epic); }, 500);
-  } catch (e) {
-    statusEl.className = 'launch-status error';
-    statusEl.textContent = 'Error: ' + e.message;
-    showToast('Launch failed: ' + e.message);
-  } finally {
-    btn.disabled = false;
+  if (_launchBusy) return;
+  const statusEl=document.getElementById('launch-status');
+  if (!_launchPending) {
+    const lines=_launchLines();
+    if (!lines.length || lines.length>20) { showToast('Enter 1 to 20 priorities'); return; }
+    const source=document.getElementById('launch-session').value;
+    if (!source) { showToast('Choose the workspace for this orchestration'); return; }
+    const readProfile=role=>({provider:document.getElementById('launch-'+role+'-provider').value,model:document.getElementById('launch-'+role+'-model').value.trim()});
+    const workers=readProfile('worker');
+    _launchPending={launch_id:crypto.randomUUID(),title:lines.length===1 ? lines[0].text : 'Fan-out: '+lines[0].text+' (+'+(lines.length-1)+' more)',
+      priorities:lines.map(line=>Object.keys(_launchOverrides[line.key] || {}).length ? {text:line.text,profile:_launchOverrides[line.key]} : line.text),
+      parent_session:source,orchestrator:readProfile('orchestrator'),...workers};
+    _saveLaunchDraft();
   }
+  const request=_launchPending;
+  _launchBusy=true; _launchControlsState();
+  statusEl.style.display=''; statusEl.className='launch-status';
+  statusEl.textContent='Creating one orchestrator and '+request.priorities.length+' fan-out workers…';
+  try {
+    const r=await fetch(API+'/api/board/launch',{method:'POST',headers:_authHeaders({'Content-Type':'application/json','X-Amux-Session':request.parent_session}),body:JSON.stringify(request),signal:AbortSignal.timeout(120000)});
+    const result=await r.json();
+    if (!r.ok) {
+      // Validation refusals created no launch; edits can be corrected. Ambiguous
+      // network/server failures retain the exact request for an idempotent retry.
+      if ([400,401,403,404].includes(r.status)) _launchPending=null;
+      throw new Error(result.error || 'Launch request failed');
+    }
+    const started=result.workers_started || 0;
+    const failures=result.failed || [];
+    const ready=result.complete === true || (result.orchestrator?.started === true && failures.length===0);
+    statusEl.className='launch-status'+(ready?'':' error');
+    statusEl.textContent=result.complete ? 'Orchestration already completed. Epic: '+result.epic : (ready?'Orchestrator ready. ':'Orchestrator: '+(result.orchestrator?.error || 'ready')+'. ')+started+'/'+request.priorities.length+' fan-out workers started. Epic: '+result.epic+(failures.length?' · '+failures.map(x=>x.name+': '+x.error).join('; '):'');
+    if (ready) { _launchPending=null; document.getElementById('launch-input').value=''; _launchOverrides={}; }
+    showToast(result.complete?'Orchestration completed: '+result.epic:ready?'Orchestration launched: '+result.epic:'Orchestration created; retry the unfinished starts');
+    fetchBoard(); fetchSessions();
+  } catch (e) {
+    statusEl.className='launch-status error'; statusEl.textContent='Launch needs attention: '+e.message;
+  } finally { _launchBusy=false; _saveLaunchDraft(); _launchControlsState(); }
 }
 
 function _peekFanOut() {
@@ -32380,7 +32450,7 @@ function _peekFanOut() {
     if (body && body.style.display === 'none') _toggleLaunchBar();
     _populateLaunchSessions();
     const sel = document.getElementById('launch-session');
-    if (sel && sess) sel.value = sess;
+    if (sel && sess && !_launchPending) { sel.value = sess; _saveLaunchDraft(); }
     const input = document.getElementById('launch-input');
     if (input) input.focus();
   }, 200);
@@ -32568,6 +32638,7 @@ function _orchBuild(allCards, allSess) {
       const children = childByEpic[epic.id] || [];
       const workers = new Set(children.map(c => c.session).filter(n => (sessMap[n] || {}).ephemeral));
       workers.forEach(n => groupedWorkers.add(n));
+      if (sessMap[epic.session]?.orchestrator || sessMap[epic.session]?.role === 'orchestrator') workers.add(epic.session);
       const ids = new Set(children.map(c => c.id));
       cards.forEach(c => { if (workers.has(c.session) && c.id !== epic.id && !ids.has(c.id)) { children.push(c); ids.add(c.id); } });
       childByEpic[epic.id] = children;
@@ -32582,7 +32653,7 @@ function _orchBuild(allCards, allSess) {
       const children = childByEpic[epic.id] || [];
       const allDone = children.length > 0 && children.every(c => c.execution_terminal === true);
       const hasEph = children.some(ch => (ch.session || '').includes('-eph-') || (sessMap[ch.session || ''] || {}).ephemeral);
-      const owners = [...new Set(children.map(c => c.session).filter(Boolean))].map(n => sessMap[n]).filter(Boolean);
+      const owners = [...new Set([...children.map(c => c.session),epic.session].filter(Boolean))].map(n => sessMap[n]).filter(Boolean);
       const paused = owners.length > 0 && owners.every(s => s.lifecycle === 'paused' || s.lifecycle === 'archived' || s.archived);
       const hasLive = owners.some(s => s.running);
       const st = epic.status || 'todo';
@@ -32619,6 +32690,13 @@ const _orchExpanded = new Set();
 function _orchToggle(id) {
   if (_orchExpanded.has(id)) _orchExpanded.delete(id); else _orchExpanded.add(id);
   if (_orchData) _orchRender(_orchData);
+}
+
+function _orchModelLabel(worker) {
+  if (!worker) return 'Model unknown';
+  const provider=worker.profile?.provider || worker.provider || '';
+  const model=worker.profile?.model || worker.model || worker.active_model || 'Provider default';
+  return (provider ? provider+' · ' : '')+model;
 }
 
 function _orchRender(data) {
@@ -32674,6 +32752,7 @@ function _orchRender(data) {
     if (epic.session) {
       const epicSess = sessMap[epic.session];
       html += '<span class="orch-node-worker" onclick="event.stopPropagation();openPeek(\'' + escJs(epic.session) + '\')">' + esc(epic.session) + '</span>';
+      html += '<span class="orch-role-profile">'+(epic._workerOnly?'Fan-out':'Orchestrator')+' · '+esc(_orchModelLabel(epicSess))+'</span>';
       html += _fanoutStartBtn(epic.session, epicSess?.running);
     }
     html += '</div>';
@@ -32707,6 +32786,7 @@ function _orchRender(data) {
         }
         if (child.session) {
           html += '<span class="orch-node-worker" onclick="event.stopPropagation();openPeek(\'' + escJs(child.session) + '\')">' + esc(child.session) + '</span>';
+          html += '<span class="orch-role-profile">'+(isEph?'Fan-out · ':'')+esc(_orchModelLabel(sess))+'</span>';
           html += _fanoutStartBtn(child.session, sess?.running);
           if (sess && sess.worktree_integration && sess.worktree_integration.status) html += '<span class="orch-integration" title="' + esc(sess.worktree_integration.detail || '') + '">' + esc(sess.worktree_integration.status.replace(/_/g, ' ')) + '</span>';
           if (sess && sess.worktree_active) html += '<span class="orch-worktree">' + esc(sess.branch || 'Detached worktree') + '</span>';

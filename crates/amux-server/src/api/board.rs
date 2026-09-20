@@ -6526,7 +6526,8 @@ async fn provision_ephemeral(
         env.set("CC_PARENT", config.parent);
         env.set("CC_BOARD_CARD", &child.id);
         env.set("CC_PROVIDER", config.provider);
-        env.set("CC_TAGS", "ephemeral");
+        let tags = parent.get_or("CC_TAGS", "");
+        env.set("CC_TAGS", &if tags.is_empty() { "ephemeral".into() } else { format!("{tags},ephemeral") });
         env.set("CC_CREATOR", config.creator);
         env.set("AMUX_BOARD_DELEGATION", "0");
         env.set("AMUX_DISPATCH_BACKLOG_WHEN_IDLE", "1");
@@ -6541,6 +6542,7 @@ async fn provision_ephemeral(
         env.set("CC_DESC", &format!("Ephemeral worker for: {}", child.title.chars().take(120).collect::<String>()));
         env.write(&path).map_err(|e| format!("env write: {e}"))?;
     }
+    session_verbs::set_initial_instructions(name, &super::orchestrations::child_instructions(config.parent));
     drop(provisioning);
     let (ok, detail) = session_verbs::start_session(state, name, "", true).await;
     if ok {
@@ -6814,14 +6816,16 @@ async fn fan_out_item(
 
 // ---- One-shot launch: priorities -> epic -> children -> fan-out -----------
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct LaunchPriority {
     text: Option<String>,
     /// Worker name override. If omitted, derived from text.
     name: Option<String>,
+    /// Optional per-worker overrides of the fan-out defaults.
+    profile: Option<LaunchProfile>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(untagged)]
 enum PriorityEntry {
     Plain(String),
@@ -6834,6 +6838,9 @@ impl PriorityEntry {
             PriorityEntry::Plain(s) => s.as_str(),
             PriorityEntry::Structured(p) => p.text.as_deref().unwrap_or(""),
         }
+    }
+    fn profile(&self) -> Option<&LaunchProfile> {
+        match self { Self::Plain(_) => None, Self::Structured(p) => p.profile.as_ref() }
     }
     fn name_override(&self) -> Option<&str> {
         match self {
@@ -6862,14 +6869,41 @@ fn slugify_name(text: &str, max_len: usize) -> String {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
+struct LaunchProfile {
+    provider: Option<String>,
+    model: Option<String>,
+    flags: Option<String>,
+}
+
+impl LaunchProfile {
+    fn resolve(&self, defaults: &(String, String, String)) -> Result<(String, String, String), String> {
+        let provider = self.provider.clone().unwrap_or_else(|| defaults.0.clone());
+        if !crate::api::session_verbs::SESSION_PROVIDERS.contains(&provider.as_str()) || provider == "iterm2" {
+            return Err(format!("unsupported worker provider: {provider}"));
+        }
+        let model = self.model.clone().unwrap_or_else(|| if provider == defaults.0 { defaults.1.clone() } else { String::new() });
+        // Models are open identifiers, not shell fragments. A provider catalog is
+        // guidance; newly released model IDs remain usable without a server edit.
+        let model = super::session_verbs::validate_model_name(&json!(model))?;
+        let flags = self.flags.clone().unwrap_or_else(|| if provider == defaults.0 { defaults.2.clone() } else { String::new() });
+        if flags.len() > 2048 || flags.contains(['\n', '\r']) || flags.contains("--model") {
+            return Err("put the model in its profile model field; flags must be a single line".into());
+        }
+        Ok((provider, model, flags))
+    }
+}
+
+#[derive(Deserialize, Serialize)]
 struct LaunchBody {
+    /// Stable across transport retries; a fresh intentional launch gets a new ID.
+    launch_id: Option<String>,
     /// Human-readable title for the epic (defaults to "Priorities")
     title: Option<String>,
     /// Each entry becomes one child card with its own ephemeral worker.
     /// Accepts plain strings or {text, name} objects.
     priorities: Vec<PriorityEntry>,
-    /// Parent session whose CC_DIR, CC_PROVIDER etc. are inherited by children.
+    /// Workspace source; without an orchestrator profile, also the coordinator.
     parent_session: String,
     /// Model for ephemeral workers (default "haiku").
     model: Option<String>,
@@ -6877,6 +6911,8 @@ struct LaunchBody {
     provider: Option<String>,
     /// Extra CC_FLAGS passed to each worker.
     flags: Option<String>,
+    /// A dedicated coordinator; omission preserves existing-worker API callers.
+    orchestrator: Option<LaunchProfile>,
 }
 
 /// POST /api/board/launch
@@ -6900,6 +6936,9 @@ async fn launch_priorities(
         );
     }
 
+    if body.launch_id.as_ref().is_some_and(|id| id.len() > 80 || !crate::api::session_verbs::valid_session_name(id)) {
+        return err(StatusCode::BAD_REQUEST,json!({"error":"invalid launch_id"}));
+    }
     if body.priorities.is_empty() || body.priorities.len() > 20 {
         return err(
             StatusCode::BAD_REQUEST,
@@ -6935,12 +6974,40 @@ async fn launch_priorities(
         );
     }
 
-    let model = body.model.unwrap_or_else(|| "haiku".into());
-    let provider = body.provider.unwrap_or_else(|| "claude".into());
-    let extra_flags = body.flags.unwrap_or_default();
-    let epic_title = body
-        .title
-        .unwrap_or_else(|| "Priorities".into());
+    let parent_env = crate::api::session_verbs::parse_env(&parent_session);
+    if ["CC_PAUSED", "CC_ARCHIVED", "CC_ISOLATED"].iter().any(|key| parent_env.get(key) == Some("1")) {
+        return err(StatusCode::CONFLICT, json!({"error":"workspace worker is paused, archived or isolated; no orchestration created"}));
+    }
+    let defaults = ("claude".to_string(), "haiku".to_string(), String::new());
+    let profile = LaunchProfile { provider: body.provider.clone(), model: body.model.clone(), flags: body.flags.clone() };
+    let worker_profile = match profile.resolve(&defaults) {
+        Ok(profile) => profile,
+        Err(error) => return err(StatusCode::BAD_REQUEST,json!({"error":error})),
+    };
+    let child_profiles = match body.priorities.iter().map(|p| p.profile().cloned().unwrap_or_default().resolve(&worker_profile)).collect::<Result<Vec<_>,_>>() {
+        Ok(profiles) => profiles,
+        Err(error) => return err(StatusCode::BAD_REQUEST,json!({"error":error})),
+    };
+    let dedicated = body.orchestrator.is_some();
+    let coordinator_profile = match body.orchestrator.as_ref().map(|p| p.resolve(&("claude".into(), "opus".into(), String::new()))).transpose() {
+        Ok(profile) => profile,
+        Err(error) => return err(StatusCode::BAD_REQUEST,json!({"error":error})),
+    };
+    let mut parent_session = parent_session;
+    if let Some(profile) = coordinator_profile.as_ref() {
+        use sha2::Digest as _;
+        let key = format!("{:x}", sha2::Sha256::digest(serde_json::to_vec(&body).expect("launch serializes")));
+        let coordinator = format!("orchestrator-{}-{}", slugify_name(body.title.as_deref().unwrap_or_else(|| body.priorities[0].text()), 20), &key[..16]);
+        if body.priorities.iter().any(|p| p.name_override() == Some(&coordinator)) {
+            return err(StatusCode::BAD_REQUEST,json!({"error":"a fan-out worker cannot use the coordinator name"}));
+        }
+        if let Err(error) = super::orchestrations::prepare_coordinator(&parent_session, &coordinator, &key, profile).await {
+            return err(StatusCode::CONFLICT,json!({"error":error,"code":"orchestrator_provision_refused"}));
+        }
+        parent_session = coordinator;
+    }
+    let (provider, model, extra_flags) = worker_profile;
+    let epic_title = body.title.clone().unwrap_or_else(|| "Priorities".into());
 
     // Phase 1: create epic + children in one transaction
     #[derive(Debug)]
@@ -6972,9 +7039,9 @@ async fn launch_priorities(
                 .join("\n");
             let previous: Option<String> = conn.query_row(
                 "SELECT id FROM issues WHERE session=?1 AND source='launch' AND type='epic' \
-                 AND title=?2 AND desc=?3 AND deleted IS NULL AND COALESCE(archived,0)=0 \
-                 AND status IN ('doing','todo','backlog','review') ORDER BY created DESC LIMIT 1",
-                rusqlite::params![parent_session_w, epic_title, format!("**Prompt:** {epic_desc}")], |r| r.get(0),
+                 AND deleted IS NULL \
+                 AND (?4 OR (title=?2 AND desc=?3 AND COALESCE(archived,0)=0 AND status IN ('doing','todo','backlog','review'))) ORDER BY created DESC LIMIT 1",
+                rusqlite::params![parent_session_w, epic_title, format!("**Prompt:** {epic_desc}"), dedicated], |r| r.get(0),
             ).optional()?;
             if let Some(id) = previous {
                 let epic = bs::get_issue(conn, &id)?.expect("selected epic exists in transaction");
@@ -6986,7 +7053,10 @@ async fn launch_priorities(
                         if let Some(owner) = row.session.clone() { children.push((row, owner)); }
                     }
                 }
-                tracing::info!(epic = %epic.id, verdict = "launch_reused", "identical open launch reused durable graph");
+                children.sort_by_key(|(row, _)| row.tags.iter()
+                    .find_map(|t| t.strip_prefix('p').and_then(|n| n.parse::<usize>().ok()))
+                    .unwrap_or(usize::MAX));
+                tracing::info!(epic = %epic.id, verdict = "launch_reused", "identical launch reused durable graph");
                 *slot_w.lock().expect("launch slot poisoned") = Some(Created { epic, children, reused: true });
                 return Ok(no_write());
             }
@@ -7117,10 +7187,17 @@ async fn launch_priorities(
     let mut started = Vec::new();
     let mut failed = Vec::new();
     let creator = format!("launch:{actor}");
-    let config = EphemeralConfig { parent: &parent_session, provider: &provider, model: &model,
-        flags: &extra_flags, creator: &creator };
+    let complete = bs::execution_is_terminal(&created.epic.status, &created.epic.item_type);
+    let coordinator = if complete {
+        json!({"name":parent_session,"role":"orchestrator","profile":super::orchestrations::worker_profile(&parent_session),
+            "started":false,"complete":true,"error":null})
+    } else { super::orchestrations::start_coordinator(&state, &parent_session, &created.epic.id, dedicated).await };
     for (child, name) in &created.children {
-        if bs::execution_is_terminal(&child.status, &child.item_type) { continue; }
+        let index = child.tags.iter().find_map(|t| t.strip_prefix('p').and_then(|n| n.parse::<usize>().ok()));
+        let selected = index.and_then(|i| child_profiles.get(i));
+        let (p, m, f) = selected.map(|(p,m,f)| (p.as_str(),m.as_str(),f.as_str())).unwrap_or((&provider,&model,&extra_flags));
+        let config = EphemeralConfig { parent: &parent_session, provider: p, model: m, flags: f, creator: &creator };
+        if complete || bs::execution_is_terminal(&child.status, &child.item_type) { continue; }
         match provision_ephemeral(&state, child, name, &config).await {
             Ok(()) => started.push(name.clone()),
             Err(error) => failed.push(json!({"name": name, "error": error})),
@@ -7147,6 +7224,8 @@ async fn launch_priorities(
             "ok": true,
             "epic": created.epic.id,
             "idempotent": created.reused,
+            "complete": complete,
+            "orchestrator": coordinator,
             "model": model,
             "priorities": created.children.len(),
             "workers_started": started.len(),
@@ -7157,6 +7236,7 @@ async fn launch_priorities(
                 "id": c.id,
                 "title": c.title,
                 "worker": eph,
+                "profile": super::orchestrations::worker_profile(eph),
             })).collect::<Vec<_>>(),
             "measured": true,
             "n_considered": created.children.len(),

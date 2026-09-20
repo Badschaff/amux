@@ -6465,6 +6465,19 @@ input.mdai-edge-path-input:focus { border-color: var(--accent); box-shadow: 0 0 
 .launch-textarea { font:inherit; font-size:.85rem; resize:vertical; min-height:80px; border-radius:10px; padding:10px 12px; }
 .launch-controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
 .launch-controls select { border-radius:10px; font-size:.82rem; }
+.launch-roles { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+.launch-role { min-width:0; margin:0; border:1px solid var(--border); border-radius:12px; padding:12px; }
+.launch-role legend { font-weight:600; padding:0 6px; }
+.launch-role p { color:var(--dim); font-size:.8rem; margin:0 0 12px; }
+.launch-profile-fields { display:grid; grid-template-columns:minmax(100px,1fr) minmax(110px,2fr); gap:10px; }
+.launch-profile-fields label,.launch-workspace { display:flex; flex-direction:column; gap:6px; font-size:.82rem; min-width:0; }
+.launch-profile-fields .input,.launch-workspace .input { width:100%; min-width:0; min-height:44px; box-sizing:border-box; }
+#launch-overrides { font-size:.82rem; }
+#launch-overrides summary { cursor:pointer; padding:8px 0; }
+.launch-worker-profile { padding:12px 0; border-top:1px solid var(--border); }
+.launch-worker-profile p { overflow-wrap:anywhere; margin:0 0 8px; }
+.orch-role-profile { color:var(--dim); font-size:.72rem; overflow-wrap:anywhere; }
+@media (max-width:600px) { .launch-roles { grid-template-columns:1fr; } }
 .launch-status { font-size:.8rem; padding:6px 0; color:var(--dim); }
 .launch-status.error { color:var(--danger); }
 /* Fanout children in board detail */
