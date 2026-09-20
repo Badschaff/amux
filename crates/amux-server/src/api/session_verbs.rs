@@ -3876,7 +3876,7 @@ fn set_effort_flag(flags: &str, effort: &str) -> Result<String, String> {
 fn provider_yolo_flag(provider: &str) -> &'static str {
     match provider {
         "codex" | "ollama" => "--dangerously-bypass-approvals-and-sandbox",
-        "gemini" => "--yolo",
+        "gemini" | "muse" => "--yolo",
         _ => "--dangerously-skip-permissions",
     }
 }
@@ -4191,15 +4191,39 @@ pub(crate) fn muse_launch_command(
     extra_flags: &str,
     default_model: &str,
 ) -> String {
+    // Provider swaps and old generic yolo toggles may leave another binary's flag in
+    // CC_FLAGS. Muse rejects Claude's flag, so normalize every yolo spelling at the
+    // launch boundary as well as when configuration is written.
+    let muse_yolo = yolo_enabled(flags, None) || yolo_enabled(extra_flags, None);
+    if let Some(f) = PROVIDER_YOLO_FLAGS
+        .iter()
+        .find(|f| **f != "--yolo" && (flags.contains(*f) || extra_flags.contains(*f)))
+    {
+        tracing::warn!(
+            stored_yolo_flag = %f,
+            launched_yolo_flag = "--yolo",
+            "muse worker carries a yolo flag muse does not accept; launch substitutes muse's flag"
+        );
+    }
+    let flags = strip_provider_yolo_flags(flags);
+    let extra_flags = strip_provider_yolo_flags(extra_flags);
     let mut opts = String::new();
     if !flags.is_empty() {
-        opts += &format!(" {}", shell_quote_flags(flags));
+        opts += &format!(" {}", shell_quote_flags(&flags));
     }
     if !extra_flags.is_empty() {
-        opts += &format!(" {}", shell_quote_flags(extra_flags));
+        opts += &format!(" {}", shell_quote_flags(&extra_flags));
     }
     if !opts.contains("--model") && !opts.contains("-m ") && !default_model.is_empty() {
         opts += &format!(" --model {}", shell_quote_flags(default_model));
+    }
+    if muse_yolo {
+        opts += " --yolo";
+    } else if !opts.contains("--approval-mode") && !opts.contains("--disable-approval") {
+        // Muse defaults to on-request even when the saved user settings say never.
+        // Lanes have nobody at the composer to answer, so make the supported automatic
+        // mode explicit on every launch while leaving the filesystem sandbox enabled.
+        opts += " --approval-mode never";
     }
     // --trust-workspace, because A LANE HAS NOBODY TO ANSWER A PROMPT.
     //
@@ -4371,7 +4395,10 @@ pub(crate) fn muse_pick_session(
 
 #[cfg(test)]
 mod muse_launch_tests {
-    use super::{launch_base_binary, muse_launch_command, muse_pick_session, SESSION_PROVIDERS};
+    use super::{
+        launch_base_binary, muse_launch_command, muse_pick_session, provider_yolo_flag,
+        SESSION_PROVIDERS,
+    };
 
     #[test]
     fn muse_is_a_session_provider_and_launches_muse() {
@@ -4384,7 +4411,7 @@ mod muse_launch_tests {
     fn muse_first_start_is_bare_with_no_session_id_flag() {
         let cmd = muse_launch_command("", "", "", "muse-spark-1.3-contributor");
         assert_eq!(cmd,
-            "MUSE_EXPERIMENTAL_PLUGINS=on muse --model muse-spark-1.3-contributor --trust-workspace");
+            "MUSE_EXPERIMENTAL_PLUGINS=on muse --model muse-spark-1.3-contributor --approval-mode never --trust-workspace");
         assert!(!cmd.contains("--session-id"), "muse has no such flag: {cmd}");
         assert!(!cmd.contains("resume"), "a first start has nothing to resume");
     }
@@ -4400,9 +4427,33 @@ mod muse_launch_tests {
         assert_eq!(
             cmd,
             "MUSE_EXPERIMENTAL_PLUGINS=on muse resume 01a081b8-006e-7182-98af-dd0820be4f61 \
-             --model muse-spark-1.2 --trust-workspace".replace("\\\n             ", " ").as_str()
+             --model muse-spark-1.2 --approval-mode never --trust-workspace".replace("\\\n             ", " ").as_str()
         );
         assert!(!cmd.contains("--last"), "--last crosses lanes in a shared CC_DIR");
+    }
+
+    #[test]
+    fn muse_launch_uses_provider_correct_yolo_and_never_claudes_flag() {
+        assert_eq!(provider_yolo_flag("muse"), "--yolo");
+        let cmd = muse_launch_command(
+            "",
+            "--dangerously-skip-permissions --model muse-spark-1.3-contributor",
+            "",
+            "muse-spark-1.3-contributor",
+        );
+        assert_eq!(
+            cmd,
+            "MUSE_EXPERIMENTAL_PLUGINS=on muse --model muse-spark-1.3-contributor --yolo --trust-workspace"
+        );
+        assert!(!cmd.contains("--dangerously-skip-permissions"), "{cmd}");
+    }
+
+    #[test]
+    fn muse_automatic_approval_keeps_the_sandbox() {
+        let cmd = muse_launch_command("", "", "", "muse-spark-1.3-contributor");
+        assert!(cmd.contains("--approval-mode never"), "{cmd}");
+        assert!(!cmd.contains("--disable-sandbox"), "{cmd}");
+        assert!(!cmd.contains("--yolo"), "{cmd}");
     }
 
     #[test]
