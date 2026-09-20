@@ -3568,3 +3568,15 @@ CARD: CLA-7
 SYMPTOM: The deployed Orchestrations view showed Working now on audit-and-disable-unused and full-e2e-test-coverage while their measured runtime states were waiting and idle. It used task_board_id without the runtime activity verdict.
 COST: The new orchestration view contradicted its own worker status and made retained board claims look like execution.
 FIX: Share the board's runtime activity predicate, require a measured linked current task for live highlighting, and retain navigation under Current task when execution is not confirmed. Report changed activity projection counts and exercise active, idle, waiting, paused, stopped, expired, unlinked and unmeasured states in the browser.
+
+
+## Layout acceptance reads different accordion renders as one frame
+AREA: tests
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-20
+SESSION: codex-lifecycle-adherence
+CARD: CLA-7
+SYMPTOM: The iPhone Paused/Archived order test queried bounding boxes in separate browser calls. Normal worker refresh replaced an accordion between element resolution and measurement, returning null while its replacement was visibly ordered correctly.
+COST: The otherwise passing final Rust/browser CI run was red. A WebKit refresh diagnostic reproduced detached geometry in 38 of 60 samples.
+FIX: Measure visibility, geometry and sibling order atomically in the page; check the initial frame and five actual worker refreshes. Emit measured frame counts and all rectangles in the test log, retain positive size checks, and require the entire live worker card to end above Paused.
