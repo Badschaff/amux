@@ -1,5 +1,6 @@
 import { test, expect, Page, allowUnusedRoute } from './fixtures';
 import type { Route } from '@playwright/test';
+import { cleanup } from './teardown';
 
 async function setup(page: Page) {
   await page.addInitScript(() => {
@@ -210,7 +211,11 @@ for (const latestFails of [true, false]) test(`the latest board read ${latestFai
     // Snapshot, not a polling assertion: a later poll must not conceal a stale
     // publication that already changed what the user saw.
     expect(afterOlder).toBe(latestFails ? 'Sync error' : 'Live');
-  } finally { await page.evaluate(() => { const w = window as any; w.__releaseOlderBoardRead?.(); w.__restoreBoardFetch?.(); }); }
+  } finally {
+    await cleanup('restore board read transport', () => page.evaluate(() => {
+      const w = window as any; w.__releaseOlderBoardRead?.(); w.__restoreBoardFetch?.();
+    }), test.info());
+  }
 });
 
 
