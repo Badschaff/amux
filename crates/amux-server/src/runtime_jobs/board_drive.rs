@@ -761,6 +761,11 @@ pub trait Fleet: Send + Sync {
     async fn start_for_dispatch(&self, lane: &str) -> Result<(), String> {
         Err(format!("fleet cannot start worker '{lane}' for board dispatch"))
     }
+    /// Called under the worker operation lock after a fully verified board.
+    /// Implementations must recheck current activity before stopping a provider.
+    async fn stop_for_retirement(&self, lane: &str) -> Result<(), String> {
+        Err(format!("fleet cannot retire worker '{lane}'"))
+    }
     /// Hand text to the lane. Durable queue + the existing delivery loop.
     async fn deliver(&self, lane: &str, text: &str);
     /// Work and reminder delivery report queue refusal so claims can be
@@ -882,6 +887,9 @@ impl Fleet for LiveFleet {
     }
     async fn start_for_dispatch(&self, lane: &str) -> Result<(), String> {
         crate::api::session_verbs::start_for_board_dispatch(&self.state, lane).await
+    }
+    async fn stop_for_retirement(&self, lane: &str) -> Result<(), String> {
+        crate::api::session_verbs::stop_verified_worker(&self.state, lane).await
     }
     async fn deliver(&self, lane: &str, text: &str) {
         let _ = self.enqueue_work(lane, text).await;
@@ -2530,9 +2538,8 @@ mod epic_completion_unit_tests {
 
 // ── Ephemeral worker reaper ──────────────────────────────────────────────
 //
-// Ephemeral workers retain their entire assigned board. Retirement requires
-// every type-specific terminal gate, a recorded integration of the unchanged
-// clean head, and a stopped provider. Workspaces survive retirement.
+// A fully Verified board retires only after its clean current head is on remote
+// main. Keep history and an Expired worker record; dispose the proven worktree.
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct EphemeralReaperReport {
@@ -2543,126 +2550,44 @@ pub struct EphemeralReaperReport {
     pub errors: usize,
 }
 
-pub(crate) async fn reap_ephemeral_workers(state: &AppState) -> EphemeralReaperReport {
+pub(crate) async fn reap_ephemeral_workers<F: Fleet>(state: &AppState, fleet: &F) -> EphemeralReaperReport {
     let home = crate::config::amux_home();
-    let sessions_dir = home.join("sessions");
     let mut report = EphemeralReaperReport { measured: true, ..Default::default() };
-
-    let entries = match std::fs::read_dir(&sessions_dir) {
-        Ok(rd) => rd,
-        Err(_) => return report,
+    let entries = match std::fs::read_dir(home.join("sessions")) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return report,
+        Err(error) => {
+            report.measured = false;
+            report.errors += 1;
+            tracing::warn!(%error,verdict="fanout_retirement_scan_failed", "could not scan workers for retirement");
+            return report;
+        }
     };
-
-    let mut ephemeral_sessions: Vec<(String, String)> = Vec::new(); // (name, parent)
+    let mut names = std::collections::BTreeSet::new();
     for entry in entries.flatten() {
-        let fname = entry.file_name();
-        let fname_s = fname.to_string_lossy();
-        if !fname_s.ends_with(".env") { continue; }
-        let name = fname_s.trim_end_matches(".env").to_string();
-        let env = crate::config::parse_env_file(&entry.path());
-        if env.get("CC_EPHEMERAL").map(|v| v == "1").unwrap_or(false)
-            && env.get("CC_PAUSED").is_none_or(|v| v != "1")
-            && env.get("CC_ARCHIVED").is_none_or(|v| v != "1") {
-            let parent = env.get("CC_PARENT").cloned().unwrap_or_default();
-            ephemeral_sessions.push((name, parent));
-        }
-    }
-
-    report.n_considered = ephemeral_sessions.len();
-    if ephemeral_sessions.is_empty() { return report; }
-
-    let cards_by_session: HashMap<String, Vec<(String, String, String)>> = match state.store.read() {
-        Ok(conn) => {
-            let mut map = HashMap::new();
-            let Ok(mut stmt) = conn.prepare("SELECT id,status,COALESCE(type,'code') FROM issues WHERE session=?1 AND deleted IS NULL AND COALESCE(archived,0)=0") else {
-                report.errors += 1;
-                return report;
-            };
-            for (name, _) in &ephemeral_sessions {
-                match stmt.query_map([name], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
-                    .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>()) {
-                    Ok(rows) => { map.insert(name.clone(), rows); }
-                    Err(_) => { report.errors += 1; }
-                }
+        let file = entry.file_name();
+        let file = file.to_string_lossy();
+        if let Some(name) = file.strip_suffix(".env").or_else(||file.strip_suffix(".env.reaped")) {
+            if crate::config::parse_env_file(&entry.path()).get("CC_EPHEMERAL").is_some_and(|v|v=="1") {
+                names.insert(name.to_string());
             }
-            map
         }
-        Err(_) => return report,
-    };
-
-    for (name, parent) in &ephemeral_sessions {
-        let cards = cards_by_session.get(name.as_str());
-        let card_list = match cards {
-            Some(c) if !c.is_empty() => c,
-            _ => continue,
-        };
-
-        // An idle worker with queued work still owns that work. Reaping it and
-        // returning cards to the parent made an ordinary pause look like a handoff.
-        if !card_list.iter().all(|(_, status, kind)| bs::execution_is_terminal(status, kind)) { continue; }
-        // Completion cannot retire a branch before its integration is recorded.
-        if crate::fanout_workspace::integration_status(&home, name)["status"] != "integrated" {
-            crate::fanout_workspace::queue_integration(state, name).await;
-            continue;
-        }
-        let Some(workspace)=crate::fanout_workspace::load(&home,name) else { continue; };
-        let integration=crate::fanout_workspace::integration_status(&home,name);
-        if crate::fanout_workspace::git(&workspace.path,&["rev-parse","HEAD"]).await.ok().as_deref()!=integration["head"].as_str()
-            || crate::fanout_workspace::git(&workspace.path,&["status","--porcelain"]).await.map(|s|!s.is_empty()).unwrap_or(true) { continue; }
-        let action = "done";
-
-        let is_idle = !crate::api::session_verbs::is_running(name).await;
-        if !is_idle {
-            // Worker is actively processing (someone sent it a message).
-            // Let it finish before reaping, regardless of card state.
-            continue;
-        }
-
-        let card_summary = card_list.iter()
-            .map(|(id, st, _)| format!("{id}={st}"))
-            .collect::<Vec<_>>().join(", ");
-
-        tracing::info!(
-            target: "amux::board",
-            session = %name,
-            parent = %parent,
-            action = action,
-            cards = %card_summary,
-            verdict = "ephemeral_reap",
-            measured = true,
-            n_considered = card_list.len(),
-            "reaping ephemeral worker"
-        );
-
-        // Stop the tmux session
-        let stq = format!("={name}");
-        let _ = tokio::process::Command::new("tmux")
-            .args(["kill-session", "-t", &stq])
-            .output()
-            .await;
-
-        // Full decommission: remove all registration files so the worker
-        // disappears from the dashboard, not just shows as STOPPED. Archiving
-        // the env file alone left ghost entries in the fleet list (AMUX-5001).
-        let env_path = sessions_dir.join(format!("{name}.env"));
-        let _ = std::fs::remove_file(&env_path);
-        let _ = std::fs::remove_file(sessions_dir.join(format!("{name}.mem")));
-        let _ = std::fs::remove_file(sessions_dir.join(format!("{name}.meta")));
-        let _ = std::fs::remove_file(sessions_dir.join(format!("{name}.log")));
-        crate::api::sessions_legacy::invalidate_sessions_cache();
-
-        // Clean steering queue so no stale prompts accumulate
-        let n = name.to_string();
-        let _ = state.store.write_async(move |conn| {
-            let _ = conn.execute("DELETE FROM steering_queue WHERE session=?", [&n]);
-            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
-        }).await;
-
-        // Worktree disposal is owned by the worktree lifecycle. A terminal card
-        // is not proof that every untracked file is disposable.
-        report.reaped_done += 1;
     }
-
+    report.n_considered = names.len();
+    for name in names {
+        match crate::fanout_retirement::retire(state,fleet,&home,&name).await {
+            Ok(crate::fanout_retirement::Outcome::Expired) => report.reaped_done += 1,
+            Ok(crate::fanout_retirement::Outcome::NeedsIntegration) => {
+                crate::fanout_workspace::queue_integration(state,&name).await;
+            },
+            Ok(crate::fanout_retirement::Outcome::Deferred) => {},
+            Err(error) => {
+                report.errors += 1;
+                tracing::warn!(session=%name,%error,verdict="fanout_retirement_deferred",measured=true,
+                    "worker retirement incomplete; retained for retry instead of claiming cleanup");
+            }
+        }
+    }
     report
 }
 
@@ -5969,7 +5894,7 @@ pub async fn drive_tick<F: Fleet>(state: &AppState, fleet: &F) -> DriveReport {
     // Complete root epics before dispatch so the Messages chip and the board
     // agree that a command is finished as soon as all of its leaves are.
     report.completed_epics = complete_finished_epics(state).await;
-    report.ephemeral_reaper = reap_ephemeral_workers(state).await;
+    report.ephemeral_reaper = reap_ephemeral_workers(state, fleet).await;
     // DRIVE TO VERIFIED, BEFORE DISPATCH. A card parked in `backlog` on a
     // `depends_on` dependency re-activates to `todo` the moment every dependency
     // reaches a terminal status, so a "do B after A" command completes instead
