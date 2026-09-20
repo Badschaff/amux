@@ -5532,8 +5532,17 @@ async fn cmd_hist_record_with_id(
         _ => Some(now_ms),
     };
     let peer_coordination = ctype == "session" && !crate::db::board_store::board_delegation_allowed(Some(&session));
+    // A follow-on qualifier has no title of its OWN — that is what makes it a
+    // qualifier — so the title test alone never admitted one, and "and TS" died
+    // in Messages eight seconds after the request it narrowed (AMUX-4881).
+    // Admit it and let `attach_prompt_qualifier` decide: with no live card from
+    // the prompt before it, capture declines back to exactly this outcome, so
+    // the widening can only add the attachment, never a card.
     let capture_pending = task_bearing && landed && !peer_coordination
-        && amux_core::board::title_from_prompt(&text).is_some()
+        && (amux_core::board::title_from_prompt(&text).is_some()
+            || (ctype == "user"
+                && amux_core::board::reads_as_qualifier(&text)
+                && !amux_core::board::is_conversational_ack(&text)))
         && !amux_core::board::is_informational_query(&text);
     let msg_row_id_w = msg_row_id.clone();
     let cap_session = session.clone();
@@ -5694,6 +5703,201 @@ async fn cmd_hist_record_with_id(
     msg_row_id.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// How long after a prompt a follow-on still reads as a refinement OF it.
+///
+/// Measured over the 1855 `cmd_history` prompts that have a predecessor on
+/// their own lane: 30 open with a backward-pointing marker inside
+/// [`amux_core::board::QUALIFIER_MAX_WORDS`], and 22 of those arrived within
+/// 120s. Past that the shape thins to 1-3 per bucket and stops clustering, so
+/// a leading "also" ten minutes later is more often coincidence than
+/// continuation. Shares the value of [`DUP_DELIVERY_WINDOW_MS`] for the same
+/// underlying reason: two minutes is how long one thought keeps being typed.
+const QUALIFIER_WINDOW_S: i64 = 120;
+
+/// The card a qualifier belongs on: the card created by the IMMEDIATELY
+/// preceding prompt on this lane, when that prompt is inside the window and
+/// its card is still live and owned here.
+///
+/// Immediately preceding, never "the most recent prompt that happens to have a
+/// card". Leapfrogging an intervening request would attach a refinement to
+/// work two prompts back, which is the same class of error as the bug. A chain
+/// still works without the leap, because an attached qualifier takes the
+/// referent's `card_id` and becomes the next one's predecessor.
+fn qualifier_referent(
+    conn: &rusqlite::Connection,
+    session: &str,
+    row_id: i64,
+    ts_ms: i64,
+) -> rusqlite::Result<Option<(i64, i64, String)>> {
+    use rusqlite::OptionalExtension;
+    let prior = conn
+        .query_row(
+            "SELECT id, ts, card_id FROM cmd_history \
+             WHERE session=?1 AND type='user' AND id<?2 ORDER BY id DESC LIMIT 1",
+            rusqlite::params![session, row_id],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((prior_id, prior_ts, Some(card))) = prior else {
+        return Ok(None);
+    };
+    let delta_s = (ts_ms - prior_ts) / 1000;
+    if !(0..=QUALIFIER_WINDOW_S).contains(&delta_s) {
+        return Ok(None);
+    }
+    let Some(row) = crate::db::board_store::get_issue(conn, &card)? else {
+        return Ok(None);
+    };
+    let live = row.session.as_deref() == Some(session)
+        && row.owner_type == "agent"
+        && row.archived == 0
+        && !crate::db::board_store::is_terminal_status(&row.status);
+    Ok(live.then_some((prior_id, delta_s, card)))
+}
+
+/// Put a follow-on qualifier on the card the prompt it modifies created, and
+/// report whether that happened. `false` means the caller's normal
+/// interpretation still owns this message.
+///
+/// Two independent halves, and BOTH have to hold. The shape half
+/// ([`amux_core::board::reads_as_qualifier`]) asks whether the text points
+/// backward. The temporal half ([`qualifier_referent`]) asks whether there is
+/// something for it to point AT. Shape alone is what shipped before AMUX-4881
+/// and it could not tell "and TS" from a request; time alone is worse — 127 of
+/// those 1855 prompts arrived within 30s of their predecessor and 73 of them
+/// earned the card they got.
+///
+/// Costs no model call, deliberately. A qualifier is the case where
+/// interpretation has the least to add: the referent is decided by the clock
+/// and the lane, not by meaning (ethos rule 2).
+async fn attach_prompt_qualifier(
+    state: &AppState,
+    row_id: i64,
+    session: &str,
+    text: &str,
+    ts_ms: i64,
+) -> bool {
+    use rusqlite::OptionalExtension;
+    if !amux_core::board::reads_as_qualifier(text) {
+        return false;
+    }
+    let referent = (|| -> anyhow::Result<Option<(i64, i64, String)>> {
+        let conn = state.store.read()?;
+        Ok(qualifier_referent(&conn, session, row_id, ts_ms)?)
+    })();
+    // Say which way it went whenever the SHAPE matched. A qualifier with no
+    // live referent falls through to normal capture and gets its own card,
+    // which is the old behaviour and is indistinguishable from the fix never
+    // running unless the decline is logged beside the attachment.
+    let (prior_id, delta_s, card) = match referent {
+        Ok(Some(found)) => found,
+        Ok(None) => {
+            tracing::info!(
+                message_id = row_id, session = %session,
+                measured = true, n_considered = 1,
+                verdict = "prompt_qualifier_unattached",
+                "ledger: follow-on qualifier has no live card from the prompt before it; capturing it on its own"
+            );
+            return false;
+        }
+        Err(error) => {
+            tracing::warn!(
+                message_id = row_id, session = %session, %error,
+                measured = false, n_considered = 0,
+                verdict = "prompt_qualifier_unmeasured",
+                "ledger: could not read the prompt before this one; capturing normally"
+            );
+            return false;
+        }
+    };
+    let note = format!(
+        "\n\nRefinement MSG-{row_id}, {delta_s}s after MSG-{prior_id}: {}",
+        redact_prompt_secrets(text)
+    );
+    let card_w = card.clone();
+    let res = state
+        .store
+        .write_async(move |conn| {
+            // The message may have been captured by a concurrent recovery tick
+            // between the read above and this write.
+            let pending: bool = conn
+                .query_row(
+                    "SELECT capture_pending!=0 AND card_id IS NULL FROM cmd_history WHERE id=?1",
+                    [row_id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if !pending {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            }
+            let Some(mut row) = crate::db::board_store::get_issue(conn, &card_w)? else {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            };
+            row.desc.push_str(&note);
+            row.log = Some(crate::db::board_store::append_log(
+                row.log.as_deref(),
+                &chrono::Local::now().format("%H:%M").to_string(),
+                &format!("MSG-{row_id} refines MSG-{prior_id} ({delta_s}s later); attached instead of carding"),
+            ));
+            crate::db::board_store::save_patched(conn, &mut row)?;
+            conn.execute(
+                "UPDATE cmd_history SET card_id=?1, capture_pending=0 WHERE id=?2",
+                rusqlite::params![card_w, row_id],
+            )?;
+            Ok(crate::db::WriteOutcome {
+                applied: true,
+                events: vec![
+                    crate::db::PendingEvent {
+                        entity_type: amux_core::revision::EntityType::Task,
+                        entity_id: row.id.clone(),
+                        mutation: amux_core::revision::MutationKind::Updated,
+                        payload: Some(row.snapshot()),
+                    },
+                    crate::db::PendingEvent {
+                        entity_type: amux_core::revision::EntityType::Message,
+                        entity_id: format!("MSG-{row_id}"),
+                        mutation: amux_core::revision::MutationKind::Updated,
+                        payload: None,
+                    },
+                ],
+            })
+        })
+        .await;
+    match res.map(|reply| reply.applied) {
+        Ok(true) => {
+            // Positive log signal (two-fix rule): if this silently stops, the
+            // detector is these lines going to zero while short
+            // backward-pointing prompts keep minting their own cards.
+            // grep "ledger: attached follow-on qualifier".
+            tracing::info!(
+                message_id = row_id, session = %session, card_id = %card,
+                prior_message_id = prior_id, delta_s,
+                measured = true, n_considered = 1,
+                verdict = "prompt_qualifier_attached",
+                "ledger: attached follow-on qualifier to the card its own prompt created"
+            );
+            true
+        }
+        Ok(false) => false,
+        Err(error) => {
+            tracing::warn!(
+                message_id = row_id, session = %session, card_id = %card, %error,
+                measured = true, n_considered = 1,
+                verdict = "prompt_qualifier_pending",
+                "ledger: qualifier attachment failed; message remains pending for retry"
+            );
+            true
+        }
+    }
+}
+
 /// Resume only explicitly pending message consequences. This does not deliver a
 /// command, insert history, or infer work from arbitrary old cardless messages.
 pub(crate) async fn capture_recorded_message(state: &AppState, row_id: i64) {
@@ -5748,6 +5952,55 @@ pub(crate) async fn capture_recorded_message(state: &AppState, row_id: i64) {
         }
         tracing::info!(marker="peer_coordination_not_assigned", message_id=row_id, session=%cap_session,
             measured=true, n_considered=1, "peer message retained without creating board work");
+        return;
+    }
+    // A qualifier sent seconds after the prompt it refines belongs ON that
+    // prompt's card (AMUX-4881). Runs BEFORE both dispositions below, because
+    // the two halves of the bug live on opposite sides of them: "and TS" was
+    // dropped by the character floor inside `title_from_prompt` and never
+    // reached the work, while a nine-word prepositional phrase cleared the
+    // floor and became a card that said nothing standalone.
+    if cap_ctype == "user" && attach_prompt_qualifier(state, row_id, &cap_session, &cap_text, now_ms).await {
+        return;
+    }
+    // Admitted by the qualifier clause of the pending gate, found nothing to
+    // land on, and carries no title to mint one from. Interpretation has
+    // nothing to work with here, so decline where the pre-AMUX-4881 gate did —
+    // by never marking it pending — rather than buying a model call for a
+    // three-word clause. All three conditions, because a titleless prompt that
+    // NAMES a live card could always link to it and still can.
+    //
+    // THE SAVED MODEL CALL IS NOT UNDER TEST, and the suite cannot tell you so.
+    // Deleting this block leaves all six `qualifier_replay` cells green, which
+    // was verified by doing it. The outcome they observe (no card, no link,
+    // receipt resolved) is identical either way, because `board_intake::plan`
+    // only reaches its classifier when `board_intake::MODEL` is set and that is
+    // a process-wide `OnceLock` with no per-test override — so every test in
+    // this binary takes the "semantic provider unavailable" early return. On a
+    // live lane with any open card it does NOT, and this block is the whole
+    // difference between a dropped fragment costing nothing and costing a
+    // classifier call with an empty title. Read the green as redundancy in the
+    // fixture, never as coverage of the cost.
+    if amux_core::board::title_from_prompt(&cap_text).is_none()
+        && amux_core::board::reads_as_qualifier(&cap_text)
+        && prompt_card_refs(&cap_text).is_empty()
+    {
+        let _ = state
+            .store
+            .write_async(move |conn| {
+                conn.execute(
+                    "UPDATE cmd_history SET capture_pending=0 WHERE id=?1 AND card_id IS NULL",
+                    [row_id],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await;
+        tracing::info!(
+            message_id = row_id, session = %cap_session,
+            measured = true, n_considered = 1,
+            verdict = "capture_predicate_declined",
+            "ledger: unattached follow-on has no title of its own; retained in Messages"
+        );
         return;
     }
     // One durable interpretation/decomposition replaces the old create-first
@@ -26163,6 +26416,205 @@ mod tests {
             )
             .unwrap();
         assert_eq!(v, None, "an unverified path must record NULL, not a verdict");
+    }
+
+    // AMUX-4881. Ethan sends a prompt and then a short qualifier seconds later.
+    // Capture filed the qualifier as its own card, where it is meaningless
+    // standalone and never reaches the work it was modifying: AMUX-4800's whole
+    // content was "with respect to the full lifecycle (standalone and
+    // orchestrate/fanout)", 19 seconds after the request it scoped, and that
+    // scope was absent from the shipped scheduler for two days.
+    //
+    // A cell each, so a mutation has to name which half it broke. The two
+    // qualifier tests fail if the WINDOW never admits anything
+    // (`QUALIFIER_WINDOW_S = 0`); the two card-of-its-own tests fail if it
+    // admits everything, whether by shape (`reads_as_qualifier` returning true)
+    // or by time (an unbounded window).
+    mod qualifier_replay {
+        use super::*;
+
+        const REQUEST: &str = "[10:38 AM] i want to create an amux scheduler that runs weekly \
+            which goes thru the entire amux server/ui to find any opprtunities where things can \
+            be simplified, consolidated, KISS etc.";
+        const QUALIFIER: &str =
+            "[10:39 AM] with respect to the full lifecycle (standalone and orchestrate/fanout)";
+
+        /// Record a prompt, then push it `gap_s` into the past so the NEXT
+        /// prompt lands exactly that far after it. A test that records both in
+        /// the same instant measures a zero delta and proves nothing about the
+        /// window.
+        async fn prompt_then_wait(st: &AppState, lane: &'static str, text: &str, gap_s: i64) -> i64 {
+            cmd_hist_record_full(st, lane, text, "user", "", false, DeliveryMeta::direct()).await;
+            let id: i64 = st.store.read().unwrap()
+                .query_row("SELECT id FROM cmd_history WHERE session=?1 ORDER BY id DESC LIMIT 1",
+                    [lane], |r| r.get(0)).unwrap();
+            st.store.write(move |conn| {
+                conn.execute("UPDATE cmd_history SET ts=ts-?1 WHERE id=?2",
+                    rusqlite::params![gap_s * 1000, id])?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            }).unwrap();
+            id
+        }
+
+        fn cards(st: &AppState, lane: &str) -> i64 {
+            st.store.read().unwrap()
+                .query_row("SELECT COUNT(*) FROM issues WHERE session=?1", [lane], |r| r.get(0))
+                .unwrap()
+        }
+
+        fn card_of(st: &AppState, msg: i64) -> Option<String> {
+            st.store.read().unwrap()
+                .query_row("SELECT card_id FROM cmd_history WHERE id=?1", [msg], |r| r.get(0))
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn the_amux_4799_qualifier_lands_on_the_card_its_own_prompt_created() {
+            let (st, _dir) = state();
+            let first = prompt_then_wait(&st, "lane-qual", REQUEST, 19).await;
+            let card = card_of(&st, first).expect("the request itself must card");
+            cmd_hist_record_full(&st, "lane-qual", QUALIFIER, "user", "", false,
+                DeliveryMeta::direct()).await;
+            let second: i64 = st.store.read().unwrap()
+                .query_row("SELECT id FROM cmd_history WHERE session='lane-qual' ORDER BY id DESC LIMIT 1",
+                    [], |r| r.get(0)).unwrap();
+
+            assert_eq!(cards(&st, "lane-qual"), 1,
+                "the refinement must not become a second card; AMUX-4800 said nothing standalone");
+            assert_eq!(card_of(&st, second).as_deref(), Some(card.as_str()),
+                "the qualifier links the card its own prompt created");
+            // Linking alone is not the fix: the text has to REACH the work.
+            let desc: String = st.store.read().unwrap()
+                .query_row("SELECT desc FROM issues WHERE id=?1", [&card], |r| r.get(0)).unwrap();
+            assert!(desc.contains("standalone and orchestrate/fanout"),
+                "the scope Ethan added must be readable on the card that ships it: {desc}");
+            // Names both ends, NOT the exact second. The delta is measured from
+            // real clocks, so pinning "19s" here made the assertion drift by
+            // however long the test itself took — green on a quiet box, red
+            // under a concurrent build, for no reason connected to the fix.
+            assert!(desc.contains(&format!("Refinement MSG-{second}")),
+                "the card must say which message this text arrived as: {desc}");
+            assert!(desc.contains(&format!("after MSG-{first}")),
+                "the card must say what this text refines: {desc}");
+            let pending: i64 = st.store.read().unwrap()
+                .query_row("SELECT capture_pending FROM cmd_history WHERE id=?1", [second], |r| r.get(0))
+                .unwrap();
+            assert_eq!(pending, 0, "an attached qualifier is a finished capture, not a retry");
+        }
+
+        /// The half that already worked, from the same 12-minute window on
+        /// another lane. "and TS" was dropped 8 seconds after the message it
+        /// qualifies, by a 12-character floor that caught it for the wrong
+        /// reason. It must still mint no card of its own — and now it also
+        /// reaches the work, which is the whole point of catching it.
+        #[tokio::test]
+        async fn the_and_ts_fragment_still_mints_no_card_of_its_own() {
+            let (st, _dir) = state();
+            let first = prompt_then_wait(&st, "lane-ts",
+                "[10:43 AM] add a board item on this board to continue driving until its fully \
+                 verified e2e in production against all lifecycle mixpeek stuff for shared and tenant.",
+                8).await;
+            let card = card_of(&st, first).expect("the request itself must card");
+            cmd_hist_record_full(&st, "lane-ts", "[10:43 AM] and TS", "user", "", false,
+                DeliveryMeta::direct()).await;
+            let second: i64 = st.store.read().unwrap()
+                .query_row("SELECT id FROM cmd_history WHERE session='lane-ts' ORDER BY id DESC LIMIT 1",
+                    [], |r| r.get(0)).unwrap();
+            assert_eq!(cards(&st, "lane-ts"), 1, "a two-word fragment is still not a card");
+            assert_eq!(card_of(&st, second).as_deref(), Some(card.as_str()),
+                "and it no longer vanishes: it lands on the request it narrows");
+        }
+
+        /// The cell that decides whether this fix is worth having. A genuinely
+        /// new request sent seconds after an unrelated one must keep its own
+        /// card, or the bug is traded for a worse one: a real ask buried in
+        /// somebody else's description.
+        ///
+        /// The rule tells them apart by whether the message opens by POINTING
+        /// BACK (a conjunction, a preposition, a reference phrase) or by
+        /// stating its own directive. This specimen is measured — it arrived
+        /// 6 seconds after an unrelated prompt on `tubescience` and earned
+        /// TUBES-2854.
+        #[tokio::test]
+        async fn a_new_request_seconds_after_an_unrelated_one_still_gets_its_own_card() {
+            let (st, _dir) = state();
+            let first = prompt_then_wait(&st, "lane-new", REQUEST, 6).await;
+            let card = card_of(&st, first).expect("the request itself must card");
+            cmd_hist_record_full(&st, "lane-new", "run the fuller pg-flat-vs-dense baseline sweep",
+                "user", "", false, DeliveryMeta::direct()).await;
+            let second: i64 = st.store.read().unwrap()
+                .query_row("SELECT id FROM cmd_history WHERE session='lane-new' ORDER BY id DESC LIMIT 1",
+                    [], |r| r.get(0)).unwrap();
+            assert_eq!(cards(&st, "lane-new"), 2, "a request that stands alone keeps its own card");
+            assert_ne!(card_of(&st, second).as_deref(), Some(card.as_str()),
+                "proximity alone must not fold a new ask into the prompt before it");
+        }
+
+        /// The temporal half is a BOUND, not a direction. Past the window the
+        /// same text is its own request again, so an unbounded window fails
+        /// here even though every qualifier test above stays green.
+        ///
+        /// 121 is a LITERAL, deliberately. Deriving it from
+        /// `QUALIFIER_WINDOW_S` would move the specimen with the constant, and
+        /// a test whose input tracks the value it is checking cannot fail when
+        /// that value changes. Widening the window past two minutes reddens
+        /// this test by name, which is the intended prompt to re-measure the
+        /// clustering rather than to edit the number here.
+        #[tokio::test]
+        async fn a_qualifier_past_the_window_is_its_own_card_again() {
+            let (st, _dir) = state();
+            let first = prompt_then_wait(&st, "lane-late", REQUEST, 121).await;
+            let card = card_of(&st, first).expect("the request itself must card");
+            cmd_hist_record_full(&st, "lane-late", QUALIFIER, "user", "", false,
+                DeliveryMeta::direct()).await;
+            let second: i64 = st.store.read().unwrap()
+                .query_row("SELECT id FROM cmd_history WHERE session='lane-late' ORDER BY id DESC LIMIT 1",
+                    [], |r| r.get(0)).unwrap();
+            assert_eq!(cards(&st, "lane-late"), 2,
+                "121s after the prompt it would modify, a follow-on is a new request");
+            assert_ne!(card_of(&st, second).as_deref(), Some(card.as_str()));
+        }
+
+        /// Shape and time can both hold with nothing to point at: the prompt
+        /// before this one produced no card. Attaching is impossible, so the
+        /// qualifier falls through to normal capture rather than disappearing.
+        #[tokio::test]
+        async fn a_qualifier_with_no_referent_falls_through_to_normal_capture() {
+            let (st, _dir) = state();
+            let first = prompt_then_wait(&st, "lane-orphan", "[10:38 AM] what is the current status?", 5).await;
+            assert_eq!(card_of(&st, first), None, "an informational turn is the cardless case");
+            cmd_hist_record_full(&st, "lane-orphan", QUALIFIER, "user", "", false,
+                DeliveryMeta::direct()).await;
+            assert_eq!(cards(&st, "lane-orphan"), 1,
+                "with nothing to refine, the follow-on is captured on its own");
+        }
+
+        /// The widened pending gate admits a TITLELESS qualifier so it can be
+        /// attached. When there is nothing to attach it to, it has to land
+        /// exactly where it landed before AMUX-4881: no card, no link, receipt
+        /// resolved rather than pending forever.
+        ///
+        /// It proves those three and NOT the fourth. The decline also exists to
+        /// avoid buying a classifier call for a two-word clause, and no test in
+        /// this binary can see that, because the model client is a process-wide
+        /// `OnceLock` that stays unset here. See the block itself.
+        #[tokio::test]
+        async fn a_titleless_qualifier_with_no_referent_cards_nothing_and_resolves_its_receipt() {
+            let (st, _dir) = state();
+            let first = prompt_then_wait(&st, "lane-bare", "[10:38 AM] what is the current status?", 5).await;
+            assert_eq!(card_of(&st, first), None, "an informational turn is the cardless case");
+            cmd_hist_record_full(&st, "lane-bare", "[10:43 AM] and TS", "user", "", false,
+                DeliveryMeta::direct()).await;
+            let second: i64 = st.store.read().unwrap()
+                .query_row("SELECT id FROM cmd_history WHERE session='lane-bare' ORDER BY id DESC LIMIT 1",
+                    [], |r| r.get(0)).unwrap();
+            assert_eq!(cards(&st, "lane-bare"), 0, "a two-word fragment still mints nothing");
+            assert_eq!(card_of(&st, second), None, "and links nothing");
+            let pending: i64 = st.store.read().unwrap()
+                .query_row("SELECT capture_pending FROM cmd_history WHERE id=?1", [second], |r| r.get(0))
+                .unwrap();
+            assert_eq!(pending, 0, "the receipt is resolved, not left pending forever");
+        }
     }
 
     // AMUX-3071: the send path lost Python's _autotask_from_command at the
