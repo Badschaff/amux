@@ -143,6 +143,12 @@ test('local invitee joins, shares work, uses worker APIs, appears in logs, and c
       const fleetRow = rows.find((row: any) => row.name === workerName);
       const info = await fetch(`/api/sessions/${encodeURIComponent(workerName)}/info`);
       const infoBody = await info.json();
+      // A send to an ordinary stopped worker now requests auto-start. Keep this
+      // fixture paused so the real handler proves member attribution and the
+      // lifecycle refusal without trying to launch a paid provider on the host.
+      const pause = await (window as any).eval('_origFetch')(`/api/workers/${encodeURIComponent(workerName)}/pause`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+      });
       // This assertion measures server member attribution. Use the native
       // transport: the UI fetch interceptor now acknowledges local queuing
       // immediately, before a server response or authored_by can exist.
@@ -162,11 +168,13 @@ test('local invitee joins, shares work, uses worker APIs, appears in logs, and c
         fleetCreator: fleetRow?.creator,
         infoStatus: info.status,
         infoBody,
+        pauseStatus: pause.status,
         sendStatus: stoppedSend.status,
         sendBody: await stoppedSend.json(),
       };
     }, memberWorker);
-    expect(workerAccess).toMatchObject({
+    if (workerAccess.createStatus === 201) createdWorkers.push(memberWorker);
+    expect(workerAccess, JSON.stringify(workerAccess)).toMatchObject({
       createStatus: 201,
       createBody: { creator: 'member:guest@example.com' },
       fleetStatus: 200,
@@ -174,10 +182,11 @@ test('local invitee joins, shares work, uses worker APIs, appears in logs, and c
       fleetCreator: 'member:guest@example.com',
       infoStatus: 200,
       infoBody: { name: memberWorker },
-      sendStatus: 200,
-      sendBody: { ok: true, authored_by: 'member:guest@example.com' },
+      pauseStatus: 200,
+      sendStatus: 409,
+      sendBody: { ok: false, authored_by: 'member:guest@example.com' },
     });
-    createdWorkers.push(memberWorker);
+    expect(workerAccess.sendBody.message).toMatch(/paused/i);
     for (const [name, tags] of [
       [groupPeer, ['e2e-multiplayer']],
       [outsider, ['e2e-outsider']],

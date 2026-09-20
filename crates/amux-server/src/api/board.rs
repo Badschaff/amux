@@ -10057,7 +10057,12 @@ pub async fn patch_item(
             Err(e) => return err(StatusCode::SERVICE_UNAVAILABLE, json!({"error":e.to_string()})),
         };
         if let Some(row) = row {
-            let owner = if map.contains_key("session") { body_str(&map, "session") } else { row.session.clone() };
+            // Use the same nullable-field semantics as the transaction below.
+            // The dashboard submits session:"" for an unassigned card. Measuring
+            // Some("") here but writing None falsely reports an ownership race.
+            let owner = body_opt_str(&map, "session")
+                .map(|value| value.filter(|name| !name.trim().is_empty()))
+                .unwrap_or_else(|| row.session.clone());
             let verdict = match owner.as_deref() {
                 Some(name) => crate::fanout_workspace::verification_ready(name).await,
                 None => Ok(()),
@@ -11158,6 +11163,10 @@ pub async fn patch_item(
 
             if let Some((observed_rev, owner, verdict)) = &workspace_verification {
                 if row.rev != *observed_rev || next.session.as_deref() != owner.as_deref() {
+                    tracing::warn!(target: "amux::verification", card = %row.id,
+                        observed_rev, current_rev = row.rev, observed_owner = ?owner,
+                        current_owner = ?next.session, verdict = "verification_observation_stale",
+                        "card changed after workspace verification was measured");
                     return finish(&slot_w, PatchOut::Refused(StatusCode::CONFLICT,
                         json!({"error":"card changed during verification; re-read and retry", "code":"verification_observation_stale", "item":row.id})), no_write());
                 }

@@ -11543,7 +11543,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.1001';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.1002';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -28238,7 +28238,10 @@ async function toggleSchedEnabled(id, enabled) {
 
 let _boardViewsLoaded = false;
 let _boardEtag = null;
+let _boardReadGeneration = 0;
+let _boardReadAppliedGeneration = 0;
 async function fetchBoard() {
+  const readGeneration = ++_boardReadGeneration;
   // Saved views sync via /api/prefs so a view made on the desktop is on the
   // phone. Fetched once, not on every board poll.
   if (!_boardViewsLoaded) { _boardViewsLoaded = true; await _boardViewsLoad(); }
@@ -28271,14 +28274,25 @@ async function fetchBoard() {
     }
     const statusData = await rs.json();
     if (!Array.isArray(statusData)) throw new Error('Board statuses response is invalid');
+    const sgData = await rsg.json();
+    if (!sgData || typeof sgData !== 'object' || Array.isArray(sgData)) throw new Error('Board gates response is invalid');
+    const data = r.status === 304 ? null : await r.json();
+    if (r.status !== 304 && !Array.isArray(data)) throw new Error('Board response is invalid');
+    // An older successful read cannot erase a newer failure, nor may an old
+    // failure replace recovered state. Publish the validated batch together.
+    if (readGeneration < _boardReadAppliedGeneration) {
+      amuxTrack('board_read_superseded', {read_generation:readGeneration, current_generation:_boardReadAppliedGeneration, outcome:'success', measured:true, n_considered:1});
+      return;
+    }
+    _boardReadAppliedGeneration = readGeneration;
     _boardReadError = '';
     updateConnectionStatus();
-    // r.ok FIRST: a 404 body {"error":"not found"} IS an object, so the typeof
-    // guard below happily assigned it and sessionGates became {error:"not found"} —
+    // HTTP status is validated first: a 404 body {"error":"not found"} IS an
+    // object, so the old typeof guard assigned it to sessionGates —
     // not merely empty, POISONED with a bogus scope key, while this endpoint 404'd
     // 27 times/day after the cutover with nothing shown. Same class as the git-fetch
     // guard: an HTTP error that parses into plausible data (AF-29/AF-30).
-    try { if (rsg.ok) { const sgData = await rsg.json(); if (sgData && typeof sgData === 'object') sessionGates = sgData; } } catch(e) {}
+    sessionGates = sgData;
     consecutiveFailures = 0;
     if (!online) setOnline(true);
     const sj = JSON.stringify(statusData);
@@ -28298,22 +28312,11 @@ async function fetchBoard() {
       if (statusesChanged) renderBoard();
       return;
     }
-    _boardEtag = r.headers.get('ETag') || null;
-    const data = await r.json();
-    // NEVER assign a non-array into boardItems (live crash 2026-08-09: a
-    // remote window holding a stale SW-cached shell sent a stale token, the
-    // 401 body {"error":"unauthorized"} became boardItems, and every
-    // _cardDoingCount/forEach in the worker-list render threw — one bad
-    // fetch bricked the whole page). Keep the previous array; a 401 means
-    // the SHELL (and its injected token) is stale, so refresh it once.
-    if (!Array.isArray(data)) {
-      if (r.status === 401) _staleShellRecover();
-      throw new Error('Board response is invalid');
-    }
     if (snapshotEpoch !== _boardSnapshotEpoch) {
       console.info('board poll completed behind a newer stream snapshot; discarded');
       return;
     }
+    _boardEtag = r.headers.get('ETag') || null;
     const j = JSON.stringify(data);
     const itemsChanged = j !== lastBoardJSON;
     _stateQuery.set(['board'], data);
@@ -28351,9 +28354,14 @@ async function fetchBoard() {
     // Seed CDC cursor so subsequent invalidations can use granular updates
     try {
       const cr = await fetch(API + '/api/board/changes?since_seq=0&limit=1');
-      if (cr.ok) { const cd = await cr.json(); if (cd.cursor) _cdcSeq = cd.cursor; }
+      if (cr.ok) { const cd = await cr.json(); if (cd.cursor && readGeneration === _boardReadAppliedGeneration) _cdcSeq = cd.cursor; }
     } catch (e2) {}
   } catch(e) {
+    if (readGeneration < _boardReadAppliedGeneration) {
+      amuxTrack('board_read_superseded', {read_generation:readGeneration, current_generation:_boardReadAppliedGeneration, outcome:'error', measured:true, n_considered:1});
+      return;
+    }
+    _boardReadAppliedGeneration = readGeneration;
     _boardReadError = String(e.message || e);
     updateConnectionStatus();
     console.error('fetch board:', e);

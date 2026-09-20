@@ -15,7 +15,7 @@ test('LC-GATE-REVISION: edit criteria on a verified task, inspect stale evidence
     await expect(page.locator('#_gate-list')).toContainText(first[0]);
     for(const box of await page.locator('#_gate-list input').all())await box.check();
     const moved=page.waitForResponse(r=>r.url().endsWith(url)&&r.request().method()==='PATCH');
-    await page.locator('#_gate-ok').click();expect((await moved).ok()).toBe(true);
+    await page.locator('#_gate-ok').click();const moveResponse=await moved;expect(moveResponse.ok(),await moveResponse.text()).toBe(true);
     await page.reload();
     await expect(page.locator('.bd-verification-section')).toContainText('Verified against recorded criteria');
     await page.locator('#bd-tab-edit').click();await page.locator('#bd-gate').fill(second.join('\n'));
@@ -28,7 +28,7 @@ test('LC-GATE-REVISION: edit criteria on a verified task, inspect stale evidence
     await page.getByRole('button',{name:'Recheck current gate',exact:true}).click();
     await expect(page.locator('#_gate-list')).toContainText('Duplicate invoice IDs are rejected');
     for(const box of await page.locator('#_gate-list input').all())await box.check();
-    const applied=page.waitForResponse(r=>r.url().endsWith(url)&&r.request().method()==='PATCH');await page.locator('#_gate-ok').click();expect((await applied).ok()).toBe(true);
+    const applied=page.waitForResponse(r=>r.url().endsWith(url)&&r.request().method()==='PATCH');await page.locator('#_gate-ok').click();const applyResponse=await applied;expect(applyResponse.ok(),await applyResponse.text()).toBe(true);
     await expect(page.locator('.bd-verification-section')).toContainText('Verified against recorded criteria');
     await expect(page.getByRole('button',{name:'Recheck current gate',exact:true})).toHaveCount(0);
     await page.locator('.bd-verification-section').scrollIntoViewIfNeeded();

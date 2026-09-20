@@ -26,7 +26,10 @@ for (const outcome of ['refused', 'accepted', 'queued', 'unconfirmed'] as const)
     });
     const entries = () => page.evaluate(name => JSON.parse(localStorage.getItem('amux_offline_queue') || '[]').filter((q: any) => q.url.endsWith(`/${name}/send`)), name);
     try {
-      await page.reload();
+      // The SPA is usable at DOMContentLoaded; WebKit can keep its load event
+      // pending on background requests. Explicitly returning to Workers also
+      // prevents saved-peek restoration from racing the menu click.
+      await page.goto('/#view=sessions', {waitUntil:'domcontentloaded'});
       const card = page.locator(`.card[data-session="${name}"]`).locator('visible=true').first();
       await card.locator('.card-menu-btn').click();
       await page.locator('.card-menu.open [data-worker-action="peek-terminal"]').click();
@@ -93,7 +96,7 @@ for (const outcome of ['refused', 'accepted', 'queued', 'unconfirmed'] as const)
       await expect(input).toHaveValue('A newer draft must survive the old delivery receipt');
       if (outcome === 'accepted') expect(await page.evaluate(() => (window as any).__composerToasts)).not.toEqual(
         expect.arrayContaining([expect.stringMatching(/queued operation|syncing|sending/i)]));
-      await page.reload();
+      await page.reload({waitUntil:'domcontentloaded'});
       const persisted = await entries();
       if (outcome !== 'accepted') {
         expect(persisted).toHaveLength(1);
@@ -108,8 +111,10 @@ for (const outcome of ['refused', 'accepted', 'queued', 'unconfirmed'] as const)
       }
     } finally {
       release();
-      await page.evaluate(name => eval('_mutateQueue')((queue: any[]) => { for (let i = queue.length - 1; i >= 0; i--) if (queue[i].url.endsWith(`/${name}/send`)) queue.splice(i, 1); }), name);
-      await deleteOwnedWorkers(page, request, headers, [name]);
+      if (!page.isClosed()) {
+        await page.evaluate(name => eval('_mutateQueue')((queue: any[]) => { for (let i = queue.length - 1; i >= 0; i--) if (queue[i].url.endsWith(`/${name}/send`)) queue.splice(i, 1); }), name);
+        await deleteOwnedWorkers(page, request, headers, [name]);
+      }
     }
   });
 }
@@ -158,7 +163,7 @@ test('LC-COMPOSER: failed local persistence retains draft and sends nothing', as
   allowUnusedRoute(page, `**/api/sessions/${name}/send`);
   await page.route(`**/api/sessions/${name}/send`, route => { sends++; return route.fulfill({json:{ok:true, submitted:true}}); });
   try {
-    await page.reload();
+    await page.goto('/#view=sessions', {waitUntil:'domcontentloaded'});
     await page.locator(`.card[data-session="${name}"]`).locator('visible=true').first().locator('.card-menu-btn').click();
     await page.locator('.card-menu.open [data-worker-action="peek-terminal"]').click();
     await page.locator('#peek-cmd-input').fill('Storage failure must keep this draft');
@@ -182,9 +187,11 @@ test('LC-COMPOSER: failed local persistence retains draft and sends nothing', as
     await expect(page.locator('#conn-modal-write-notice')).toContainText('Device storage full');
     await expect(page.locator('#conn-modal-write-notice')).toContainText('has not left this device');
   } finally {
-    await page.evaluate(() => (window as any).__restoreStorage?.());
-    const connectionModal = page.locator('#conn-hist-modal');
-    if (await connectionModal.isVisible()) await connectionModal.click({position:{x:4,y:4}});
-    await deleteOwnedWorkers(page, request, headers, [name]);
+    if (!page.isClosed()) {
+      await page.evaluate(() => (window as any).__restoreStorage?.());
+      const connectionModal = page.locator('#conn-hist-modal');
+      if (await connectionModal.isVisible()) await connectionModal.click({position:{x:4,y:4}});
+      await deleteOwnedWorkers(page, request, headers, [name]);
+    }
   }
 });

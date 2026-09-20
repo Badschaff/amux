@@ -1273,18 +1273,28 @@ mod tests {
         for (i, provider) in [CliProvider::ClaudeCode, CliProvider::CodexCli, CliProvider::GeminiCli].into_iter().enumerate() {
             let dir = tempfile::tempdir().unwrap();
             let script = dir.path().join("provider");
-            std::fs::write(&script, "#!/bin/sh\nsleep 120 &\necho $! > tool.pid\nwait\n").unwrap();
+            std::fs::write(&script, "#!/bin/sh\nsleep 120 &\necho $! > tool.pid.tmp\nmv tool.pid.tmp tool.pid\nwait\n").unwrap();
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
             let proto = StructuredCliProtocol::new();
             let w = worker_id(&format!("{:05}", i + 60));
             proto.register(w.clone(), WorkerConfig { provider, cwd:dir.path().into(), binary:Some(script), model:None, conversation:Some("saved-conversation".into()) });
             proto.send_prompt(&w, prompt("before-pause")).await.unwrap();
-            for _ in 0..100 {
-                if dir.path().join("tool.pid").exists() { break; }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            let tool = std::fs::read_to_string(dir.path().join("tool.pid")).unwrap();
+            // Wait for the fixture's atomic readiness signal, not a one-second
+            // host scheduling assumption. Always stop its process group before
+            // reporting failure, so a failed readiness check cannot leak work.
+            let tool = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match std::fs::read_to_string(dir.path().join("tool.pid")) {
+                        Ok(pid) => break Ok(pid),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+                        Err(e) => break Err(e),
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }).await;
             proto.pause(&w).await.unwrap();
+            let tool = tool.expect("fake provider did not publish tool readiness within 10s")
+                .expect("fake provider readiness could not be read");
             assert_eq!(proto.state(&w).await.unwrap(), AgentState::Paused);
             assert!(matches!(proto.send_prompt(&w, prompt("while-paused")).await, Err(ProtocolError::Rejected(_))));
             let status = Command::new("ps").args(["-p", tool.trim(), "-o", "stat="]).output().await.unwrap();

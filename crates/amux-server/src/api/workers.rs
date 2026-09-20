@@ -2936,7 +2936,7 @@ mod tests {
         drop(conn);
         crate::api::sessions_legacy::invalidate_sessions_cache();
 
-        let (status, _, payload) = read_fixture_sessions(&app, "active").await;
+        let (status, _, payload) = read_real_sessions_settled(&app, "active").await;
         assert_eq!(status, StatusCode::OK, "{payload}");
         let rows = payload.as_array().expect("legacy session array");
         let linked = rows.iter().find(|row| row["name"] == "linked").expect("linked row");
@@ -3005,7 +3005,7 @@ mod tests {
         drop(conn);
         crate::api::sessions_legacy::invalidate_sessions_cache();
         idle_race.store(true, std::sync::atomic::Ordering::SeqCst);
-        let (status, _, idle_payload) = read_fixture_sessions(&app, "idle").await;
+        let (status, _, idle_payload) = read_real_sessions_settled(&app, "idle").await;
         assert_eq!(injected.load(std::sync::atomic::Ordering::SeqCst), 1, "idle discovery-race control must execute");
         assert_eq!(status, StatusCode::OK, "{idle_payload}");
         let idle_tubescience = idle_payload

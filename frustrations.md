@@ -3523,3 +3523,26 @@ CARD: CLA-6
 SYMPTOM: The global tab promoted ordinary epics into orchestration roots and rendered full fan-out boards as repeated worker rows. The live snapshot contained 13 fan-out workers under three parents, but 199 epics in the projection and nearly 200 displayed entries.
 COST: User could not find the actual coordinator/fan-out structure in the global tab after the role/model launcher change.
 FIX: Project actual tracked worker boards and linked ancestors, then group by recorded coordinator ownership. Show each worker once with expandable board tasks, active work, model and workspace state. Report included/excluded populations through orchestration_projection and API fields; preserve scoped and retired inventory.
+
+
+## Verifying an unassigned card reports a false ownership race
+AREA: gates
+SEVERITY: wrong-state
+STATUS: open
+DATE: 2026-09-20
+SESSION: codex-lifecycle-adherence
+CARD: CLA-7
+SYMPTOM: The board details form submitted session:"" while moving a chore to Verified. The workspace preflight treated the owner as Some("") but the write normalized it to None, returning verification_observation_stale even though no concurrent edit occurred.
+COST: Gate-revision acceptance failed on desktop, mobile and iOS, and legitimate unassigned tasks could not reach Verified through the UI.
+FIX: Apply the transaction's nullable-owner normalization before measuring workspace readiness. Preserve the revision/owner race check, add its observed/current values to logs, and cover empty, whitespace, null and retained owners through the public API.
+
+## An older board poll clears a newer read failure
+AREA: ui
+SEVERITY: wrong-state
+STATUS: open
+DATE: 2026-09-20
+SESSION: codex-lifecycle-adherence
+CARD: CLA-7
+SYMPTOM: Overlapping board reads published in response order. An older successful response could clear a newer board/status read failure and show Live while the board was unavailable; an old failure could likewise overwrite a recovery.
+COST: The iOS outage acceptance test intermittently displayed Live instead of Sync error, hiding actionable failure state from the user.
+FIX: Validate each response batch before publishing and order publication by read generation. Older reads may finish while a newer read is pending, but cannot replace a newer completed result. Emit board_read_superseded and test both failure and recovery with deliberately reversed responses.

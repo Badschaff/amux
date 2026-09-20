@@ -15,7 +15,9 @@ for(const surface of ['card','details'] as const) for(const mode of ['Send','Que
   const held=new Promise<void>(r=>release=r); const verb=mode==='Queue'?'steer':'send';
   await page.route(`**/api/sessions/${name}/${verb}`,async r=>{if(offline)return r.abort('internetdisconnected');payloads.push(r.request().postDataJSON());await held;await r.fulfill({json:{ok:true,submitted:true,id:'accepted-'+name}})});
   const open=async()=>{
-    await page.goto('/');if(await page.locator('#peek-overlay.active').isVisible())await page.getByRole('button',{name:'Close worker',exact:true}).click();const card=page.locator(`#cards .card[data-session="${name}"]`).locator('visible=true').first();
+    // This helper deliberately returns to Workers. A bare root URL restores
+    // the saved peek after boot, racing the card-menu click on iOS.
+    await page.goto('/#view=sessions');await expect(page.locator('#peek-overlay')).not.toHaveClass(/active/);const card=page.locator(`#cards .card[data-session="${name}"]`).locator('visible=true').first();
     if(surface==='card'){await card.locator('.card-name').click();return card;}
     await card.locator('.card-menu-btn').click();await page.locator('.card-menu.open [data-worker-action="peek-terminal"]').click();return page.locator('#peek-overlay');
   };

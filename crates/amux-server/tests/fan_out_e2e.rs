@@ -897,6 +897,29 @@ async fn verified_requires_the_current_clean_fanout_head_to_be_integrated() {
 }
 
 #[tokio::test]
+async fn verification_owner_observation_matches_nullable_patch_semantics() {
+    let r = rig().await;
+    // Unassigned cards are submitted as session:"" by the dashboard. Explicit
+    // clearing and a retained owner must agree with the transaction too.
+    for (original, patch, expected) in [
+        (Value::Null, json!(""), Value::Null),
+        (Value::Null, json!("   "), Value::Null),
+        (json!("ordinary"), Value::Null, Value::Null),
+        (json!("ordinary"), json!("ordinary"), json!("ordinary")),
+    ] {
+        let card = create(&r.app, json!({"title":"Verify nullable owner", "type":"chore",
+            "session":original, "gate":["Fixture output checked"]})).await;
+        let path = format!("/api/board/{}", card["id"].as_str().unwrap());
+        let (status, _, body) = send(&r.app, "PATCH", &path,
+            Some(json!({"status":"verified", "session":patch,
+                "gate_checked":["Fixture output checked"]})), &[]).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "verified", "{body}");
+        assert_eq!(body["session"], expected, "{body}");
+    }
+}
+
+#[tokio::test]
 async fn launch_has_a_real_coordinator_and_independent_child_profiles() {
     let r=rig().await;
     write_parent_env(&r.home,"workspace");
