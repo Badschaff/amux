@@ -3468,3 +3468,14 @@ CARD: CLA-4
 SYMPTOM: The real browser regression timed out finding global current activity even with two running fixture workers. Moving the shared strip inside its host for worker-detail scrolling also put the global strip inside the horizontal columns; every global render replaced that host and erased it.
 COST: Running workers disappeared from board activity across filters and view changes, making real task execution look like non-adherence.
 FIX: Mount global activity above the replaceable horizontal columns while retaining the worker-detail scrolling mount. Report active-work-missing through the existing measured UI diagnostics. Browser coverage exercises list/worker/status views, same-status task switching, filters, pause and both desktop/phone widths, with missing-strip and compressed-row negative controls.
+
+## Supported textual criteria are misclassified as an unstructured capture
+AREA: board
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-19
+SESSION: codex-lifecycle-adherence
+CARD: CLA-4
+SYMPTOM: The public board API accepts text or a string array for acceptance_criteria, but has_execution_details and its SQL mirror only accepted arrays. Two active-board cards with next actions and nonempty textual criteria were consequently counted as raw captures.
+COST: AMUX-4508 and MHC-808 could be sent back to intake despite already carrying the execution fields the public API accepts.
+FIX: Use the same accepted text/array shapes in the shared Rust and SQL predicates, with empty/malformed/object controls. The text_criteria_recognized log names recovered captured work once per card/hour. Preserve the criteria verbatim and retain actual approval/event holds.

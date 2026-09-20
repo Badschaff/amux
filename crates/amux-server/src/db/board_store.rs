@@ -3646,8 +3646,24 @@ pub fn has_execution_details(row: &IssueRow) -> bool {
     row.next_action.as_deref().is_some_and(|s| !s.trim().is_empty())
         && row.acceptance_criteria.as_deref()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-            .and_then(|v| v.as_array().cloned())
-            .is_some_and(|items| items.iter().any(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())))
+            .is_some_and(|value| match value {
+                // The public board API accepts both text and string arrays.
+                // Recognizing only arrays sent legitimate structured work back
+                // to intake while the board correctly displayed its criteria.
+                serde_json::Value::String(text) => {
+                    let present = !text.trim().is_empty();
+                    if present && row.creator == "amux" && row.desc.trim_start().starts_with("**Prompt:**")
+                        && crate::log_dedupe::first_this_bucket(
+                            &format!("text-criteria:{}", row.id),
+                            crate::log_dedupe::hour_bucket(chrono::Utc::now().timestamp() as f64)) {
+                        tracing::info!(card = %row.id, measured=true, n_considered=1,
+                            verdict="text_criteria_recognized", "structured captured work uses supported textual acceptance criteria");
+                    }
+                    present
+                },
+                serde_json::Value::Array(items) => items.iter().any(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())),
+                _ => false,
+            })
 }
 
 fn execution_details_sql() -> String {
@@ -3655,9 +3671,11 @@ fn execution_details_sql() -> String {
     let whitespace = "char(9)||char(10)||char(11)||char(12)||char(13)||' '||char(133)||char(160)||char(5760)||char(8192)||char(8193)||char(8194)||char(8195)||char(8196)||char(8197)||char(8198)||char(8199)||char(8200)||char(8201)||char(8202)||char(8232)||char(8233)||char(8239)||char(8287)||char(12288)";
     format!("(length(trim(COALESCE(i.next_action,''), {whitespace})) > 0 AND \
         CASE WHEN json_valid(i.acceptance_criteria) THEN \
-          json_type(i.acceptance_criteria)='array' AND EXISTS(\
+          CASE json_type(i.acceptance_criteria) \
+          WHEN 'text' THEN length(trim(json_extract(i.acceptance_criteria,'$'), {whitespace})) > 0 \
+          WHEN 'array' THEN EXISTS(\
             SELECT 1 FROM json_each(i.acceptance_criteria) c WHERE c.type='text' \
-            AND length(trim(c.value, {whitespace})) > 0) ELSE 0 END)")
+            AND length(trim(c.value, {whitespace})) > 0) ELSE 0 END ELSE 0 END)")
 }
 
 /// A captured message whose FIRST LINE opens with `ASK` and names a board id is
@@ -6925,6 +6943,9 @@ everything to a clean machine.";
         let conn = crate::db::migrate::test_memdb();
         for (i, (action, criteria, expected)) in [
             ("Run the reproduction", r#"["Regression no longer reproduces"]"#, false),
+            ("Run the reproduction", r#""Regression no longer reproduces""#, false),
+            ("Run the reproduction", r#"" \t\n\u2003""#, true),
+            ("", r#""Regression no longer reproduces""#, true),
             ("", r#"["Regression no longer reproduces"]"#, true),
             ("Run the reproduction", "[]", true),
             ("Run the reproduction", r#"[" ", null, 1]"#, true),
