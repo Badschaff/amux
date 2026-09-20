@@ -3602,3 +3602,27 @@ CARD: CLA-9
 SYMPTOM: A coordinator continuation returned confirmed after an Escape+Enter retry, but the exact instruction remained in its native composer. A later bare Enter resumed the coordinator. The retry still pressed Escape after picker-safe paste, and its final confirmation accepted a single cleared frame; a missing-UI frame also failed to reset the earlier clear observation.
 COST: The orchestrator did not act on an accepted continuation until the terminal was independently inspected and the pending input submitted.
 FIX: Retry Enter without Escape because picker-shaped input already uses bracketed paste. Require consecutive clear frames, including the final read, or durable provider acceptance. Emit submission_enter_retry with its actual key mode. A model-free real-tmux replay fails on the old retry bytes [Escape, Enter] and verifies the new path submits without interrupting; frame-sequence controls cover repaint, missing UI, active input and collapsed paste.
+
+
+## Concurrent test subscribers hide board diagnostic warnings
+AREA: tests
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-20
+SESSION: codex-lifecycle-adherence
+CARD: CLA-8
+SYMPTOM: CI's parallel server tests returned the expected unreadable-WIP error but captured only the success-side INFO event; the WARN assertion failed. The board's two log-contract tests installed thread-local subscribers while sharing process-wide callsite interest with other tests.
+COST: A valid release could not complete verification because the diagnostic test observed a different logging environment than production.
+FIX: Execute each board diagnostic contract in its own exact-test subprocess, following the existing storage-probe contract pattern. Preserve every real production call and required diagnostic field; fail if the child exits unsuccessfully or runs zero tests. The child output is included on failure instead of retrying or ignoring a missing warning.
+
+
+## Board recovery fixture mistakes a concurrent policy change for repeated work
+AREA: tests
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-20
+SESSION: codex-lifecycle-adherence
+CARD: CLA-8
+SYMPTOM: The parallel board suite queued another blocker-recovery turn after a progress-only edit. Its fixture left scoped settings unguarded while other tests changed AMUX_HOME; recovery identity correctly includes the approval policy, which differed between the real workspace and those temporary homes.
+COST: The unchanged-state assertion failed for a changed-policy scenario it had accidentally constructed.
+FIX: Hold the existing shared temporary-home guard in both recovery-identity tests. The policy remains fixed across progress-only edits, while real blocker/output changes must still rearm and explicit holds remain intact. Keep failed-test output as evidence rather than explaining it away as build contention.

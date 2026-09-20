@@ -9310,6 +9310,10 @@ mod tests {
 
     #[tokio::test]
     async fn idle_parked_backlog_gets_one_specific_recovery_without_clearing_holds() {
+        // Recovery identity includes the scoped approval policy. Keep that
+        // scope fixed while parallel tests install and remove fixture homes.
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
         let (_dir, state, store) = drive_state();
         drive_card(&store, "PARKED", "backlog", "agent", "code");
         drive_card(&store, "EXTERNAL", "todo", "agent", "code");
@@ -9411,6 +9415,10 @@ mod tests {
 
     #[test]
     fn blocker_progress_notes_do_not_buy_another_model_turn() {
+        // Recovery identity includes the scoped approval policy. Keep that
+        // scope fixed while parallel tests install and remove fixture homes.
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
         let (_dir, _state, store) = drive_state();
         drive_card(&store, "WAIT", "backlog", "agent", "code");
         store.write(|conn| {
@@ -11011,8 +11019,28 @@ mod tests {
         assert!(should_drain_nudge(0, 0, population.len() as i64, 0));
     }
 
+    // Callsite interest is process-wide, even with a thread-local subscriber.
+    // Run log contracts alone so concurrent subscriber registration cannot hide
+    // the diagnostic under test. Keep the production calls and every assertion.
+    fn diagnostic_test_ran_in_child(test: &str) -> bool {
+        if std::env::var("AMUX_BOARD_LOG_TEST_CHILD").as_deref() == Ok(test) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env("AMUX_BOARD_LOG_TEST_CHILD", test)
+            .output().expect("run isolated board diagnostic contract");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{stdout}{}", String::from_utf8_lossy(&output.stderr));
+        assert!(stdout.contains("1 passed"), "diagnostic child did not run: {stdout}");
+        true
+    }
+
     #[test]
     fn nudge_population_logs_exclusions_and_refuses_unreadable_input() {
+        if diagnostic_test_ran_in_child("runtime_jobs::board_drive::tests::nudge_population_logs_exclusions_and_refuses_unreadable_input") {
+            return;
+        }
         #[derive(Clone)]
         struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Sink {
@@ -12159,6 +12187,9 @@ mod tests {
 
     #[test]
     fn wip_exemptions_and_failed_measurements_write_distinct_log_signals() {
+        if diagnostic_test_ran_in_child("runtime_jobs::board_drive::tests::wip_exemptions_and_failed_measurements_write_distinct_log_signals") {
+            return;
+        }
         #[derive(Clone)]
         struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Sink {
